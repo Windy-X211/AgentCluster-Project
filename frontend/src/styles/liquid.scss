@@ -1,0 +1,154 @@
+/* 液态玻璃美学主题 */
+$bg-deep: #0a0e1a;
+$glass-bg: rgba(255,255,255,0.06);
+$glass-border: rgba(255,255,255,0.12);
+$glass-highlight: rgba(255,255,255,0.08);
+$accent: #6ea8ff;
+$accent-2: #b472ff;
+$text: #e8ecf4;
+$text-dim: rgba(232,236,244,0.6);
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #app { height: 100%; width: 100%; }
+body {
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: $text;
+  background: radial-gradient(ellipse at 20% 10%, #1a2340 0%, $bg-deep 60%),
+              radial-gradient(ellipse at 80% 90%, #2d1645 0%, transparent 50%);
+  background-attachment: fixed;
+  overflow: hidden;
+}
+
+// 液态玻璃通用类
+.glass {
+  background: $glass-bg;
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid $glass-border;
+  border-radius: 16px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.25), inset 0 1px 0 $glass-highlight;
+}
+.glass-soft {
+  background: rgba(255,255,255,0.03);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+}
+.btn {
+  background: linear-gradient(135deg, rgba(110,168,255,0.25), rgba(180,114,255,0.25));
+  border: 1px solid rgba(255,255,255,0.15);
+  color: $text;
+  padding: 6px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: all .2s ease;
+  backdrop-filter: blur(8px);
+  &:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(110,168,255,0.2); }
+  &.ghost { background: transparent; &:hover { background: rgba(255,255,255,0.06); } }
+}
+.input {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: $text;
+  font-size: 13px;
+  outline: none;
+  width: 100%;
+  transition: border-color .2s;
+  &:focus { border-color: $accent; }
+  &::placeholder { color: $text-dim; }
+}
+/* select / option 深色主题覆盖（浏览器默认是白底） */
+select.input {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, rgba(255,255,255,0.4) 50%),
+                    linear-gradient(135deg, rgba(255,255,255,0.4) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 30px;
+  color: $text;
+  /* Firefox / IE 下拉箭头 */
+  @supports not (appearance: none) { padding-right: 8px; }
+}
+/* WebKit 下拉弹窗：option 背景 */
+select option, select optgroup {
+  background: #1a1f30 !important;
+  background-color: #1a1f30 !important;
+  color: $text !important;
+}
+/* 覆盖其他可能的下拉 */
+option { background: #1a1f30; color: $text; }
+
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: rgba(110,168,255,0.18);
+  color: #a8c8ff;
+  border: 1px solid rgba(110,168,255,0.3);
+  &.skill { background: rgba(180,114,255,0.18); color: #d4a8ff; border-color: rgba(180,114,255,0.3); }
+  &.plugin { background: rgba(100,220,160,0.18); color: #80e4b8; border-color: rgba(100,220,160,0.3); }
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+/* 滚动条交叉处的角落默认会渲染成白色方块/三角，显式置透明消除右下角白角 */
+::-webkit-scrollbar-corner { background: transparent; }
+
+// 布局
+.app-root {
+  display: grid;
+  // 4 列：left | center | resize-handle | right（宽度由 Home.vue 内联 gridTemplateColumns 覆盖）
+  grid-template-columns: 240px minmax(0, 1fr) 6px 300px;
+  grid-template-rows: 48px 1fr;
+  grid-template-areas:
+    "topbar topbar topbar topbar"
+    "left   center handle   right";
+  height: 100vh;
+  gap: 10px;
+  padding: 10px;
+}
+.topbar { grid-area: topbar; }
+.left { grid-area: left; display: flex; flex-direction: column; min-height: 0; transition: width .28s cubic-bezier(.4, 0, .2, 1); }
+.center { grid-area: center; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.resize-handle {
+  grid-area: handle;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: col-resize;
+  background: transparent;
+  border-radius: 3px;
+  transition: background .15s, box-shadow .15s;
+  user-select: none;
+  touch-action: none;
+}
+.resize-handle::before {
+  content: '';
+  width: 2px;
+  height: 40%;
+  background: rgba(255,255,255,0.14);
+  border-radius: 2px;
+  transition: background .15s, height .15s;
+}
+.resize-handle:hover { background: rgba(255,255,255,0.04); }
+.resize-handle:hover::before { background: rgba(110,168,255,0.55); height: 55%; }
+.resize-handle:active::before { background: rgba(110,168,255,0.9); height: 65%; }
+.right { grid-area: right; display: flex; flex-direction: column; min-height: 0; }
+
+.section-title {
+  font-size: 11px;
+  color: $text-dim;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 8px 12px 4px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
