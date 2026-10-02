@@ -1,7 +1,4 @@
 /.trae
-/AppData
-**/AppData/
-E:/智能体集群工作区/AppData/
 /debug.log
 /tray_debug.log
 /_deck_shots

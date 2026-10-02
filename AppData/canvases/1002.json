@@ -1,0 +1,116 @@
+{
+  "id": 1002,
+  "name": "游戏制作团队",
+  "description": "专业游戏制作集群，从项目立项到技术实现的完整工作流",
+  "nodes": [
+    {
+      "id": 1,
+      "agent_id": 19,
+      "x": -62.62181284907578,
+      "y": -191.74597558271688
+    },
+    {
+      "id": 2,
+      "agent_id": 20,
+      "x": -284.05719041362215,
+      "y": -357.57865192989
+    },
+    {
+      "id": 3,
+      "agent_id": 21,
+      "x": 151.6583436575912,
+      "y": -357.57865192989
+    },
+    {
+      "id": 4,
+      "agent_id": 22,
+      "x": 151.6583436575912,
+      "y": -23.46929524170848
+    },
+    {
+      "id": 5,
+      "agent_id": 23,
+      "x": -284.05719041362215,
+      "y": -23.46929524170848
+    }
+  ],
+  "edges": [
+    {
+      "id": 6,
+      "from_node": 1,
+      "to_node": 2,
+      "type": "handoff"
+    },
+    {
+      "id": 11,
+      "from_node": 5,
+      "to_node": 1,
+      "type": "chat"
+    },
+    {
+      "id": 12,
+      "from_node": 1,
+      "to_node": 5,
+      "type": "chat"
+    },
+    {
+      "id": 18,
+      "from_node": 2,
+      "to_node": 1,
+      "type": "chat"
+    },
+    {
+      "id": 19,
+      "from_node": 3,
+      "to_node": 1,
+      "type": "chat"
+    },
+    {
+      "id": 20,
+      "from_node": 1,
+      "to_node": 3,
+      "type": "chat"
+    },
+    {
+      "id": 21,
+      "from_node": 5,
+      "to_node": 2,
+      "type": "chat"
+    },
+    {
+      "id": 22,
+      "from_node": 2,
+      "to_node": 5,
+      "type": "chat"
+    },
+    {
+      "id": 23,
+      "from_node": 5,
+      "to_node": 4,
+      "type": "chat"
+    },
+    {
+      "id": 24,
+      "from_node": 4,
+      "to_node": 5,
+      "type": "chat"
+    },
+    {
+      "id": 25,
+      "from_node": 1,
+      "to_node": 4,
+      "type": "chat"
+    },
+    {
+      "id": 26,
+      "from_node": 4,
+      "to_node": 1,
+      "type": "chat"
+    }
+  ],
+  "created_at": "2026-09-26T04:54:45.721864",
+  "workdir": "E:\\智能体集群工作区\\新FPS游戏",
+  "execution_mode": "serial",
+  "sort_order": 2,
+  "ws_pin": null
+}

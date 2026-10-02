@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GLTF 3D 模型查看器</title>
+<style>
+ body{margin:0;overflow:hidden;font-family:Arial,Helvetica,sans-serif}
+ #ui{position:absolute;top:10px;left:10px;z-index:10;background:rgba(255,255,255,0.8);padding:10px;border-radius:4px;max-width:200px}
+ #modelList{width:100%;margin-bottom:8px}
+</style>
+</head>
+<body>
+<div id="ui">
+  <label for="modelList">选择模型:</label><br>
+  <select id="modelList">
+    <option value="https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Models@master/2.0/Avocado/glTF/Avocado.gltf">Avocado（水果）</option>
+    <option value="https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Models@master/2.0/Cube/glTF/Cube.gltf">Cube（立方体）</option>
+  </select><br>
+  <button id="loadBtn">加载</button>
+  <p id="status">已准备好</p>
+</div>
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js';
+import {GLTFLoader} from 'https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/loaders/GLTFLoader.js';
+import {OrbitControls} from 'https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+
+let scene = new THREE.Scene();
+scene.background = new THREE.Color(0xdddddd);
+let camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight,0.1,1000);
+camera.position.set(2,2,2);
+let renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.update();
+
+const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+hemiLight.position.set(0,20,0);
+scene.add(hemiLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(-3,10,10);
+scene.add(dirLight);
+
+let currentGroup;
+const loader = new GLTFLoader();
+const status = document.getElementById('status');
+
+function loadModel(url){
+  if(currentGroup){scene.remove(currentGroup);} 
+  status.textContent='加载中...';
+  loader.load(url,
+    (gltf)=>{
+      currentGroup = gltf.scene;
+      currentGroup.scale.setScalar(1.0);
+      scene.add(currentGroup);
+      status.textContent='加载完成';
+    },
+    (xhr)=>{status.textContent=`已完成 ${(xhr.loaded / xhr.total * 100).toFixed(0)}%`;},
+    (err)=>{status.textContent='加载失败!'; console.error(err);}
+  );
+}
+
+document.getElementById('loadBtn').addEventListener('click',()=>{
+  const url=document.getElementById('modelList').value;
+  loadModel(url);
+});
+
+function animate(){requestAnimationFrame(animate);renderer.render(scene, camera);}
+animate();
+
+window.addEventListener('resize',()=>{
+  camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);
+});
+</script>
+</body>
+</html>

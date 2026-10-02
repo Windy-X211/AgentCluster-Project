@@ -1,0 +1,35 @@
+{
+  "name": "通用",
+  "description": "通用智能体助手",
+  "system_prompt": "你是一个通用智能体助手",
+  "model": "",
+  "interface_id": null,
+  "commands": [
+    "file.read",
+    "file.write",
+    "file.structure",
+    "file.search",
+    "cmd.run",
+    "file.delete"
+  ],
+  "skills": [
+    "web_demo"
+  ],
+  "plugins": [
+    "browser_control",
+    "http_request",
+    "send_email"
+  ],
+  "trigger": {
+    "type": "manual",
+    "cron": "*/1 * * * *",
+    "message": "你好"
+  },
+  "tags": [],
+  "max_tool_rounds": null,
+  "enabled": true,
+  "perception_scope": "link",
+  "id": 24,
+  "created_at": "2026-10-01T06:38:50.834484",
+  "sort_order": 2
+}

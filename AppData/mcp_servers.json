@@ -1,0 +1,59 @@
+{
+  "mcpServers": {
+    "http_request": {
+      "command": "python",
+      "enabled": false,
+      "args": [
+        "-u",
+        "AppData/plugins/http_request/server.py"
+      ],
+      "label": "HTTP 请求",
+      "icon": "🌐",
+      "tags": [
+        "网络"
+      ],
+      "description": "向外部 HTTP 接口发起 GET/POST/PUT/PATCH/DELETE 请求。"
+    },
+    "send_email": {
+      "command": "python",
+      "enabled": true,
+      "args": [
+        "-u",
+        "AppData/plugins/send_email/server.py"
+      ],
+      "label": "发送邮件",
+      "icon": "✉️",
+      "tags": [
+        "通讯"
+      ],
+      "description": "通过 SMTP 发送文本邮件，支持主流邮箱预设。"
+    },
+    "browser_control": {
+      "command": "python",
+      "enabled": true,
+      "args": [
+        "-u",
+        "AppData/plugins/browser_control/server.py"
+      ],
+      "label": "浏览器控制",
+      "icon": "🌐",
+      "tags": [
+        "浏览器"
+      ],
+      "description": "Playwright 统一浏览器控制（navigate/click/type/screenshot/evaluate…）。"
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "env": {},
+      "enabled": true,
+      "label": "记忆存储",
+      "icon": "🧠",
+      "description": "基于知识图谱的持久化记忆：实体、关系、观察笔记，跨会话记住事实。",
+      "source": "marketplace"
+    }
+  }
+}

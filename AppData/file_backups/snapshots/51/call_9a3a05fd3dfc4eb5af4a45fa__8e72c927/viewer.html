@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D 模型查看器</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a2e; color: #eee; }
+
+  /* ===== 画布 ===== */
+  canvas { display: block; }
+
+  /* ===== 顶部工具栏 ===== */
+  #toolbar {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 20;
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px;
+    background: linear-gradient(180deg, rgba(26,26,46,.95), rgba(26,26,46,.75));
+    border-bottom: 1px solid rgba(100,120,200,.25);
+    backdrop-filter: blur(10px);
+  }
+  #toolbar h1 { font-size: 16px; font-weight: 600; white-space: nowrap; color: #7ec8ff; }
+
+  #modelSelect {
+    background: #2a2a4a; color: #eee; border: 1px solid rgba(100,120,200,.4);
+    border-radius: 6px; padding: 6px 12px; font-size: 14px; cursor: pointer; outline: none;
+    max-width: 280px;
+  }
+  #modelSelect:hover { border-color: #7ec8ff; }
+
+  .btn {
+    background: #2a2a4a; color: #eee; border: 1px solid rgba(100,120,200,.4);
+    border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer; outline: none;
+    transition: all .15s;
+  }
+  .btn:hover { background: #3a3a6a; border-color: #7ec8ff; }
+  .btn.active { background: #4a6aaa; border-color: #7ec8ff; }
+
+  #dragBtn { position: relative; overflow: hidden; }
+  #dragBtn input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+
+  #toolbar .spacer { flex: 1; }
+
+  /* ===== 右侧信息面板 ===== */
+  #infoPanel {
+    position: absolute; top: 60px; right: 16px; z-index: 15;
+    width: 260px; padding: 14px 18px;
+    background: rgba(26,26,46,.85); border: 1px solid rgba(100,120,200,.25);
+    border-radius: 10px; backdrop-filter: blur(10px);
+    font-size: 13px; line-height: 1.8;
+  }
+  #infoPanel h3 { font-size: 14px; color: #7ec8ff; margin-bottom: 8px; }
+  #infoPanel .row { display: flex; justify-content: space-between; }
+  #infoPanel .row .v { color: #ffd700; font-weight: 600; }
+  #infoPanel .hint { margin-top: 8px; font-size: 11px; color: #888; }
+
+  /* ===== 左下角操作提示 ===== */
+  #hints {
+    position: absolute; bottom: 12px; left: 16px; z-index: 15;
+    font-size: 12px; color: rgba(255,255,255,.5);
+    background: rgba(26,26,46,.6); padding: 8px 12px; border-radius: 8px;
+    backdrop-filter: blur(6px);
+  }
+  #hints span { margin-right: 14px; }
+
+  /* ===== 加载进度 ===== */
+  #loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 25;
+    text-align: center; display: none;
+  }
+  #loading .ring {
+    width: 48px; height: 48px; margin: 0 auto 12px;
+    border: 4px solid rgba(126,200,255,.2); border-top-color: #7ec8ff;
+    border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading p { font-size: 14px; color: #aaa; }
+
+  /* ===== 拖拽遮罩 ===== */
+  #dragMask {
+    position: absolute; inset: 0; z-index: 30; display: none;
+    background: rgba(126,200,255,.15); border: 3px dashed #7ec8ff;
+    align-items: center; justify-content: center;
+    font-size: 22px; color: #7ec8ff; font-weight: 600;
+  }
+  #dragMask.show { display: flex; }
+
+  /* ===== 动画面板（如有骨骼动画）===== */
+  #animPanel {
+    position: absolute; bottom: 12px; right: 16px; z-index: 15;
+    display: none; gap: 8px; align-items: center;
+    background: rgba(26,26,46,.85); border: 1px solid rgba(100,120,200,.25);
+    border-radius: 10px; padding: 8px 14px; backdrop-filter: blur(10px);
+  }
+  #animPanel button { min-width: 36px; }
+  #animSlider {
+    width: 120px; -webkit-appearance: none; height: 4px; border-radius: 4px;
+    background: #444; outline: none;
+  }
+  #animSlider::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: #7ec8ff; cursor: pointer;
+  }
+</style>
+
+<!-- ===== importmap: 把 'three' 映射到本地文件 ===== -->
+<script type="importmap">
+{
+  "imports": {
+    "three":      "./assets/vendor/three.module.js",
+    "three/":     "./assets/vendor/"
+  }
+}
+</script>
+</head>
+<body>
+
+<!-- ===== 顶部工具栏 ===== -->
+<div id="toolbar">
+  <h1>3D 模型查看器</h1>
+  <select id="modelSelect">
+    <!-- 由 JS 动态填充 -->
+  </select>
+  <button class="btn" id="gridBtn" title="切换网格">网格</button>
+  <button class="btn" id="wireBtn" title="切换线框">线框</button>
+  <button class="btn" id="skeletonBtn" title="切换骨骼">骨骼</button>
+  <button class="btn" id="resetBtn" title="重置视角">重置视角</button>
+  <div class="spacer"></div>
+  <label class="btn" id="dragBtn">
+    拖拽 / 选择模型文件
+    <input type="file" id="fileInput" accept=".glb,.gltf" multiple>
+  </label>
+</div>
+
+<!-- ===== 右侧信息面板 ===== -->
+<div id="infoPanel">
+  <h3>模型信息</h3>
+  <div class="row"><span>名称</span><span class="v" id="iName">—</span></div>
+  <div class="row"><span>三角面</span><span class="v" id="iTris">—</span></div>
+  <div class="row"><span>顶点</span><span class="v" id="iVerts">—</span></div>
+  <div class="row"><span>网格</span><span class="v" id="iMeshes">—</span></div>
+  <div class="row"><span>材质</span><span class="v" id="iMats">—</span></div>
+  <div class="row"><span>尺寸(XYZ)</span><span class="v" id="iSize">—</span></div>
+  <div class="row"><span>动画</span><span class="v" id="iAnims">—</span></div>
+  <div class="hint" id="iHint">鼠标左键旋转 · 右键平移 · 滚轮缩放</div>
+</div>
+
+<!-- ===== 动画控制面板 ===== -->
+<div id="animPanel">
+  <button class="btn" id="animPlay">▶</button>
+  <input type="range" id="animSlider" min="0" max="100" value="0">
+  <span id="animName" style="font-size:12px;min-width:80px;text-align:center">—</span>
+  <button class="btn" id="animPrev">◀</button>
+  <button class="btn" id="animNext">▶</button>
+</div>
+
+<!-- ===== 加载指示 ===== -->
+<div id="loading">
+  <div class="ring"></div>
+  <p id="loadingText">加载中…</p>
+</div>
+
+<!-- ===== 拖拽遮罩 ===== -->
+<div id="dragMask">拖入 .glb / .gltf 文件</div>
+
+<!-- ===== 左下提示 ===== -->
+<div id="hints">
+  <span>🖱 左键旋转</span>
+  <span>🖱 右键平移</span>
+  <span>🖱 滚轮缩放</span>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from './assets/vendor/controls/OrbitControls.js';
+import { GLTFLoader }   from './assets/vendor/loaders/GLTFLoader.js';
+
+// ============================================================
+//  场景初始化
+// ============================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(
+  45, window.innerWidth / window.innerHeight, 0.01, 1000
+);
+camera.position.set(0, 1.2, 3);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// ----- 相机控制 -----
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 0.1;
+controls.maxDistance = 100;
+
+// ----- 光照 -----
+const hemiLight = new THREE.HemisphereLight(0xffffff, 0x333344, 1.0);
+hemiLight.position.set(0, 20, 0);
+scene.add(hemiLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(5, 10, 7);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+const sc = dirLight.shadow.camera;
+sc.left = -5; sc.right = 5; sc.top = 5; sc.bottom = -5;
+scene.add(dirLight);
+
+// ----- 地面网格 -----
+const gridHelper = new THREE.GridHelper(20, 40, 0x4466aa, 0x2a2a44);
+gridHelper.material.opacity = 0.5;
+gridHelper.material.transparent = true;
+scene.add(gridHelper);
+
+// ----- 接收阴影的地面 -----
+const groundMat = new THREE.ShadowMaterial({ opacity: 0.3 });
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(50, 50), groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ============================================================
+//  全局状态
+// ============================================================
+let currentModel = null;       // 当前加载的模型根
+let mixer = null;              // AnimationMixer
+let clips = [];                // 动画片段数组
+let currentClipIndex = 0;
+let isPlaying = false;
+let wireframeEnabled = false;
+let skeletonHelper = null;
+
+const loader = new GLTFLoader();
+
+// 预设模型列表（本地 assets/models 目录）
+const presetModels = [
+  { name: 'Fox（狐狸）',          file: './assets/models/Fox.glb' },
+  { name: 'CesiumMan（人）',       file: './assets/models/CesiumMan.glb' },
+  { name: 'RobotExpressive（机器人）', file: './assets/models/RobotExpressive.glb' },
+  { name: 'Soldier（士兵）',       file: './assets/models/Soldier.glb' },
+  { name: 'Xbot（角色）',          file: './assets/models/Xbot.glb' },
+];
+
+// ============================================================
+//  填充模型下拉列表
+// ============================================================
+const modelSelect = document.getElementById('modelSelect');
+presetModels.forEach((m, i) => {
+  const opt = document.createElement('option');
+  opt.value = m.file;
+  opt.textContent = m.name;
+  modelSelect.appendChild(opt);
+});
+
+// ============================================================
+//  加载模型
+// ============================================================
+function showLoading(text) {
+  document.getElementById('loadingText').textContent = text || '加载中…';
+  document.getElementById('loading').style.display = 'block';
+}
+function hideLoading() {
+  document.getElementById('loading').style.display = 'none';
+}
+
+/**
+ * 加载模型（URL 或 File）
+ * @param {string|File} source
+ * @param {string} [displayName]
+ */
+function loadModel(source, displayName) {
+  showLoading('加载中…');
+
+  // 清理旧模型
+  if (currentModel) {
+    scene.remove(currentModel);
+    currentModel.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        if (Array.isArray(o.material)) o.material.forEach(m => m.dispose());
+        else o.material.dispose();
+      }
+    });
+    currentModel = null;
+  }
+  if (mixer) { mixer.stopAllAction(); mixer = null; }
+  if (skeletonHelper) { scene.remove(skeletonHelper); skeletonHelper = null; }
+
+  const onLoad = (gltf) => {
+    currentModel = gltf.scene;
+    currentModel.traverse(o => {
+      if (o.isMesh) {
+        o.castShadow = true;
+        o.receiveShadow = true;
+        // 保存原始材质引用，方便线框切换
+        o._origMat = o.material;
+      }
+    });
+
+    // --- 自动居中 + 自动缩放（基于包围盒）---
+    const box = new THREE.Box3().setFromObject(currentModel);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const scale = maxDim > 0 ? 2 / maxDim : 1;  // 归一化到 ~2 单位大小
+    currentModel.scale.setScalar(scale);
+
+    // 重新计算缩放后的包围盒，居中到原点
+    const box2 = new THREE.Box3().setFromObject(currentModel);
+    const center2 = box2.getCenter(new THREE.Vector3());
+    currentModel.position.sub(center2);
+
+    scene.add(currentModel);
+
+    // --- 动画 ---
+    clips = gltf.animations || [];
+    setupAnimations();
+
+    // --- 信息面板 ---
+    updateInfoPanel(displayName || source.name || '未命名', currentModel, size, clips);
+
+    hideLoading();
+  };
+
+  const onError = (err) => {
+    console.error('模型加载失败:', err);
+    document.getElementById('loadingText').textContent = '❌ 加载失败，请检查文件格式';
+    setTimeout(hideLoading, 2000);
+  };
+
+  const onProgress = (xhr) => {
+    if (xhr.total) {
+      const pct = Math.round((xhr.loaded / xhr.total) * 100);
+      showLoading(`加载中… ${pct}%`);
+    }
+  };
+
+  if (source instanceof File) {
+    const url = URL.createObjectURL(source);
+    loader.load(url, onLoad, onProgress, (e) => { URL.revokeObjectURL(url); onError(e); });
+    displayName = displayName || source.name;
+  } else {
+    loader.load(source, onLoad, onProgress, onError);
+  }
+}
+
+// ============================================================
+//  信息面板更新
+// ============================================================
+function updateInfoPanel(name, model, rawSize, anims) {
+  let tris = 0, verts = 0, meshCount = 0;
+  const matSet = new Set();
+
+  model.traverse(o => {
+    if (o.isMesh) {
+      meshCount++;
+      const geo = o.geometry;
+      if (geo.index) tris += geo.index.count / 3;
+      else if (geo.attributes.position) tris += geo.attributes.position.count / 3;
+      if (geo.attributes.position) verts += geo.attributes.position.count;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach(m => matSet.add(m.uuid));
+    }
+  });
+
+  document.getElementById('iName').textContent   = name.length > 18 ? name.slice(0, 16) + '..' : name;
+  document.getElementById('iTris').textContent  = tris.toLocaleString();
+  document.getElementById('iVerts').textContent  = verts.toLocaleString();
+  document.getElementById('iMeshes').textContent = meshCount;
+  document.getElementById('iMats').textContent  = matSet.size;
+  document.getElementById('iSize').textContent   =
+    `${rawSize.x.toFixed(2)} × ${rawSize.y.toFixed(2)} × ${rawSize.z.toFixed(2)}`;
+  document.getElementById('iAnims').textContent  = anims.length ? `${anims.length} 个` : '无';
+}
+
+// ============================================================
+//  动画系统
+// ============================================================
+function setupAnimations() {
+  const panel = document.getElementById('animPanel');
+  if (clips.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = 'flex';
+  mixer = new THREE.AnimationMixer(currentModel);
+  currentClipIndex = 0;
+  playClip(currentClipIndex);
+}
+
+function playClip(index) {
+  if (!mixer || clips.length === 0) return;
+  mixer.stopAllAction();
+  currentClipIndex = (index + clips.length) % clips.length;
+  const clip = clips[currentClipIndex];
+  const action = mixer.clipAction(clip);
+  action.reset();
+  action.play();
+  isPlaying = true;
+  document.getElementById('animPlay').textContent = '⏸';
+  document.getElementById('animName').textContent = clip.name || `Clip ${currentClipIndex + 1}`;
+}
+
+document.getElementById('animPlay').addEventListener('click', () => {
+  if (!mixer) return;
+  if (isPlaying) {
+    mixer.timeScale = 0;
+    isPlaying = false;
+    document.getElementById('animPlay').textContent = '▶';
+  } else {
+    mixer.timeScale = 1;
+    isPlaying = true;
+    document.getElementById('animPlay').textContent = '⏸';
+  }
+});
+
+document.getElementById('animPrev').addEventListener('click', () => playClip(currentClipIndex - 1));
+document.getElementById('animNext').addEventListener('click', () => playClip(currentClipIndex + 1));
+
+document.getElementById('animSlider').addEventListener('input', (e) => {
+  if (!mixer || clips.length === 0) return;
+  const clip = clips[currentClipIndex];
+  const action = mixer.clipAction(clip);
+  const t = (parseFloat(e.target.value) / 100) * clip.duration;
+  action.paused = true;
+  action.play();
+  action.startAt(t);
+  mixer.update(0);
+});
+
+// ============================================================
+//  工具栏按钮
+// ============================================================
+// 网格切换
+document.getElementById('gridBtn').addEventListener('click', (e) => {
+  gridHelper.visible = !gridHelper.visible;
+  e.target.classList.toggle('active', gridHelper.visible);
+});
+
+// 线框切换
+document.getElementById('wireBtn').addEventListener('click', (e) => {
+  wireframeEnabled = !wireframeEnabled;
+  e.target.classList.toggle('active', wireframeEnabled);
+  if (currentModel) {
+    currentModel.traverse(o => {
+      if (o.isMesh && o.material) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        mats.forEach(m => { m.wireframe = wireframeEnabled; });
+      }
+    });
+  }
+});
+
+// 骨骼切换
+document.getElementById('skeletonBtn').addEventListener('click', (e) => {
+  if (!currentModel) return;
+  if (skeletonHelper) {
+    scene.remove(skeletonHelper);
+    skeletonHelper = null;
+    e.target.classList.remove('active');
+  } else {
+    skeletonHelper = new THREE.SkeletonHelper(currentModel);
+    skeletonHelper.material.linewidth = 2;
+    scene.add(skeletonHelper);
+    e.target.classList.add('active');
+  }
+});
+
+// 重置视角
+document.getElementById('resetBtn').addEventListener('click', () => {
+  if (!currentModel) return;
+  const box = new THREE.Box3().setFromObject(currentModel);
+  const sz = box.getSize(new THREE.Vector3()).length();
+  const c = box.getCenter(new THREE.Vector3());
+  camera.position.set(c.x + sz * 0.8, c.y + sz * 0.5, c.z + sz * 0.8);
+  controls.target.copy(c);
+  controls.update();
+});
+
+// 模型下拉列表切换
+modelSelect.addEventListener('change', () => {
+  loadModel(modelSelect.value, modelSelect.options[modelSelect.selectedIndex].text);
+});
+
+// ============================================================
+//  拖拽上传
+// ============================================================
+const dragMask = document.getElementById('dragMask');
+let dragCounter = 0;
+
+window.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragCounter++;
+  dragMask.classList.add('show');
+});
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter <= 0) { dragMask.classList.remove('show'); dragCounter = 0; }
+});
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  dragMask.classList.remove('show');
+  const files = [...e.dataTransfer.files].filter(f =>
+    f.name.toLowerCase().endsWith('.glb') || f.name.toLowerCase().endsWith('.gltf')
+  );
+  if (files.length > 0) loadModel(files[0], files[0].name);
+});
+
+// file input
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (f) loadModel(f, f.name);
+  e.target.value = '';
+});
+
+// ============================================================
+//  渲染循环
+// ============================================================
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  if (mixer) mixer.update(dt);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ============================================================
+//  窗口自适应
+// ============================================================
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============================================================
+//  启动：默认加载第一个模型
+// ============================================================
+// 让网格按钮初始高亮
+document.getElementById('gridBtn').classList.add('active');
+loadModel(presetModels[0].file, presetModels[0].name);
+</script>
+</body>
+</html>

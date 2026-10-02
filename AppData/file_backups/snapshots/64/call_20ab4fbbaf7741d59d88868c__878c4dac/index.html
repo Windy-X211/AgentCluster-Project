@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang='zh-CN'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>CHRONO SHOOTER - 时序回溯射手</title>
+<style>
+/* ============ 全局 ============ */
+:root{
+  --bg:#0A0E1A; --bg2:#10162B; --cyan:#00F0FF; --magenta:#FF00E0;
+  --violet:#7B2FFF; --amber:#FFB300; --red:#FF2D55; --white:#E0FFFF;
+  --dark:#1A2238; --panel:rgba(10,14,26,0.75);
+}
+*{ margin:0; padding:0; box-sizing:border-box; user-select:none; }
+html,body{ width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--white);
+  font-family:'Orbitron','Rajdhani','Segoe UI',monospace; }
+canvas{ display:block; }
+.hidden{ display:none !important; }
+
+/* ============ 霓虹描边面板 ============ */
+.panel{
+  background:var(--panel); border:1px solid rgba(0,240,255,0.6);
+  box-shadow:0 0 12px rgba(0,240,255,0.35), inset 0 0 18px rgba(0,240,255,0.08);
+  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px);
+}
+.title-glow{ text-shadow:0 0 12px rgba(0,240,255,0.8), 0 0 40px rgba(0,240,255,0.4); }
+.mg-glow{ text-shadow:0 0 12px rgba(255,0,224,0.8), 0 0 40px rgba(255,0,224,0.4); }
+
+/* ============ 主菜单 ============ */
+#menu{ position:fixed; inset:0; z-index:50; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:26px;
+  background:radial-gradient(ellipse at 50% 40%, rgba(16,22,43,0.85) 0%, rgba(10,14,26,0.96) 70%); }
+#menu h1{ font-size:64px; letter-spacing:10px; color:var(--cyan); }
+#menu h1 .m{ color:var(--magenta); }
+#menu .sub{ font-size:16px; letter-spacing:4px; color:#6E87A8; margin-top:-14px; }
+#menu .btn-row{ display:flex; flex-direction:column; gap:14px; width:300px; }
+.mbtn{ padding:14px 24px; font-family:inherit; font-size:17px; letter-spacing:3px; color:var(--cyan);
+  background:rgba(0,240,255,0.05); border:1px solid rgba(0,240,255,0.6);
+  box-shadow:0 0 10px rgba(0,240,255,0.25); cursor:pointer; transition:all .18s;
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px); }
+.mbtn:hover{ background:rgba(255,0,224,0.2); border-color:var(--magenta); color:var(--white);
+  box-shadow:0 0 16px rgba(255,0,224,0.5); }
+#menu .foot{ position:absolute; bottom:22px; font-size:12px; letter-spacing:2px; color:rgba(255,0,224,0.6); }
+
+/* ============ 操作说明页 ============ */
+#controls{ position:fixed; inset:0; z-index:60; display:none; flex-direction:column;
+  align-items:center; justify-content:center; gap:18px; background:rgba(10,14,26,0.96); }
+#controls .panel{ padding:44px 60px; text-align:center; }
+#controls h2{ color:var(--cyan); letter-spacing:6px; margin-bottom:18px; font-size:26px; }
+#controls p{ font-size:16px; line-height:2.2; color:var(--white); letter-spacing:1px; }
+#controls .q{ color:var(--magenta); font-weight:bold; }
+
+/* ============ HUD 顶层 ============ */
+#hud{ position:fixed; inset:0; z-index:30; pointer-events:none; display:none; }
+#topbar{ position:absolute; top:14px; left:50%; transform:translateX(-50%);
+  display:flex; gap:26px; padding:8px 22px; font-size:14px; letter-spacing:2px;
+  background:rgba(0,240,255,0.08); border:1px solid rgba(0,240,255,0.55);
+  box-shadow:0 0 14px rgba(0,240,255,0.3); color:var(--cyan);
+  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px); }
+#topbar b{ color:var(--white); }
+#kills{ color:var(--violet); }
+
+/* 准星 */
+#crosshair{ position:absolute; left:50%; top:50%; width:0; height:0; }
+#crosshair span{ position:absolute; background:var(--white); box-shadow:0 0 6px rgba(224,255,255,0.8); }
+#crosshair .h{ left:-10px; top:-1px; width:20px; height:2px; }
+#crosshair .v{ left:-1px; top:-10px; width:2px; height:20px; }
+#crosshair .dot{ left:-2px; top:-2px; width:4px; height:4px; border-radius:50%; background:var(--cyan); }
+#crosshair.hit .h,#crosshair.hit .v{ background:var(--red); box-shadow:0 0 8px var(--red); }
+#crosshair.hit .dot{ background:var(--red); }
+
+/* 底部栏 */
+#bottombar{ position:absolute; left:50%; bottom:26px; transform:translateX(-50%);
+  display:flex; gap:30px; align-items:flex-end; }
+.meter{ width:250px; }
+.meter .lab{ font-size:12px; letter-spacing:2px; color:#6E87A8; margin-bottom:5px; display:flex; justify-content:space-between; }
+.meter .bar{ height:12px; border:1px solid rgba(0,240,255,0.5); background:rgba(0,240,255,0.06);
+  clip-path:polygon(4px 0,100% 0,100% calc(100% - 4px),calc(100% - 4px) 100%,0 100%,0 4px); }
+.meter .fill{ height:100%; width:100%; transition:width .12s; }
+#hpFill{ background:linear-gradient(90deg,#0077AA,#00F0FF); box-shadow:0 0 10px rgba(0,240,255,0.6); }
+#hpFill.low{ background:linear-gradient(90deg,#8A4A00,#FFB300); box-shadow:0 0 12px rgba(255,179,0,0.9); animation:blink .5s infinite; }
+#enFill{ background:linear-gradient(90deg,#8800AA,#FF00E0); box-shadow:0 0 10px rgba(255,0,224,0.6); }
+#enFill.gray{ background:#444; box-shadow:none; }
+@keyframes blink{ 50%{ opacity:.55; } }
+#weapons{ display:flex; gap:14px; }
+.wslot{ padding:6px 12px; border:1px solid rgba(0,240,255,0.4); font-size:13px; letter-spacing:1px;
+  background:rgba(0,240,255,0.05); color:#6E87A8; }
+.wslot.active{ border-color:var(--cyan); color:var(--white); box-shadow:0 0 10px rgba(0,240,255,0.4); }
+.wslot .ammo{ color:var(--cyan); }
+.wslot .ammo.low{ color:var(--amber); }
+
+/* 飘字 */
+#floaters{ position:absolute; right:26px; top:90px; display:flex; flex-direction:column; gap:6px; align-items:flex-end; }
+.floater{ font-size:15px; letter-spacing:1px; text-shadow:0 0 8px rgba(0,240,255,0.8);
+  animation:floatUp 1.2s ease-out forwards; }
+.floater.mg{ color:var(--magenta); text-shadow:0 0 8px rgba(255,0,224,0.8); }
+@keyframes floatUp{ 0%{ opacity:0; transform:translateY(8px); } 20%{ opacity:1; } 100%{ opacity:0; transform:translateY(-30px); } }
+
+/* 波次横幅 */
+#banner{ position:absolute; top:120px; left:50%; transform:translateX(-50%); padding:10px 34px;
+  font-size:20px; letter-spacing:4px; color:var(--cyan); opacity:0;
+  background:rgba(10,14,26,0.7); border:1px solid rgba(0,240,255,0.6);
+  box-shadow:0 0 20px rgba(0,240,255,0.4); white-space:nowrap;
+  clip-path:polygon(12px 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%,0 12px); }
+#banner.show{ animation:bannerIn 2.4s ease forwards; }
+#banner.elite{ color:var(--magenta); border-color:var(--magenta); box-shadow:0 0 24px rgba(255,0,224,0.6); }
+@keyframes bannerIn{ 0%{ opacity:0; transform:translateX(-50%) translateY(-14px); }
+  18%{ opacity:1; transform:translateX(-50%) translateY(0); } 80%{ opacity:1; } 100%{ opacity:0; } }
+
+/* 回溯演出覆盖层 */
+#rewind{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; flex-direction:column; gap:14px;
+  background:rgba(0,240,255,0.28); backdrop-filter:blur(1px); }
+#rewind .big{ font-size:64px; letter-spacing:14px; color:var(--cyan); -webkit-text-stroke:1px var(--magenta);
+  text-shadow:0 0 30px rgba(0,240,255,0.9); animation:rwPulse .6s ease; }
+@keyframes rwPulse{ 0%{ transform:scale(1.6); opacity:0; } 30%{ opacity:1; } 100%{ transform:scale(1); } }
+#rewindClock{ font-size:16px; letter-spacing:4px; color:var(--white); opacity:.85; }
+
+/* 受击红闪 / 低血渐晕 / 死亡 */
+#hurt{ position:absolute; inset:0; display:none; background:radial-gradient(ellipse at center, transparent 40%, rgba(255,45,85,0.5) 100%); }
+#lowhp{ position:absolute; inset:0; display:none; background:radial-gradient(ellipse at center, transparent 45%, rgba(255,45,85,0.35) 100%); animation:blink 1s infinite; }
+#dead{ position:absolute; inset:0; display:none; background:rgba(255,30,60,0.28); }
+
+/* 结算/暂停面板 */
+#endpanel{ position:fixed; inset:0; z-index:70; display:none; align-items:center; justify-content:center; background:rgba(10,14,26,0.9); }
+#endpanel .box{ min-width:460px; padding:44px 50px; text-align:center; }
+#endpanel h2{ font-size:30px; letter-spacing:6px; margin-bottom:20px; }
+#endpanel .txt{ font-size:15px; line-height:2.1; color:#9FB3CE; margin-bottom:18px; white-space:pre-line; }
+#endpanel .stat{ font-size:14px; color:var(--violet); letter-spacing:2px; margin-bottom:22px; }
+#endpanel .row{ display:flex; gap:14px; justify-content:center; }
+/* 暂停 */
+#pause{ position:fixed; inset:0; z-index:65; display:none; align-items:center; justify-content:center; background:rgba(10,14,26,0.85); }
+#pause .box{ padding:40px 56px; text-align:center; }
+#pause h2{ color:var(--cyan); letter-spacing:5px; font-size:26px; margin-bottom:24px; }
+#pause .row{ display:flex; gap:14px; justify-content:center; }
+
+/* 提示条（左下角操作提示） */
+#tip{ position:absolute; left:26px; bottom:26px; font-size:13px; letter-spacing:1px; color:rgba(224,255,255,0.6); line-height:1.9; }
+#tip b{ color:var(--cyan); }
+</style>
+</head>
+<body>
+
+<!-- 主菜单 -->
+<div id='menu'>
+  <h1 class='title-glow'>CHRONO <span class='m mg-glow'>SHOOTER</span></h1>
+  <div class='sub'>你欠时间一条命。现在，用三秒去还。</div>
+  <div class='btn-row'>
+    <button class='mbtn' id='btnStart'>开始演武 START</button>
+    <button class='mbtn' id='btnControls'>操作说明 CONTROLS</button>
+    <button class='mbtn' id='btnLedger'>信用记录 LEDGER</button>
+  </div>
+  <div class='foot'>时之商会荣誉出品 · 时间债务不因死亡而免除</div>
+</div>
+
+<!-- 操作说明 -->
+<div id='controls'>
+  <div class='panel'>
+    <h2>操作说明 CONTROLS</h2>
+    <p>WASD 移动 · 鼠标瞄准 · 左键射击 · R 换弹 · 空格 跳跃<br>
+       <span class='q'>Q 回卷时间 3 秒</span>——子弹会倒飞，敌人会退场，你的失误会被抹去。<br>
+       能量有限（40/次），谨慎使用。</p>
+    <br><button class='mbtn' id='btnBack'>返回 RETURN</button>
+  </div>
+</div>
+
+<!-- HUD -->
+<div id='hud'>
+  <div id='topbar'>
+    <span id='waveLabel'>WAVE 1/8</span>
+    <span>残敌 REMAINING: <b id='remain'>0</b></span>
+    <span id='kills'>击杀 0</span>
+  </div>
+  <div id='crosshair'><span class='h'></span><span class='v'></span><span class='dot'></span></div>
+  <div id='bottombar'>
+    <div class='meter' id='hpMeter'>
+      <div class='lab'><span>护甲 HULL</span><span id='hpNum'>100</span></div>
+      <div class='bar'><div class='fill' id='hpFill'></div></div>
+    </div>
+    <div class='meter' id='enMeter'>
+      <div class='lab'><span>回卷能量 REWIND</span><span id='enNum'>100</span></div>
+      <div class='bar'><div class='fill' id='enFill'></div></div>
+    </div>
+    <div id='weapons'></div>
+  </div>
+  <div id='floaters'></div>
+  <div id='banner'>WAVE 1</div>
+  <div id='rewind'><div class='big'>REWIND</div><div id='rewindClock'></div></div>
+  <div id='hurt'></div>
+  <div id='lowhp'></div>
+  <div id='dead'></div>
+  <div id='tip'><b>WASD</b> 移动 <b>Q</b> 回卷 3秒 <b>R</b> 换弹 <b>1/2/3</b> 切枪</div>
+</div>
+
+<!-- 结算 -->
+<div id='endpanel'>
+  <div class='box panel'>
+    <h2 id='endTitle'>结算</h2>
+    <div class='txt' id='endTxt'></div>
+    <div class='stat' id='endStat'></div>
+    <div class='row'>
+      <button class='mbtn' id='btnRetry'>再战 RETRY</button>
+      <button class='mbtn' id='btnMenu'>主菜单 MENU</button>
+    </div>
+  </div>
+</div>
+
+<!-- 暂停 -->
+<div id='pause'>
+  <div class='box panel'>
+    <h2>时间冻结——商会在等账单</h2>
+    <div class='row'>
+      <button class='mbtn' id='btnResume'>继续演武 CONTINUE</button>
+      <button class='mbtn' id='btnQuit'>认输 FORFEIT</button>
+    </div>
+  </div>
+</div>
+
+<script src='assets/lib/three.min.js'></script>
+<script>
+'use strict';
+// ===MOD-CONFIG===
+// ===MOD-UTIL===
+// ===MOD-SCENE===
+// ===MOD-PLAYER===
+// ===MOD-WEAPON===
+// ===MOD-ENEMY===
+// ===MOD-REWIND===
+// ===MOD-WAVE===
+// ===MOD-HUD===
+// ===MOD-MENU===
+// ===MOD-MAIN===
+</script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# browser_control 浏览器控制插件 —— Playwright 统一驱动
+# 参考: https://docs.dify.ai/plugins/concepts/manifest
+version: "0.1.0"
+type: "plugin"
+name: "browser_control"
+label:
+  zh_Hans: "浏览器控制"
+  en_US: "Browser Control"
+author: "AgentCluster"
+description:
+  zh_Hans: |
+    统一浏览器控制插件，支持三种后端：
+    • system  — 启动系统 Edge/Chrome（channel 方式，cookie 持久化）
+    • cdp     — connect_over_cdp 桥接到已运行的浏览器（共享登录态、cookies、扩展）
+    • chromium — Playwright 内置 Chromium（干净沙箱）
+    • auto    — 自动选择（优先级 cdp > system > chromium）
+    完整 action: navigate / click / type / screenshot / get_text / get_html / evaluate / wait / close / info
+  en_US: |
+    Unified browser control with three backends: system (Edge/Chrome channel),
+    cdp (connect to running browser via remote-debugging-port),
+    chromium (Playwright built-in).
+    Auto-select: cdp > system > chromium.
+    Actions: navigate / click / type / screenshot / get_text / get_html / evaluate / wait / close / info.
+version_code: 2
+icon: "🌐"
+tags: ["browser", "automation", "playwright", "web", "cdp", "unified"]

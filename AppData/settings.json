@@ -1,0 +1,15 @@
+{
+  "default_commands": [
+    "file.read",
+    "file.write",
+    "file.structure",
+    "file.search",
+    "cmd.run",
+    "file.delete"
+  ],
+  "default_skills": [],
+  "default_plugins": [],
+  "storage_version": 2,
+  "max_tool_rounds": 500,
+  "storage_location": "F:/PythonProjects/TraeProjects/智能体集群/AppData"
+}

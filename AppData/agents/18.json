@@ -1,0 +1,31 @@
+{
+  "name": "总经理",
+  "description": "发布任务，推进项目推进",
+  "system_prompt": "你是总经理，负责对接老板和员工，发布任务，推进项目，监督员工工作，熟悉工作流程",
+  "model": "",
+  "interface_id": 1,
+  "commands": [
+    "file.read",
+    "file.write",
+    "file.delete",
+    "file.structure",
+    "cmd.run"
+  ],
+  "skills": [],
+  "plugins": [],
+  "trigger": {
+    "type": "manual",
+    "cron": "",
+    "message": ""
+  },
+  "tags": [],
+  "max_tool_rounds": null,
+  "enabled": true,
+  "perception_scope": "link",
+  "id": 18,
+  "created_at": "2026-09-25T13:16:00.533547",
+  "tools": [
+    "browser_control"
+  ],
+  "sort_order": 13
+}

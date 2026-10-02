@@ -1,0 +1,106 @@
+# browser_control 插件的 tool 定义 — 统一浏览器控制
+# 通过 mode 参数选择不同浏览器：system(系统Edge/Chrome) / cdp(桥接到运行中的浏览器) / chromium(内置) / auto(自动)
+identity:
+  name: "browser_control"
+  author: "AgentCluster"
+version: "0.1.0"
+
+description:
+  zh_Hans: |
+    统一浏览器控制。支持三种后端模式：
+      - system: 启动系统 Edge/Chrome（独立 context，cookie 持久化）
+      - cdp: 桥接到正在运行的浏览器（共享登录态、cookies、扩展，需浏览器带 --remote-debugging-port=9222 启动）
+      - chromium: Playwright 内置 Chromium（干净沙箱）
+      - auto: 自动选择（优先 cdp > system > chromium）
+    action 取值：navigate(打开URL) / click(点击元素) / type(输入文字) / get_text(抓文本) / get_html(抓HTML) / screenshot(截图,返回base64) / evaluate(执行JS) / wait(等待秒数) / close(关闭浏览器) / info(查看当前状态)。
+    selector 用 CSS 选择器，url 以 http(s):// 开头。每次调用返回 {ok, data, current_url}。
+  en_US: "Unified browser control. mode: auto/system/cdp/chromium. action: navigate/click/type/get_text/get_html/screenshot/evaluate/wait/close/info."
+
+parameters:
+  - name: "action"
+    type: string
+    required: true
+    description: "操作类型：navigate / click / type / get_text / get_html / screenshot / evaluate / wait / close / info"
+    enum: ["navigate", "click", "type", "get_text", "get_html", "screenshot", "evaluate", "wait", "close", "info"]
+
+  - name: "mode"
+    type: string
+    required: false
+    description: |
+      浏览器后端模式：
+        auto     — 自动选择（优先检测 CDP 端点，否则用系统浏览器，最后 Chromium）
+        system   — 启动系统已安装的 Edge/Chrome（channel 方式，独立 context）
+        cdp      — connect_over_cdp 桥接到已运行的浏览器（共享登录态/cookies/扩展）
+        chromium — Playwright 内置 Chromium（最干净的沙箱）
+      默认 auto。
+    enum: ["auto", "system", "cdp", "chromium"]
+    default: "auto"
+
+  - name: "purpose"
+    type: string
+    required: false
+    description: |
+      截图用途（仅 screenshot action 生效）：
+        inspect  — 智能体内部了解页面状况（默认）。不落盘，只把 base64 返回给智能体组装多模态消息，前端不渲染给用户看。
+        share    — 给用户展示。保存到工作区 screenshots/ 目录，返回 file 路径，前端自动渲染图片。
+      智能体判断规则：自己看图用 inspect；要给用户看、要发报告/文档用 share。
+    enum: ["inspect", "share"]
+    default: "inspect"
+
+  - name: "cdp_endpoint"
+    type: string
+    required: false
+    description: "cdp 模式下的远程调试端点地址，默认 http://127.0.0.1:9222（localhost 会被自动规范化为 127.0.0.1 以规避 IPv6 坑）。启动浏览器示例：msedge --remote-debugging-port=9222"
+    default: ""
+
+  - name: "url"
+    type: string
+    required: false
+    description: "navigate 时必填；screenshot 可选：设置后先跳转到该 URL 再截图"
+
+  - name: "selector"
+    type: string
+    required: false
+    description: "click/type/get_text/get_html/evaluate 时的 CSS 选择器。get_text/get_html 缺省时取整个页面。"
+
+  - name: "text"
+    type: string
+    required: false
+    description: "type 时要输入的文字；evaluate 时要执行的 JS 代码（或用 js 参数）"
+
+  - name: "js"
+    type: string
+    required: false
+    description: "evaluate 时要执行的 JavaScript 代码"
+
+  - name: "value"
+    type: number
+    required: false
+    description: "wait 时要等待的秒数；默认 1"
+    default: 1
+
+  - name: "timeout"
+    type: number
+    required: false
+    description: "单次操作的超时秒数，默认 15"
+    default: 15
+
+  - name: "visible"
+    type: boolean
+    required: false
+    description: "是否以有头（可见）模式启动浏览器；默认 true。cdp 模式忽略此参数（桥接到已运行的浏览器）。"
+    default: true
+
+outputs:
+  - name: "ok"
+    type: boolean
+    description: "操作是否成功"
+  - name: "data"
+    type: string
+    description: "操作结果（截图为 base64 字符串，其他为文本/HTML）"
+  - name: "current_url"
+    type: string
+    description: "操作后浏览器地址栏 URL"
+  - name: "error"
+    type: string
+    description: "失败时的错误信息"

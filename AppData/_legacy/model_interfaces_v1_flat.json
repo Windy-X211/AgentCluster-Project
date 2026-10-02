@@ -1,0 +1,13 @@
+[
+  {
+    "name": "all",
+    "url": "http://127.0.0.1:8001/v1",
+    "api_key": "111",
+    "default_model": "all",
+    "models": [
+      "all"
+    ],
+    "description": "",
+    "id": 1
+  }
+]
