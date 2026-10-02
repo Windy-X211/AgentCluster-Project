@@ -44,7 +44,7 @@ AgentCluster 是一个本地优先的多智能体编排平台，将「组团队�
 
 1. **克隆项目**
 ```bash
-git clone <repository-url>
+git clone https://github.com/Windy-X211/AgentCluster-Project.git
 cd 智能体集群
 ```
 
