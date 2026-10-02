@@ -208,15 +208,12 @@ npm run dev
 - [ ] 性能监控面板
 - [ ] 插件开发 SDK
 
-## 📄 许可证
-
-MIT License
 
 ## 📞 联系
 
 如有问题或建议，请通过以下方式联系：
 - Issues: 项目 GitHub Issues
-- 文档: `/.trae/specs/agent-cluster-polish/`
+- 邮箱：483636702@qq.com
 
 ## 🙏 致谢
 
