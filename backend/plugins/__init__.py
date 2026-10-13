@@ -94,6 +94,22 @@ def _parse_yaml(text: str) -> dict:
             return [_unquote(x) for x in inner.split(",")]
         return v
 
+    BLOCK_SCALAR_TAGS = ("|", "|-", "|+", ">", ">-", ">+")
+
+    def _read_block_scalar(i: int, key_indent: int) -> tuple[str, int]:
+        """处理 `key: |` 这样的多行字面量块：收集所有缩进更深的行，去掉公共缩进、保留相对缩进。"""
+        parts: list[str] = []
+        block_indent: int | None = None
+        while i < len(lines):
+            ci, cl = lines[i]
+            if ci <= key_indent:
+                break
+            if block_indent is None:
+                block_indent = ci
+            parts.append(cl[block_indent:] if ci >= block_indent else cl.strip())
+            i += 1
+        return "\n".join(parts), i
+
     # 递归：从 i 开始，base_indent 是当前 block 的缩进阈值
     def _parse_block(i: int, base_indent: int) -> tuple[Any, int]:
         # 判断是 list block 还是 dict block
@@ -154,8 +170,12 @@ def _parse_yaml(text: str) -> dict:
                     ck, _, crest = cstripped.partition(":")
                     ck = ck.strip(); crest = crest.strip()
                     if crest:
-                        item_dict[ck] = _unquote(crest)
                         i += 1
+                        if crest in BLOCK_SCALAR_TAGS:
+                            text, i = _read_block_scalar(i, ci)
+                            item_dict[ck] = text
+                        else:
+                            item_dict[ck] = _unquote(crest)
                     else:
                         i += 1
                         sub_val, i = _parse_block(i, ci + 2)
@@ -180,8 +200,12 @@ def _parse_yaml(text: str) -> dict:
             k, _, rest = cur_stripped.partition(":")
             k = k.strip(); rest = rest.strip()
             if rest:
-                result[k] = _unquote(rest)
                 i += 1
+                if rest in BLOCK_SCALAR_TAGS:
+                    val, i = _read_block_scalar(i, cur_indent)
+                    result[k] = val
+                else:
+                    result[k] = _unquote(rest)
             else:
                 i += 1
                 # 下一行是子 block

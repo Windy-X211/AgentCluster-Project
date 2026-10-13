@@ -17,6 +17,13 @@ export const api = {
     remove: (id: number) => req(`/agents/${id}`, { method: 'DELETE' }),
     reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
+  agent_groups: {
+    list: () => req<any[]>('/agent_groups'),
+    create: (d: any) => req('/agent_groups', { method: 'POST', body: JSON.stringify(d) }),
+    update: (id: number, d: any) => req(`/agent_groups/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
+    remove: (id: number) => req(`/agent_groups/${id}`, { method: 'DELETE' }),
+    reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
+  },
   canvases: {
     list: () => req<any[]>('/canvases'),
     create: (d: any) => req('/canvases', { method: 'POST', body: JSON.stringify(d) }),
@@ -26,7 +33,9 @@ export const api = {
     setWorkdir: (id: number, workdir: string | null) =>
       req(`/canvases/${id}/workdir`, { method: 'POST', body: JSON.stringify({ workdir }) }),
     browse: () => req<{ path: string | null }>('/canvases/browse', { method: 'POST' }),
-    workspace: (id: number) => req<any>(`/canvases/${id}/workspace`),
+    // rev: 上次拿到的树版本号；未变化时后端只回 {changed:false}（轮询用），rev<0 强制全量
+    workspace: (id: number, rev = -1) =>
+      req<any>(`/canvases/${id}/workspace` + (rev >= 0 ? `?rev=${rev}` : '')),
     trash: (id: number) => req<any>(`/canvases/${id}/trash`),
     restoreTrash: (id: number, items: { conv_id: number; op_idx: number }[]) =>
       req(`/canvases/${id}/trash/restore`, { method: 'POST', body: JSON.stringify({ items }) }),
@@ -41,7 +50,39 @@ export const api = {
     fileCopy: (id: number, src: string, destDir: string) =>
       req(`/canvases/${id}/file/copy`, { method: 'POST', body: JSON.stringify({ src, dest_dir: destDir }) }),
     fileDelete: (id: number, path: string) =>
-      req(`/canvases/${id}/file/delete`, { method: 'POST', body: JSON.stringify({ path }) })
+      req(`/canvases/${id}/file/delete`, { method: 'POST', body: JSON.stringify({ path }) }),
+    fileRun: (id: number, path: string) =>
+      req<any>(`/canvases/${id}/file/run`, { method: 'POST', body: JSON.stringify({ path }) }),
+    filePyInput: (id: number, sid: string, text: string) =>
+      req<any>(`/canvases/${id}/file/pyconsole/${sid}/input`, { method: 'POST', body: JSON.stringify({ text }) }),
+    filePyStop: (id: number, sid: string, force = false) =>
+      req<any>(`/canvases/${id}/file/pyconsole/${sid}/stop`, { method: 'POST', body: JSON.stringify({ force }) }),
+    filePyClose: (id: number, sid: string) =>
+      req<any>(`/canvases/${id}/file/pyconsole/${sid}/close`, { method: 'POST' }),
+    filePyStream: (id: number, sid: string, onEvent: (ev: any) => void, signal?: AbortSignal) =>
+      new Promise<void>(async (res, rej) => {
+        try {
+          const r = await fetch(BASE + `/canvases/${id}/file/pyconsole/${sid}/stream`, { signal })
+          if (!r.ok || !r.body) return rej(new Error(`${r.status} ${r.statusText}`))
+          const reader = r.body.getReader()
+          const dec = new TextDecoder()
+          let buf = ''
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buf += dec.decode(value, { stream: true })
+            let i
+            while ((i = buf.indexOf('\n\n')) >= 0) {
+              const raw = buf.slice(0, i)
+              buf = buf.slice(i + 2)
+              const line = raw.trim()
+              if (!line.startsWith('data:')) continue
+              try { onEvent(JSON.parse(line.slice(5).trim())) } catch { }
+            }
+          }
+          res()
+        } catch (e) { rej(e) }
+      })
   },
   convs: {
     list: () => req<any[]>('/conversations'),
@@ -64,6 +105,13 @@ export const api = {
       req<any>(`/conversations/${id}/file_ops/restore`, { method: 'POST', body: JSON.stringify({ op_indices: opIndices }) }),
     restoreOneFileOp: (id: number, opIdx: number) =>
       req<any>(`/conversations/${id}/file_ops/restore_one/${opIdx}`, { method: 'POST' }),
+    // 截断消息 / 删除单条 / 撤销
+    deleteMessage: (id: number, index: number) =>
+      req<any>(`/conversations/${id}/delete_message`, { method: 'POST', body: JSON.stringify({ index }) }),
+    truncate: (id: number, index: number) =>
+      req<any>(`/conversations/${id}/truncate`, { method: 'POST', body: JSON.stringify({ index }) }),
+    undoFrom: (id: number, index: number) =>
+      req<any>(`/conversations/${id}/undo_from`, { method: 'POST', body: JSON.stringify({ index }) }),
   },
   models: {
     list: () => req<any[]>('/model_interfaces'),

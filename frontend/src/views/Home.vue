@@ -12,7 +12,7 @@ const models = useModelStore()
 const settings = useSettingsStore()
 const convs = useConvStore()
 const layout = useLayoutStore()
-const leftCollapsed = ref(false)
+const leftCollapsed = ref(true)
 
 // 4 列布局：left | center | handle(6px) | right；中间是 flex 的 1fr
 const gridStyle = computed(() => ({

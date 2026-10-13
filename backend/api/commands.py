@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Any
-from core.commands import run_command, COMMAND_META
+from core.commands import run_command, COMMAND_META, COMMAND_GROUPS
 from plugins import list_plugins as list_plugins_meta, run_plugin, load_plugins
 from skills import list_skills as list_skills_meta, get_skill_prompt, load_skills
 
@@ -18,6 +18,7 @@ def list_capabilities():
     """一次性返回所有能力类型"""
     return {
         "commands": COMMAND_META,
+        "command_groups": [g[0] for g in COMMAND_GROUPS],
         "skills": list_skills_meta(),
         "plugins": list_plugins_meta(),
     }

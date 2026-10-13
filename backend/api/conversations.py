@@ -6,7 +6,7 @@ from typing import Any
 from core.store import load, upsert, delete_by, get_by, next_id, load_list_payloads
 from core.agent_runtime import agent_reply
 from core.file_backup import (
-    list_file_ops, restore_op, restore_range,
+    list_file_ops, restore_op, restore_range, _load_conv_ops,
 )
 
 router = APIRouter()
@@ -141,3 +141,114 @@ def restore_one(cid: int, op_idx: int):
     if not conv:
         raise HTTPException(404, "not found")
     return restore_op(cid, op_idx)
+
+
+# ==============================================================
+# 消息删除 / 撤销（截断消息 + 还原文件）
+# ==============================================================
+
+class TruncateMsgReq(BaseModel):
+    """截断到指定消息索引（包含该索引）。index 为 -1 表示清空所有。"""
+    index: int
+
+
+class DeleteMsgReq(BaseModel):
+    """删除单条消息（按原始 messages 索引）。"""
+    index: int
+
+
+class UndoFromMsgReq(BaseModel):
+    """从某条消息开始撤销：删除该消息及之后的所有内容，并还原之后的所有文件操作。"""
+    index: int
+
+
+@router.post("/{cid}/delete_message")
+def delete_message(cid: int, req: DeleteMsgReq):
+    """删除单条消息（仅删除该条，保留其余消息）。
+    index 为原始 messages 数组下标。
+
+    特殊处理：若删除的是带 tool_calls 的 assistant 消息，会一并删除紧随其后的
+    所有 tool 角色消息（即该轮的工具结果）。否则会留下孤立的 tool 消息：
+      1) 违反 OpenAI 消息顺序契约（tool 必须紧跟在带 tool_calls 的 assistant 之后），
+         下一轮调用 LLM 会返回 400；
+      2) 工具结果仍含本轮调用的信息，模型能从残留 tool 结果里"还原"刚才说过/做过的事，
+         表现为"删除了消息但智能体还记得自己说过什么"。
+    """
+    conv = get_by("conversations", cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    msgs = conv.get("messages") or []
+    if req.index < 0 or req.index >= len(msgs):
+        raise HTTPException(400, f"index {req.index} 越界（共 {len(msgs)} 条）")
+
+    target = msgs[req.index] or {}
+    removed = 1
+    del msgs[req.index]
+
+    # 清理该 assistant 轮次后续的 tool 结果（连续的 role=tool 消息）
+    if target.get("role") == "assistant" and target.get("tool_calls"):
+        while req.index < len(msgs) and msgs[req.index].get("role") == "tool":
+            del msgs[req.index]
+            removed += 1
+
+    conv["messages"] = msgs
+    upsert("conversations", conv)
+    return {"ok": True, "kept": len(msgs), "removed": removed}
+
+
+@router.post("/{cid}/truncate")
+def truncate_messages(cid: int, req: TruncateMsgReq):
+    """截断对话消息到指定索引（包含该索引）。
+    index = -1 → 清空所有消息。
+    index = N → 保留 messages[0..N]，删除 messages[N+1..]"""
+    conv = get_by("conversations", cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    msgs = conv.get("messages") or []
+    if req.index < -1 or req.index >= len(msgs):
+        raise HTTPException(400, f"index {req.index} 越界（共 {len(msgs)} 条）")
+    if req.index == -1:
+        conv["messages"] = []
+    else:
+        conv["messages"] = msgs[:req.index + 1]
+    upsert("conversations", conv)
+    return {"ok": True, "kept": len(conv["messages"])}
+
+
+@router.post("/{cid}/undo_from")
+def undo_from_message(cid: int, req: UndoFromMsgReq):
+    """从某条消息开始撤销：
+    1. 记录该消息的 ts
+    2. 找到该 ts 之后的所有文件操作
+    3. 截断消息到 index-1（不包含该消息本身）
+    4. 批量还原文件操作（倒序）
+    返回还原结果和保留的消息数。"""
+    conv = get_by("conversations", cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    msgs = conv.get("messages") or []
+    if req.index < 0 or req.index >= len(msgs):
+        raise HTTPException(400, f"index {req.index} 越界（共 {len(msgs)} 条）")
+
+    target_ts = msgs[req.index].get("ts", "")
+
+    # 1. 截断消息（删除 index 及之后所有）
+    kept_msgs = msgs[:req.index]
+    conv["messages"] = kept_msgs
+    upsert("conversations", conv)
+
+    # 2. 找到该 ts 之后的所有文件操作并批量还原
+    all_ops = _load_conv_ops(cid)
+    to_restore = [i for i, o in enumerate(all_ops) if o.get("ts", "") >= target_ts and not o.get("restored")]
+
+    restore_results = []
+    if to_restore:
+        restore_results = restore_range(cid, to_restore).get("results", [])
+
+    return {
+        "ok": True,
+        "kept_msgs": len(kept_msgs),
+        "removed_msgs": len(msgs) - len(kept_msgs),
+        "restored_ops": len(to_restore),
+        "restore_results": restore_results,
+    }

@@ -5,7 +5,17 @@
   "system_prompt": "你是PPT视觉设计师，专注于打造专业、美观、有冲击力的演示文稿视觉呈现，同时具备动态视觉和AI绘图能力。\n\n## 核心职责\n- 根据品牌规范和风格偏好设计视觉方案\n- 确定主色调、辅助色、字体组合\n- 设计统一的页面版式模板\n- 选择合适的图标、图片、图表样式\n- 规划留白、对齐、层次关系\n- 输出《视觉设计规范》和设计思路说明\n- 提供图片、图标、插画的AI生成提示词\n- 设计动态切换效果和动画方案\n- 统一版式，确保多页风格一致性\n\n## 输出风格\n- 详细描述配色方案和字体规范\n- 提供每页的版式设计建议\n- 说明图表、图片的使用原则\n- 给出具体的视觉优化建议\n- 提供可执行的AI绘图提示词\n\n## 边界\n- 不负责内容策划和文案撰写\n- 不直接生成PPT文件（只给设计方案）\n- 设计需与内容策划师协作，确保内容与视觉统一",
   "model": "",
   "interface_id": null,
-  "commands": [],
+  "commands": [
+    "file.read",
+    "file.write",
+    "file.delete",
+    "file.replace",
+    "file.patch",
+    "file.structure",
+    "file.search",
+    "file.find",
+    "workspace.search"
+  ],
   "skills": [],
   "plugins": [],
   "trigger": {
@@ -20,5 +30,8 @@
   "tools": [
     "browser_control"
   ],
-  "sort_order": 11
+  "sort_order": 11,
+  "perception_scope": "link",
+  "group_id": 3,
+  "workflow_mode": "none"
 }

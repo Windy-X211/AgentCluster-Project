@@ -25,7 +25,12 @@
     "cluster.create_rule",
     "cluster.update_rule",
     "cluster.delete_rule",
-    "file.search"
+    "file.search",
+    "cluster.list_groups",
+    "cluster.create_group",
+    "cluster.update_group",
+    "cluster.delete_group",
+    "cluster.assign_agent_group"
   ],
   "skills": [],
   "plugins": [],
@@ -45,5 +50,7 @@
   ],
   "max_tool_rounds": null,
   "perception_scope": "link",
-  "sort_order": 0
+  "workflow_mode": "plan",
+  "sort_order": 0,
+  "group_id": 1
 }

@@ -6,14 +6,14 @@
     {
       "id": 1,
       "agent_id": 19,
-      "x": -62.62181284907578,
-      "y": -191.74597558271688
+      "x": -61.08198380205192,
+      "y": -189.98478392231112
     },
     {
       "id": 2,
       "agent_id": 20,
       "x": -284.05719041362215,
-      "y": -357.57865192989
+      "y": -368.57865192989
     },
     {
       "id": 3,
@@ -72,30 +72,6 @@
       "type": "chat"
     },
     {
-      "id": 21,
-      "from_node": 5,
-      "to_node": 2,
-      "type": "chat"
-    },
-    {
-      "id": 22,
-      "from_node": 2,
-      "to_node": 5,
-      "type": "chat"
-    },
-    {
-      "id": 23,
-      "from_node": 5,
-      "to_node": 4,
-      "type": "chat"
-    },
-    {
-      "id": 24,
-      "from_node": 4,
-      "to_node": 5,
-      "type": "chat"
-    },
-    {
       "id": 25,
       "from_node": 1,
       "to_node": 4,
@@ -109,8 +85,8 @@
     }
   ],
   "created_at": "2026-09-26T04:54:45.721864",
-  "workdir": "E:\\智能体集群工作区\\新FPS游戏",
+  "workdir": "E:\\智能体集群工作区\\贪吃蛇",
   "execution_mode": "serial",
-  "sort_order": 2,
+  "sort_order": 4,
   "ws_pin": null
 }

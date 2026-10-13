@@ -29,10 +29,13 @@ from __future__ import annotations
 import base64
 import io
 import json as _json
+import os
+import re
 import sys
 import threading
 import queue as _queue
 import time as _time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +63,26 @@ class _BrowserWorker:
         self._q: _queue.Queue[tuple[dict, _queue.Queue]] = _queue.Queue()
         self._thread = threading.Thread(target=self._run, name="browser-worker", daemon=True)
         self._thread.start()
+        # —— 录制状态（线程安全）——
+        self._recording = False
+        self._recording_steps: list[dict] = []
+        self._recording_meta: dict = {}   # {name, description, start_url, start_time, mode}
+        self._recording_lock = threading.Lock()
+        self._recording_started_at: float = 0   # Unix 时间戳，过滤录制开始前的 console 消息
+        self._recording_handlers: list = []      # 保存 Playwright handler 引用（用于 detach）
+        # —— 模板目录 ——
+        self._templates_dir = Path(__file__).resolve().parent / "templates"
+        self._templates_dir.mkdir(parents=True, exist_ok=True)
+        # —— 提前启动 UI 线程（tkinter Tk root + mainloop 必须在同一线程）——
+        try:
+            from . import recording_panel as _rp  # type: ignore
+            _rp.ensure_ui_thread()
+        except Exception:
+            try:
+                from recording_panel import ensure_ui_thread as _eu  # type: ignore
+                _eu()
+            except Exception:
+                pass  # 没装 tkinter 或环境无显示 —— 录制面板功能不可用，但浏览器功能不受影响
 
     @classmethod
     def instance(cls) -> "_BrowserWorker":
@@ -119,6 +142,35 @@ class _BrowserWorker:
             return self._page.url if (self._page is not None and not self._page.is_closed()) else ""
         except Exception:
             return ""
+
+    def _list_pages(self) -> list[dict[str, Any]]:
+        """枚举当前 context 下所有标签页：[{index, url, title, is_active}, ...]。
+
+        is_active 表示该页是否为 self._page（即后续 navigate/click/type 等操作的默认目标）。
+        """
+        out: list[dict[str, Any]] = []
+        if self._context is None:
+            return out
+        try:
+            pages = list(self._context.pages)
+        except Exception:
+            return out
+        for i, p in enumerate(pages):
+            try:
+                url = p.url or ""
+            except Exception:
+                url = ""
+            try:
+                title = p.title() or ""
+            except Exception:
+                title = ""
+            out.append({
+                "index": i,
+                "url": url,
+                "title": title,
+                "is_active": (p is self._page),
+            })
+        return out
 
     # ==============================================================
     # 模式检测与选择
@@ -393,12 +445,887 @@ class _BrowserWorker:
         self._cdp_endpoint = ""
 
     # ==============================================================
+    # 元素快照（@eN 编号）—— get_html(format=snapshot) 的核心
+    # 设计：默认发结构化快照（"目录+页码"），按需回填 outerHTML（"翻到某页"）。
+    # ==============================================================
+    EID_ATTR = "data-ac-eid"
+
+    @staticmethod
+    def _parse_eid(selector: str) -> tuple[int, str] | None:
+        """解析 '@e5' / '@f1e3' / 'e5' / 'f1e3' → (frame_idx, eid)。默认 frame_idx=0（主文档）。"""
+        s = (selector or "").strip()
+        if s.startswith("@"):
+            s = s[1:]
+        # 带帧前缀：f1e3 / @f1e3
+        if s.startswith("f") and "e" in s:
+            try:
+                f_part, e_part = s.split("e", 1)
+                f_num = f_part[1:] if f_part.startswith("f") else f_part
+                if f_num.isdigit() and e_part.isdigit():
+                    return int(f_num), "e" + e_part
+            except ValueError:
+                pass
+        # 不带帧前缀：e5 → 默认主文档 f0
+        if s.startswith("e") and s[1:].isdigit():
+            return 0, s
+        return None
+
+    @classmethod
+    def _translate_selector(cls, selector: str) -> tuple[int | None, str]:
+        """翻译选择器，返回 (frame_idx_or_None, css_selector)。
+
+        - '@f1e3' → (1, '[data-ac-eid="e3"]')  — 子帧
+        - '@e5'   → (0, '[data-ac-eid="e5"]')  — 主文档
+        - '.btn'  → (None, '.btn')             — 普通 CSS（在当前 page.frames[0] 上执行）
+        """
+        parsed = cls._parse_eid(selector)
+        if parsed:
+            frame_idx, eid = parsed
+            return frame_idx, f'[{cls.EID_ATTR}="{eid}"]'
+        return None, selector
+
+    @staticmethod
+    def _resolve_frame(page, frame_idx: int | None):
+        """根据 frame_idx 从 page 上拿到正确的 frame 对象。None / 0 = main_frame。"""
+        if frame_idx is None or frame_idx == 0:
+            return page.main_frame
+        frames = page.frames
+        if 0 <= frame_idx < len(frames):
+            return frames[frame_idx]
+        return page.main_frame
+
+    def _snapshot_js(self) -> str:
+        """生成页面结构化快照：DOM 瘦身 + 关键元素编号 + 紧凑文本。
+
+        多通道采集：A. 语义标签/role（button、input、[role=button]…）
+        B. 有 onclick 回调  C. 可聚焦 tabindex  D. cursor:pointer 且有 onclick/role（严准入，排除装饰元素）
+        去重后按文档位置排序，确保 @eN 顺序 ≈ 视觉从上到下。
+        """
+        return r"""(frameIdx) => {
+  const EID = "data-ac-eid";
+  document.querySelectorAll("[" + EID + "]").forEach(e => e.removeAttribute(EID));
+  const NOISE_TAGS = new Set(["script","style","noscript","svg","canvas","iframe","template","link","meta","head","path"]);
+  const NOISE_SEL = "script,style,noscript,svg,canvas,iframe,template,link,meta,head";
+  function isNoise(el){ if(!el||el.nodeType!==1) return true; const tag=el.tagName.toLowerCase(); if(NOISE_TAGS.has(tag)) return true; try{ const cs=window.getComputedStyle(el); if(cs.display==="none"||cs.visibility==="hidden"||cs.opacity==="0") return true; }catch(_){} const r=el.getBoundingClientRect(); if(r.width===0&&r.height===0) return true; return false; }
+  function hasNoiseAncestor(el){ let p=el.parentElement; while(p&&p!==document.body){ if(isNoise(p)) return true; p=p.parentElement; } return false; }
+  const KEY="a[href],button,input,select,textarea,option,[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=option],[role=combobox],[role=switch],[role=searchbox],[role=textbox],[contenteditable],h1,h2,h3,h4,h5,h6,table,tr,th,td,img[alt],figure,label,summary";
+  const vw=window.innerWidth||document.documentElement.clientWidth||0;
+  const vh=window.innerHeight||document.documentElement.clientHeight||0;
+  const seen=new Set(); const all=[];
+  function add(el){ if(!el||el.nodeType!==1) return; if(seen.has(el)) return; seen.add(el); all.push(el); }
+  if(document.body){
+    // 通道 A：语义关键元素
+    document.body.querySelectorAll(KEY).forEach(add);
+    // 通道 B/C：onclick 或可聚焦（排除 tabindex=-1 这种禁用焦点）
+    document.body.querySelectorAll("[onclick],[tabindex]").forEach(el=>{
+      if(el.getAttribute("tabindex")==="-1") return;
+      add(el);
+    });
+    // 通道 D：cursor:pointer + (有 onclick 或有 role) — 严准入，排除装饰性 cursor:pointer
+    const candidates=document.body.querySelectorAll("*");
+    for(const el of candidates){
+      if(el.tagName==="BODY"||el.tagName==="HTML") continue;
+      if(NOISE_SEL.split(",").includes(el.tagName.toLowerCase())) continue;
+      if(el.firstElementChild&&el.firstElementChild.tagName==="SVG"&&el.children.length===1) continue; // 跳过纯 svg 包装器
+      if(seen.has(el)) continue;
+      let cs; try{ cs=window.getComputedStyle(el); }catch(_){ continue; }
+      if(cs.cursor!=="pointer") continue;
+      if(!el.hasAttribute("onclick")&&!el.getAttribute("role")) continue; // 必须有语义信号，排除纯装饰 cursor
+      add(el);
+    }
+  }
+  // 按文档位置排序，让 @eN 编号 ≈ 视觉从上到下
+  all.sort((a,b)=>{ const p=a.compareDocumentPosition(b); if(p&Node.DOCUMENT_POSITION_FOLLOWING) return -1; if(p&Node.DOCUMENT_POSITION_PRECEDING) return 1; return 0; });
+  let counter=0; const out=[]; const MAX=400;
+  for(const el of all){
+    if(counter>=MAX) break;
+    if(isNoise(el)||hasNoiseAncestor(el)) continue;
+    counter++;
+    const eid="e"+counter; el.setAttribute(EID,eid);
+    const r=el.getBoundingClientRect();
+    const inVP=r.width>0&&r.height>0&&r.bottom>=0&&r.right>=0&&r.top<=vh&&r.left<=vw;
+    const tag=el.tagName.toLowerCase();
+    const role=el.getAttribute("role")||"";
+    const type=(el.getAttribute("type")||"").toLowerCase();
+    const name=el.getAttribute("name")||"";
+    const id=el.id||"";
+    const href=el.getAttribute("href")||"";
+    const disabled=el.hasAttribute("disabled")||el.getAttribute("aria-disabled")==="true";
+    const placeholder=el.getAttribute("placeholder")||"";
+    const value=el.getAttribute("value")||"";
+    const ariaLabel=el.getAttribute("aria-label")||"";
+    const alt=el.getAttribute("alt")||"";
+    const hasOnclick=el.hasAttribute("onclick");
+    let text="";
+    if(tag==="input"||tag==="textarea"||tag==="select"){ text=placeholder||value||ariaLabel||""; }
+    else{ text=(el.innerText||el.textContent||"").trim().replace(/\s+/g," "); if(text.length>80) text=text.slice(0,77)+"..."; }
+    let parentId=""; let p=el.parentElement;
+    while(p){ const pid=p.getAttribute&&p.getAttribute(EID); if(pid){parentId=pid;break;} p=p.parentElement; }
+    out.push({eid,tag,role,type,name,id,href,disabled:!!disabled,inVP:!!inVP,placeholder,value,ariaLabel,alt,text,parentId,hasOnclick});
+  }
+  const byEid=new Map(out.map(o=>[o.eid,o]));
+  function depth(o){ let d=0,pid=o.parentId,seen=new Set(); while(pid&&!seen.has(pid)){seen.add(pid);d++;const p=byEid.get(pid);pid=p?p.parentId:"";} return d; }
+  const lines=out.map(o=>{
+    const ind="  ".repeat(Math.min(depth(o),10));
+    const a=[];
+    if(o.role) a.push("role="+o.role);
+    if(o.type) a.push("type="+o.type);
+    if(o.name) a.push("name="+o.name);
+    if(o.id) a.push("#"+o.id);
+    if(o.href) a.push("href="+o.href);
+    if(o.placeholder) a.push("ph="+JSON.stringify(o.placeholder));
+    if(o.value&&o.tag==="input") a.push("val="+JSON.stringify(o.value));
+    if(o.ariaLabel) a.push("al="+JSON.stringify(o.ariaLabel));
+    if(o.alt) a.push("alt="+JSON.stringify(o.alt));
+    if(o.disabled) a.push("disabled");
+    if(o.hasOnclick&&!o.role&&!["a","button","input","select","textarea"].includes(o.tag)) a.push("clickable");
+    if(!o.inVP) a.push("offscreen");
+    const as=a.length?" ["+a.join(" ")+"]":"";
+    const ts=o.text?" "+JSON.stringify(o.text):"";
+    const eidOut = (frameIdx||0) > 0 ? "@f" + frameIdx + o.eid.slice(1) : "@" + o.eid;
+    return ind + eidOut + " <" + o.tag + ">" + as + ts;
+  });
+  return { count:out.length, viewport:{w:vw,h:vh}, snapshot:lines.join("\n"), truncated:counter>=MAX };
+}"""
+
+    def _element_extract_js(self) -> str:
+        """按 @eN 取单个元素 outerHTML（已剔除内嵌 script/style 噪声）。"""
+        return r"""(eid) => {
+  const EID = "data-ac-eid";
+  const el = document.querySelector("[" + EID + "='" + eid + "']");
+  if (!el) return { found:false, error:"元素 @" + eid + " 未找到（页面可能已刷新或跳转，请重新 get_html(format=snapshot) 生成编号）" };
+  let html = el.outerHTML || "";
+  html = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
+  return { found:true, outerHTML: html.slice(0, 8000) };
+}"""
+
+    # ==============================================================
+    # 稳定 CSS 选择器生成（用于模板回放，避免 @eN 的瞬态性）
+    # ==============================================================
+    def _stable_selector_js(self) -> str:
+        """给定 data-ac-eid 编号，生成稳定的 CSS 选择器。
+        优先级：#id → [name=] → .class → nth-child 路径。
+        失败返回空字符串。"""
+        return r"""(eid) => {
+  const EID = "data-ac-eid";
+  const el = document.querySelector("[" + EID + "='" + eid + "']");
+  if (!el) return "";
+  function escape(s){ return s.replace(/[^\w-]/g, m => "\\" + m); }
+  // 1) id
+  if (el.id) return "#" + escape(el.id);
+  // 2) name 属性（表单元素）
+  if (el.name && ["input","textarea","select","button"].includes(el.tagName.toLowerCase())) {
+    return el.tagName.toLowerCase() + "[name=\"" + el.name.replace(/"/g,'\\"') + "\"]";
+  }
+  // 3) 有意义的 class（排除框架噪声如 col-*, row, container 等）
+  const NOISE = /^(col-|row$|container|container-fluid|btn-group|form-control|form-group|input-group|navbar|modal|dropdown|tooltip|popover|fade|show|active|hidden|visible|collapse|expand|justify|align|text-|bg-|border-|rounded|shadow|p-|m-|d-|flex|grid|table-|thead|tbody|thead|list-group|breadcrumb|pagination)/;
+  const meaningful = Array.from(el.classList).filter(c => !NOISE.test(c) && c.length < 30);
+  if (meaningful.length > 0) {
+    return el.tagName.toLowerCase() + "." + meaningful.map(escape).join(".");
+  }
+  // 4) nth-child 路径（限制深度）
+  let path = [];
+  let cur = el;
+  let depth = 0;
+  while (cur && cur.nodeType === 1 && cur.tagName !== "BODY" && cur.tagName !== "HTML" && depth < 8) {
+    const tag = cur.tagName.toLowerCase();
+    let nth = 1;
+    let sib = cur;
+    while ((sib = sib.previousElementSibling) !== null) {
+      if (sib.tagName === cur.tagName) nth++;
+    }
+    path.unshift(tag + ":nth-of-type(" + nth + ")");
+    cur = cur.parentElement;
+    depth++;
+  }
+  return path.join(" > ");
+}"""
+
+    def _get_stable_selector(self, page, frame_idx: int | None, eid: str) -> str:
+        """通过 JS 在页面中查询并生成稳定 CSS 选择器。"""
+        try:
+            frame = self._resolve_frame(page, frame_idx)
+            return str(frame.evaluate(self._stable_selector_js(), eid) or "")
+        except Exception:
+            return ""
+
+    # ==============================================================
+    # 用户操作录制 —— 核心方案：注入 JS 监听器到浏览器页面
+    #   1) add_init_script 注册全局监听器（跨导航存活）
+    #   2) Playwright page.on('console') 捕获 __AC_REC__: 前缀的 JSON
+    #   3) page.on('framenavigated') 捕获导航事件
+    #   4) 同时注入一个浏览器内悬浮提示条
+    # ==============================================================
+
+    # 注入到每个 frame 的监听器（跨导航通过 add_init_script 重新注册）
+    _AC_REC_PREFIX = "__AC_REC__:"
+
+    def _user_recording_listeners_js(self) -> str:
+        # 注意：add_init_script / frame.evaluate 接受的是"直接执行的 JS 代码"，
+        # 所以这里用 IIFE 立即执行，而不是 () => { ... } 函数表达式。
+        # 关键设计：
+        #   1) 监听器挂在 window 捕获阶段（最先触发，防止页面脚本 stopPropagation 拦截）
+        #   2) SPA 路由跳转（pushState/replaceState/popstate/hashchange）→ emit navigate
+        #   3) 注入后立即发心跳，便于 Python 侧确认 console 链路通
+        return (r"""(function(){
+  if (window.__ac_rec_installed__) return;
+  window.__ac_rec_installed__ = true;
+
+  var PREFIX = "__AC_REC__:";
+  function emit(obj){
+    try { console.log(PREFIX + JSON.stringify(obj)); } catch(e){}
+  }
+  // 心跳：注入成功标记（Python 侧只确认链路，不记 step）
+  try { console.log("[AC_REC] installed on " + location.href); } catch(e){}
+
+  function stableSel(el) {
+    if (!el || el.nodeType !== 1) return "";
+    function esc(s){ return s.replace(/[^\w-]/g, function(m){ return "\\" + m; }); }
+    if (el.id) return "#" + esc(el.id);
+    if (el.name && ["input","textarea","select","button"].indexOf(el.tagName.toLowerCase()) >= 0) {
+      return el.tagName.toLowerCase() + "[name=\"" + el.name.replace(/"/g,'\\"') + "\"]";
+    }
+    var NOISE = /^(col-|row$|container|form-control|navbar|modal|btn-|text-|bg-|p-|m-|d-|active|show|fade|collapse|dropdown|tooltip|popover)/;
+    var meaningful = Array.from(el.classList||[]).filter(function(c){ return !NOISE.test(c) && c.length < 30; });
+    if (meaningful.length > 0) {
+      return el.tagName.toLowerCase() + "." + meaningful.map(esc).join(".");
+    }
+    var path=[]; var cur=el; var depth=0;
+    while(cur && cur.nodeType===1 && cur.tagName!=="BODY" && cur.tagName!=="HTML" && depth<8){
+      var tag=cur.tagName.toLowerCase(); var nth=1; var sib=cur;
+      while((sib=sib.previousElementSibling)!==null){ if(sib.tagName===cur.tagName) nth++; }
+      path.unshift(tag+":nth-of-type("+nth+")"); cur=cur.parentElement; depth++;
+    }
+    return path.join(" > ");
+  }
+
+  function isOverlayNode(el) {
+    var cur = el;
+    while (cur && cur.nodeType === 1) {
+      if (cur.id === '__ac_rec_overlay__') return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
+  // —— click（window 捕获阶段，最先触发，防页面脚本拦截）——
+  window.addEventListener('click', function(e) {
+    var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
+    emit({ kind:'click', selector: stableSel(tgt), text:(tgt.innerText||tgt.textContent||'').trim().slice(0,100), tag: tgt.tagName.toLowerCase() });
+  }, true);
+
+  // —— input/textarea 输入（防抖 600ms）——
+  var inputTimer = null;
+  var inputBuff = null;
+  window.addEventListener('input', function(e) {
+    var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
+    if (["INPUT","TEXTAREA","SELECT"].indexOf(tgt.tagName) < 0) return;
+    if (inputBuff && inputBuff.selector === stableSel(tgt)) {
+      inputBuff.text = tgt.value || tgt.textContent || '';
+    } else {
+      inputBuff = { selector: stableSel(tgt), text: tgt.value || tgt.textContent || '' };
+    }
+    if (inputTimer) clearTimeout(inputTimer);
+    inputTimer = setTimeout(function() {
+      if (inputBuff) {
+        emit({ kind:'type', selector: inputBuff.selector, text: inputBuff.text });
+        inputBuff = null;
+      }
+    }, 600);
+  }, true);
+
+  // —— select change ——
+  window.addEventListener('change', function(e) {
+    var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
+    if (tgt.tagName === 'SELECT') {
+      emit({ kind:'type', selector: stableSel(tgt), text: (tgt.value||'').slice(0,200) });
+    }
+  }, true);
+
+  // —— form submit ——
+  window.addEventListener('submit', function(e) {
+    emit({ kind:'form_submit', selector: stableSel(e.target) });
+  }, true);
+
+  // —— SPA 路由跳转（B 站等单页应用：pushState 不触发 framenavigated）——
+  var lastUrl = location.href;
+  function navEmit(){
+    try {
+      if (location.href === lastUrl) return;
+      lastUrl = location.href;
+      emit({ kind:'navigate', url: location.href });
+    } catch(e){}
+  }
+  try {
+    var _origPush = history.pushState;
+    history.pushState = function(){ _origPush.apply(this, arguments); setTimeout(navEmit, 50); };
+    var _origReplace = history.replaceState;
+    history.replaceState = function(){ _origReplace.apply(this, arguments); setTimeout(navEmit, 50); };
+    window.addEventListener('popstate', navEmit);
+    window.addEventListener('hashchange', navEmit);
+  } catch(e){}
+})()""")
+
+    def _user_recording_overlay_js(self) -> str:
+        """浏览器内悬浮提示条。"""
+        return (r"""(function(){
+  if (document.getElementById('__ac_rec_overlay__')) return;
+  const div = document.createElement('div');
+  div.id = '__ac_rec_overlay__';
+  div.innerHTML = '<span class="dot">●</span><span class="txt">正在录制操作模板</span>';
+  const st = div.style;
+  st.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;'
+               'background:rgba(231,76,60,0.92);color:#fff;padding:8px 14px;'
+               'border-radius:8px;font-size:13px;font-family:system-ui,-apple-system,sans-serif;'
+               'box-shadow:0 4px 16px rgba(0,0,0,0.25);cursor:default;user-select:none;'
+               'display:flex;align-items:center;gap:8px;';
+  div.querySelector('.dot').style.cssText = 'font-size:11px;animation:pulse 1.2s infinite;';
+  div.querySelector('.txt').style.cssText = 'font-weight:500;';
+  const kf = '@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}';
+  const st2 = document.createElement('style'); st2.textContent = kf;
+  document.head.appendChild(st2);
+  document.body.appendChild(div);
+})()""")
+
+    def _user_recording_teardown_js(self) -> str:
+        return (r"""(function(){
+  const el = document.getElementById('__ac_rec_overlay__');
+  if (el) el.remove();
+  window.__ac_rec_installed__ = false;
+})()""")
+
+    # —— 将一条 console 事件转成 step dict ——
+    def _parse_rec_console(self, text: str, page) -> dict | None:
+        prefix = self._AC_REC_PREFIX
+        if not text.startswith(prefix):
+            return None
+        try:
+            payload = _json.loads(text[len(prefix):])
+        except Exception:
+            return None
+        kind = payload.get("kind", "")
+        step: dict = {
+            "index": 0,  # 稍后重新编号
+            "action": "",
+            "url_before": "",
+            "url_after": self.current_url(),
+            "url": self.current_url(),
+            "selector": payload.get("selector", ""),
+            "stable_selector": payload.get("selector", ""),  # 注入的 JS 已经生成了稳定选择器
+            "text": payload.get("text", ""),
+            "coordinate": None,
+            "annotation": "",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "_kind": kind,
+        }
+        if kind == "click":
+            step["action"] = "click"
+        elif kind == "type":
+            step["action"] = "type"
+        elif kind == "form_submit":
+            step["action"] = "form_submit"
+        elif kind == "navigate":
+            # SPA 路由跳转（pushState/replaceState/popstate/hashchange）
+            step["action"] = "navigate"
+            step["url"] = payload.get("url", "")
+            step["url_before"] = ""
+            step["url_after"] = payload.get("url", "")
+        else:
+            return None
+        return step
+
+    def _append_step(self, step: dict) -> None:
+        with self._recording_lock:
+            if not self._recording:
+                return
+            step["index"] = len(self._recording_steps)
+            self._recording_steps.append(step)
+
+    # ==============================================================
+    # 录制状态管理（public API：record_start / record_status / ...）
+    # ==============================================================
+    def _record_start(self, req: dict) -> dict:
+        name = (req.get("record_name") or "").strip() or f"template_{int(_time.time())}"
+        description = (req.get("record_description") or "").strip()
+        # 确保 page 可用
+        page = None
+        try:
+            requested_mode = (req.get("mode") or self._mode or "auto").strip().lower()
+            cdp_endpoint = (req.get("cdp_endpoint") or self._cdp_endpoint or "http://localhost:9222").strip()
+            final_mode, final_ep = self._resolve_mode(requested_mode, cdp_endpoint)
+            page = self._ensure_page(visible=True, mode=final_mode, cdp_endpoint=final_ep)
+        except Exception as e:
+            return {"ok": False, "error": f"启动浏览器失败：{e}",
+                    "_note": "录制需要一个可用的浏览器页面。"}
+
+        start_url = self.current_url()
+        mode = self._mode or "auto"
+
+        with self._recording_lock:
+            self._recording = True
+            self._recording_steps = []
+            self._recording_meta = {
+                "name": name, "description": description,
+                "start_url": start_url,
+                "start_time": datetime.now().isoformat(timespec="seconds"),
+                "mode": mode,
+            }
+            self._recording_started_at = _time.time()
+
+        # —— 注入监听器（两重保险：add_init_script 跨导航 + 当前页面立即注入）——
+        try:
+            init_script = self._user_recording_listeners_js()
+            _sl = lambda s: s.encode("ascii", "replace").decode("ascii") if s else s
+            print(f"[browser_control] injecting recording listeners, context={self._context}, pages={len(self._context.pages) if self._context else 0}")
+            if self._context is not None:
+                self._context.add_init_script(init_script)
+                print("[browser_control] [OK] add_init_script set")
+            injected_count = 0
+            for p in (self._context.pages if self._context else []):
+                for frame in p.frames:
+                    try:
+                        frame.evaluate(init_script)
+                        injected_count += 1
+                    except Exception as e:
+                        print(f"[browser_control] frame evaluate failed ({_sl((frame.url or '')[:60])}): {e}")
+            print(f"[browser_control] [OK] listeners injected into {injected_count} frames")
+            for p in (self._context.pages if self._context else []):
+                try:
+                    p.evaluate(self._user_recording_overlay_js())
+                    print(f"[browser_control] [OK] overlay injected into {_sl((p.url or '')[:60])}")
+                except Exception as e:
+                    print(f"[browser_control] overlay inject failed: {e}")
+        except Exception as e:
+            return {"ok": False, "error": f"注入录制监听器失败：{e}"}
+
+        # —— 给所有现有 page 挂 console 监听器 ——
+        # 重要：Windows 控制台是 gbk，B 站页面自身的中文 console 输出会让
+        # print() 抛 UnicodeEncodeError。所以先判断 PREFIX 再打印，
+        # 打印也必须包 try——否则一个中文噪音就把整条 __AC_REC__ 消息吞掉。
+        def _on_console(msg):
+            try:
+                text = msg.text or ""
+            except Exception:
+                return
+            if self._AC_REC_PREFIX not in text:
+                # 心跳消息（注入成功标记），只打印确认链路，不记 step
+                if text.startswith("[AC_REC]"):
+                    try:
+                        print(f"[browser_control] [HEARTBEAT] {text[:110]}")
+                    except Exception:
+                        pass
+                return
+            try:
+                print(f"[browser_control] console: {text[:110]}")
+            except Exception:
+                pass
+            step = self._parse_rec_console(text, page)
+            if step:
+                try:
+                    print(f"[browser_control] [CAUGHT] {step.get('action')} sel={(step.get('selector') or '')[:50]}")
+                except Exception:
+                    pass
+                self._append_step(step)
+            else:
+                try:
+                    print(f"[browser_control] [PARSE-FAIL] {text[:100]}")
+                except Exception:
+                    pass
+
+        def _on_nav(page_obj, url):
+            try:
+                print(f"[browser_control] navigated: {url}")
+            except Exception:
+                pass
+            if not self._recording:
+                return
+            with self._recording_lock:
+                if not self._recording:
+                    return
+            self._append_step({
+                "index": 0,
+                "action": "navigate",
+                "url": url,
+                "url_before": "",
+                "url_after": url,
+                "selector": "",
+                "stable_selector": "",
+                "text": "",
+                "coordinate": None,
+                "annotation": "",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            })
+            # 导航后重新注入 overlay（页面重建了 DOM）
+            try:
+                page_obj.evaluate(self._user_recording_overlay_js())
+            except Exception:
+                pass
+
+        with self._recording_lock:
+            # 清理旧 handler（避免多次 record_start 累积）
+            for p in (self._context.pages if self._context else []):
+                try:
+                    p.remove_listener("console", self._recording_handlers.pop(0))
+                except Exception:
+                    pass
+                try:
+                    p.remove_listener("framenavigated", self._recording_handlers.pop(0))
+                except Exception:
+                    pass
+            self._recording_handlers.clear()
+            # 挂新 handler
+            if self._context is not None:
+                for p in self._context.pages:
+                    try:
+                        p.on("console", _on_console)
+                        self._recording_handlers.append(_on_console)
+                        p.on("framenavigated", lambda u, _p=p: _on_nav(_p, u))
+                        self._recording_handlers.append(_on_nav)
+                    except Exception:
+                        pass
+
+        # —— 弹出 Python 录制面板（独立于主应用和浏览器）——
+        _panel_error = None
+        try:
+            from . import recording_panel as _rp  # type: ignore
+            _rp.open_panel(self, {"name": name, "start_url": start_url})
+            print("[browser_control] recording panel opened (import: from .)")
+        except Exception as e1:
+            print(f"[browser_control] from . import failed: {e1}")
+            try:
+                from recording_panel import open_panel as _open  # type: ignore
+                _open(self, {"name": name, "start_url": start_url})
+                print("[browser_control] recording panel opened (import: top-level)")
+            except Exception as e2:
+                print(f"[browser_control] import recording_panel failed: {e2}")
+                try:
+                    import importlib.util as _iu
+                    _rp_path = Path(__file__).resolve().parent / "recording_panel.py"
+                    _spec = _iu.spec_from_file_location("recording_panel", str(_rp_path))
+                    _mod = _iu.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    _mod.open_panel(self, {"name": name, "start_url": start_url})
+                    print("[browser_control] recording panel opened (import: spec)")
+                except Exception as e3:
+                    print(f"[browser_control] spec_from_file_location also failed: {e3}")
+                    _panel_error = f"{e1} / {e2} / {e3}"
+
+        return {"ok": True, "recording": True, "name": name, "start_url": start_url,
+                "_note": "⚠️ 现在必须立即停止运行！录制已开始，用户正在浏览器里操作。你不要调任何其他浏览器 action（navigate/click/type 等）——那些是智能体代录，不是用户录。"
+                         "你现在应该告诉用户「录制已开始，请在浏览器里正常操作，完成后回到对话告诉我」，然后结束你的当前回复。"
+                         "等用户操作完说「好了」/「保存吧」/「完成录制」，你再回来调 record_complete 或 record_status。",
+                "_suggest_stop": True}   # 给智能体框架的显式信号：调完此 action 后应停止、等用户下一条消息
+
+    def _teardown_user_recording(self) -> None:
+        """停止录制：清理 handler + 浏览器内悬浮条 + add_init_script。"""
+        if self._context is None:
+            return
+        # detach handlers
+        for p in self._context.pages:
+            for h in self._recording_handlers:
+                try:
+                    p.remove_listener("console", h)
+                except Exception:
+                    pass
+                try:
+                    p.remove_listener("framenavigated", h)
+                except Exception:
+                    pass
+        self._recording_handlers.clear()
+        # 移除浏览器内悬浮条
+        try:
+            for p in self._context.pages:
+                p.evaluate(self._user_recording_teardown_js())
+        except Exception:
+            pass
+        # 清理 add_init_script（Playwright 没有 remove_init_script，
+        # 但它只对后续导航生效，且我们的 JS 有 __ac_rec_installed__ 防重复标记，
+        # 所以简单做法是保留 init script 但 JS 内部检测 self._recording 状态）
+        # 更干净的方案：在 teardown 时注册一个新的 init script 把 __ac_rec_installed__ 重置掉
+        try:
+            reset_js = "() => { window.__ac_rec_installed__ = false; const el = document.getElementById('__ac_rec_overlay__'); if (el) el.remove(); }"
+            self._context.add_init_script(reset_js)
+            for p in self._context.pages:
+                for frame in p.frames:
+                    try:
+                        frame.evaluate(reset_js)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _record_status(self) -> dict:
+        with self._recording_lock:
+            if not self._recording:
+                return {"recording": False, "steps": [], "meta": {}}
+            steps_copy = [dict(s) for s in self._recording_steps]
+            meta_copy = dict(self._recording_meta)
+        return {"recording": True, "steps": steps_copy, "meta": meta_copy}
+
+    def _record_step_annotate(self, req: dict) -> dict:
+        idx = int(req.get("step_index", -1))
+        note = str(req.get("annotation") or "")
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": False, "error": "当前没有正在进行的录制"}
+            if 0 <= idx < len(self._recording_steps):
+                self._recording_steps[idx]["annotation"] = note
+                return {"ok": True, "step_index": idx, "annotation": note}
+        return {"ok": False, "error": f"step_index {idx} 越界（共 {len(self._recording_steps)} 步）"}
+
+    def _record_step_delete(self, req: dict) -> dict:
+        idx = int(req.get("step_index", -1))
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": False, "error": "当前没有正在进行的录制"}
+            if 0 <= idx < len(self._recording_steps):
+                removed = self._recording_steps.pop(idx)
+                for i, s in enumerate(self._recording_steps):
+                    s["index"] = i
+                return {"ok": True, "removed": removed}
+        return {"ok": False, "error": f"step_index {idx} 越界（共 {len(self._recording_steps)} 步）"}
+
+    def _record_step_reorder(self, req: dict) -> dict:
+        order = req.get("new_order") or req.get("order")
+        if not order or not isinstance(order, list):
+            return {"ok": False, "error": "需要 new_order 参数（整数数组）"}
+        new_order = [int(x) for x in order]
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": False, "error": "当前没有正在进行的录制"}
+            n = len(self._recording_steps)
+            if sorted(new_order) != list(range(n)):
+                return {"ok": False, "error": f"new_order 必须是 0..{n-1} 的一个排列，收到 {new_order}"}
+            self._recording_steps = [dict(self._recording_steps[i]) for i in new_order]
+            for i, s in enumerate(self._recording_steps):
+                s["index"] = i
+        return {"ok": True, "new_order": new_order}
+
+    def _record_complete(self, req: dict) -> dict:
+        template_name = (req.get("template_name") or req.get("record_name") or "").strip()
+        description = (req.get("record_description") or "").strip()
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": False, "error": "当前没有正在进行的录制"}
+            steps_copy = [dict(s) for s in self._recording_steps]
+            meta_copy = dict(self._recording_meta)
+            final_url = self.current_url()
+            self._recording = False
+            self._recording_steps = []
+            self._recording_meta = {}
+        self._teardown_user_recording()
+        if template_name:
+            meta_copy["name"] = template_name
+        if description:
+            meta_copy["description"] = description
+        # 清理内部字段
+        for s in steps_copy:
+            s.pop("_kind", None)
+        template = {
+            "version": 1,
+            "name": meta_copy.get("name", "template"),
+            "description": meta_copy.get("description", ""),
+            "start_url": meta_copy.get("start_url", ""),
+            "mode": meta_copy.get("mode", "auto"),
+            "created_at": meta_copy.get("start_time", datetime.now().isoformat(timespec="seconds")),
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+            "steps": steps_copy,
+            "final_url": final_url,
+        }
+        safe_name = re.sub(r'[^\w\-]+', '_', template["name"]).strip('_') or "template"
+        save_path = self._templates_dir / f"{safe_name}.json"
+        counter = 1
+        while save_path.exists():
+            save_path = self._templates_dir / f"{safe_name}_{counter}.json"
+            counter += 1
+        try:
+            save_path.write_text(_json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            return {"ok": False, "error": f"保存模板失败：{e}"}
+        return {"ok": True, "template": template, "path": str(save_path),
+                "steps_count": len(steps_copy)}
+
+    def _record_cancel(self) -> dict:
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": True, "_note": "当前没有正在进行的录制"}
+            self._recording = False
+            self._recording_steps = []
+            self._recording_meta = {}
+        self._teardown_user_recording()
+        return {"ok": True, "_note": "录制已取消，步骤已丢弃。"}
+
+    # ==============================================================
+    # 模板管理（worker 线程内执行，模板目录 I/O）
+    # ==============================================================
+    def _template_list(self) -> dict:
+        items = []
+        for fp in sorted(self._templates_dir.glob("*.json")):
+            try:
+                data = _json.loads(fp.read_text(encoding="utf-8"))
+                items.append({
+                    "name": data.get("name", fp.stem),
+                    "filename": fp.name,
+                    "path": str(fp),
+                    "description": data.get("description", ""),
+                    "start_url": data.get("start_url", ""),
+                    "final_url": data.get("final_url", ""),
+                    "mode": data.get("mode", "auto"),
+                    "steps_count": len(data.get("steps", [])),
+                    "created_at": data.get("created_at", ""),
+                })
+            except Exception:
+                continue
+        return {"ok": True, "templates": items}
+
+    def _template_load(self, req: dict) -> dict:
+        name = (req.get("template_name") or req.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "需要 template_name 参数"}
+        # 尝试精确匹配 .json 或直接用 stem
+        candidates = [
+            self._templates_dir / name,
+            self._templates_dir / (name + ".json"),
+        ]
+        found_path: Path | None = None
+        for c in candidates:
+            if c.exists():
+                found_path = c
+                break
+        if found_path is None:
+            # 模糊匹配（name 作为 stem）
+            for fp in self._templates_dir.glob("*.json"):
+                if fp.stem == name or fp.name == name:
+                    found_path = fp
+                    break
+        if found_path is None:
+            return {"ok": False, "error": f"未找到模板：{name}"}
+        try:
+            data = _json.loads(found_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"ok": False, "error": f"模板读取失败：{e}"}
+        return {"ok": True, "template": data, "path": str(found_path)}
+
+    def _template_delete(self, req: dict) -> dict:
+        name = (req.get("template_name") or req.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "需要 template_name 参数"}
+        for fp in list(self._templates_dir.glob("*.json")):
+            if fp.stem == name or fp.name == name:
+                try:
+                    fp.unlink()
+                    return {"ok": True, "deleted": fp.name}
+                except Exception as e:
+                    return {"ok": False, "error": f"删除失败：{e}"}
+        return {"ok": False, "error": f"未找到模板：{name}"}
+
+    def _template_run(self, req: dict) -> dict:
+        """依次执行模板中的每一步（navigate → click → type → coordinate_click）。
+        每一步调用 worker 内部的 _handle 方法。
+        回放期间临时禁用录制捕获（避免把回放步骤录进当前录制会话）。"""
+        load_res = self._template_load(req)
+        if not load_res.get("ok"):
+            return load_res
+        template = load_res["template"]
+        steps = template.get("steps", [])
+        if not steps:
+            return {"ok": False, "error": "模板没有步骤"}
+
+        results = []
+        # 确保有 page
+        requested_mode = (req.get("mode") or template.get("mode") or self._mode or "auto").strip().lower()
+        cdp_endpoint = (req.get("cdp_endpoint") or self._cdp_endpoint or "").strip()
+        final_mode, final_ep = self._resolve_mode(requested_mode, cdp_endpoint)
+        try:
+            page = self._ensure_page(visible=True, mode=final_mode, cdp_endpoint=final_ep)
+        except Exception as e:
+            return {"ok": False, "error": f"启动浏览器失败：{e}"}
+
+        # —— 临时禁用录制捕获 ——
+        with self._recording_lock:
+            _prev_recording = self._recording
+            self._recording = False
+        try:
+            for i, step in enumerate(steps):
+                action = step.get("action", "")
+                step_req: dict = {}
+                if action == "navigate":
+                    step_req = {"action": "navigate", "url": step.get("url") or step.get("url_after") or ""}
+                elif action == "click":
+                    sel = step.get("stable_selector") or step.get("selector") or ""
+                    step_req = {"action": "click", "selector": sel}
+                elif action == "type":
+                    sel = step.get("stable_selector") or step.get("selector") or ""
+                    step_req = {"action": "type", "selector": sel, "text": step.get("text", "")}
+                elif action == "coordinate_click":
+                    coord = step.get("coordinate") or {}
+                    step_req = {"action": "coordinate_click", "x": coord.get("x", -1), "y": coord.get("y", -1)}
+                elif action == "wait":
+                    step_req = {"action": "wait", "value": step.get("value", 1)}
+                elif action == "screenshot":
+                    step_req = {"action": "screenshot", "purpose": step.get("purpose", "inspect")}
+                else:
+                    results.append({"step": i, "action": action, "ok": False, "error": f"跳过未知 action: {action}"})
+                    continue
+                step_req.setdefault("timeout", req.get("timeout", 15))
+                r = self._handle(step_req)
+                results.append({"step": i, "action": action, **r})
+                if not r.get("ok"):
+                    return {"ok": False, "error": f"步骤 {i}({action}) 失败：{r.get('error','')}",
+                            "results": results, "failed_at_step": i}
+                page.wait_for_timeout(300)
+        except Exception as e:
+            return {"ok": False, "error": f"执行异常：{type(e).__name__}: {e}", "results": results}
+        finally:
+            # —— 恢复录制状态 ——
+            with self._recording_lock:
+                self._recording = _prev_recording
+
+        return {"ok": True, "template": template.get("name"), "steps_executed": len(steps),
+                "current_url": self.current_url(), "results": results}
+
+    # ==============================================================
     # 请求分发（worker 线程内执行）
     # ==============================================================
     def _handle(self, req: dict[str, Any]) -> dict[str, Any]:
         action = (req.get("action") or "").strip().lower()
         if not action:
             return {"ok": False, "data": "", "error": "缺少 action 参数", "current_url": self.current_url()}
+
+        # —— 录制/模板管理 action（不需要浏览器 page，独立分发）——
+        if action == "record_start":
+            return self._record_start(req)
+
+        if action == "record_status":
+            return self._record_status()
+
+        if action == "record_step_annotate":
+            return self._record_step_annotate(req)
+
+        if action == "record_step_delete":
+            return self._record_step_delete(req)
+
+        if action == "record_step_reorder":
+            return self._record_step_reorder(req)
+
+        if action == "record_complete":
+            return self._record_complete(req)
+
+        if action == "record_cancel":
+            return self._record_cancel()
+
+        if action == "record_template_list":
+            return self._template_list()
+
+        if action == "record_template_load":
+            return self._template_load(req)
+
+        if action == "record_template_delete":
+            return self._template_delete(req)
+
+        if action == "record_template_run":
+            # 模板回放走专门的执行器（会自行 _ensure_page + _handle 各步）
+            return self._template_run(req)
 
         # resolve mode
         requested_mode = (req.get("mode") or self._mode or "auto").strip().lower()
@@ -412,6 +1339,99 @@ class _BrowserWorker:
             except Exception as e:
                 return {"ok": False, "data": "", "error": f"close 失败: {e}", "current_url": self.current_url()}
 
+        # —— info：纯查询状态，不应无谓拉起新浏览器 ——
+        # 但 cdp 模式例外：用户已经有浏览器在跑，只是我们还没 connect_over_cdp；
+        # 做一次 ensure_page（cdp 模式只建立连接，不启动新浏览器），这样才能列出已有的标签页。
+        if action == "info":
+            if final_mode == "cdp" and self._context is None:
+                try:
+                    self._ensure_page(visible=False, mode="cdp", cdp_endpoint=final_ep)
+                except Exception:
+                    pass  # CDP 端点连不上就保持 context=None，下面会返回空列表
+            page_list = self._list_pages() if self._context is not None else []
+            n = len(page_list)
+            active_idx = next((p["index"] for p in page_list if p["is_active"]), -1)
+            cur_url = self.current_url()
+            vw = vh = 0
+            try:
+                if self._page is not None and not self._page.is_closed():
+                    vs = self._page.viewport_size or {}
+                    vw = int(vs.get("width") or 0)
+                    vh = int(vs.get("height") or 0)
+            except Exception:
+                pass
+            lines = [f"mode={final_mode} visible={self._visible} pages={n} active=#{active_idx}"]
+            for p in page_list:
+                tag = "[active]" if p["is_active"] else "       "
+                t = (p.get("title") or "").strip()
+                url = p.get("url") or "(about:blank)"
+                lines.append(f"[#{p['index']}]{tag} {url}" + (f"  — {t}" if t else ""))
+            if vw and vh:
+                lines.append(f"viewport={vw}x{vh}")
+            if n == 0:
+                lines.append("(当前没有打开的浏览器页面，navigate / new_tab 会自动启动)")
+            summary = "\n".join(lines)
+            return {
+                "ok": True,
+                "mode": final_mode,
+                "cdp_endpoint": final_ep if final_mode == "cdp" else "",
+                "visible": self._visible,
+                "current_url": cur_url,
+                "active_page_index": active_idx,
+                "page_count": n,
+                "pages": page_list,
+                "viewport": {"w": vw, "h": vh} if vw and vh else {"w": 0, "h": 0},
+                "data": summary,
+            }
+
+        # —— focus_tab：切标签页，需要已有连接但不应该自动启动浏览器 ——
+        if action == "focus_tab":
+            try:
+                idx = int(req.get("tab_index")) if req.get("tab_index") is not None else -1
+                if idx < 0:
+                    idx = int(req.get("index")) if req.get("index") is not None else -1
+            except Exception:
+                idx = -1
+            if idx < 0:
+                return {"ok": False, "data": "", "error": "focus_tab 需要 index（≥0，可用 info 查看）",
+                        "current_url": self.current_url()}
+            # cdp 模式：如果浏览器在跑但还没 connect，先惰性连接（不启动新浏览器）
+            if final_mode == "cdp" and self._context is None:
+                try:
+                    self._ensure_page(visible=False, mode="cdp", cdp_endpoint=final_ep)
+                except Exception:
+                    pass
+            if self._context is None:
+                return {"ok": False, "data": "", "error": "没有可用的浏览器（cdp 端点连不上 / 请先 navigate / new_tab）",
+                        "current_url": self.current_url()}
+            try:
+                pages_now = list(self._context.pages)
+            except Exception as e:
+                return {"ok": False, "data": "", "error": f"获取标签页失败: {e}",
+                        "current_url": self.current_url()}
+            if idx >= len(pages_now):
+                return {"ok": False, "data": "", "error": f"focus_tab index 越界：共 {len(pages_now)} 个，index={idx}",
+                        "current_url": self.current_url()}
+            target = pages_now[idx]
+            try:
+                target.bring_to_front()
+            except Exception:
+                pass
+            self._page = target
+            all_pages = self._list_pages()
+            return {
+                "ok": True,
+                "mode": final_mode,
+                "cdp_endpoint": final_ep if final_mode == "cdp" else "",
+                "visible": self._visible,
+                "current_url": self.current_url(),
+                "active_page_index": idx,
+                "page_count": len(all_pages),
+                "pages": all_pages,
+                "data": f"已切换到标签页 #{idx}: {self.current_url()}",
+            }
+
+        # —— 下面这些 action 需要浏览器页面，确保 page 可用 ——
         timeout_i = max(1, int(float(req.get("timeout") or 15)))
         visible = bool(req.get("visible"))
         try:
@@ -420,6 +1440,33 @@ class _BrowserWorker:
             return {"ok": False, "data": "", "error": f"启动浏览器失败({final_mode}): {e}", "current_url": self.current_url()}
 
         try:
+            # —— 可选：把本次操作重定向到 tab_index 指定的标签页 ——
+            # switch_active=True：同时切为活动页（bring_to_front + 更新 self._page）；
+            # switch_active=False（默认）：后台操作，不 bring_to_front、不改 self._page。
+            redirected = False
+            if action in ("navigate", "click", "coordinate_click", "type",
+                          "get_text", "get_html", "screenshot", "evaluate", "wait"):
+                tab_index_req = req.get("tab_index")
+                try:
+                    tgt_idx = int(tab_index_req) if tab_index_req is not None else -1
+                except Exception:
+                    tgt_idx = -1
+                if tgt_idx >= 0:
+                    if self._context is None:
+                        return {"ok": False, "data": "", "error": "没有可用的浏览器 context", "current_url": self.current_url()}
+                    pages_now = list(self._context.pages)
+                    if tgt_idx >= len(pages_now):
+                        return {"ok": False, "data": "", "error": f"tab_index 越界：共有 {len(pages_now)} 个标签页，index={tgt_idx}", "current_url": self.current_url()}
+                    target_page = pages_now[tgt_idx]
+                    if bool(req.get("switch_active", False)):
+                        try:
+                            target_page.bring_to_front()
+                        except Exception:
+                            pass
+                        self._page = target_page
+                    page = target_page
+                    redirected = True
+
             if action == "navigate":
                 url = req.get("url") or ""
                 if not url:
@@ -432,18 +1479,45 @@ class _BrowserWorker:
                 selector = req.get("selector") or ""
                 if not selector:
                     return {"ok": False, "data": "", "error": "click 需要 selector", "current_url": self.current_url()}
-                loc = page.locator(selector).first
+                frame_idx, css = self._translate_selector(selector)  # @eN/@fNeN → (frame_idx, css)
+                frame = self._resolve_frame(page, frame_idx)
+                loc = frame.locator(css).first
                 loc.wait_for(state="visible", timeout=timeout_i * 1000)
                 loc.click(timeout=timeout_i * 1000)
                 page.wait_for_timeout(300)
                 return {"ok": True, "data": f"已点击 {selector}", "current_url": self.current_url()}
+
+            if action == "coordinate_click":
+                try:
+                    nx = float(req.get("x") if req.get("x") is not None else -1.0)
+                    ny = float(req.get("y") if req.get("y") is not None else -1.0)
+                except Exception:
+                    nx, ny = -1.0, -1.0
+                if not (0.0 <= nx <= 1.0) or not (0.0 <= ny <= 1.0):
+                    return {"ok": False, "data": "", "error": f"coordinate_click 需要归一化坐标 x,y ∈ [0,1]，收到 x={nx} y={ny}", "current_url": self.current_url()}
+                vs = page.viewport_size or {}
+                vw = int(vs.get("width") or 0)
+                vh = int(vs.get("height") or 0)
+                if not vw or not vh:
+                    dims = page.evaluate("() => ({w: window.innerWidth || document.documentElement.clientWidth || 0, h: window.innerHeight || document.documentElement.clientHeight || 0})")
+                    vw = int(dims.get("w") or 0)
+                    vh = int(dims.get("h") or 0)
+                if not vw or not vh:
+                    return {"ok": False, "data": "", "error": "无法获取页面 viewport 尺寸，无法换算坐标", "current_url": self.current_url()}
+                px = max(0, min(vw - 1, int(round(nx * vw))))
+                py = max(0, min(vh - 1, int(round(ny * vh))))
+                page.mouse.click(px, py)
+                page.wait_for_timeout(300)
+                return {"ok": True, "data": f"已点击 坐标 norm=({nx:.4f},{ny:.4f}) px=({px},{py}) viewport=({vw}x{vh})", "current_url": self.current_url(), "pixel": {"x": px, "y": py}, "viewport": {"width": vw, "height": vh}}
 
             if action == "type":
                 selector = req.get("selector") or ""
                 text = req.get("text") or ""
                 if not selector:
                     return {"ok": False, "data": "", "error": "type 需要 selector", "current_url": self.current_url()}
-                loc = page.locator(selector).first
+                frame_idx, css = self._translate_selector(selector)  # @eN/@fNeN → (frame_idx, css)
+                frame = self._resolve_frame(page, frame_idx)
+                loc = frame.locator(css).first
                 loc.wait_for(state="visible", timeout=timeout_i * 1000)
                 loc.fill("")
                 loc.type(text, delay=30)
@@ -452,7 +1526,9 @@ class _BrowserWorker:
             if action == "get_text":
                 selector = req.get("selector") or ""
                 if selector:
-                    loc = page.locator(selector).first
+                    frame_idx, css = self._translate_selector(selector)  # @eN/@fNeN → (frame_idx, css)
+                    frame = self._resolve_frame(page, frame_idx)
+                    loc = frame.locator(css).first
                     loc.wait_for(state="visible", timeout=timeout_i * 1000)
                     text = loc.inner_text(timeout=timeout_i * 1000)
                 else:
@@ -460,14 +1536,133 @@ class _BrowserWorker:
                 return {"ok": True, "data": (text or "")[:20000], "current_url": self.current_url()}
 
             if action == "get_html":
-                selector = req.get("selector") or ""
-                if selector:
-                    loc = page.locator(selector).first
+                fmt = (req.get("format") or "snapshot").strip().lower()
+                selector = (req.get("selector") or "").strip()
+
+                if fmt == "raw":
+                    # 分层3：整页/整块原始 HTML（旧行为，仅在确需原始结构时用）
+                    frame_idx, css = self._translate_selector(selector) if selector else (None, "")
+                    if css:
+                        frame = self._resolve_frame(page, frame_idx)
+                        loc = frame.locator(css).first
+                        loc.wait_for(state="visible", timeout=timeout_i * 1000)
+                        html = loc.evaluate("(el) => el.outerHTML")
+                    else:
+                        html = page.content()
+                    return {"ok": True, "data": (html or "")[:30000], "current_url": self.current_url(),
+                            "format": "raw"}
+
+                if fmt == "element":
+                    # 分层2：按需回填单个元素的 outerHTML（@eN/@fNeN 或 CSS 选择器）
+                    if not selector:
+                        return {"ok": False, "data": "", "error": "format=element 需要 selector（@eN/@fNeN 或 CSS 选择器）",
+                                "current_url": self.current_url()}
+                    parsed = self._parse_eid(selector)
+                    if parsed:
+                        frame_idx, eid = parsed
+                        frame = self._resolve_frame(page, frame_idx)
+                        res_el = frame.evaluate(self._element_extract_js(), eid)
+                        if not res_el or not res_el.get("found"):
+                            return {"ok": False, "data": "", "error": (res_el or {}).get("error", "元素未找到"),
+                                    "current_url": self.current_url()}
+                        return {"ok": True, "data": res_el["outerHTML"], "current_url": self.current_url(),
+                                "format": "element", "eid": f"f{frame_idx}{eid}"}
+                    frame_idx, css = self._translate_selector(selector)
+                    frame = self._resolve_frame(page, frame_idx)
+                    loc = frame.locator(css).first
                     loc.wait_for(state="visible", timeout=timeout_i * 1000)
                     html = loc.evaluate("(el) => el.outerHTML")
-                else:
-                    html = page.content()
-                return {"ok": True, "data": (html or "")[:30000], "current_url": self.current_url()}
+                    return {"ok": True, "data": (html or "")[:8000], "current_url": self.current_url(),
+                            "format": "element"}
+
+                # 分层1（默认）：多帧结构化快照 —— DOM 瘦身 + 关键元素编号 + 帧前缀
+                # 先等 SPA 渲染：轮询直到所有可见 iframe 里出现 input/contenteditable/[role=*]
+                _iframe_waited = False
+                for _ in range(6):
+                    frames_ready = True
+                    total_body_inputs = page.evaluate(
+                        """() => document.querySelectorAll(
+                            'input,textarea,[contenteditable],button,[role=button],[role=textbox],[role=searchbox]'
+                        ).length"""
+                    ) or 0
+                    for f in page.frames:
+                        if f == page.main_frame:
+                            continue
+                        try:
+                            n = f.evaluate(
+                                """() => document.querySelectorAll(
+                                    'input,textarea,[contenteditable],button,[role=button],[role=textbox],[role=searchbox]'
+                                ).length"""
+                            ) or 0
+                            if n > 0:
+                                total_body_inputs += n
+                                break
+                        except Exception:
+                            continue
+                    if total_body_inputs > 0:
+                        _iframe_waited = True
+                        break
+                    page.wait_for_timeout(800)
+
+                # 遍历所有帧采集
+                frame_lines: list[str] = []
+                total_count = 0
+                truncated = False
+                frame_meta: list[dict] = []
+                js_code = self._snapshot_js()
+                for f_idx, frame in enumerate(page.frames):
+                    try:
+                        snap = frame.evaluate(js_code, f_idx)
+                    except Exception:
+                        continue
+                    if not isinstance(snap, dict) or not snap.get("count"):
+                        continue
+                    # JS 端已经根据 frameIdx 输出了带/不带帧前缀的 @eN，这里直接取
+                    frame_snap = snap.get("snapshot", "")
+                    frame_title = ""
+                    try:
+                        frame_title = (frame.title() or "").strip()[:50]
+                    except Exception:
+                        pass
+                    frame_url = ""
+                    try:
+                        frame_url = (frame.url or "")[:100]
+                    except Exception:
+                        pass
+                    header = f"\n--- frame f{f_idx}: {frame_title or '(no title)'}  url={frame_url} ---\n"
+                    frame_lines.append(header + frame_snap)
+                    total_count += snap.get("count", 0)
+                    if snap.get("truncated"):
+                        truncated = True
+                    frame_meta.append({
+                        "idx": f_idx,
+                        "title": frame_title,
+                        "url": frame_url,
+                        "count": snap.get("count", 0),
+                        "main": f_idx == 0,
+                    })
+
+                note = (
+                    "结构化快照（多帧采集）：已为关键元素编号 @fNeM（f=帧号，主帧省略 f0 前缀）。"
+                    "后续 click/type/get_text/element 的 selector 直接传 @eN 或 @fNeM 即可操作。"
+                    "找不到输入框？先 format=snapshot 看它在哪个 frame；跨域 iframe 里的元素编号会自动带帧前缀。"
+                    "页面跳转/刷新后编号失效，需重新 snapshot。"
+                )
+                if truncated:
+                    note += "（部分帧已达元素上限 400，可按需 format=element 补充）"
+                if not _iframe_waited:
+                    note += "（SPA 渲染等待超时，可能有元素未捕获，可稍后再 snapshot）"
+
+                return {
+                    "ok": True,
+                    "data": "\n".join(frame_lines),
+                    "format": "snapshot",
+                    "element_count": total_count,
+                    "frames": frame_meta,
+                    "truncated": truncated,
+                    "_note": note,
+                    "current_url": self.current_url(),
+                }
 
             if action == "screenshot":
                 url = req.get("url") or ""
@@ -480,9 +1675,11 @@ class _BrowserWorker:
                 # —— 截图策略 ——
                 # CDP 模式下 Playwright screenshot 会卡住（内部等 fonts），
                 # 优先用原生 websocket 调 CDP Page.captureScreenshot 绕过它。
+                # 但 CDP direct 只能截浏览器默认页（_page_ws_url 绑定的是初始连接页），
+                # 后台标签页操作时必须走 Playwright，否则截到的是别的页。
                 png_bytes: bytes | None = None
 
-                if self._mode == "cdp" and self._page_ws_url:
+                if self._mode == "cdp" and self._page_ws_url and not redirected:
                     png_bytes = self._cdp_screenshot_direct()
 
                 if png_bytes is None:
@@ -496,6 +1693,7 @@ class _BrowserWorker:
                         png_bytes = page.screenshot(type="png", full_page=False, timeout=30000)
 
                 b64 = base64.b64encode(png_bytes).decode("ascii")
+                data_url = f"data:image/png;base64,{b64}"
 
                 res: dict[str, Any] = {
                     "ok": True,
@@ -505,31 +1703,16 @@ class _BrowserWorker:
                 }
 
                 if purpose in ("share", "user", "save"):
-                    # —— share 模式：保存到工作区 screenshots/ 目录，给用户看 ——
-                    shot_dir = Path.cwd() / "screenshots"
-                    shot_dir.mkdir(parents=True, exist_ok=True)
-                    shot_path = shot_dir / f"shot_{_time.strftime('%Y%m%d_%H%M%S')}_{int(_time.time()*1000)%1000:03d}.png"
-                    try:
-                        shot_path.write_bytes(png_bytes)
-                        res["file"] = str(shot_path)
-                        res["purpose"] = "share"
-                        res["_note"] = "截图已保存到工作区 screenshots/ 目录，可供用户查看。"
-                    except Exception as e:
-                        shot_dir = Path.home() / "AppData" / "Local" / "Temp" / "agentcluster_screenshots"
-                        shot_dir.mkdir(parents=True, exist_ok=True)
-                        shot_path = shot_dir / f"shot_{_time.strftime('%Y%m%d_%H%M%S')}_{int(_time.time()*1000)%1000:03d}.png"
-                        try:
-                            shot_path.write_bytes(png_bytes)
-                            res["file"] = str(shot_path)
-                            res["purpose"] = "share"
-                            res["_note"] = f"工作区无法写入({e})，降级保存到临时目录。"
-                        except Exception:
-                            res["purpose"] = "inspect"
-                            res["_note"] = "截图未保存（磁盘写入失败），仅返回给智能体内部判断。"
+                    # —— share 模式：不落盘，直接把 base64 data URL 塞进返回包 ——
+                    # 数据会随 tool_result 一起流到前端对话区渲染成缩略图，
+                    # 并保存在 AppData/conversations/*.json 的对话记录里，不再落独立截图文件夹。
+                    res["purpose"] = "share"
+                    res["image_data_url"] = data_url
+                    res["_note"] = "截图已随本次工具结果返回给前端对话区展示，数据保存在 AppData 对话记录中。"
                 else:
                     # —— inspect 模式（默认）：不落盘，只给智能体内部看图 ——
                     res["purpose"] = "inspect"
-                    res["_note"] = "仅供智能体内部判断页面状况，未保存到磁盘。"
+                    res["_note"] = "仅供智能体内部判断页面状况，未保存，也不推送到前端。"
 
                 return res
 
@@ -559,17 +1742,50 @@ class _BrowserWorker:
                 page.wait_for_timeout(int(ms))
                 return {"ok": True, "data": f"已等待 {ms:.0f}ms", "current_url": self.current_url()}
 
-            if action == "info":
-                """返回当前浏览器状态：mode / cdp_endpoint / url / page_count。"""
-                pages = self._context.pages if self._context else []
+            if action == "new_tab":
+                """新建标签页并设为当前活动页；url 可选，提供则在打开后跳转。"""
+                try:
+                    if self._context is None:
+                        return {"ok": False, "data": "", "error": "没有可用的浏览器 context", "current_url": self.current_url()}
+                    new_page = self._context.new_page()
+                except Exception as e:
+                    return {"ok": False, "data": "", "error": f"新建标签页失败: {type(e).__name__}: {e}", "current_url": self.current_url()}
+                self._page = new_page
+                url = (req.get("url") or "").strip()
+                goto_err = ""
+                if url:
+                    try:
+                        new_page.goto(url, wait_until="domcontentloaded", timeout=timeout_i * 1000)
+                        new_page.wait_for_timeout(300)
+                    except Exception as e:
+                        goto_err = f"跳转失败: {e}"
+                try:
+                    new_page.bring_to_front()
+                except Exception:
+                    pass
+                all_pages = self._list_pages()
+                new_idx = next((p["index"] for p in all_pages if p["is_active"]), -1)
+                if new_idx < 0 and all_pages:
+                    new_idx = all_pages[-1]["index"]
+                note = f"已新建标签页 #{new_idx}"
+                try:
+                    final_url = new_page.url
+                except Exception:
+                    final_url = ""
+                if goto_err:
+                    note += f"；{goto_err}"
+                else:
+                    note += f"：{final_url or '(空白)'}"
                 return {
                     "ok": True,
                     "mode": final_mode,
                     "cdp_endpoint": final_ep if final_mode == "cdp" else "",
                     "visible": self._visible,
                     "current_url": self.current_url(),
-                    "page_count": len(pages),
-                    "data": f"mode={final_mode} url={self.current_url()} pages={len(pages)}",
+                    "active_page_index": new_idx,
+                    "page_count": len(all_pages),
+                    "pages": all_pages,
+                    "data": note,
                 }
 
             return {"ok": False, "data": "", "error": f"未知 action: {action}", "current_url": self.current_url()}
@@ -588,6 +1804,10 @@ def run(action: str = "", url: str = "", selector: str = "",
         timeout: float | int = 15, visible: bool = True,
         mode: str = "auto", cdp_endpoint: str = "",
         purpose: str = "",
+        x: float = -1.0, y: float = -1.0,
+        tab_index: int = -1, switch_active: bool = False,
+        index: int = -1,  # 已弃用，请改用 tab_index；focus_tab 仍可识别
+        format: str = "",
         **_extra: Any) -> dict[str, Any]:
     """供 LLM 调用的主入口。始终在线程中执行，不依赖当前是否有 asyncio loop。"""
     # cdp_endpoint 为空时由 _normalize_cdp_endpoint 兜底为 127.0.0.1:9222
@@ -597,5 +1817,19 @@ def run(action: str = "", url: str = "", selector: str = "",
         "timeout": timeout, "visible": visible,
         "mode": mode, "cdp_endpoint": cdp_endpoint,
         "purpose": purpose,
+        "x": x, "y": y,
+        "tab_index": tab_index, "switch_active": switch_active,
+        "index": index,  # 已弃用别名，仅供 focus_tab 兼容旧调用方
+        "format": format,
     }
-    return _BrowserWorker.instance().submit(req, timeout=max(5, int(float(timeout or 15)) + 30))
+    # 合并额外参数（录制相关：record_name, record_description, step_index, annotation,
+    # new_order, template_name, record_id 等）
+    if _extra:
+        req.update({k: v for k, v in _extra.items() if v is not None})
+    # 模板回放 / 录制相关操作可能耗时较长 → 用更大的 submit 超时
+    action = req.get("action", "")
+    if action in ("record_template_run", "record_start"):
+        submit_timeout = max(10, int(float(timeout or 15)) * 20 + 60)  # 例如 15*20+60=360s
+    else:
+        submit_timeout = max(5, int(float(timeout or 15)) + 30)
+    return _BrowserWorker.instance().submit(req, timeout=submit_timeout)

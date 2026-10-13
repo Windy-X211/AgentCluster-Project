@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, ref, computed, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useModelStore, useSettingsStore } from '@/stores'
 import { api } from '@/api'
 import FileExplorerDialog from '@/components/FileExplorerDialog.vue'
+import ParamSelect from '@/components/ParamSelect.vue'
+import { getAvatarGradient } from '@/utils/avatar'
 
 const models = useModelStore()
 const settings = useSettingsStore()
@@ -34,6 +36,7 @@ const maxRounds = ref<number>(50)
 // 统一能力选择器（与 AgentEditDialog 同款）
 const pickerOpen = ref<string | null>(null)
 const selectedKeys = ref<Set<string>>(new Set())
+const collapsedGroups = ref<Set<string>>(new Set())
 
 // 能力刷新
 const refreshLoading = ref(false)
@@ -113,7 +116,7 @@ const availableByType = (type: string) => {
                                      : settings.pluginsMeta
   const added = new Set((defaults.value[type as keyof typeof defaults.value] || []) as string[])
   return Object.entries(source as Record<string, any>)
-    .filter(([k]) => !added.has(k))
+    .filter(([k, v]) => !added.has(k) && !(type === 'commands' && (v as any).hidden))
     .map(([k, v]) => ({
       key: k,
       label: v.label || k,
@@ -123,11 +126,51 @@ const availableByType = (type: string) => {
 }
 const currentPickerItems = computed(() => pickerOpen.value ? availableByType(pickerOpen.value) : [])
 
+// 命令选择器分组（仅 commands；skills/plugins 返回 null 走扁平列表）
+const currentPickerGroups = computed(() => {
+  if (!pickerOpen.value || pickerOpen.value !== 'commands') return null
+  const items = availableByType('commands')
+  const byGroup = new Map<string, any[]>()
+  for (const it of items) {
+    const g = (settings.commandsMeta[it.key] || {}).group || '其他'
+    if (!byGroup.has(g)) byGroup.set(g, [])
+    byGroup.get(g)!.push(it)
+  }
+  const order = [...(settings.commandGroups || [])]
+  for (const g of byGroup.keys()) if (!order.includes(g)) order.push(g)
+  return order.filter(g => byGroup.has(g)).map(g => ({ name: g, items: byGroup.get(g)! }))
+})
+function toggleGroupExpand(name: string) {
+  const s = new Set(collapsedGroups.value)
+  if (s.has(name)) s.delete(name)
+  else s.add(name)
+  collapsedGroups.value = s
+}
+function isGroupSelected(group: { name: string; items: any[] }) {
+  return group.items.length > 0 && group.items.every(it => selectedKeys.value.has(it.key))
+}
+function isGroupIndeterminate(group: { name: string; items: any[] }) {
+  const cnt = group.items.filter(it => selectedKeys.value.has(it.key)).length
+  return cnt > 0 && cnt < group.items.length
+}
+function toggleGroup(group: { name: string; items: any[] }) {
+  if (isGroupSelected(group)) {
+    group.items.forEach(it => selectedKeys.value.delete(it.key))
+  } else {
+    group.items.forEach(it => selectedKeys.value.add(it.key))
+  }
+}
+
 function pickerTitle(type: string) {
   return type === 'commands' ? '选择默认命令' : type === 'skills' ? '选择默认技能' : '选择默认插件'
 }
 
-function openPicker(type: string) { selectedKeys.value = new Set(); pickerOpen.value = type }
+function openPicker(type: string) {
+  selectedKeys.value = new Set()
+  pickerOpen.value = type
+  // 命令组默认折叠，点击展开后单独勾选
+  collapsedGroups.value = type === 'commands' ? new Set(settings.commandGroups || []) : new Set()
+}
 function closePicker() { pickerOpen.value = null; selectedKeys.value = new Set() }
 function togglePick(key: string) {
   if (selectedKeys.value.has(key)) selectedKeys.value.delete(key)
@@ -199,7 +242,15 @@ const currentTargetParams = computed(() => {
   const base = presetForm.value?.target_type === 'skill' ? settings.skillsMeta : settings.pluginsMeta
   const meta = (base || {})[presetForm.value?.target_name] || {}
   const norm = (arr: any[]) => (arr || [])
-    .map((p: any) => typeof p === 'string' ? { name: p, desc: '' } : { name: p?.name || '', desc: p?.description || p?.desc || p?.label || '' })
+    .map((p: any) => typeof p === 'string'
+      ? { name: p, desc: '', type: '', enum: null as any, default: undefined }
+      : {
+          name: p?.name || '',
+          desc: p?.description || p?.desc || p?.label || '',
+          type: p?.type || '',
+          enum: Array.isArray(p?.enum) ? p.enum : null,
+          default: p?.default,
+        })
     .filter((p: any) => p.name)
   const fromParams = norm(meta.parameters)
   return fromParams.length ? fromParams : norm(meta.params)
@@ -207,13 +258,64 @@ const currentTargetParams = computed(() => {
 function paramOptions(currentKey: string) {
   const opts = currentTargetParams.value.slice()
   if (currentKey && !opts.some(p => p.name === currentKey)) {
-    opts.unshift({ name: currentKey, desc: '自定义' })
+    opts.unshift({ name: currentKey, desc: '自定义', type: '', enum: null as any, default: undefined })
   }
   return opts
 }
-function trimDesc(d: string) {
-  if (!d) return ''
-  return d.length > 50 ? d.slice(0, 50) + '…' : d
+
+// —— 外观设置 ——
+const avatarMode = computed({
+  get() { return settings.data.avatar_mode || 'differentiated' },
+  set(v: string) { settings.update({ avatar_mode: v }) }
+})
+
+function avatarPreviewGradient(name: string): string {
+  if (avatarMode.value === 'unified') {
+    return 'linear-gradient(135deg, #6ea8ff, #b472ff)'
+  }
+  return getAvatarGradient(name)
+}
+
+// —— 固定参数值选项：当目标参数带 enum 或为 boolean 时，返回可选值列表（用于下拉框）；否则返回 null（用文本/密码输入） ——
+function valueOptionsFor(targetType: string, targetName: string, key: string): any[] | null {
+  if (!key) return null
+  const base = targetType === 'skill' ? settings.skillsMeta : settings.pluginsMeta
+  const meta = (base || {})[targetName] || {}
+  const params: any[] = meta.parameters || meta.params || []
+  const p = params.find((x: any) => (typeof x === 'string' ? x : x?.name) === key)
+  if (!p || typeof p === 'string') return null
+  if (Array.isArray(p.enum) && p.enum.length) {
+    return p.enum.map((v: any) => ({ value: String(v), label: String(v) }))
+  }
+  if ((p.type || '').toLowerCase() === 'boolean') {
+    return [{ value: 'false', label: 'false' }, { value: 'true', label: 'true' }]
+  }
+  return null
+}
+function paramValueOptions(row: any): any[] | null {
+  const f = presetForm.value
+  return valueOptionsFor(f?.target_type, f?.target_name, row?.key)
+}
+// 把当前值对齐到选项（用于加载旧数据 / 切换 key 时规范化）
+function coerceToOption(row: any): void {
+  const opts = paramValueOptions(row)
+  if (!opts) return
+  const cur = String(row.value ?? '').toLowerCase()
+  const m = opts.find((o: any) => String(o.value).toLowerCase() === cur)
+  if (m) {
+    row.value = m.value
+  } else {
+    // 不在选项内 → 取参数 default（若 default 也在选项内）或首项
+    const p = currentTargetParams.value.find((x: any) => x.name === row.key)
+    const def = p?.default
+    const defOpt = (def !== undefined && def !== null && def !== '')
+      ? opts.find((o: any) => String(o.value).toLowerCase() === String(def).toLowerCase())
+      : null
+    row.value = defOpt ? defOpt.value : opts[0].value
+  }
+}
+function onFixedKeyChange(row: any) {
+  coerceToOption(row)
 }
 const presetTypeIcon = (t: string) => t === 'skill' ? '⚡' : '🧩'
 
@@ -227,7 +329,17 @@ function openNewPreset() {
 function editPreset(p: any) {
   presetForm.value = {
     ...p,
-    fixed: (p.fixed || []).map((x: any) => ({ ...x })),
+    fixed: (p.fixed || []).map((x: any) => {
+      const row = { ...x, _visible: false }
+      // 加载时把 enum/布尔固定参数的值对齐到选项（旧加密条目解密后可能是 "False" 等大小写不一致的值）
+      const opts = valueOptionsFor(p.target_type, p.target_name, row.key)
+      if (opts && opts.length) {
+        const cur = String(row.value ?? '').toLowerCase()
+        const m = opts.find((o: any) => String(o.value).toLowerCase() === cur)
+        row.value = m ? m.value : (opts[0]?.value ?? row.value)
+      }
+      return row
+    }),
     optional: (p.optional || []).map((x: any) => ({ ...x })),
   }
   isEditingPreset.value = true; presetDialog.value = true
@@ -241,7 +353,18 @@ async function savePreset() {
       target_type: f.target_type,
       target_name: f.target_name,
       label: f.label || '', note: f.note || '', enabled: !!f.enabled,
-      fixed: (f.fixed || []).map((x: any) => ({ key: (x.key || '').trim(), value: x.value ?? '' })).filter((x: any) => x.key),
+      fixed: (f.fixed || []).map((x: any) => {
+        const opts = paramValueOptions(x)
+        const isPlain = !!(opts && opts.length)
+        // 值对齐到选项；不在选项内时落到首项
+        let val = x.value ?? ''
+        if (isPlain && opts) {
+          const cur = String(val).toLowerCase()
+          const m = opts.find((o: any) => String(o.value).toLowerCase() === cur)
+          val = m ? m.value : opts[0].value
+        }
+        return { key: (x.key || '').trim(), value: val, plain: isPlain }
+      }).filter((x: any) => x.key),
       optional: (f.optional || []).map((x: any) => ({ key: (x.key || '').trim(), desc: x.desc ?? '' })).filter((x: any) => x.key),
     }
     if (isEditingPreset.value) await api.presets.update(f.id, payload)
@@ -391,6 +514,50 @@ async function togglePreset(p: any) {
         <div v-else class="empty">还没有预设，点击右上角"新建预设"</div>
       </div>
 
+      <!-- 外观设置 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>🎨 外观设置</span>
+          <span class="hint">智能体头像显示风格</span>
+        </div>
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">头像风格</span>
+          </div>
+          <div class="appearance-row">
+            <label class="radio-label" :class="{ active: avatarMode === 'differentiated' }">
+              <input type="radio" name="avatarMode" value="differentiated" v-model="avatarMode" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">差异化</span>
+            </label>
+            <label class="radio-label" :class="{ active: avatarMode === 'unified' }">
+              <input type="radio" name="avatarMode" value="unified" v-model="avatarMode" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">统一化</span>
+            </label>
+          </div>
+          <div class="avatar-preview">
+            <div class="preview-item">
+              <div class="preview-label">智能体 A</div>
+              <div class="preview-avatar" :style="{ background: avatarPreviewGradient('Alpha') }">A</div>
+            </div>
+            <div class="preview-item">
+              <div class="preview-label">智能体 B</div>
+              <div class="preview-avatar" :style="{ background: avatarPreviewGradient('Beta') }">B</div>
+            </div>
+            <div class="preview-item">
+              <div class="preview-label">用户</div>
+              <div class="preview-avatar user" :style="{ background: 'linear-gradient(135deg, #f97316, #ec4899)' }">U</div>
+            </div>
+          </div>
+          <div class="hint-empty" style="margin-top: 8px">
+            差异化：每个智能体根据名称生成不同颜色
+            <br />
+            统一化：所有智能体使用统一的蓝紫色渐变
+          </div>
+        </div>
+      </div>
+
       <!-- 数据存储 -->
       <div class="panel glass">
         <div class="panel-title">
@@ -472,19 +639,49 @@ async function togglePreset(p: any) {
             <span class="picker-sub">共 {{ currentPickerItems.length }} 项</span>
           </div>
           <div class="picker-list">
-            <label v-for="item in currentPickerItems" :key="item.key"
-                   :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
-              <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
-              <div class="pi-body">
-                <div class="pi-label">
-                  {{ item.label }}
-                  <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
+            <!-- 命令：按分组展示，可整组勾选或展开后单独勾选 -->
+            <template v-if="currentPickerGroups">
+              <div v-for="g in currentPickerGroups" :key="g.name" class="picker-group">
+                <div class="pg-head" @click="toggleGroupExpand(g.name)">
+                  <input type="checkbox"
+                         :checked="isGroupSelected(g)"
+                         :indeterminate="isGroupIndeterminate(g)"
+                         @click.stop="toggleGroup(g)" />
+                  <span class="pg-name">{{ g.name }}</span>
+                  <span class="pg-count">{{ g.items.length }}</span>
+                  <span class="pg-arrow">{{ collapsedGroups.has(g.name) ? '▸' : '▾' }}</span>
                 </div>
-                <div class="pi-key">{{ item.key }}</div>
-                <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
+                <div v-if="!collapsedGroups.has(g.name)" class="pg-items">
+                  <label v-for="item in g.items" :key="item.key"
+                         :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
+                    <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
+                    <div class="pi-body">
+                      <div class="pi-label">{{ item.label }}</div>
+                      <div class="pi-key">{{ item.key }}</div>
+                      <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
+                    </div>
+                  </label>
+                </div>
               </div>
-            </label>
-            <div v-if="currentPickerItems.length === 0" class="hint-empty">全部已添加</div>
+              <div v-if="currentPickerGroups.length === 0" class="hint-empty">全部已添加</div>
+            </template>
+
+            <!-- 技能 / 插件：扁平列表 -->
+            <template v-else>
+              <label v-for="item in currentPickerItems" :key="item.key"
+                     :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
+                <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
+                <div class="pi-body">
+                  <div class="pi-label">
+                    {{ item.label }}
+                    <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
+                  </div>
+                  <div class="pi-key">{{ item.key }}</div>
+                  <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
+                </div>
+              </label>
+              <div v-if="currentPickerItems.length === 0" class="hint-empty">全部已添加</div>
+            </template>
           </div>
           <div class="picker-actions">
             <button class="btn ghost" @click="closePicker">取消</button>
@@ -542,19 +739,24 @@ async function togglePreset(p: any) {
         <div class="preset-block">
           <div class="preset-block-title">
             <span>🔒 固定参数</span>
-            <span class="hint-empty">加密保存 · 模型不可见、不可更改</span>
+            <span class="hint-empty">敏感值加密保存 · 明确选项（下拉选择）明文保存 · 模型不可见、不可更改</span>
           </div>
           <div v-for="(row, i) in presetForm.fixed" :key="'f' + i" class="kv-row">
-            <select v-if="currentTargetParams.length && !row._manual" class="input mono" v-model="row.key">
-              <option value="" disabled>选择参数…</option>
-              <option v-for="p in paramOptions(row.key)" :key="p.name" :value="p.name">{{ p.name }}{{ p.desc ? ' — ' + trimDesc(p.desc) : '' }}</option>
-            </select>
-            <input v-else class="input mono" v-model="row.key" placeholder="参数名（如 smtp_user）" list="preset-param-list" />
+            <ParamSelect v-if="currentTargetParams.length && !row._manual" :modelValue="row.key"
+                         @update:modelValue="(v: any) => { row.key = v; onFixedKeyChange(row) }"
+                         :options="paramOptions(row.key)" />
+            <input v-else class="input mono" v-model="row.key" @change="onFixedKeyChange(row)" placeholder="参数名（如 smtp_user）" list="preset-param-list" />
             <button v-if="currentTargetParams.length" type="button" class="btn sm ghost icon-btn" @click="row._manual = !row._manual" :title="row._manual ? '从列表选择' : '手动输入'">{{ row._manual ? '▾' : '✎' }}</button>
-            <input class="input" v-model="row.value" type="password" placeholder="固定值（如发件邮箱、授权码）" />
+            <select v-if="paramValueOptions(row)" class="input" v-model="row.value">
+              <option v-for="o in paramValueOptions(row)" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+            <template v-else>
+              <input class="input" v-model="row.value" :type="row._visible ? 'text' : 'password'" placeholder="固定值（如发件邮箱、授权码）" />
+              <button type="button" class="btn sm ghost icon-btn" @click="row._visible = !row._visible" :title="row._visible ? '隐藏' : '显示'">{{ row._visible ? '🙈' : '👁' }}</button>
+            </template>
             <button class="btn sm ghost" @click="presetForm.fixed.splice(i, 1)">×</button>
           </div>
-          <button class="btn sm ghost" @click="presetForm.fixed.push({ key: '', value: '' })">+ 添加固定参数</button>
+          <button class="btn sm ghost" @click="presetForm.fixed.push({ key: '', value: '', _visible: false })">+ 添加固定参数</button>
         </div>
 
         <!-- 可选参数 -->
@@ -564,10 +766,7 @@ async function togglePreset(p: any) {
             <span class="hint-empty">文字描述仅供模型参考选择</span>
           </div>
           <div v-for="(row, i) in presetForm.optional" :key="'o' + i" class="kv-row">
-            <select v-if="currentTargetParams.length && !row._manual" class="input mono" v-model="row.key">
-              <option value="" disabled>选择参数…</option>
-              <option v-for="p in paramOptions(row.key)" :key="p.name" :value="p.name">{{ p.name }}{{ p.desc ? ' — ' + trimDesc(p.desc) : '' }}</option>
-            </select>
+            <ParamSelect v-if="currentTargetParams.length && !row._manual" v-model="row.key" :options="paramOptions(row.key)" />
             <input v-else class="input mono" v-model="row.key" placeholder="参数名（如 to_email）" list="preset-param-list" />
             <button v-if="currentTargetParams.length" type="button" class="btn sm ghost icon-btn" @click="row._manual = !row._manual" :title="row._manual ? '从列表选择' : '手动输入'">{{ row._manual ? '▾' : '✎' }}</button>
             <textarea class="input" v-model="row.desc" rows="2" placeholder="描述，如：小明 &lt;xiaoming@x.com&gt;、小红 &lt;xiaohong@x.com&gt;"></textarea>
@@ -643,6 +842,55 @@ async function togglePreset(p: any) {
 .hint-empty { font-size: 12px; opacity: .45; padding: 4px 0; }
 .rounds-input { width: 140px; }
 
+/* —— 外观设置 —— */
+.appearance-row { display: flex; gap: 12px; margin-bottom: 12px; }
+.radio-label {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-radius: 8px; cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.03);
+  transition: all .15s;
+  flex: 1; justify-content: center;
+  input { display: none; }
+  .radio-dot {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.3);
+    position: relative;
+    transition: all .15s;
+    &::after {
+      content: '';
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%) scale(0);
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--accent);
+      transition: transform .15s;
+    }
+  }
+  .radio-text { font-size: 13px; }
+  &:hover { border-color: rgba(110,168,255,0.4); background: rgba(110,168,255,0.08); }
+  &.active {
+    border-color: var(--accent);
+    background: rgba(110,168,255,0.15);
+    .radio-dot { border-color: var(--accent); &::after { transform: translate(-50%, -50%) scale(1); } }
+  }
+}
+.avatar-preview {
+  display: flex; gap: 16px; align-items: flex-end; padding: 12px;
+  background: rgba(255,255,255,0.03); border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.preview-item { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.preview-label { font-size: 11px; opacity: .6; }
+.preview-avatar {
+  width: 36px; height: 36px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 600; color: #fff;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+}
+.preview-avatar.user {
+  background: linear-gradient(135deg, #f97316, #ec4899);
+}
+
 .picker-mask {
   position: fixed; inset: 0;
   background: rgba(0,0,0,0.35);
@@ -659,10 +907,22 @@ async function togglePreset(p: any) {
   font-size: 14px; font-weight: 600; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 10px; }
 .picker-sub { font-size: 11px; opacity: .5; font-weight: normal; }
 .picker-list { overflow-y: auto; flex: 1; }
+.picker-group { margin-bottom: 4px; }
+.pg-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border-radius: 8px; cursor: pointer;
+  background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+  &:hover { background: rgba(255,255,255,0.06); }
+  input { accent-color: var(--accent); flex-shrink: 0; }
+}
+.pg-name { font-size: 13px; font-weight: 600; flex: 1; }
+.pg-count { font-size: 11px; opacity: .5; }
+.pg-arrow { font-size: 11px; opacity: .6; width: 12px; text-align: center; }
+.pg-items { padding-left: 10px; border-left: 1px solid rgba(255,255,255,0.06); margin-left: 8px; }
 .picker-item { display: flex; gap: 10px; padding: 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; border: 1px solid transparent; font-size: 12px;
   &:hover { background: rgba(255,255,255,0.04); }
   &.selected { background: rgba(110,168,255,0.15); border-color: rgba(110,168,255,0.3); }
-  input { accent-color: #6ea8ff; flex-shrink: 0; margin-top: 3px; }
+  input { accent-color: var(--accent); flex-shrink: 0; margin-top: 3px; }
 }
 .pi-body { flex: 1; min-width: 0; }
 .pi-label { font-size: 13px; font-weight: 500; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
@@ -696,12 +956,12 @@ async function togglePreset(p: any) {
 .pc-actions { display: flex; gap: 6px; margin-top: 8px; }
 
 .preset-modal { width: 660px; max-height: 84vh; overflow-y: auto; }
-.chk-full { flex-direction: row !important; align-items: center; gap: 6px; grid-column: 1 / -1; input { accent-color: #6ea8ff; } }
+.chk-full { flex-direction: row !important; align-items: center; gap: 6px; grid-column: 1 / -1; input { accent-color: var(--accent); } }
 .preset-block { margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.07); }
 .preset-block-title { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; margin-bottom: 10px; }
 .kv-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: flex-start;
   input.mono, select.mono { flex: 0 0 40%; }
-  input:not(.mono) { flex: 1; min-width: 0; }
+  input:not(.mono), select:not(.mono) { flex: 1; min-width: 0; }
   .btn { flex-shrink: 0; }
   textarea { flex: 1; resize: vertical; }
 }

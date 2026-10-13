@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from core.store import load, upsert, delete_by, get_by, next_id
-from core import workspace
-import os, threading
+from core import workspace, pyconsole
+import os, threading, asyncio, json
 
 router = APIRouter()
 
@@ -184,15 +185,24 @@ def _require_workdir(cid: int):
 
 
 @router.get("/{cid}/workspace")
-def get_workspace(cid: int):
-    """画布工作区项目树：以 canvas.workdir 为根，标注大小/修改时间/创建者/修改者/参与者。"""
+def get_workspace(cid: int, rev: int = -1):
+    """画布工作区项目树：以 canvas.workdir 为根，标注大小/修改时间/创建者/修改者/参与者。
+
+    rev: 上次拿到的树版本号。与当前一致时返回 changed=false（不带 tree），
+    供前端高频轮询做实时更新；rev<0 或已过期则返回全量 tree + 新 rev。
+    """
     cur = _require_workdir(cid)
     wd = cur.get("workdir")
     if not wd:
-        return {"ok": False, "error": "未设置工作区", "workdir": None, "tree": [], "count": 0}
+        return {"ok": False, "error": "未设置工作区", "workdir": None, "tree": [], "count": 0, "rev": 0, "changed": True}
     data = workspace.build_tree(wd)
-    return {"ok": data.get("exists", False), "workdir": wd, "error": "" if data.get("exists") else "工作区目录不存在",
-            "tree": data.get("tree", []), "count": data.get("count", 0)}
+    ok = data.get("exists", False)
+    cur_rev = data.get("rev", 0)
+    if rev >= 0 and rev == cur_rev:
+        return {"ok": ok, "workdir": wd, "error": "" if ok else "工作区目录不存在",
+                "tree": [], "count": data.get("count", 0), "rev": cur_rev, "changed": False}
+    return {"ok": ok, "workdir": wd, "error": "" if ok else "工作区目录不存在",
+            "tree": data.get("tree", []), "count": data.get("count", 0), "rev": cur_rev, "changed": True}
 
 
 @router.get("/{cid}/trash")
@@ -284,3 +294,93 @@ def delete_canvas_file(cid: int, req: FileDeleteReq):
     if "error" in r:
         raise HTTPException(400, r["error"])
     return r
+
+
+@router.post("/{cid}/file/run")
+def run_canvas_file(cid: int, req: FileDeleteReq):
+    """在工作区内"运行"一个文件（双击 / 右键"运行"）。
+
+    - .py → 启动 Python 控制台会话：返回 session_id，前端接入控制台浮窗（输入输出 / 停止 / 运行）；
+    - 其他 → 用系统默认程序打开（等价资源管理器双击）。
+    路径先经 _resolve_under 校验，确保落在工作区内（防路径穿越）。
+    """
+    wd = _require_wd(cid)
+    p = workspace._resolve_under(wd, req.path)
+    if not p or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    if p.suffix.lower().lstrip(".") == "py":
+        r = pyconsole.start(str(p), cwd=wd)
+        if "error" in r:
+            raise HTTPException(400, r["error"])
+        return {"kind": "console", **r}
+    r = workspace.open_with_system(str(p))
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return {"kind": "open", **r}
+
+
+class PyInputReq(BaseModel):
+    text: str = ""
+
+
+class PyStopReq(BaseModel):
+    force: bool = False
+
+
+@router.post("/{cid}/file/pyconsole/{sid}/input")
+def pyconsole_input(cid: int, sid: str, req: PyInputReq):
+    """向 Python 控制台子进程的 stdin 写入文本（模拟键盘输入）。"""
+    _require_wd(cid)
+    r = pyconsole.write(sid, req.text)
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return r
+
+
+@router.post("/{cid}/file/pyconsole/{sid}/stop")
+def pyconsole_stop(cid: int, sid: str, req: PyStopReq = PyStopReq()):
+    """停止 Python 控制台子进程（含其子进程树）。"""
+    _require_wd(cid)
+    r = pyconsole.stop(sid, force=req.force)
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return r
+
+
+@router.post("/{cid}/file/pyconsole/{sid}/close")
+def pyconsole_close(cid: int, sid: str):
+    """关闭控制台会话：停掉子进程并清理缓冲区。"""
+    _require_wd(cid)
+    return pyconsole.close(sid)
+
+
+@router.get("/{cid}/file/pyconsole/{sid}/stream")
+async def pyconsole_stream(cid: int, sid: str):
+    """SSE 长连接：持续推送控制台输出（type=out）与结束事件（type=exit / closed）。"""
+    _require_wd(cid)
+
+    def _frame(payload: dict) -> str:
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+    async def gen():
+        while True:
+            r = pyconsole.drain(sid)
+            if "error" in r:
+                yield _frame({"type": "closed", "error": r["error"]})
+                return
+            if r["text"]:
+                yield _frame({"type": "out", "text": r["text"]})
+            if r["running"]:
+                await asyncio.sleep(0.08)
+                continue
+            # 进程已退出：管道 EOF 需要一点时间，再收尾拉取残留输出
+            for _ in range(15):
+                d = pyconsole.drain(sid)
+                if not d.get("text"):
+                    break
+                yield _frame({"type": "out", "text": d["text"]})
+                await asyncio.sleep(0.07)
+            yield _frame({"type": "exit", "exit_code": r["exit_code"]})
+            return
+
+    return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")

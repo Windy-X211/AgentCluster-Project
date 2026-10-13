@@ -208,6 +208,48 @@ def list_all_ops() -> list:
     return out
 
 
+# 会话操作记录缓存：按 (mtime_ns, size) 判断文件是否变化，未变直接复用已解析的列表。
+# 工作区/回收站每次请求都要聚合全部会话 ops，反复 json.loads 是主要卡顿来源。
+_ops_cache: dict = {}          # conv_id -> {"stamp": (mtime_ns, size), "ops": list}
+_ops_cache_lock = threading.RLock()
+
+
+def _conv_ops_cached(conv_id: int, stamp) -> list:
+    with _ops_cache_lock:
+        hit = _ops_cache.get(conv_id)
+        if hit and hit["stamp"] == stamp:
+            return hit["ops"]
+        ops = _load_conv_ops(conv_id)
+        _ops_cache[conv_id] = {"stamp": stamp, "ops": ops}
+        return ops
+
+
+def list_all_ops_cached() -> list:
+    """list_all_ops 的缓存版：只重读发生过变化的会话记录文件。
+
+    语义与 list_all_ops 完全一致（每条记录带 _conv_id / _idx）。
+    """
+    _ensure_dirs()
+    out = []
+    for p in sorted(_conv_index().glob("*.json")):
+        try:
+            cid = int(p.stem)
+        except ValueError:
+            continue
+        try:
+            st = p.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+        ops = _conv_ops_cached(cid, stamp)
+        for i, op in enumerate(ops):
+            rec = dict(op)
+            rec["_conv_id"] = cid
+            rec["_idx"] = i
+            out.append(rec)
+    return out
+
+
 def purge_op(conv_id: int, op_idx: int) -> dict:
     """彻底删除某条操作的快照备份（回收站永久清除，之后不可还原）。"""
     with _lock:

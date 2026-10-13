@@ -24,18 +24,22 @@ import atexit, json, os, queue, tempfile, threading, glob, time
 from pathlib import Path
 from copy import deepcopy
 
-ROOT_DEFAULT = Path(__file__).resolve().parent.parent.parent / "AppData"
-# 固定位置的自定义存储路径（独立于 ROOT，避免“存储位置存在存储位置里”的套娃）
-_BOOTSTRAP_FILE = Path(__file__).resolve().parent.parent / ".runtime" / "storage_location"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT_DEFAULT = _PROJECT_ROOT / "AppData"
+# 自定义存储路径记录文件，固定放在项目根目录（独立于 ROOT，避免“存储位置存在存储位置里”的套娃）。
+# 内容为相对项目根的路径（位于项目内时）或绝对路径（位于项目外时）。
+_BOOTSTRAP_FILE = _PROJECT_ROOT / ".storage_location"
 
 
 def _resolve_root() -> Path:
-    """启动时解析存储根：优先读 .runtime/storage_location，无效则回退项目 AppData。"""
+    """启动时解析存储根：优先读项目根目录下的 .storage_location，无效则回退项目 AppData。"""
     try:
         if _BOOTSTRAP_FILE.exists():
             custom = _BOOTSTRAP_FILE.read_text(encoding="utf-8").strip()
             if custom:
                 p = Path(custom)
+                if not p.is_absolute():
+                    p = _PROJECT_ROOT / p
                 if p.exists() and p.is_dir():
                     return p
     except Exception:
@@ -137,7 +141,7 @@ def _drain_sync_queue() -> None:
         pass
 
 # 记录型域 → 目录下每条一个 id.json
-RECORD_DOMAINS = ["agents", "canvases", "conversations", "model_interfaces", "rules", "param_presets"]
+RECORD_DOMAINS = ["agents", "agent_groups", "canvases", "conversations", "model_interfaces", "rules", "param_presets"]
 # 单文件域 → 整个域一个 json
 SINGLE_DOMAINS = ["settings"]
 # 预留的文件夹（用户可在这里放自定义 skills / plugins）
@@ -146,7 +150,8 @@ EXTRA_DIRS = ["skills", "plugins"]
 DEFAULT_SETTINGS = {
     "storage_version": 2,
     "default_model_interface": None,
-    "default_commands": ["file.read", "file.write", "file.delete", "file.structure", "cmd.run"],
+    "default_commands": ["file.read", "file.write", "file.delete", "file.structure",
+                        "file.search", "file.find", "workspace.search", "cmd.run"],
     "default_skills": [],
     "default_plugins": [],
     "max_tool_rounds": 50,
@@ -596,6 +601,7 @@ def get_store_paths() -> dict:
             "skills_dir": str(ROOT / "skills"),
             "plugins_dir": str(ROOT / "plugins"),
             "param_presets_dir": str(ROOT / "param_presets"),
+            "agent_groups_dir": str(ROOT / "agent_groups"),
             "legacy_dir": str(LEGACY_DIR),
         }
         # 每个域的统计
@@ -612,17 +618,33 @@ def set_root(new_path: str) -> dict:
     """切换存储根目录到新位置（不迁移旧数据），并让后续读写都走新位置。
 
     新位置会补建目录结构与 settings.json；若已有数据则原样读取。
+    设置信息写入项目根目录的 .storage_location：位于项目内时存相对路径（便于整体迁移），
+    位于项目外时存绝对路径；切回默认 AppData 则删除该文件。
     返回 get_store_paths() 的最新结果，供前端立即刷新展示。"""
     global ROOT, LEGACY_DIR
-    p = Path(new_path).expanduser().resolve()
+    p = Path(new_path).expanduser()
+    if not p.is_absolute():
+        p = _PROJECT_ROOT / p
+    p = p.resolve()
     if p == ROOT.resolve():
         return get_store_paths()
     with LOCK:
         p.mkdir(parents=True, exist_ok=True)
         if not p.is_dir():
             raise ValueError(f"不是有效目录：{new_path}")
-        _BOOTSTRAP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _BOOTSTRAP_FILE.write_text(str(p), encoding="utf-8")
+        if p == ROOT_DEFAULT.resolve():
+            # 切回默认位置：删除记录文件，恢复“出厂”状态
+            try:
+                _BOOTSTRAP_FILE.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            _BOOTSTRAP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                stored = str(p.relative_to(_PROJECT_ROOT))
+            except ValueError:
+                stored = str(p)
+            _BOOTSTRAP_FILE.write_text(stored, encoding="utf-8")
         ROOT = p
         LEGACY_DIR = ROOT / "_legacy"
         _LIST_PAYLOAD_CACHE.clear()

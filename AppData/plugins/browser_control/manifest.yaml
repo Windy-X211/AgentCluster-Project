@@ -9,18 +9,49 @@ label:
 author: "AgentCluster"
 description:
   zh_Hans: |
-    统一浏览器控制插件，支持三种后端：
+    统一浏览器控制插件，支持四种后端 + 自动模式：
     • system  — 启动系统 Edge/Chrome（channel 方式，cookie 持久化）
-    • cdp     — connect_over_cdp 桥接到已运行的浏览器（共享登录态、cookies、扩展）
+    • cdp     — connect_over_cdp 桥接到已运行的浏览器（共享登录态、cookies、扩展；需 --remote-debugging-port=9222）
     • chromium — Playwright 内置 Chromium（干净沙箱）
     • auto    — 自动选择（优先级 cdp > system > chromium）
-    完整 action: navigate / click / type / screenshot / get_text / get_html / evaluate / wait / close / info
+
+    ★ 用户录制、智能体使用 ★
+    智能体调 record_start → 弹出 Python tkinter 录制面板 + 浏览器内 "● 正在录制" 提示条
+    → 用户在浏览器里正常操作（点击/输入/跳转...被自动捕获）
+    → Python 面板实时显示步骤，用户可删除、调序、加注释、完成或取消
+    → 模板 JSON 保存到 templates/
+
+    之后智能体两种用法：
+      • record_template_run — 固定场景一键回放（操作不变）
+      • record_template_load — 学习模板步骤后，智能体自己灵活执行（页面变了也能自适应）
+
+    基础 action: navigate / new_tab / click / coordinate_click / type / screenshot / get_text / get_html / evaluate / wait / close / info / focus_tab
+    录制 action: record_start / record_status / record_step_annotate / record_step_delete / record_step_reorder / record_complete / record_cancel
+    模板 action: record_template_list / record_template_load / record_template_run / record_template_delete
+
+    适用场景：网页自动化、数据抓取、表单填写、截图、自动化测试、批量登录、固定流程模板复用。
   en_US: |
-    Unified browser control with three backends: system (Edge/Chrome channel),
-    cdp (connect to running browser via remote-debugging-port),
-    chromium (Playwright built-in).
-    Auto-select: cdp > system > chromium.
-    Actions: navigate / click / type / screenshot / get_text / get_html / evaluate / wait / close / info.
+    Unified browser control plugin, supports four backends + auto mode:
+    • system  — launch system Edge/Chrome (channel mode, persistent cookies)
+    • cdp     — connect_over_cdp to a running browser (shared login state/cookies/extensions; requires --remote-debugging-port=9222)
+    • chromium — Playwright built-in Chromium (clean sandbox)
+    • auto    — auto-select (priority: cdp > system > chromium)
+
+    ★ USER records, AGENT uses ★
+    Agent calls record_start → pops Python tkinter recording panel + "● Recording" badge in browser
+    → User operates normally in browser (clicks/types/navigates... auto-captured)
+    → Panel shows steps in real time; user can delete/reorder/annotate/complete/cancel
+    → Template JSON saved to templates/
+
+    Two ways for the agent to use later:
+      • record_template_run — one-click replay for fixed scenarios (steps never change)
+      • record_template_load — agent learns the step list then flexibly executes (adapts to page changes)
+
+    Core actions: navigate / new_tab / click / coordinate_click / type / screenshot / get_text / get_html / evaluate / wait / close / info / focus_tab
+    Recording actions: record_start / record_status / record_step_annotate / record_step_delete / record_step_reorder / record_complete / record_cancel
+    Template actions: record_template_list / record_template_load / record_template_run / record_template_delete
+
+    Use cases: web automation, data scraping, form filling, screenshots, automated testing, batch login, reusable workflow templates.
 version_code: 2
 icon: "🌐"
 tags: ["browser", "automation", "playwright", "web", "cdp", "unified"]

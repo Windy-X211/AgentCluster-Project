@@ -31,8 +31,8 @@ from core.store import get_by, upsert
 
 PROTOCOL = "a2a-lite/0.1"
 MAX_CHAIN = 5   # 单次用户发言最多接力的智能体数（handoff）
-MAX_CALL = 4  # 单次用户发言最多消息数（cluster.send_message 多轮）
-MAX_CALLS_PER_PAIR = 2  # 同一对智能体 A→B 之间最多往返次数（防 A↔B 死循环）
+MAX_CALL = 9999  # 单次用户发言最多消息数（cluster.send_message 多轮），9999 表示基本无上限
+MAX_CALLS_PER_PAIR = 9999  # 同一对智能体 A→B 之间最多往返次数（防 A↔B 死循环），9999 表示基本无上限
 
 # A2A 成果移交协议总开关：False=暂时停用（handoff 工具 + 自动出边接力均不生效）
 # 保留 cluster.send_message 发送消息（可往返多轮）（连线智能体按需调用，仍用 a2a-lite 信封 kind=message）

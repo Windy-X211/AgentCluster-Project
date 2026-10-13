@@ -16,7 +16,10 @@
     "cmd.run"
   ],
   "skills": [],
-  "plugins": [],
+  "plugins": [
+    "http_request",
+    "browser_control"
+  ],
   "trigger": {
     "type": "manual",
     "cron": "",
@@ -30,5 +33,7 @@
   "created_at": "2026-10-01T02:00:00.000000",
   "max_tool_rounds": null,
   "perception_scope": "link",
-  "sort_order": 1
+  "workflow_mode": "spec",
+  "sort_order": 1,
+  "group_id": 1
 }

@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <!-- 钉住时嵌入画布视口 DOM（随 transform 自动跟随平移/缩放）；未钉住时浮动（body 下 fixed） -->
   <Teleport :to="teleportTarget">
     <!-- 工作区面板（可拖动） -->
@@ -28,8 +28,12 @@
         <div v-else-if="loading" class="ws-empty">加载中…</div>
         <div v-else-if="!rows.length" class="ws-empty">{{ errorMsg || '工作区为空' }}</div>
         <div v-else class="ws-tree">
-          <div v-for="row in rows" :key="row.path" class="ws-row" :class="{ dir: row.is_dir }"
+          <div v-for="row in rows" :key="row.path" class="ws-row"
+               :class="{ dir: row.is_dir, changed: flashPaths.has(row.path), dragging: dragPath === row.path }"
                :style="{ paddingLeft: 8 + row.depth * 16 + 'px' }"
+               draggable="true"
+               @dragstart="onRowDragStart($event, row)"
+               @dragend="onRowDragEnd"
                @click="onRowClick(row)"
                @dblclick="onRowDblClick(row)"
                @contextmenu.prevent.stop="showRowCtx($event, row)">
@@ -63,6 +67,7 @@
       <div class="ws-foot">
         <span class="ws-count">{{ rows.length }} 项</span>
         <span v-if="copiedPath" class="ws-copy-hint">📋 已复制：{{ copiedName }}</span>
+        <span v-else-if="copyPathHint" class="ws-copy-hint" :title="copyPathHint">🔗 地址已复制：{{ copyPathHint }}</span>
         <span class="ws-legend" :class="{ on: !compact }" :title="compact ? '点击显示 大小·修改时间·参与者' : '点击隐藏 大小·修改时间·参与者（文件名更多空间）'"
               @click="compact = !compact">大小·修改时间·参与者</span>
       </div>
@@ -109,10 +114,15 @@
 
   <!-- 右键菜单（始终 fixed，避免被画布 transform 影响） -->
   <Teleport to="body">
-    <div v-if="ctxMenu" class="ws-ctx glass" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop @contextmenu.stop.prevent>
+    <div v-if="ctxMenu" ref="ctxEl" class="ws-ctx glass"
+         :style="{ left: ctxPos.x + 'px', top: ctxPos.y + 'px' }"
+         @click.stop @contextmenu.stop.prevent @mousedown.stop>
       <template v-if="ctxMenu.row">
         <div class="ws-ctx-title">{{ ctxMenu.row.is_dir ? '📁' : '📄' }} {{ ctxMenu.row.name }}</div>
         <template v-if="!ctxMenu.row.is_dir">
+          <div class="ws-ctx-item" @click="actRun" title="双击文件也可运行/打开">
+            {{ rowIsPy(ctxMenu.row) ? '🖥 控制台运行' : '↗️ 默认程序打开' }}
+          </div>
           <div class="ws-ctx-item" @click="actEdit">✏️ 编辑</div>
           <div class="ws-ctx-item" @click="actCopy">📋 复制</div>
         </template>
@@ -120,6 +130,7 @@
           <div class="ws-ctx-item" :class="{ disabled: !copiedPath }" @click="actPaste">📥 粘贴{{ copiedPath ? '' : '（先复制文件）' }}</div>
         </template>
         <div class="ws-ctx-item" @click="actRename">✏️ 重命名</div>
+        <div class="ws-ctx-item" @click="actCopyPath" title="复制绝对路径到系统剪贴板">🔗 复制文件地址</div>
         <div class="ws-ctx-divider" />
         <div class="ws-ctx-item danger" @click="actDelete">🗑 删除（进入回收站）</div>
       </template>
@@ -129,30 +140,62 @@
     </div>
   </Teleport>
 
-  <!-- 文件编辑器（双击文件打开） -->
+  <!-- 文件编辑器浮窗（可拖动，不遮挡其他操作） -->
   <Teleport to="body">
-    <div v-if="editor" class="ws-modal-bg" @mousedown.self="closeEditor">
-      <div class="ws-modal-card glass" @contextmenu.stop.prevent>
-        <div class="ws-modal-head">
-          <span class="ws-modal-title">📄 {{ editor.name }}</span>
-          <span class="ws-modal-meta">{{ formatSize(editor.size) }} · {{ editor.ext || 'txt' }}</span>
-          <span v-if="dirty" class="ws-modal-dirty">● 未保存</span>
-          <button class="ws-btn" @click.stop="closeEditor" title="关闭">✕</button>
-        </div>
-        <textarea class="ws-editor-text" v-model="editContent" spellcheck="false"
-                  :placeholder="editor.ext ? '' : '（不支持在线编辑的二进制文件，已只读）'"
-                  :readonly="!editor.ext" @keydown.ctrl.enter.prevent="saveEditor" @keydown.esc="closeEditor"></textarea>
-        <div class="ws-modal-foot">
-          <span class="ws-modal-hint">Ctrl+Enter 保存 · Esc 关闭</span>
-          <button class="ws-btn ok" @click="saveEditor" :disabled="saving || !editor.ext">💾 保存</button>
-        </div>
+    <div v-if="editor" class="ws-edit-float glass" :style="editFloatStyle"
+         @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
+      <div class="ws-edit-float-head" @mousedown="startEditDrag">
+        <span class="ws-modal-title">📄 {{ editor.name }}</span>
+        <span class="ws-modal-meta">{{ formatSize(editor.size) }} · {{ editor.ext || 'txt' }}</span>
+        <span v-if="dirty" class="ws-modal-dirty">● 未保存</span>
+        <button class="ws-btn" @click.stop="closeEditor" title="关闭">✕</button>
+      </div>
+      <textarea class="ws-editor-text" v-model="editContent" spellcheck="false"
+                :placeholder="editor.ext ? '' : '（不支持在线编辑的二进制文件，已只读）'"
+                :readonly="!editor.ext" @keydown.ctrl.enter.prevent="saveEditor" @keydown.esc="closeEditor"></textarea>
+      <div class="ws-modal-foot">
+        <span class="ws-modal-hint">拖动标题栏移动 · Ctrl+Enter 保存 · Esc 关闭</span>
+        <button class="ws-btn ok" @click="saveEditor" :disabled="saving || !editor.ext">💾 保存</button>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- Python 控制台浮窗（可拖动：运行 / 停止 / 输入 / 实时输出） -->
+  <Teleport to="body">
+    <div v-if="pyConsole" class="ws-console-float glass" :style="consoleFloatStyle"
+         @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
+      <div class="ws-console-head" @mousedown="startConsoleDrag">
+        <span class="ws-modal-title">🐍 {{ pyConsole.name }}</span>
+        <span class="ws-modal-meta" :class="pyConsole.exitCode && pyConsole.exitCode !== 0 ? 'warn' : 'ok'">
+          <template v-if="pyConsole.starting">⏳ 启动中…</template>
+          <template v-else-if="pyConsole.running">● 运行中{{ pyConsole.pid ? ' · PID ' + pyConsole.pid : '' }}</template>
+          <template v-else-if="pyConsole.exitCode === 0">✓ 已退出（正常）</template>
+          <template v-else>⚠ 已退出（退出码 {{ pyConsole.exitCode ?? '?' }}）</template>
+        </span>
+        <button class="ws-btn ok" @click.stop="startConsole"
+                :disabled="pyConsole.starting || pyConsole.running" title="运行 / 重新运行">▶️ 运行</button>
+        <button class="ws-btn danger" @click.stop="stopConsole"
+                :disabled="!pyConsole.running" title="停止（含子进程）">⏹ 停止</button>
+        <button class="ws-btn" @click.stop="closeConsole" title="关闭">✕</button>
+      </div>
+      <pre class="ws-console-output" ref="consoleOutEl">{{ pyConsole.output || '（等待程序输出…）' }}</pre>
+      <div class="ws-console-input">
+        <input v-model="consoleInput" @keydown.enter.prevent="sendConsoleInput"
+               :disabled="!pyConsole.running" spellcheck="false"
+               placeholder="输入内容，回车发送到程序 stdin" />
+        <button class="ws-btn ok" @click="sendConsoleInput"
+                :disabled="!pyConsole.running || !consoleInput">发送</button>
+      </div>
+      <div class="ws-modal-foot">
+        <span class="ws-modal-hint">拖动标题栏移动 · 回车发送输入 · Esc 关闭</span>
+        <button class="ws-btn" @click="clearConsoleOutput">🧹 清空输出</button>
       </div>
     </div>
   </Teleport>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { api } from '@/api'
 
 // —— 全局单例：坐标契约全部由宿主 MainView 下发，禁止自行推断画布位置 ——
@@ -268,14 +311,15 @@ const panelStyle = computed(() => {
   return { position: 'absolute' as const, left: x + 'px', top: y + 'px' }
 })
 
-// 回收站面板：跟随工作区面板右侧
+// 回收站面板：紧跟工作区面板右侧，坐标系与面板一致（钉住=画布坐标 absolute，浮动=屏幕像素 fixed）
 const trashStyle = computed(() => {
+  const pos = props.pinned ? 'absolute' as const : 'fixed' as const
   const p = trashPos.value
-  if (p) return { left: p.x + 'px', top: p.y + 'px' }
-  // 默认紧挨着面板右侧
+  if (p) return { position: pos, left: p.x + 'px', top: p.y + 'px' }
+  // 默认紧挨面板右侧（panelStyle 的 left/top 与面板同一坐标系）
   const left = (parseFloat(panelStyle.value.left) + PANEL_W + 12)
   const top = parseFloat(panelStyle.value.top)
-  return { left: Math.max(8, left) + 'px', top: Math.max(8, top) + 'px' }
+  return { position: pos, left: Math.max(8, left) + 'px', top: Math.max(8, top) + 'px' }
 })
 
 // —— 拖动 ——
@@ -285,6 +329,8 @@ const dragStart = ref<{ clientX: number; clientY: number; base: { x: number; y: 
 function startDrag(e: MouseEvent) {
   if ((e.target as HTMLElement).closest('button')) return
   e.preventDefault()
+  // 拖动面板时让回收站重新贴合面板右侧（清掉之前的独立拖拽偏移）
+  trashPos.value = null
   if (props.pinned) {
     // 钉住：记录面板当前的画布坐标（由边对 + 位移反推），拖动时重新计算"最近相邻边对 + 位移"直接下发
     const b = props.bbox
@@ -300,11 +346,12 @@ function startDrag(e: MouseEvent) {
 }
 function startTrashDrag(e: MouseEvent) {
   if ((e.target as HTMLElement).closest('button')) return
-  const p = trashPos.value || {
+  // base 用当前面板右侧的位置（坐标系与面板一致），保证拖动前后坐标系匹配
+  const base = trashPos.value || {
     x: parseFloat(panelStyle.value.left) + PANEL_W + 12,
     y: parseFloat(panelStyle.value.top),
   }
-  dragStart.value = { clientX: e.clientX, clientY: e.clientY, base: p, trash: true, kind: 'float' }
+  dragStart.value = { clientX: e.clientX, clientY: e.clientY, base, trash: true, kind: props.pinned ? 'pin' : 'float' }
   e.preventDefault()
 }
 function onMove(e: MouseEvent) {
@@ -312,7 +359,9 @@ function onMove(e: MouseEvent) {
   const dx = e.clientX - dragStart.value.clientX
   const dy = e.clientY - dragStart.value.clientY
   if (dragStart.value.trash) {
-    trashPos.value = { x: dragStart.value.base.x + dx, y: dragStart.value.base.y + dy }
+    // 钉住：屏幕差 ÷ scale → 画布差；浮动：直接用屏幕差
+    const s = props.pinned ? (props.scale || 1) : 1
+    trashPos.value = { x: dragStart.value.base.x + dx / s, y: dragStart.value.base.y + dy / s }
     return
   }
   if (dragStart.value.kind === 'float') {
@@ -346,19 +395,57 @@ watch(() => props.visible, (v) => {
 // —— 钉住切换 ——
 function onPinToggle() {
   emit('set-pinned', !props.pinned)
-  trashPos.value = null
+  trashPos.value = null   // 切换坐标系，让回收站重新贴合面板右侧
 }
 
 // —— 项目树（单例：cid() 变化时刷新，DOM 不销毁） ——
 const tree = ref<any[]>([])
 const loading = ref(false)
 const errorMsg = ref('')
-const expanded = ref<Set<string>>(new Set())
+const expanded = ref<Set<string>>(new Set())   // 默认折叠：清空初始状态，只在用户点击时展开
 const compact = ref(false)
-const autoExpanded = ref(false)
 
 // 避免 canvasId 连续变化时的竞态
 let refreshSeq = 0
+// 后端树版本号：轮询时带上，未变化后端只回 {changed:false}（省流量、秒级实时）
+const wsRev = ref(-1)
+// 刚发生变动的行路径（短暂高亮，提示"只有这些变了"）
+const flashPaths = ref<Set<string>>(new Set())
+let flashTimer: number | null = null
+
+function nodeSig(n: any): string {
+  if (!n) return ''
+  const ppl = (n.participants || []).map((p: any) => `${p.id}:${p.name}:${p.last_op || ''}:${p.last_ts || ''}`).join(',')
+  return [n.name, n.rel, n.is_dir ? 1 : 0, n.size, n.mtime, n.truncated ? 1 : 0,
+    n.created_by || '', n.modified_by || '', n.last_ts || '', ppl].join('|')
+}
+
+/** 对比新旧树，收集真正变动（新增/修改/删除涉及）的路径，用于高亮提示。 */
+function diffChangedPaths(oldList: any[], newList: any[], out: string[]) {
+  const oldMap = new Map<string, any>((oldList || []).map((n: any) => [n.path, n]))
+  for (const n of newList || []) {
+    const o = oldMap.get(n.path)
+    if (!o || nodeSig(o) !== nodeSig(n)) out.push(n.path)
+    if (n.children?.length) diffChangedPaths(o?.children || [], n.children, out)
+  }
+}
+
+function flashChanged(paths: string[]) {
+  if (!paths.length) return
+  const s = new Set(flashPaths.value)
+  for (const p of paths) s.add(p)
+  flashPaths.value = s
+  if (flashTimer != null) clearTimeout(flashTimer)
+  flashTimer = window.setTimeout(() => { flashPaths.value = new Set(); flashTimer = null }, 1100)
+}
+
+/** 应用新树：保留展开状态，仅变动的行做高亮；未变的行 DOM 不动（界面不闪）。 */
+function applyTree(newTree: any[]) {
+  const changed: string[] = []
+  diffChangedPaths(tree.value, newTree, changed)
+  tree.value = newTree || []
+  flashChanged(changed)
+}
 
 const rows = computed(() => {
   const out: any[] = []
@@ -378,35 +465,73 @@ function toggleDir(p: string) {
   expanded.value = s
 }
 
-function ensureExpanded() {
-  if (autoExpanded.value) return
-  autoExpanded.value = true
-  const s = new Set<string>()
-  for (const n of tree.value) if (n.is_dir) s.add(n.path)
-  expanded.value = s
-}
-
 async function refresh() {
-  if (props.canvasId == null || !props.workdir) { tree.value = []; return }
+  if (props.canvasId == null || !props.workdir) { tree.value = []; wsRev.value = -1; return }
   const seq = ++refreshSeq
-  loading.value = true
+  // 已有树时不进入 loading：避免整树被"加载中…"替换造成的闪烁
+  const firstLoad = !tree.value.length
+  if (firstLoad) loading.value = true
   errorMsg.value = ''
   try {
-    const r: any = await api.canvases.workspace(cid())
+    const r: any = await api.canvases.workspace(cid(), -1)
     if (seq !== refreshSeq) return  // 已切到新画布,结果丢弃
-    if (r?.ok) { tree.value = r.tree || []; ensureExpanded() }
-    else { tree.value = []; errorMsg.value = r?.error || '工作区不可用' }
+    if (r?.ok) {
+      wsRev.value = typeof r.rev === 'number' ? r.rev : -1
+      applyTree(r.tree || [])
+    } else { tree.value = []; errorMsg.value = r?.error || '工作区不可用' }
   } catch (e: any) {
     if (seq !== refreshSeq) return
-    tree.value = []
-    errorMsg.value = '加载失败：' + (e?.message || e)
+    if (firstLoad) { tree.value = []; errorMsg.value = '加载失败：' + (e?.message || e) }
   } finally {
     if (seq === refreshSeq) loading.value = false
   }
 }
 
-// 单例模式：canvasId 变化时自动刷新（DOM 不销毁）
+// —— 实时更新：面板打开期间每 1.2s 轮询一次差量接口；有变动才下发全量树并合并 ——
+const POLL_MS = 1200
+let pollTimer: number | null = null
+let polling = false
+let nudgeQueued = false
+async function pollWorkspace() {
+  if (polling || document.hidden) return
+  const id = props.canvasId
+  if (id == null || !props.workdir) return
+  const seq = refreshSeq
+  polling = true
+  try {
+    const r: any = await api.canvases.workspace(id, wsRev.value)
+    if (props.canvasId !== id || seq !== refreshSeq) return
+    if (r?.ok && r.changed) {
+      wsRev.value = typeof r.rev === 'number' ? r.rev : -1
+      applyTree(r.tree || [])
+    } else if (r?.ok && typeof r.rev === 'number') {
+      wsRev.value = r.rev
+    }
+  } catch { /* 网络抖动忽略，下一轮重试 */ } finally {
+    polling = false
+    if (nudgeQueued) { nudgeQueued = false; pollWorkspace() }
+  }
+}
+// 智能体刚写完文件（conversation store 广播）→ 立刻刷一次，不等轮询间隔
+function onWorkspaceChangedNudge() {
+  if (polling) nudgeQueued = true
+  else pollWorkspace()
+}
+onMounted(() => {
+  if (pollTimer == null) pollTimer = window.setInterval(pollWorkspace, POLL_MS)
+  window.addEventListener('agentcluster:workspace-changed', onWorkspaceChangedNudge)
+})
+onBeforeUnmount(() => {
+  if (pollTimer != null) { clearInterval(pollTimer); pollTimer = null }
+  if (flashTimer != null) { clearTimeout(flashTimer); flashTimer = null }
+  if (copyPathTimer != null) { clearTimeout(copyPathTimer); copyPathTimer = null }
+  window.removeEventListener('agentcluster:workspace-changed', onWorkspaceChangedNudge)
+})
+
+// 单例模式：canvasId / workdir 变化时清空展开状态（默认折叠），并刷新
 watch(() => [props.canvasId, props.workdir], ([id, wd]) => {
+  expanded.value = new Set()   // 切换工作区时回到默认折叠
+  wsRev.value = -1
   if (id != null && wd) refresh()
   else tree.value = []
 }, { immediate: true })
@@ -414,36 +539,94 @@ watch(() => [props.canvasId, props.workdir], ([id, wd]) => {
 function onRowClick(row: any) { if (row.is_dir) toggleDir(row.path) }
 function onRowDblClick(row: any) {
   if (row.is_dir) { toggleDir(row.path); return }
-  openEditor(row)
+  runFile(row)
 }
 
 // —— 右键菜单 + 文件操作 ——
 const ctxMenu = ref<{ x: number; y: number; row?: any } | null>(null)
+const ctxEl = ref<HTMLElement | null>(null)
+// 实际渲染坐标（会按视口钳制，避免超出界面）
+const ctxPos = ref({ x: 0, y: 0 })
+const MARGIN = 4
 const copiedPath = ref<string | null>(null)
 const copiedName = ref('')
+const copiedFromWd = ref<string | ''>('')
+const copiedSrcAbsolute = ref<boolean>(false)
 const renameTarget = ref<{ path: string; value: string } | null>(null)
 const busy = ref(false)
+// 复制文件地址：底栏短暂提示 + 正在拖拽的行
+const copyPathHint = ref('')
+let copyPathTimer: number | null = null
+const dragPath = ref('')
+
+function clampCtx() {
+  const el = ctxEl.value
+  if (!el || !ctxMenu.value) return
+  const w = el.offsetWidth || 220
+  const h = el.offsetHeight || 200
+  const vw = window.innerWidth || document.documentElement.clientWidth
+  const vh = window.innerHeight || document.documentElement.clientHeight
+  const x = Math.max(MARGIN, Math.min(ctxMenu.value.x, vw - w - MARGIN))
+  const y = Math.max(MARGIN, Math.min(ctxMenu.value.y, vh - h - MARGIN))
+  ctxPos.value = { x, y }
+}
 
 function showRowCtx(e: MouseEvent, row: any) {
+  ctxPos.value = { x: e.clientX, y: e.clientY }
   ctxMenu.value = { x: e.clientX, y: e.clientY, row }
+  nextTick(clampCtx)
 }
 function showRootCtx(e: MouseEvent) {
   if (!props.workdir || !copiedPath.value) return
+  ctxPos.value = { x: e.clientX, y: e.clientY }
   ctxMenu.value = { x: e.clientX, y: e.clientY }
+  nextTick(clampCtx)
 }
 function closeCtx() { ctxMenu.value = null }
+
+// 点击其他区域 / 右键 / 失焦 / 滚轮 / Esc → 关闭右键菜单
+function onCtxMouseDown(e: MouseEvent) {
+  if (!ctxMenu.value) return
+  // 点中菜单本体（含子项）则不关——事件会从菜单冒泡到 window
+  if ((e.target as HTMLElement)?.closest?.('.ws-ctx')) return
+  ctxMenu.value = null
+}
+function onCtxContextMenu() { ctxMenu.value = null }
+function onCtxBlur() { if (ctxMenu.value) ctxMenu.value = null }
+function onCtxKeydown(e: KeyboardEvent) { if (e.key === 'Escape' && ctxMenu.value) ctxMenu.value = null }
+onMounted(() => {
+  window.addEventListener('mousedown', onCtxMouseDown)
+  window.addEventListener('contextmenu', onCtxContextMenu)
+  window.addEventListener('blur', onCtxBlur)
+  window.addEventListener('keydown', onCtxKeydown)
+  window.addEventListener('wheel', onCtxBlur, { passive: true })
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('mousedown', onCtxMouseDown)
+  window.removeEventListener('contextmenu', onCtxContextMenu)
+  window.removeEventListener('blur', onCtxBlur)
+  window.removeEventListener('keydown', onCtxKeydown)
+  window.removeEventListener('wheel', onCtxBlur)
+})
 
 function actEdit() {
   const row = ctxMenu.value?.row
   closeCtx()
   if (row && !row.is_dir) openEditor(row)
 }
+function actRun() {
+  const row = ctxMenu.value?.row
+  closeCtx()
+  if (row && !row.is_dir) runFile(row)
+}
 function actCopy() {
   const row = ctxMenu.value?.row
   closeCtx()
   if (!row) return
+  // row.path 是绝对路径；同时记录来源 workdir，用于跨工作区粘贴时区分同源/跨源
   copiedPath.value = row.path
   copiedName.value = row.name
+  copiedFromWd.value = props.workdir || ''
   // 同时把内容拷进系统剪贴板，方便外部使用
   if (!row.is_dir) {
     api.canvases.fileRead(cid(), row.path).then(r => {
@@ -451,6 +634,45 @@ function actCopy() {
     }).catch(() => {})
   }
 }
+/** 复制文本到系统剪贴板（clipboard API 不可用时兜底 execCommand） */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch { /* 无权限/非安全上下文 → 走兜底 */ }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  } catch { return false }
+}
+/** 右键菜单：复制文件/文件夹的绝对地址到系统剪贴板 */
+async function actCopyPath() {
+  const row = ctxMenu.value?.row
+  closeCtx()
+  if (!row) return
+  if (!(await copyText(row.path))) { alert('复制文件地址失败'); return }
+  copyPathHint.value = row.path
+  if (copyPathTimer != null) clearTimeout(copyPathTimer)
+  copyPathTimer = window.setTimeout(() => { copyPathHint.value = ''; copyPathTimer = null }, 2500)
+}
+/** 拖拽：把绝对路径写进 dataTransfer，供右侧对话输入框读取 */
+function onRowDragStart(e: DragEvent, row: any) {
+  dragPath.value = row.path
+  const dt = e.dataTransfer
+  if (!dt) return
+  dt.effectAllowed = 'copy'
+  dt.setData('application/x-agentcluster-path', row.path)
+  dt.setData('text/plain', row.path)   // 兜底：其他程序/组件读 text/plain 也能拿到
+}
+function onRowDragEnd() { dragPath.value = '' }
 function actPaste() {
   const row = ctxMenu.value?.row
   closeCtx()
@@ -462,16 +684,40 @@ function actPasteRoot() {
   if (!copiedPath.value) return
   doPaste('')
 }
+function sameWorkdir(a: string, b: string) {
+  if (!a || !b) return false
+  const norm = (s: string) => s.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  return norm(a) === norm(b)
+}
+function toRelative(absPath: string, wd: string): string | null {
+  // 把 absPath 转为相对 wd 的路径；不在其下返回 null
+  if (!wd) return null
+  const norm = (s: string) => s.replace(/\\/g, '/').replace(/\/+$/, '')
+  const a = norm(absPath).toLowerCase()
+  const w = norm(wd).toLowerCase()
+  if (a === w) return ''
+  if (!a.startsWith(w + '/')) return null
+  return a.slice(w.length + 1)
+}
 async function doPaste(destDir: string) {
   if (!copiedPath.value) return
   busy.value = true
   try {
     const base = props.workdir || ''
     const dest = destDir ? destDir : base
-    await api.canvases.fileCopy(cid(), copiedPath.value, dest)
+    // 同源粘贴：把 src 转成相对路径（后端 _resolve_under 才能接受）；
+    // 跨源粘贴：保留绝对路径（后端检测到绝对路径会跳过 _resolve_under 直接复制）
+    const src = sameWorkdir(copiedFromWd.value, base)
+      ? (toRelative(copiedPath.value, base) ?? copiedPath.value)
+      : copiedPath.value
+    await api.canvases.fileCopy(cid(), src, dest)
     await refresh()
   } catch (e: any) {
-    alert('粘贴失败：' + (e?.message || e))
+    let msg = '粘贴失败：' + (e?.message || e)
+    if (!sameWorkdir(copiedFromWd.value, props.workdir || '')) {
+      msg += `\n\n（从工作区「${copiedFromWd.value}」复制，粘贴到「${props.workdir}」）`
+    }
+    alert(msg)
   } finally { busy.value = false }
 }
 function actRename() {
@@ -518,6 +764,42 @@ const editContent = ref('')
 const dirty = ref(false)
 const saving = ref(false)
 
+// 编辑浮窗位置（屏幕像素，跨编辑保留）
+const editPos = ref({ x: 120, y: 80 })
+const EDIT_W = 640
+const EDIT_H = 500
+const editDragStart = ref<{ clientX: number; clientY: number; base: { x: number; y: number } } | null>(null)
+const editFloatStyle = computed(() => {
+  const p = editPos.value
+  const x = Math.max(0, Math.min(p.x, window.innerWidth - EDIT_W))
+  const y = Math.max(0, Math.min(p.y, window.innerHeight - 120))
+  return { position: 'fixed' as const, left: x + 'px', top: y + 'px', width: EDIT_W + 'px', height: EDIT_H + 'px' }
+})
+function startEditDrag(e: MouseEvent) {
+  if ((e.target as HTMLElement).closest('button')) return
+  editDragStart.value = { clientX: e.clientX, clientY: e.clientY, base: { x: editPos.value.x, y: editPos.value.y } }
+  e.preventDefault()
+}
+function onEditDragMove(e: MouseEvent) {
+  const s = editDragStart.value
+  if (!s) return
+  editPos.value = { x: s.base.x + (e.clientX - s.clientX), y: s.base.y + (e.clientY - s.clientY) }
+}
+function onEditDragUp() { editDragStart.value = null }
+function onEditKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && editor.value) closeEditor()
+}
+onMounted(() => {
+  window.addEventListener('mousemove', onEditDragMove)
+  window.addEventListener('mouseup', onEditDragUp)
+  window.addEventListener('keydown', onEditKeydown)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('mousemove', onEditDragMove)
+  window.removeEventListener('mouseup', onEditDragUp)
+  window.removeEventListener('keydown', onEditKeydown)
+})
+
 async function openEditor(row: any) {
   busy.value = true
   try {
@@ -547,6 +829,204 @@ async function saveEditor() {
 function closeEditor() {
   if (dirty.value && !window.confirm('有未保存的修改，放弃并关闭？')) return
   editor.value = null
+}
+
+// —— 双击文件：.py 开控制台，其他用系统默认程序打开 ——
+function isPyFile(name: string) {
+  return (name.split('.').pop() || '').toLowerCase() === 'py'
+}
+function rowIsPy(row: any) { return !!row && isPyFile(row.name || '') }
+
+async function runFile(row: any) {
+  if (row.is_dir) return
+  if (isPyFile(row.name)) { await openPyConsole(row); return }
+  try {
+    await api.canvases.fileRun(cid(), row.path)
+  } catch (e: any) {
+    alert('打开失败：' + (e?.message || e))
+  }
+}
+
+// —— Python 控制台 ——
+// pyConsole: null 无 / { name, path, sessionId, pid, running, exitCode, starting, output }
+const pyConsole = ref<{
+  name: string; path: string; sessionId: string | null; pid: number | null;
+  running: boolean; exitCode: number | null; starting: boolean; output: string
+} | null>(null)
+const consoleInput = ref('')
+const consoleOutEl = ref<HTMLElement | null>(null)
+let consoleAbort: AbortController | null = null
+let consoleGen = 0   // 会话代际：防止「重新运行 / 关闭」后旧流事件污染新会话
+
+// 浮窗位置（屏幕像素，跨会话保留）
+const consolePos = ref({ x: 90, y: 90 })
+const CONSOLE_W = 620
+const CONSOLE_H = 470
+const consoleDragStart = ref<{ clientX: number; clientY: number; base: { x: number; y: number } } | null>(null)
+const consoleFloatStyle = computed<Record<string, string>>(() => {
+  const p = consolePos.value
+  const x = Math.max(0, Math.min(p.x, window.innerWidth - CONSOLE_W))
+  const y = Math.max(0, Math.min(p.y, window.innerHeight - 120))
+  return { position: 'fixed', left: x + 'px', top: y + 'px', width: CONSOLE_W + 'px', height: CONSOLE_H + 'px' }
+})
+
+function startConsoleDrag(e: MouseEvent) {
+  if ((e.target as HTMLElement).closest('button')) return
+  consoleDragStart.value = { clientX: e.clientX, clientY: e.clientY, base: { x: consolePos.value.x, y: consolePos.value.y } }
+  e.preventDefault()
+}
+function onConsoleDragMove(e: MouseEvent) {
+  const s = consoleDragStart.value
+  if (!s) return
+  consolePos.value = { x: s.base.x + (e.clientX - s.clientX), y: s.base.y + (e.clientY - s.clientY) }
+}
+function onConsoleDragUp() { consoleDragStart.value = null }
+function onConsoleKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && pyConsole.value) closeConsole()
+}
+onMounted(() => {
+  window.addEventListener('mousemove', onConsoleDragMove)
+  window.addEventListener('mouseup', onConsoleDragUp)
+  window.addEventListener('keydown', onConsoleKeydown)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('mousemove', onConsoleDragMove)
+  window.removeEventListener('mouseup', onConsoleDragUp)
+  window.removeEventListener('keydown', onConsoleKeydown)
+  consoleGen++
+  consoleAbort?.abort()
+  if (pyConsole.value?.sessionId) api.canvases.filePyClose(cid(), pyConsole.value.sessionId).catch(() => { })
+})
+
+function scrollConsole() {
+  const el = consoleOutEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+// 断开当前 SSE 流并清理后端会话（防止重新运行/切换文件时旧进程泄漏）
+async function dropSession(sid: string | null | undefined) {
+  consoleAbort?.abort()
+  consoleAbort = null
+  if (!sid) return
+  try { await api.canvases.filePyClose(cid(), sid) } catch { }
+}
+
+async function openPyConsole(row: any) {
+  const prevSid = pyConsole.value?.sessionId
+  if (prevSid && pyConsole.value) pyConsole.value.sessionId = null
+  await dropSession(prevSid)
+  pyConsole.value = {
+    name: row.name, path: row.path, sessionId: null, pid: null,
+    running: false, exitCode: null, starting: false, output: '',
+  }
+  await startConsole()
+}
+
+async function startConsole() {
+  const pc = pyConsole.value
+  if (!pc || pc.starting) return
+  const gen = ++consoleGen
+  pc.starting = true
+  consoleInput.value = ''
+  pc.running = false
+  pc.exitCode = null
+  pc.pid = null
+  pc.output = ''
+  // 重新运行同一文件：先清理上一次会话
+  const prevSid = pc.sessionId
+  if (prevSid) pc.sessionId = null
+  await dropSession(prevSid)
+  if (gen !== consoleGen) return   // 清理期间被更新的运行/关闭取代
+  consoleAbort = new AbortController()   // 保证 streamConsole 有可 abort 的 signal
+  try {
+    const r: any = await api.canvases.fileRun(cid(), pc.path)
+    if (gen !== consoleGen) return
+    if (r?.session_id) {
+      pc.sessionId = r.session_id
+      pc.pid = r.pid || null
+      pc.starting = false
+      pc.running = true
+      streamConsole(r.session_id, gen)
+    } else {
+      pc.starting = false
+      pc.output = '❌ 启动失败：' + (r?.error || '未知错误')
+    }
+  } catch (e: any) {
+    if (gen !== consoleGen) return
+    pc.starting = false
+    pc.output = '❌ 启动失败：' + (e?.message || e)
+  }
+}
+
+async function streamConsole(sid: string, gen: number) {
+  try {
+    await api.canvases.filePyStream(cid(), sid, (ev) => {
+      if (gen !== consoleGen) return
+      const pc = pyConsole.value
+      if (!pc || pc.sessionId !== sid) return
+      if (ev.type === 'out') {
+        pc.output += ev.text || ''
+        nextTick(scrollConsole)
+      } else if (ev.type === 'exit') {
+        pc.running = false
+        pc.exitCode = (typeof ev.exit_code === 'number') ? ev.exit_code : null
+      } else if (ev.type === 'closed') {
+        pc.running = false
+        if (!pc.output) pc.output = ev.error || '控制台会话已结束'
+      }
+    }, consoleAbort?.signal)
+  } catch (e: any) {
+    if (gen !== consoleGen) return
+    const pc = pyConsole.value
+    if (!pc || pc.sessionId !== sid) return
+    if (pc.running) {
+      pc.running = false
+      pc.output += '\n\n[与后端的输出连接中断：' + (e?.message || e) + ']'
+    }
+  }
+}
+
+async function sendConsoleInput() {
+  const pc = pyConsole.value
+  if (!pc || !pc.running || !pc.sessionId) return
+  const text = consoleInput.value
+  if (!text) return
+  consoleInput.value = ''
+  pc.output += '>>> ' + text + '\n'
+  nextTick(scrollConsole)
+  try {
+    await api.canvases.filePyInput(cid(), pc.sessionId, text + '\n')
+  } catch (e: any) {
+    pc.output += '\n[输入失败：' + (e?.message || e) + ']\n'
+  }
+}
+
+async function stopConsole() {
+  const pc = pyConsole.value
+  if (!pc || !pc.running || !pc.sessionId) return
+  try {
+    const r: any = await api.canvases.filePyStop(cid(), pc.sessionId)
+    pc.running = false
+    if (typeof r?.exit_code === 'number') pc.exitCode = r.exit_code
+  } catch (e: any) {
+    pc.output += '\n\n[停止失败：' + (e?.message || e) + ']'
+  }
+}
+
+async function closeConsole() {
+  const pc = pyConsole.value
+  if (!pc) return
+  consoleGen++
+  consoleAbort?.abort()
+  consoleAbort = null
+  if (pc.sessionId) {
+    try { await api.canvases.filePyClose(cid(), pc.sessionId) } catch { }
+  }
+  pyConsole.value = null
+}
+
+function clearConsoleOutput() {
+  if (pyConsole.value) pyConsole.value.output = ''
 }
 
 // —— 回收站 ——
@@ -684,16 +1164,16 @@ function peopleTitle(row: any) {
 .ws-btn {
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  color: #e8ecf4; border-radius: 7px; cursor: pointer;
+  color: rgb(var(--text-rgb)); border-radius: 7px; cursor: pointer;
   font-size: 11px; padding: 3px 8px; line-height: 1.6; transition: all .15s;
 }
 .ws-btn:hover { background: rgba(110, 168, 255, 0.18); }
 .ws-btn:disabled { opacity: .4; cursor: not-allowed; }
 .ws-btn.pin.active { background: rgba(255, 180, 90, 0.22); border-color: rgba(255, 180, 90, 0.5); }
 .ws-btn.trash.active { background: rgba(255, 120, 120, 0.2); border-color: rgba(255, 120, 120, 0.5); }
-.ws-btn.purple { background: rgba(180, 114, 255, 0.18); border-color: rgba(180, 114, 255, 0.4); color: #d4a8ff; }
-.ws-btn.ok { background: rgba(100, 220, 160, 0.15); border-color: rgba(100, 220, 160, 0.4); color: #80e4b8; }
-.ws-btn.danger { background: rgba(255, 80, 80, 0.18); border-color: rgba(255, 80, 80, 0.42); color: #ffb0b0; }
+.ws-btn.purple { background: rgba(180, 114, 255, 0.18); border-color: rgba(180, 114, 255, 0.4); color: var(--purple-ink); }
+.ws-btn.ok { background: rgba(100, 220, 160, 0.15); border-color: rgba(100, 220, 160, 0.4); color: var(--green-ink); }
+.ws-btn.danger { background: rgba(255, 80, 80, 0.18); border-color: rgba(255, 80, 80, 0.42); color: var(--red-ink); }
 
 .ws-body { flex: 1; overflow-y: auto; padding: 6px 6px 8px; min-height: 60px; }
 .ws-empty { padding: 22px 12px; text-align: center; font-size: 12px; opacity: .6; display: flex; flex-direction: column; align-items: center; gap: 10px; }
@@ -705,7 +1185,15 @@ function peopleTitle(row: any) {
   cursor: default; transition: background .12s;
 }
 .ws-row.dir { cursor: pointer; }
+.ws-row.dragging { opacity: .45; }
 .ws-row:hover { background: rgba(255, 255, 255, 0.05); }
+/* 刚变动的行：短促高亮后淡出，让用户一眼看到"只更新了这些" */
+.ws-row.changed { animation: ws-row-flash 1.1s ease-out; }
+@keyframes ws-row-flash {
+  0% { background: rgba(110, 168, 255, 0.3); }
+  60% { background: rgba(110, 168, 255, 0.12); }
+  100% { background: transparent; }
+}
 .ws-row-ico { flex-shrink: 0; width: 16px; text-align: center; }
 .ws-row-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ws-row.dir .ws-row-name { font-weight: 500; }
@@ -713,22 +1201,22 @@ function peopleTitle(row: any) {
 .ws-row-size { flex-shrink: 0; width: 58px; text-align: right; font-family: Consolas, monospace; font-size: 10.5px; opacity: .7; }
 .ws-row-time { flex-shrink: 0; width: 76px; text-align: right; font-family: Consolas, monospace; font-size: 10.5px; opacity: .5; }
 .ws-row-people { flex-shrink: 0; display: flex; gap: 4px; }
-.chip { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: rgba(110, 168, 255, 0.18); color: #a8c8ff; border: 1px solid rgba(110, 168, 255, 0.3); white-space: nowrap; }
-.chip.more { background: rgba(180, 114, 255, 0.18); color: #d4a8ff; border-color: rgba(180, 114, 255, 0.3); }
+.chip { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: rgba(110, 168, 255, 0.18); color: var(--accent-ink); border: 1px solid rgba(110, 168, 255, 0.3); white-space: nowrap; }
+.chip.more { background: rgba(180, 114, 255, 0.18); color: var(--purple-ink); border-color: rgba(180, 114, 255, 0.3); }
 .chip.none { background: transparent; color: rgba(232, 236, 244, 0.3); border-color: transparent; }
 
 .ws-rename-input {
   flex: 1; min-width: 0; background: rgba(0, 0, 0, 0.35);
   border: 1px solid rgba(110, 168, 255, 0.6); border-radius: 6px;
-  color: #e8ecf4; font-size: 12px; padding: 2px 6px; outline: none;
+  color: rgb(var(--text-rgb)); font-size: 12px; padding: 2px 6px; outline: none;
 }
 
 .ws-foot { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-top: 1px solid rgba(255, 255, 255, 0.07); font-size: 10.5px; opacity: .5; }
 .ws-count { flex-shrink: 0; }
 .ws-copy-hint { flex: 1; min-width: 0; font-family: Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #ffd18a; }
-.ws-legend { flex-shrink: 0; cursor: pointer; padding: 2px 6px; border-radius: 6px; transition: all .15s; white-space: nowrap; }
+.ws-legend { flex-shrink: 0; margin-left: auto; cursor: pointer; padding: 2px 6px; border-radius: 6px; transition: all .15s; white-space: nowrap; }
 .ws-legend:hover { background: rgba(255, 255, 255, 0.08); }
-.ws-legend.on { color: #a8c8ff; }
+.ws-legend.on { color: var(--accent-ink); }
 
 /* —— 右键菜单 —— */
 .ws-ctx { position: fixed; min-width: 210px; padding: 6px; z-index: 9999; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5); }
@@ -746,11 +1234,69 @@ function peopleTitle(row: any) {
 .ws-modal-head { display: flex; align-items: center; gap: 10px; }
 .ws-modal-title { font-size: 14px; font-weight: 600; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ws-modal-meta { font-size: 11px; opacity: .55; font-family: Consolas, monospace; white-space: nowrap; }
+.ws-modal-meta.ok { opacity: 1; color: #7dd88f; }
+.ws-modal-meta.warn { opacity: 1; color: #ffd18a; }
 .ws-modal-dirty { font-size: 11px; color: #ffd18a; }
+/* —— 文件编辑器浮窗 —— */
+.ws-edit-float {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 0; overflow: hidden; z-index: 9993;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.55);
+  border-radius: 10px;
+}
+.ws-edit-float-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; cursor: grab; user-select: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+.ws-edit-float-head:active { cursor: grabbing; }
+.ws-edit-float .ws-modal-foot { padding: 6px 10px; border-top: 1px solid rgba(255, 255, 255, 0.08); flex-shrink: 0; }
+.ws-editor-text {
+  flex: 1; min-height: 0; margin: 0 10px; background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
+  color: rgb(var(--text-rgb)); font-size: 12.5px; font-family: Consolas, "Courier New", monospace;
+  padding: 10px; outline: none; resize: none; line-height: 1.55;
+}
+.ws-editor-text:focus { border-color: rgba(110, 168, 255, 0.6); }
+.ws-editor-text[readonly] { opacity: .7; }
+/* —— Python 控制台浮窗 —— */
+.ws-console-float {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 0; overflow: hidden; z-index: 9992;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.55);
+  border-radius: 10px;
+}
+.ws-console-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; cursor: grab; user-select: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+.ws-console-head:active { cursor: grabbing; }
+.ws-console-float .ws-modal-foot { padding: 6px 10px; border-top: 1px solid rgba(255, 255, 255, 0.08); flex-shrink: 0; }
+.ws-console-output {
+  flex: 1; min-height: 0; margin: 0 10px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+  background: rgba(0, 0, 0, 0.45); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
+  color: #bfe6c6; font-size: 12.5px; font-family: Consolas, "Courier New", monospace;
+  padding: 10px; line-height: 1.55;
+}
+.ws-console-input {
+  display: flex; gap: 6px; margin: 0 10px; flex-shrink: 0;
+}
+.ws-console-input input {
+  flex: 1; min-width: 0; background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
+  color: rgb(var(--text-rgb)); font-size: 12.5px; font-family: Consolas, "Courier New", monospace;
+  padding: 7px 10px; outline: none;
+}
+.ws-console-input input:focus { border-color: rgba(110, 168, 255, 0.6); }
+.ws-console-input input:disabled { opacity: .5; }
 .ws-editor-text {
   width: 100%; height: 420px; background: rgba(0, 0, 0, 0.35);
   border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
-  color: #e8ecf4; font-size: 12.5px; font-family: Consolas, "Courier New", monospace;
+  color: rgb(var(--text-rgb)); font-size: 12.5px; font-family: Consolas, "Courier New", monospace;
   padding: 10px; outline: none; resize: none; line-height: 1.55;
 }
 .ws-editor-text:focus { border-color: rgba(110, 168, 255, 0.6); }
@@ -758,9 +1304,9 @@ function peopleTitle(row: any) {
 .ws-modal-foot { display: flex; justify-content: space-between; align-items: center; }
 .ws-modal-hint { font-size: 10.5px; opacity: .5; }
 
-/* —— 回收站浮层 —— */
+/* —— 回收站浮层（position 由 trashStyle 内联控制：钉住=absolute 画布坐标，浮动=fixed 屏幕像素） —— */
 .ws-trash {
-  position: fixed; width: 380px; max-height: min(70vh, 560px);
+  width: 380px; max-height: min(70vh, 560px);
   display: flex; flex-direction: column; z-index: 9991;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
   border-color: rgba(255, 120, 120, 0.28);
@@ -795,7 +1341,7 @@ function peopleTitle(row: any) {
 .wt-check { flex-shrink: 0; font-size: 13px; opacity: .8; }
 .wt-card-meta { font-size: 10.5px; opacity: .72; display: flex; gap: 6px; line-height: 1.6; }
 .wt-card-meta .k { flex-shrink: 0; width: 34px; opacity: .6; }
-.wt-card-tag { margin-top: 5px; font-size: 10px; color: #ffb0b0; }
-.wt-card-tag.ok { color: #80e4b8; }
+.wt-card-tag { margin-top: 5px; font-size: 10px; color: var(--red-ink); }
+.wt-card-tag.ok { color: var(--green-ink); }
 .wt-card-tag.warn { color: #ffd18a; }
 </style>

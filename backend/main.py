@@ -1,11 +1,13 @@
 """智能体集群 - FastAPI 入口"""
 import os
+import zlib
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
 
 from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, ROOT
-from api import agents, canvases, conversations, models, settings, commands, rules, param_presets
+from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets
 
 from datetime import datetime
 
@@ -43,6 +45,11 @@ ORCHESTRATOR_RULE_CMDS = [
     "cluster.list_rules", "cluster.create_rule", "cluster.update_rule", "cluster.delete_rule",
 ]
 
+ORCHESTRATOR_GROUP_CMDS = [
+    "cluster.list_groups", "cluster.create_group", "cluster.update_group",
+    "cluster.delete_group", "cluster.assign_agent_group",
+]
+
 
 def _ensure_orchestrator():
     """启动时如果没有「集群编排师」agent，就自动创建一个；已有则补齐缺失的 cluster.* 命令"""
@@ -51,9 +58,9 @@ def _ensure_orchestrator():
         if a.get("name") == ORCHESTRATOR_NAME and any(
             str(c).startswith("cluster.") for c in (a.get("commands") or [])
         ):
-            # 已存在 → 确保规章制度工具可用
+            # 已存在 → 确保规章制度 / 分组工具可用
             cmds = a.get("commands") or []
-            missing = [c for c in ORCHESTRATOR_RULE_CMDS if c not in cmds]
+            missing = [c for c in ORCHESTRATOR_RULE_CMDS + ORCHESTRATOR_GROUP_CMDS if c not in cmds]
             if missing:
                 a["commands"] = cmds + missing
                 upsert("agents", a)
@@ -72,6 +79,8 @@ def _ensure_orchestrator():
             "cluster.add_node", "cluster.remove_node", "cluster.connect", "cluster.disconnect",
             # 规章制度（按画布隔离）
             *ORCHESTRATOR_RULE_CMDS,
+            # 智能体分组（agent_groups）
+            *ORCHESTRATOR_GROUP_CMDS,
             # 同时给基础文件能力，方便写系统提示词时参考
             "file.read", "file.write", "file.structure",
         ],
@@ -92,11 +101,74 @@ async def lifespan(app: FastAPI):
     yield
 
 
+class JsonGzipMiddleware:
+    """只对 application/json 响应启用 gzip（工作区全量树等大 JSON，可缩到 ~1/15）。
+
+    流式接口（text/plain 的对话流 / text/event-stream）完全不经过压缩，
+    避免对聊天流式输出产生任何影响。
+    """
+
+    def __init__(self, app, minimum_size: int = 2048):
+        self.app = app
+        self.minimum_size = minimum_size
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        if "gzip" not in (headers.get("Accept-Encoding") or "").lower():
+            await self.app(scope, receive, send)
+            return
+        state = {"initial": None, "compressor": None, "started": False, "skip": False}
+
+        async def send_wrapper(message):
+            t = message.get("type")
+            if t == "http.response.start":
+                state["initial"] = message
+                h = Headers(raw=message["headers"])
+                ct = h.get("content-type", "").partition(";")[0].strip().lower()
+                state["skip"] = (ct != "application/json") or ("content-encoding" in h)
+            elif t == "http.response.body":
+                if state["skip"]:
+                    if not state["started"]:
+                        state["started"] = True
+                        await send(state["initial"])
+                    await send(message)
+                    return
+                body = message.get("body") or b""
+                more = bool(message.get("more_body"))
+                if not state["started"] and not more and len(body) < self.minimum_size:
+                    # 小响应不值得压缩，直接原样发出
+                    state["started"] = True
+                    await send(state["initial"])
+                    await send(message)
+                    return
+                comp = state["compressor"] or zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+                state["compressor"] = comp
+                out = comp.compress(body) + (comp.flush(zlib.Z_SYNC_FLUSH) if more else comp.flush())
+                if not state["started"]:
+                    state["started"] = True
+                    mh = MutableHeaders(raw=list(state["initial"]["headers"]))
+                    if "content-length" in mh:
+                        del mh["content-length"]
+                    mh["Content-Encoding"] = "gzip"
+                    mh.add_vary_header("Accept-Encoding")
+                    await send({**state["initial"], "headers": mh.raw})
+                await send({"type": "http.response.body", "body": out, "more_body": more})
+            else:
+                await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
 app = FastAPI(title="AgentCluster", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(JsonGzipMiddleware, minimum_size=2048)
 
 ROUTES = [
     ("agents", agents.router),
+    ("agent_groups", agent_groups.router),
     ("canvases", canvases.router),
     ("conversations", conversations.router),
     ("model_interfaces", models.router),

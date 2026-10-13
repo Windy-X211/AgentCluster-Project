@@ -11,7 +11,14 @@
     "file.delete",
     "file.replace",
     "file.structure",
-    "cmd.run"
+    "cmd.run",
+    "file.patch",
+    "file.search",
+    "file.find",
+    "workspace.search",
+    "cmd.bg_list",
+    "cmd.bg_stop",
+    "cmd.bg_log"
   ],
   "skills": [],
   "plugins": [
@@ -30,5 +37,7 @@
   "tools": [
     "browser_control"
   ],
-  "sort_order": 12
+  "sort_order": 12,
+  "group_id": 3,
+  "workflow_mode": "none"
 }

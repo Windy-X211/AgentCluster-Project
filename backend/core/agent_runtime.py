@@ -5,6 +5,7 @@
   C:<id>|<name>|<args>    tool_call 完整（id、名称、JSON参数）→ 参数收齐，结束流式状态
   R:<id>|<content>        tool_result（工具执行结果）
   F:<final_text>          最终完整文本（方便前端完整展示）
+  RESET                   清空本轮已流出的正文/思考（快通道检测到 <continue> 切换慢通道时）
   SPEAK:<agent_id>        切换发言者（画布气泡 / 流动连线跟随）
   A2A:<envelope json>     A2A 消息信封（前端插入信封卡片，新开流式消息）
   DONE                    结束
@@ -12,7 +13,7 @@
   ⚠️ 行协议用 \n 做分隔符，因此 T:/RN: 等载荷文本中的 \n 必须在 yield 前用
      _esc 转义为 \\n，前端收到后用 _unesc 还原。
 """
-import json, asyncio, os, time
+import json, asyncio, os, time, re
 from datetime import datetime
 from typing import Any
 from core.store import load, save, upsert, get_by, next_id
@@ -25,7 +26,6 @@ from core.a2a import (
     _resolve_target,
 )
 from plugins import PLUGIN_REGISTRY, run_plugin
-from core.intent_classifier import classify_intent
 from core.validator import verify_completion
 
 
@@ -35,9 +35,81 @@ def _esc(s: str) -> str:
     return s.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r')
 
 
+# ===== <continue> 续跑标记：快通道动态注入到本轮用户消息（不进 system prompt） =====
+# 机制：快通道把续跑提示**附加在发给模型的当前用户消息末尾**（仅存在于本次请求的
+# 内存 messages 中，不落库、不进历史）；后端流式检测到 <continue> → 自动切换慢通道，
+# 切换时把该提示从用户消息中动态剔除。标记与提示块本身任何情况下都不允许出现在
+# 对话界面 / 落库内容 / LLM 上下文。
+CONTINUE_TAG = "<continue>"
+_CONTINUE_HINT = (
+    "\n\n[系统追加 · 非用户输入 · 任务续跑标记] "
+    "若任务尚未结束（仍有必要步骤未完成、结果不完整），在回复正文最末尾**单独一行**输出：<continue>；"
+    "仅当任务已全部完成、无需任何后续操作时才不输出。"
+    "该标记仅供系统自动识别，不会展示给用户——不要向用户提及或解释它，"
+    "输出时一行只有这一个标记，不附加任何其他文字。"
+)
+_CONTINUE_RE = re.compile(r"<\s*continue\s*>", re.I)
+# 流式判定用：从 '<' 起、到缓冲末尾为止，是否仍可能是未写完的 <continue> 前缀
+_CONTINUE_PARTIAL_RE = re.compile(
+    r"^<\s*(?:c(?:o(?:n(?:t(?:i(?:n(?:u(?:e)?)?)?)?)?)?)?)?\s*$", re.I
+)
+
+
+def strip_continue(text):
+    """动态剔除：连同 <continue> 标记与续跑提示块一起从文本中移除。
+
+    - 提示块：快通道只注入在本次请求的用户消息里，正常不落库；此处兜底，
+      防止模型复述指令时把整块提示带回上下文/输出。
+    - 标记：大小写/标签内空白不敏感。
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if _CONTINUE_HINT in text:
+        text = text.replace(_CONTINUE_HINT, "")
+    return _CONTINUE_RE.sub("", text)
+
+
+class _ContinueScanner:
+    """流式 <continue> 剥离器：标记可能被拆分到多个 chunk，需缓存尾部未判定字符。
+
+    feed() 返回可安全下发的文本；close() 在流结束时吐出缓存（未写完的前缀原样保留）；
+    found 表示流中是否出现过完整标记。
+    """
+
+    def __init__(self):
+        self._buf = ""
+        self.found = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        buf = self._buf + text
+        out: list[str] = []
+        i = 0
+        n = len(buf)
+        while i < n:
+            if buf[i] == "<":
+                m = _CONTINUE_RE.match(buf, i)
+                if m:
+                    self.found = True
+                    i = m.end()
+                    continue
+                # 缓冲末尾可能是未写完的标记前缀（如 "<cont"）→ 暂存等下一个 chunk
+                if _CONTINUE_PARTIAL_RE.match(buf, i):
+                    break
+            out.append(buf[i])
+            i += 1
+        self._buf = buf[i:]
+        return "".join(out)
+
+    def close(self) -> str:
+        s, self._buf = self._buf, ""
+        return s
+
+
 # ===== 分层自适应循环参数 =====
 MAX_VERIFY_RETRIES = 3    # 验证器不通过时，最多让模型修正几轮
-FAST_PATH_NO_TOOLS = True # 快通道不注入 tools（简单任务不需要工具调用能力）
+FAST_PATH_NO_TOOLS = False # 快通道也允许使用工具（与慢通道一致注入 tools + tool_choice=auto）
 
 # ===== A2A 消息接力参数 =====
 A2A_MAX_RELAY_DEPTH = 6   # 消息接力（cluster.send_message / 自动回复）允许的最大 relay 深度；
@@ -475,35 +547,36 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
     if rules:
         numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(rules, 1))
         parts.append(f"\n## 规章制度（集群工作流程与规则，必须遵守）\n{numbered}")
-    # 技能 prompt 拼接（如果有）
-    skills = agent.get("skills", [])
-    if skills:
-        from skills import SKILL_REGISTRY
-        skill_prompts = []
+    # 技能 prompt 拼接（渐进式加载）
+    # Level 1（发现）：只把 name + description 放进 system prompt，零 token 成本，让模型知道有哪些技能可用。
+    # Level 2（激活）：SKILL.md 全文**不**自动拼入 system prompt；模型判断相关时必须用 skill.invoke
+    #   显式调用，工具返回完整正文。这样模型无法"未调用就使用技能"，也避免多技能同时常驻上下文。
+    # Level 3（执行）：需要 scripts/ / references/ / assets/ 时再按 skill.invoke 返回的提示去读文件。
+    # 范围：agent 显式配置了 skills 就用配置的子集，否则回退到全部已注册技能
+    # （skill.invoke 是常驻工具，不配置也应能按需调用任意技能）。
+    try:
+        from skills import SKILL_REGISTRY, load_skills
+        load_skills()  # 热重载：用户在对话中新增/修改技能后立即可见
+        wanted = agent.get("skills") or []
+        names = [s for s in wanted if SKILL_REGISTRY.get(s)] if wanted else sorted(SKILL_REGISTRY.keys())
         skill_index = []
-        for s in skills:
+        for s in names:
             meta = SKILL_REGISTRY.get(s)
             if not meta:
                 continue
-            if meta.get("description"):
-                skill_index.append(f"- {meta.get('label') or s}：{meta['description']}")
-            if meta.get("prompt"):
-                body = meta["prompt"]
-                # 能力参数预设：技能的可选参数以文字描述附加进技能提示，仅供模型参考
-                try:
-                    from core.param_presets import get_optional_desc
-                    optional = get_optional_desc("skill", s)
-                    if optional:
-                        extra = ("\n\n【能力参数预设 · 可选参数（仅供模型参考选择）】\n"
-                                 + "\n".join(f"- {k}：{v}" for k, v in optional.items()))
-                        body = body + extra
-                except Exception:
-                    pass
-                skill_prompts.append(f"--- 技能：{meta.get('label') or s} ---\n{body}")
+            label = meta.get("label") or s
+            desc = meta.get("description", "")
+            skill_index.append(f"- {label}（skill_name={s}）：{desc}" if desc else f"- {label}（skill_name={s}）")
         if skill_index:
-            parts.append("\n## 技能索引（任务相关时优先考虑加载/遵循对应技能）\n" + "\n".join(skill_index))
-        if skill_prompts:
-            parts.append("\n## 你加载了以下技能，请结合使用：\n" + "\n\n".join(skill_prompts))
+            parts.append(
+                "\n## 可用技能（索引，不含正文）\n"
+                "下列技能**不会**自动加载到你的上下文。任务与某个技能相关时，"
+                "用 skill.invoke 并传入其 skill_name 获取完整指令，再按指令执行；"
+                "不要凭猜测使用未加载的技能内容。\n"
+                + "\n".join(skill_index)
+            )
+    except Exception as e:
+        print(f"[agent_runtime] WARN 技能索引构建失败：{e}")
     # 工具能力：完整清单 + 主动调用规则（按任务自动选工具，不等用户点名）
     if tools:
         capability = _tool_capability_brief(tools)
@@ -1051,7 +1124,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     if mode == "linked" and canvas:
         cluster_context, speaker_names = _build_cluster_context(canvas, agent)
     _wd_probe = turn.get("_wd_probe") if turn else None
-    messages.append({"role": "system", "content": _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe)})
+    system_prompt_base = _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe)
+    messages.append({"role": "system", "content": system_prompt_base})
     for m in conv.get("messages", []):
         # a2a 信封只用于前端展示，不进 LLM 历史（未知 role 会被接口拒绝）
         if m.get("role") == "a2a":
@@ -1060,8 +1134,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         _m_role = m.get("role")
         if not _m_role or _m_role not in ("system", "user", "assistant", "tool"):
             continue
-        # tool role / tool_calls 历史也要带上
-        content = _truncate_history_content(m.get("content", ""))
+        # tool role / tool_calls 历史也要带上（上下文中的 <continue> 标记一律剥离）
+        content = strip_continue(_truncate_history_content(m.get("content", "")))
         if mode == "linked" and _m_role == "assistant" and m.get("agent_id") and content:
             # 给历史消息标注发言者，让智能体分得清谁说了什么
             name = speaker_names.get(m["agent_id"])
@@ -1072,6 +1146,9 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         if m.get("tool_call_id"): entry["tool_call_id"] = m["tool_call_id"]
         messages.append(entry)
     messages.append({"role": "user", "content": user_input})
+    # 本轮用户消息的引用：快通道在其末尾动态附加 <continue> 续跑提示（仅本次请求的
+    # 内存 messages，不写入 conv）；进入慢通道时用它把提示动态剔除。
+    user_msg_ref = messages[-1]
 
     # 保存用户消息（接力段的 user 输入是 A2A 信封渲染文本，前端聊天区过滤）
     user_entry = {"role": "user", "content": user_input, "ts": datetime.utcnow().isoformat()}
@@ -1105,20 +1182,20 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     assistant_reasoning = ""  # 让循环外可访问
     _last_assistant_text = ""  # 让循环外可访问
 
-    # ===== 分层自适应路由：先判断快/慢通道 =====
-    # linked 集群模式默认走复杂通道（可能需要 A2A 消息），跳过分类节省 token
-    intent_route = "complex"
-    intent_method = "default"
-    if mode != "linked":
-        try:
-            intent = await classify_intent(interface, model, user_input, tools, cluster_mode=False)
-            intent_route = intent["route"]
-            intent_method = intent.get("method", "llm")
-        except Exception:
-            intent_route = "complex"
+    # ===== 分层自适应路由：默认快通道 =====
+    # 非 linked 模式一律从快通道开始（把 <continue> 续跑提示动态附加到当前用户消息）；
+    # 输出检测到 <continue>、意外触发工具调用或上游错误时自动降级/切换慢通道。
+    # linked 集群模式涉及 A2A 接力/移交，保持直接走慢通道。
+    intent_route = "complex" if mode == "linked" else "simple"
 
     # —— 快通道：简单问答，单次推理直接返回 ——
     if intent_route == "simple":
+        # 快通道：续跑提示动态附加到本轮用户消息末尾（不放进 system prompt；
+        # 落库的 user_entry 保持原始输入，历史里永远看不到这段提示）
+        user_msg_ref["content"] = user_input + _CONTINUE_HINT
+        # 确认日志：在 backend.log 可直接核实提示已动态注入（慢通道/linked 模式无此行）
+        print(f"[runtime] 快通道注入续跑标记到用户消息: user_len={len(user_input)}, "
+              f"hint_attached={user_msg_ref['content'].endswith(_CONTINUE_HINT)}")
         # 快通道可以选择不注入 tools（模型就不会输出 tool_calls）
         fast_tools = None if FAST_PATH_NO_TOOLS else (tools or None)
         fast_tool_choice = "none" if FAST_PATH_NO_TOOLS else "auto"
@@ -1127,16 +1204,22 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         fast_reasoning_parts = []
         fast_tool_calls = []
         _fast_upstream_error = False
+        fast_text_scan = _ContinueScanner()
+        fast_reason_scan = _ContinueScanner()
 
         try:
             async for kind, payload in chat(interface, model, messages, stream=True,
                                              tools=fast_tools, tool_choice=fast_tool_choice):
                 if kind == "text":
-                    fast_content_parts.append(payload)
-                    yield f"T:{_esc(payload)}\n"
+                    _delta = fast_text_scan.feed(payload)
+                    if _delta:
+                        fast_content_parts.append(_delta)
+                        yield f"T:{_esc(_delta)}\n"
                 elif kind == "reasoning":
-                    fast_reasoning_parts.append(payload)
-                    yield f"RN:{_esc(payload)}\n"
+                    _delta = fast_reason_scan.feed(payload)
+                    if _delta:
+                        fast_reasoning_parts.append(_delta)
+                        yield f"RN:{_esc(_delta)}\n"
                 elif kind == "tool_call_start":
                     # 名称已确定，参数仍在流式 → 前端立刻显示"正在调用: xxx"
                     yield f"TS:{payload.get('name') or ''}\n"
@@ -1164,8 +1247,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             yield "DONE\n"
             return
 
-        fast_text = "".join(fast_content_parts)
-        assistant_reasoning = "".join(fast_reasoning_parts).strip()
+        fast_content_parts.append(fast_text_scan.close())
+        fast_reasoning_parts.append(fast_reason_scan.close())
+        fast_text = strip_continue("".join(fast_content_parts))
+        assistant_reasoning = strip_continue("".join(fast_reasoning_parts).strip())
 
         if fast_tool_calls:
             # 降级：把刚收到的 tool_call 当作慢通道第一轮的开始，执行后继续循环
@@ -1203,6 +1288,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 # 快通道上游 400 → 直接降级到慢通道循环（不存空 assistant 消息）
                 # 慢通道会重新调用 LLM，且带上 tools —— payload 不同，有可能成功
                 yield "RN:（快通道上游错误，降级到慢通道重试）\n"
+            elif fast_text_scan.found or fast_reason_scan.found:
+                # 模型输出了 <continue> → 任务未结束：清掉前端已流出的快通道内容，
+                # 不入库、不 return，直接落入下方慢通道循环继续处理
+                yield "RESET\n"
+                yield "RN:（检测到任务未完成标记，自动切换到慢通道继续处理）\n"
             else:
                 # 快通道正常结束
                 final_text_parts.append(fast_text)
@@ -1221,6 +1311,9 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 return
 
     # —— 慢通道：多轮 Tool Call Loop + 独立验证器 ——
+    # 慢通道不携带续跑提示：把快通道附加到用户消息上的提示动态剔除
+    # （linked 直连慢通道时 content 本就等于 user_input，剔除是幂等的）
+    user_msg_ref["content"] = user_input
     verify_retry_count = 0  # 验证器未通过时的修正轮数
 
     for round_idx in range(max_tool_rounds):
@@ -1233,6 +1326,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         assistant_content_parts = []
         assistant_reasoning_parts_round = []
         assistant_tool_calls = []
+        round_text_scan = _ContinueScanner()
+        round_reason_scan = _ContinueScanner()
         # 实时检测：本轮中收集到的非法工具调用（用于流式结束后注入纠错反馈）
         _round_invalid_calls: list[dict] = []
         _upstream_error = False  # 上游返回非 200（如 400）时置位，跳过本轮后续处理
@@ -1240,11 +1335,15 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         try:
             async for kind, payload in chat(interface, model, messages, stream=True, tools=tools or None, tool_choice=tool_choice):
                 if kind == "text":
-                    assistant_content_parts.append(payload)
-                    yield f"T:{_esc(payload)}\n"
+                    _delta = round_text_scan.feed(payload)
+                    if _delta:
+                        assistant_content_parts.append(_delta)
+                        yield f"T:{_esc(_delta)}\n"
                 elif kind == "reasoning":
-                    assistant_reasoning_parts_round.append(payload)
-                    yield f"RN:{_esc(payload)}\n"
+                    _delta = round_reason_scan.feed(payload)
+                    if _delta:
+                        assistant_reasoning_parts_round.append(_delta)
+                        yield f"RN:{_esc(_delta)}\n"
                 elif kind == "tool_call_start":
                     # 名称首次确定即广播（参数还在流）→ 画布气泡/聊天区立刻显示"正在调用: xxx"
                     yield f"TS:{payload.get('name') or ''}\n"
@@ -1289,8 +1388,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             yield "DONE\n"
             return
 
-        assistant_text = "".join(assistant_content_parts)
-        assistant_reasoning = "".join(assistant_reasoning_parts_round).strip()
+        assistant_content_parts.append(round_text_scan.close())
+        assistant_reasoning_parts_round.append(round_reason_scan.close())
+        assistant_text = strip_continue("".join(assistant_content_parts))
+        assistant_reasoning = strip_continue("".join(assistant_reasoning_parts_round).strip())
         _last_assistant_text = assistant_text
 
         # 把 assistant 消息入库（仅当有 tool_calls 时 —— 否则统一走循环外的 final 保存）
@@ -1360,6 +1461,12 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 conv["messages"].append(tool_entry)
                 yield f"R:{tc['id']}|{result_str}\n"
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
+
+            # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
+            # 否则模型每轮工具之间"过渡解说文字"都会触发一次验证器（上一条工具常有
+            # 未消化的报错 → deterministic blocked），3 次配额会被无进展地耗光，
+            # 导致"强制采纳"把整个运行提前掐死在任务中途。
+            verify_retry_count = 0
 
             # —— 串行/并行模式：cluster.send_message 后的行为差异 ——
             if mode == "linked" and canvas:
@@ -1467,7 +1574,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         mark_envelope_done(conversation_id, env.get("message_id"))
 
     # 存最终 assistant 文字（如果最后一轮没文字但执行了工具，前端可以不展示）
-    final_text = "".join(final_text_parts)
+    final_text = strip_continue("".join(final_text_parts))
     # 去掉首尾连续空行，保留中间换行
     final_text = final_text.strip("\n")
     final_entry = {

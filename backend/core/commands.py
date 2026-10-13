@@ -18,25 +18,33 @@ from core.a2a import cmd_cluster_handoff, HANDOFF_TOOL, cmd_cluster_send_message
 # ======================================================
 #  后台进程管理（cmd.run 自动识别长运行命令并后台化）
 # ======================================================
-# 长运行命令关键词（小写匹配），命中任一 → 自动后台启动
-_LONG_RUN_KEYWORDS = [
+# 长运行命令关键词 —— 两类匹配策略：
+#   1) _LONG_RUN_EXACT：子串精确匹配（命令里出现这个短语就认为是长运行）
+#      这些词都很独特，几乎不可能在普通代码里误命中
+#   2) _LONG_RUN_CMD_STARTS：仅当命令以该词开头（或前面是 &&/&/|/;）时才匹配
+#      这些词（node、watch、code）太泛，python -c 代码里容易偶然包含
+_LONG_RUN_EXACT = [
     # 静态服务器
     "http.server", "http.serve", "simplehttpserver",
     # Web 框架 dev server
     "uvicorn", "gunicorn", "flask run", "flask --app run", "django-admin runserver",
-    "manage.py runserver", "streamlit run", "gradio",
+    "manage.py runserver", "streamlit run",
     # Node.js
-    "node ", "npm run dev", "npm run start", "npm run serve", "npx", "vite",
+    "npm run dev", "npm run start", "npm run serve", "npx", "vite",
     "webpack-dev-server", "next dev", "next start", "react-scripts start",
     # 文件监听 / 守护进程
-    "watch", "tail -f", "tail -F", "nodemon", "forever", "pm2", "supervisord",
+    "nodemon", "forever", "pm2", "supervisord",
     # 数据库 / 缓存服务
-    "redis-server", "mongod", "mysqld", "postgres", "postgres -", "memcached",
+    "redis-server", "mongod", "mysqld", "postgres -", "memcached",
     "elasticsearch", "kibana", "logstash",
     # 消息队列 / 代理
-    "rabbitmq", "kafka", "zookeeper", "nginx", "apache2", "httpd",
-    # 其他常驻服务
-    "daemon", "serve -l", "serve -p",
+    "rabbitmq", "zookeeper",
+]
+_LONG_RUN_CMD_STARTS = [
+    # 这些词太泛，仅在命令开头（或 shell 分隔符之后）作为第一个词时才匹配
+    "node", "npm", "python -m http.server", "python -m simplehttpserver",
+    "watch", "gradio", "postgres", "kafka", "nginx", "apache2", "httpd", "daemon",
+    "serve -l", "serve -p", "tail -f", "tail -F",
 ]
 
 # 正在运行的后台进程表：pid → {"proc": Popen, "command": str, "cwd": str, "started_at": float, "log_path": str}
@@ -45,11 +53,37 @@ _BG_LOCK = threading.Lock()
 
 
 def _is_long_running(command: str) -> bool:
-    """判断一条命令是否看起来是长运行（后台）进程。"""
+    """判断一条命令是否看起来是长运行（后台）进程。
+
+    使用两层匹配避免误伤：
+    - 精确短语匹配（独特词，不太可能误命中）
+    - 命令开头匹配（泛词只在作为命令入口时才算）
+    """
     if not command:
         return False
     lower = command.lower()
-    return any(kw in lower for kw in _LONG_RUN_KEYWORDS)
+    # 第一层：精确短语匹配
+    if any(kw in lower for kw in _LONG_RUN_EXACT):
+        return True
+    # 第二层：命令开头/分隔符后的起始词匹配
+    # 把 &&、||、&、| 当作 shell 命令分隔符（注意不含 ; —— 它在 python -c 里是语句分隔符）
+    segments = re.split(r'\s*(?:&&|\|\||[&|])\s*', lower)
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        # 取命令段第一个"词"（到第一个空格为止），或检查段本身是否以某个精确短语开头
+        first_word = seg.split()[0] if seg.split() else ""
+        for kw in _LONG_RUN_CMD_STARTS:
+            if " " in kw:
+                # 含空格的短语（如 "python -m http.server"）：检查段是否以它开头
+                if seg.startswith(kw):
+                    return True
+            else:
+                # 单词：检查段的第一个词是否等于它（避免子串匹配）
+                if first_word == kw:
+                    return True
+    return False
 
 
 def _extract_port(command: str) -> int | None:
@@ -97,8 +131,61 @@ def _cleanup_dead_bg() -> None:
                     pass
 
 
+def _is_gui_launch(command: str) -> bool:
+    """判断命令是否是 Windows GUI 启动命令（start / 浏览器 / 常见应用）。
+    这类命令的 shell 包装进程（cmd.exe / powershell）会立即退出，
+    真正的 GUI 子进程脱离出来运行——Popen 本身不应被当作"秒挂"。
+
+    使用两层精确匹配避免误伤普通 python -c 代码：
+      - _GUI_EXACT：独特短语，命令里出现即匹配
+      - _GUI_CMD_STARTS：泛词（如 code/explorer）只作为命令入口时才匹配
+    """
+    if not command:
+        return False
+    lower = command.lower()
+
+    # 精确短语：不太可能误命中
+    _GUI_EXACT = [
+        "--remote-debugging-port",
+    ]
+    for kw in _GUI_EXACT:
+        if kw in lower:
+            return True
+
+    # 命令开头/分隔符后的起始词匹配（泛词）
+    _GUI_CMD_STARTS = [
+        "start",         # cmd.exe 的 start 命令（注意：会命中所有 cmd.exe 命令...
+                         # 但实际上带 start 的命令几乎都是 GUI/后台启动，保留）
+        "explorer.exe", "explorer",
+        "msedge", "chrome.exe", "chrome", "firefox.exe", "brave.exe",
+        "code.exe", "calc.exe",
+        "notepad.exe", "notepad",
+    ]
+    # 不含 ; —— 它在 python -c 里是 Python 语句分隔符，不是 shell 命令分隔符
+    segments = re.split(r'\s*(?:&&|\|\||[&|])\s*', lower)
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        first_word = seg.split()[0] if seg.split() else ""
+        if first_word in _GUI_CMD_STARTS:
+            return True
+        # 对 start 特殊处理：start 可以不带扩展名
+        if first_word == "start":
+            return True
+
+    return False
+
+
 def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
-    """在后台启动一条长运行命令，立即返回状态。"""
+    """在后台启动一条长运行 / GUI 命令，立即返回状态。
+
+    两类场景都走这里：
+      (a) 常驻服务（uvicorn/node/redis...）→ Popen 进程自身就是服务进程，会一直活着
+      (b) GUI 启动（start / 浏览器...）→ Popen 只是 shell 包装（cmd.exe），
+          它会很快退出；真正的 GUI 子进程脱离出来独立运行。
+          这种情况下 Popen 的退出是正常的，不算"秒挂"。
+    """
     import tempfile
     _cleanup_dead_bg()
 
@@ -132,14 +219,18 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
         return {"error": f"后台启动失败: {e}", "command": command}
 
     pid = proc.pid
-    with _BG_LOCK:
-        _BG_PROCESSES[pid] = {
-            "proc": proc,
-            "command": command,
-            "cwd": cwd,
-            "started_at": time.time(),
-            "log_path": log_path,
-        }
+    # GUI 启动命令不把 shell wrapper 的 pid 记入后台表（它会秒退），
+    # 直接跳过，让后续逻辑按"已启动"处理
+    gui_cmd = _is_gui_launch(command)
+    if not gui_cmd:
+        with _BG_LOCK:
+            _BG_PROCESSES[pid] = {
+                "proc": proc,
+                "command": command,
+                "cwd": cwd,
+                "started_at": time.time(),
+                "log_path": log_path,
+            }
 
     # 快速探活：等一小会儿看端口
     port = _extract_port(command)
@@ -155,35 +246,76 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
         # 没识别到端口，等 0.3s 看进程是不是已经挂了
         time.sleep(0.3)
 
-    proc_info = _BG_PROCESSES.get(pid, {})
     still_alive = proc.poll() is None
-    if not still_alive:
-        # 启动秒挂
-        with _BG_LOCK:
-            _BG_PROCESSES.pop(pid, None)
-        # 读一下日志
-        tail = ""
-        if os.path.isfile(log_path):
-            try:
-                with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
-                    tail = lf.read()[-2000:]
-            except Exception:
-                pass
-        return {
-            "error": f"进程启动后立即退出（exit_code={proc.returncode}）",
-            "stdout_tail": tail,
-            "log_path": log_path,
-            "command": command,
-        }
+    # —— 判定启动成功与否 ——
+    # GUI 启动：Popen 进程（shell wrapper）秒退是正常的；
+    #           只要端口探活成功 / 或命令本身就是 GUI 启动，就认为成功
+    # 常驻服务：Popen 进程必须活着，且端口（如果有）要探活成功
+    launch_ok = False
+    if gui_cmd:
+        # GUI 启动：即使 Popen 退出也没关系
+        if probe and probe["ok"]:
+            launch_ok = True    # 端口已就绪（浏览器 CDP 等）
+        elif still_alive:
+            launch_ok = True    # shell wrapper 还活着（有些 GUI 程序会等一会儿）
+        else:
+            # Popen 已退、端口也没探活到 —— 做最后一次尝试
+            # 可能 Edge 启动慢，再等 1s 看看
+            if port:
+                time.sleep(1.0)
+                probe2 = _probe_port(port)
+                if probe2["ok"]:
+                    probe = probe2
+                    launch_ok = True
+                else:
+                    # 端口还是没起来，但 start 命令本身已经退出了（说明它成功地
+                    # 把任务交给了 GUI 子进程），也当作成功，只是 note 里提示
+                    launch_ok = True
+            else:
+                # 无端口 + GUI 命令 + shell 已退 → 大概率成功
+                # （start/notepad/explorer 这类，shell 退了就是启动完了）
+                launch_ok = True
+    else:
+        # 常驻服务：Popen 进程必须还活着
+        if not still_alive:
+            # 秒挂 → 记录日志，返回 error
+            with _BG_LOCK:
+                _BG_PROCESSES.pop(pid, None)
+            tail = ""
+            if os.path.isfile(log_path):
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
+                        tail = lf.read()[-2000:]
+                except Exception:
+                    pass
+            return {
+                "error": f"进程启动后立即退出（exit_code={proc.returncode}）",
+                "stdout_tail": tail,
+                "log_path": log_path,
+                "command": command,
+            }
+        launch_ok = True
+
+    # 构建成功返回
+    note = ""
+    if gui_cmd:
+        if probe and probe["ok"]:
+            note = "GUI 程序已启动（端口探活就绪），不阻塞智能体"
+        elif port:
+            note = "GUI 程序已启动（端口尚未就绪，可能需要再等一会儿）"
+        else:
+            note = "GUI 程序已启动，不阻塞智能体"
+    else:
+        note = "已后台启动（长运行命令自动后台化，不阻塞智能体）"
 
     result = {
         "ok": True,
-        "pid": pid,
+        "pid": pid if still_alive else None,
         "command": command,
         "cwd": cwd,
-        "running": True,
+        "running": still_alive if not gui_cmd else True,
         "background": True,
-        "note": "已后台启动（长运行命令自动后台化，不阻塞智能体）",
+        "note": note,
         "log_path": log_path,
     }
     if port:
@@ -274,6 +406,11 @@ def _effective_workdir() -> str | None:
     """返回当前生效的工作区绝对路径（没有则返回 None）。"""
     # 1) 画布模式注入的 workdir
     wd = WORKDIR_CTX.get()
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "wd_debug.log"), "a", encoding="utf-8") as _f:
+            _f.write(f"{time.time():.3f} _effective_workdir ctx={wd!r} isdir={os.path.isdir(wd) if wd else None} cwd={os.getcwd()}\n")
+    except Exception:
+        pass
     if wd and os.path.isdir(wd):
         return wd
     # 2) 兜底：settings 里的 default_workdir（独立对话模式）
@@ -465,33 +602,265 @@ def cmd_file_structure(root: str = ".", depth: int = 3, max_items: int = 200) ->
         return {"error": str(e)}
 
 
-# 新增文件内容搜索命令
+# —— 搜索辅助：二进制文件探测 ——
+def _is_binary_file(path: Path, max_check: int = 8192) -> bool:
+    """快速判断文件是否为二进制：前 max_check 字节含 NUL 即视为二进制。"""
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(max_check)
+        return b"\x00" in chunk
+    except Exception:
+        return True  # 读不出来的当二进制跳过
+
+
+# 新增文件内容搜索命令（对齐 Trae Work 搜索工具：行号 / 上下文 / 封顶 / 跳过二进制与大文件）
 def cmd_file_search(pattern: str,
                     path: str = ".",
                     glob: str = "**/*",
                     i: bool = False,
-                    abs: bool = False) -> dict:
-    """在给定路径(默认工作目录)内搜索匹配 pattern 的文件内容。
-    返回匹配文件列表及对应匹配行。"""
+                    abs: bool = False,
+                    context: int = 0,
+                    max_matches: int = 50,
+                    max_files: int = 20,
+                    whole_word: bool = False,
+                    max_file_size: int = 1048576) -> dict:
+    """在指定目录递归搜索文件内容（正则/关键字），返回命中文件路径 + 行号 + 命中行文本。
+
+    改进点（对齐 Trae Work 搜索工具）：
+      - 预编译正则一次，不再每个文件重复编译；
+      - 自动跳过二进制文件与大于 max_file_size 的文件；
+      - 每个命中带行号；可选 context 行上下文（前后各 context 行）；
+      - max_matches / max_files 双重封顶，避免结果撑爆 LLM 上下文；
+      - whole_word 模式按词边界 (\\b...\\b) 匹配。
+
+    返回 {matches: [{path, hits:[{line, text, (context?)}]}], count,
+          files_searched, files_skipped, truncated}
+    """
     try:
-        from pathlib import Path
         root = _resolve(path)
-        matches = []
+        pat = rf"\b{pattern}\b" if whole_word else pattern
+        try:
+            comp = re.compile(pat, re.MULTILINE | (re.IGNORECASE if i else 0))
+        except re.error as e:
+            return {"error": f"正则表达式非法: {e}"}
+
+        matches: list[dict] = []
+        total_hits = 0
+        files_searched = 0
+        files_skipped = 0
+        truncated = False
+        ctx = max(0, int(context))
+
         for p in root.rglob(glob):
-            if p.is_file():
-                try:
-                    txt = p.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
+            if not p.is_file():
+                continue
+            try:
+                if p.stat().st_size > max_file_size:
+                    files_skipped += 1
                     continue
-                import re
-                flags = re.MULTILINE | (re.IGNORECASE if i else 0)
-                comp = re.compile(pattern, flags)
-                lines = [ln for ln in txt.splitlines() if comp.search(ln)]
-                if lines:
-                    matches.append({"path": str(p if abs else p.relative_to(root)), "lines": lines})
-        return {"matches": matches, "count": len(matches)}
+            except Exception:
+                files_skipped += 1
+                continue
+            if _is_binary_file(p):
+                files_skipped += 1
+                continue
+            files_searched += 1
+            try:
+                lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            hits: list[dict] = []
+            for idx, ln in enumerate(lines):
+                if comp.search(ln):
+                    hit = {"line": idx + 1, "text": ln[:500]}
+                    if ctx > 0:
+                        start = max(0, idx - ctx)
+                        end = min(len(lines), idx + ctx + 1)
+                        snippet = []
+                        for j in range(start, end):
+                            marker = ">>" if j == idx else "  "
+                            snippet.append(f"{marker}{j + 1:>5}: {lines[j][:300]}")
+                        hit["context"] = "\n".join(snippet)
+                    hits.append(hit)
+                    total_hits += 1
+                    if total_hits >= max_matches:
+                        truncated = True
+                        break
+            if hits:
+                matches.append({
+                    "path": str(p if abs else p.relative_to(root)),
+                    "hits": hits,
+                })
+                if len(matches) >= max_files:
+                    truncated = True
+            if truncated:
+                break
+        return {
+            "matches": matches,
+            "count": total_hits,
+            "files_searched": files_searched,
+            "files_skipped": files_skipped,
+            "truncated": truncated,
+        }
     except Exception as e:
         return {"error": str(e)}
+
+
+def cmd_file_find(pattern: str,
+                  path: str = ".",
+                  type: str = "any",
+                  max_results: int = 100,
+                  i: bool = True) -> dict:
+    """按文件/目录名查找路径（对齐 Trae Work 的 #File / #Folder）。
+
+    pattern 支持 glob 通配符（如 *.py）或纯子串（如 main → 自动包成 *main*）；
+    type = file | dir | any；返回相对 root 的匹配路径列表，最多 max_results 条。
+    适合按文件名定位（而非内容），先 find 拿路径再 read / search。
+    """
+    try:
+        import fnmatch
+        root = _resolve(path)
+        glob_pat = pattern if any(ch in pattern for ch in "*?[") else f"*{pattern}*"
+        results: list[str] = []
+        for p in root.rglob("*"):
+            if p == root:
+                continue
+            name = p.name
+            ok = fnmatch.fnmatch(name.lower(), glob_pat.lower()) if i else fnmatch.fnmatch(name, glob_pat)
+            if not ok:
+                continue
+            if type == "file" and not p.is_file():
+                continue
+            if type == "dir" and not p.is_dir():
+                continue
+            results.append(str(p.relative_to(root)))
+            if len(results) >= max_results:
+                break
+        return {
+            "matches": results,
+            "count": len(results),
+            "truncated": len(results) >= max_results,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _tokenize_query(query: str) -> list[str]:
+    """简单分词：按非字母数字下划线汉字以外字符切分，转小写，过滤长度<2 的噪声 token。"""
+    raw = re.split(r"[^\w\u4e00-\u9fff]+", (query or "").lower())
+    return [t for t in raw if len(t) >= 2]
+
+
+def cmd_workspace_search(query: str,
+                         path: str = ".",
+                         glob: str = "**/*",
+                         max_files: int = 10,
+                         max_matches_per_file: int = 3,
+                         max_file_size: int = 1048576,
+                         i: bool = True) -> dict:
+    """工作区关键词检索（对齐 Trae Work 的 #Workspace）。
+
+    无向量索引时使用轻量词频(TF)打分：把 query 分词，对每个文件统计关键词命中数，
+    按得分降序返回 top-N 文件及其最佳匹配行（带行号），让智能体在工作区里
+    "按语义关键词定位最相关的几处代码/文档"。
+
+    适用：不确定具体文件、需要在多文件间定位与 query 最相关的位置时。
+    """
+    try:
+        root = _resolve(path)
+        tokens = _tokenize_query(query)
+        if not tokens:
+            return {"error": "query 至少需要包含一个长度≥2 的关键词"}
+        line_re = re.compile("|".join(re.escape(t) for t in tokens),
+                             re.IGNORECASE if i else 0)
+
+        scored: list[tuple[int, str, list[dict]]] = []
+        files_searched = 0
+        files_skipped = 0
+        for p in root.rglob(glob):
+            if not p.is_file():
+                continue
+            try:
+                if p.stat().st_size > max_file_size:
+                    files_skipped += 1
+                    continue
+            except Exception:
+                files_skipped += 1
+                continue
+            if _is_binary_file(p):
+                files_skipped += 1
+                continue
+            files_searched += 1
+            try:
+                lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            score = 0
+            snippets: list[dict] = []
+            for idx, ln in enumerate(lines):
+                found = line_re.findall(ln)
+                if found:
+                    # 行内命中关键词按 token 去重计数一次（防同一词反复刷分）
+                    score += len(set(t.lower() for t in found))
+                    if len(snippets) < max_matches_per_file:
+                        snippets.append({"line": idx + 1, "text": ln[:300]})
+            if score > 0:
+                scored.append((score, str(p.relative_to(root)), snippets))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        truncated = len(scored) > max_files
+        top = scored[:max_files]
+        results = [{"path": p, "score": s, "snippets": snip} for s, p, snip in top]
+        return {
+            "query": query,
+            "results": results,
+            "count": len(results),
+            "files_searched": files_searched,
+            "files_skipped": files_skipped,
+            "truncated": truncated,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def cmd_skill_invoke(skill_name: str) -> dict:
+    """显式调用指定的技能。返回技能内容供LLM参考使用。
+    
+    技能内容将不会自动添加到系统提示词中，仅在通过此命令显式调用时使用。
+    """
+    try:
+        # 确保技能注册表是最新的
+        from skills import SKILL_REGISTRY, load_skills
+        load_skills()  # 热重载技能
+        
+        # 查找技能
+        if skill_name not in SKILL_REGISTRY:
+            # 尝试不同的命名格式
+            alt_name = skill_name.replace("_", "-") if "_" in skill_name else skill_name.replace("-", "_")
+            if alt_name in SKILL_REGISTRY:
+                skill_name = alt_name
+            else:
+                return {"error": f"未找到技能: {skill_name}"}
+        
+        skill_data = SKILL_REGISTRY[skill_name]
+        
+        # 构建返回结果
+        result = {
+            "skill_name": skill_name,
+            "skill_label": skill_data.get("label", skill_name),
+            "description": skill_data.get("description", ""),
+            "prompt": skill_data.get("prompt", ""),
+        }
+        
+        # 如果技能有scripts目录，也可以提供执行入口信息
+        if skill_data.get("_subdirs", {}).get("scripts"):
+            result["has_scripts"] = True
+            result["script_note"] = "此技能包含可执行脚本，如需执行请参考技能文档"
+        
+        return result
+        
+    except Exception as e:
+        return {"error": f"调用技能失败: {str(e)}"}
 
 
 def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = True,
@@ -513,9 +882,13 @@ def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = T
             cwd_eff = str(_resolve(cwd))
 
         # —— 判断是否需要后台启动 ——
+        # 两类情况都要后台/立即返回：
+        #   (a) 常驻服务（uvicorn/node/redis...）—— 会一直运行不退出
+        #   (b) GUI 启动（start/浏览器/explorer...）—— 若走 subprocess.run + capture_output，
+        #       GUI 子进程会继承 pipe 句柄，Python 永远等不到输出关闭 → 卡住
         should_bg = background
         if should_bg is None:
-            should_bg = _is_long_running(command)
+            should_bg = _is_long_running(command) or _is_gui_launch(command)
 
         if should_bg:
             return _start_bg_process(command, cwd_eff, shell=shell)
@@ -553,6 +926,24 @@ COMMAND_TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill.invoke",
+            "description": "显式调用指定的技能。技能内容将不会自动添加到系统提示词中，仅在通过此命令显式调用时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "要调用的技能名称（对应AppData/skills中的文件夹名）"}
+                },
+                "required": ["skill_name"]
+            }
+        }
+    },
+
+
+
+
     {
         "type": "function",
         "function": {
@@ -639,7 +1030,7 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "file.search",
-            "description": "在文件系统中搜索文件内容：按正则或关键字在指定目录（默认工作目录）递归查找，返回命中的文件路径与匹配行。适合先搜索定位再 file.read / file.patch。",
+            "description": "按正则/关键字递归搜索文件内容（对齐 Trae Work 搜索工具）。返回命中文件路径 + 行号 + 命中行文本，可选上下文行。自动跳过二进制与大文件，结果按 max_matches / max_files 双重封顶，不会撑爆上下文。适合先定位再 file.read / file.patch。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -647,9 +1038,52 @@ COMMAND_TOOLS = [
                     "path": {"type": "string", "description": "搜索根目录，默认当前工作目录（相对路径自动解析到工作目录）"},
                     "glob": {"type": "string", "description": "限定搜索的文件 glob 模式，默认 '**/*'；例 '**/*.py' 只搜 Python 文件"},
                     "i": {"type": "boolean", "description": "忽略大小写搜索，默认 false"},
-                    "abs": {"type": "boolean", "description": "返回绝对路径，默认相对搜索根目录"}
+                    "abs": {"type": "boolean", "description": "返回绝对路径，默认相对搜索根目录"},
+                    "context": {"type": "integer", "description": "每个命中行前后显示的上下文行数，默认 0（不显示）"},
+                    "max_matches": {"type": "integer", "description": "最多返回的命中条数（跨文件累计），默认 50"},
+                    "max_files": {"type": "integer", "description": "最多返回的命中文件数，默认 20"},
+                    "whole_word": {"type": "boolean", "description": "按词边界 (\\b...\\b) 匹配，默认 false"},
+                    "max_file_size": {"type": "integer", "description": "跳过大于该字节数的文件，默认 1048576（1MB）"}
                 },
                 "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file.find",
+            "description": "按文件/目录名查找路径（对齐 Trae Work 的 #File / #Folder）。pattern 支持 glob 通配符（如 '*.py'）或纯子串（如 'main' 自动包成 *main*）。返回相对根目录的匹配路径列表，适合按文件名定位而非内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "文件名 glob 或子串，如 '*.py' 或 'main'"},
+                    "path": {"type": "string", "description": "搜索根目录，默认当前工作目录"},
+                    "type": {"type": "string", "enum": ["file", "dir", "any"], "description": "只查文件/目录/全部，默认 any"},
+                    "max_results": {"type": "integer", "description": "最多返回条数，默认 100"},
+                    "i": {"type": "boolean", "description": "忽略大小写，默认 true"}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace.search",
+            "description": "工作区关键词检索（对齐 Trae Work 的 #Workspace）。用自然语言关键词在工作区定位最相关的代码/文档位置，基于轻量词频打分返回 top-N 文件及其最佳匹配行（带行号）。不确定具体文件、需要全局定位时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "自然语言关键词或描述，如 '用户登录鉴权' 或 'cache invalidation'"},
+                    "path": {"type": "string", "description": "搜索根目录，默认当前工作目录"},
+                    "glob": {"type": "string", "description": "限定搜索的文件 glob 模式，默认 '**/*'"},
+                    "max_files": {"type": "integer", "description": "最多返回的文件数，默认 10"},
+                    "max_matches_per_file": {"type": "integer", "description": "每个文件最多展示的命中行数，默认 3"},
+                    "max_file_size": {"type": "integer", "description": "跳过大于该字节数的文件，默认 1048576（1MB）"},
+                    "i": {"type": "boolean", "description": "忽略大小写，默认 true"}
+                },
+                "required": ["query"]
             }
         }
     },
@@ -682,7 +1116,7 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "cmd.bg_list",
-            "description": "列出当前所有由 cmd.run 后台启动的进程状态（pid、命令、运行时长、日志路径）。",
+            "description": "列出当前所有由 cmd.run 后台启动的进程状态（pid、命令、运行时长、日志路径）。【不需要任何参数，留空即可】",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
@@ -719,36 +1153,45 @@ COMMAND_TOOLS = [
 ]
 
 # 命令中文标签（前端能力标签与对话工具行共用，label 仅用于界面展示，不参与工具调用）
+#  emoji 要贴合动作：读→打开、写→✍️、删→🗑、运行→🚀、创建→🤖/🎨/✨、连接→🔗…
 COMMAND_CN_LABELS = {
-    "file.read": "读文件",
-    "file.write": "写文件",
-    "file.delete": "删文件",
-    "file.replace": "替换文本",
-    "file.patch": "补丁编辑",
-    "file.structure": "文件树",
-    "file.search": "搜索内容",
-    "cmd.run": "运行命令",
-    "cmd.bg_list": "后台进程",
-    "cmd.bg_stop": "停止进程",
-    "cmd.bg_log": "进程日志",
-    "cluster.list_agents": "列出智能体",
-    "cluster.create_agent": "创建智能体",
-    "cluster.update_agent": "更新智能体",
-    "cluster.delete_agent": "删除智能体",
-    "cluster.list_canvases": "列出画布",
-    "cluster.create_canvas": "创建画布",
-    "cluster.delete_canvas": "删除画布",
-    "cluster.get_canvas": "查看画布",
-    "cluster.add_node": "添加节点",
-    "cluster.remove_node": "移除节点",
-    "cluster.connect": "连接节点",
-    "cluster.disconnect": "断开连线",
-    "cluster.list_rules": "列出规章制度",
-    "cluster.create_rule": "新增规章制度",
-    "cluster.update_rule": "修改规章制度",
-    "cluster.delete_rule": "删除规章制度",
-    "cluster.handoff": "A2A 移交",
-    "cluster.send_message": "发送消息",
+    "file.read": "📖 读文件",
+    "file.write": "✍️ 写文件",
+    "file.delete": "🗑 删除文件",
+    "file.replace": "🔄 替换文本",
+    "file.patch": "🩹 补丁编辑",
+    "file.structure": "📁 文件树",
+    "file.search": "🔍 搜索内容",
+    "file.find": "🔎 查找文件",
+    "workspace.search": "🌐 工作区检索",
+    "skill.invoke": "🔧 调用技能",
+    "cmd.run": "🚀 运行命令",
+    "cmd.bg_list": "📋 后台进程",
+    "cmd.bg_stop": "🛑 停止进程",
+    "cmd.bg_log": "📜 进程日志",
+    "cluster.list_agents": "👥 列出智能体",
+    "cluster.create_agent": "🤖 创建智能体",
+    "cluster.update_agent": "✏️ 更新智能体",
+    "cluster.delete_agent": "🗑 删除智能体",
+    "cluster.list_canvases": "🎨 列出画布",
+    "cluster.create_canvas": "🌟 创建画布",
+    "cluster.delete_canvas": "🗑 删除画布",
+    "cluster.get_canvas": "👁 查看画布",
+    "cluster.add_node": "📌 添加节点",
+    "cluster.remove_node": "❌ 移除节点",
+    "cluster.connect": "🔗 连接节点",
+    "cluster.disconnect": "✂️ 断开连线",
+    "cluster.list_rules": "📜 列出规章制度",
+    "cluster.create_rule": "📋 新增规章制度",
+    "cluster.update_rule": "✏️ 修改规章制度",
+    "cluster.delete_rule": "🗑 删除规章制度",
+    "cluster.list_groups": "📁 列出分组",
+    "cluster.create_group": "📂 新建分组",
+    "cluster.update_group": "✏️ 重命名分组",
+    "cluster.delete_group": "🗑 删除分组",
+    "cluster.assign_agent_group": "🏷 归纳分组",
+    "cluster.handoff": "🤝 A2A 移交",
+    "cluster.send_message": "📨 发送消息",
 }
 
 # 保留旧字典格式兼容（label 用中文，未覆盖的仍用原名）
@@ -779,24 +1222,50 @@ def build_plugin_tool(name: str, meta: dict) -> dict:
 
 
 def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict) -> list:
-    """根据 agent 的能力列表，构建要传给 LLM 的 tools"""
+    """根据 agent 的能力列表，构建要传给 LLM 的 tools。
+
+    所有 tool 的 parameters 都强制加 additionalProperties=False，
+    明确禁止 LLM 传 schema 未声明的多余字段（如凭空加 root / 空键等）。
+    """
     result = []
     cmd_names = set(command_names or [])
     for t in COMMAND_TOOLS:
         if t["function"]["name"] in cmd_names:
-            result.append(t)
+            result.append(_seal_schema(t))
+    # 内置常驻工具：无需在智能体配置里勾选，始终可用。
+    # skill.invoke 是技能的渐进式加载入口（技能正文不进 system prompt，按需显式拉取）。
+    if not any(t["function"]["name"] == "skill.invoke" for t in result):
+        for t in COMMAND_TOOLS:
+            if t["function"]["name"] == "skill.invoke":
+                result.append(_seal_schema(t))
+                break
     for pname in (plugin_names or []):
         meta = plugin_registry.get(pname)
         if meta:
             tool = meta.get("function_schema") or build_plugin_tool(pname, meta)
-            result.append(_with_preset(tool, pname))
+            result.append(_seal_schema(_with_preset(tool, pname)))
     return result
+
+
+def _seal_schema(tool: dict) -> dict:
+    """给一个 OpenAI tool schema 的 parameters 加 additionalProperties=False。
+    如果工具带 properties（含空 properties 的零参数工具），统一加。"""
+    fn = tool.get("function") or {}
+    params = fn.get("parameters")
+    if isinstance(params, dict) and params.get("type") == "object":
+        # additionalProperties=False 只在 properties 存在时加（空 properties 也可以加）
+        params = {**params, "additionalProperties": False}
+        tool = {"type": tool.get("type", "function"),
+                "function": {**fn, "parameters": params}}
+    return tool
 
 
 def _with_preset(tool: dict, pname: str) -> dict:
     """能力参数预设整形插件 schema：
     - 固定参数：从 properties/required 中剔除（模型不可见、不可改）；
-    - 可选参数：只把文字描述附加到 tool description（供模型参考选择）。
+    - 可选参数：把文字描述同时注入到**对应参数的 description** 内，并追加到 tool description 末尾。
+      注入到参数自身 description 是关键——模型选择该参数取值时直接看到预设提示，
+      否则提示被埋在很长的 tool description 末尾，容易被忽略（如 browser_control 的 action）。
     预设不存在或出错时原样返回 tool。
     """
     try:
@@ -815,6 +1284,16 @@ def _with_preset(tool: dict, pname: str) -> dict:
                 required.remove(k)
         desc = fn.get("description") or ""
         if optional:
+            # 1) 把每个可选参数提示注入到该参数自己的 description 里
+            new_props: dict = {}
+            for pk, pmeta in props.items():
+                hint = optional.get(pk)
+                if hint and isinstance(pmeta, dict):
+                    base = (pmeta.get("description") or "").rstrip()
+                    pmeta = {**pmeta, "description": base + f"\n【能力参数预设提示】{hint}"}
+                new_props[pk] = pmeta
+            props = new_props
+            # 2) 仍在 tool description 末尾保留汇总（兜底 + 供无对应参数的提示展示）
             desc = (desc.rstrip() + "\n\n【能力参数预设 · 可选参数（仅供模型参考选择，按需填入）】\n"
                     + "\n".join(f"- {k}：{v}" for k, v in optional.items()))
         return {
@@ -905,7 +1384,8 @@ def cmd_cluster_list_agents() -> dict:
 def cmd_cluster_create_agent(name: str, description: str = "", system_prompt: str = "",
                              model: str = "", commands: list | None = None,
                              skills: list | None = None, plugins: list | None = None,
-                             max_tool_rounds: int | None = None) -> dict:
+                             max_tool_rounds: int | None = None,
+                             group_id: int | None = None) -> dict:
     from datetime import datetime
     item = {
         "id": _next_id("agents"),
@@ -915,6 +1395,7 @@ def cmd_cluster_create_agent(name: str, description: str = "", system_prompt: st
         "trigger": {"type": "manual", "cron": "", "message": ""},
         "tags": [], "enabled": True, "created_at": datetime.utcnow().isoformat(),
         "max_tool_rounds": max_tool_rounds,
+        "group_id": group_id,
     }
     _upsert("agents", item)
     return {"ok": True, "agent": item}
@@ -927,7 +1408,8 @@ def cmd_cluster_update_agent(agent_id: int, name: str | None = None,
                              commands: list | None = None,
                              skills: list | None = None,
                              plugins: list | None = None,
-                             max_tool_rounds: int | None = None) -> dict:
+                             max_tool_rounds: int | None = None,
+                             group_id: int | None = None) -> dict:
     cur = _get_by("agents", agent_id)
     if not cur: return {"error": f"agent {agent_id} not found"}
     if name is not None: cur["name"] = name
@@ -938,6 +1420,7 @@ def cmd_cluster_update_agent(agent_id: int, name: str | None = None,
     if skills is not None: cur["skills"] = skills
     if plugins is not None: cur["plugins"] = plugins
     if max_tool_rounds is not None: cur["max_tool_rounds"] = max_tool_rounds
+    if group_id is not None: cur["group_id"] = group_id
     _upsert("agents", cur)
     return {"ok": True, "agent": cur}
 
@@ -1121,13 +1604,85 @@ def cmd_cluster_delete_rule(rule_id: int) -> dict:
     return {"ok": True, "rule_id": rule_id}
 
 
+# ---- 智能体分组（agent_groups）----
+def _group_sort_key(g: dict):
+    so = g.get("sort_order")
+    if so is None:
+        return (1, g.get("id", 0))
+    return (0, so)
+
+
+def cmd_cluster_list_groups() -> dict:
+    items = _load_all("agent_groups")
+    items.sort(key=_group_sort_key)
+    agents = _load_all("agents")
+    out = []
+    for g in items:
+        count = sum(1 for a in agents if a.get("group_id") == g.get("id"))
+        out.append({
+            "id": g.get("id"),
+            "name": g.get("name"),
+            "agents_count": count,
+        })
+    return {"groups": out, "count": len(out)}
+
+
+def cmd_cluster_create_group(name: str) -> dict:
+    from datetime import datetime
+    if not (name or "").strip():
+        return {"error": "name 不能为空"}
+    item = {
+        "id": _next_id("agent_groups"),
+        "name": name.strip(),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    _upsert("agent_groups", item)
+    return {"ok": True, "group": item}
+
+
+def cmd_cluster_update_group(group_id: int, name: str) -> dict:
+    cur = _get_by("agent_groups", group_id)
+    if not cur: return {"error": f"group {group_id} not found"}
+    if not (name or "").strip():
+        return {"error": "name 不能为空"}
+    cur["name"] = name.strip()
+    _upsert("agent_groups", cur)
+    return {"ok": True, "group": cur}
+
+
+def cmd_cluster_delete_group(group_id: int) -> dict:
+    ok = _delete_by("agent_groups", group_id)
+    if not ok: return {"error": f"group {group_id} not found"}
+    # 组内智能体移回"全部"组（group_id 置空）
+    agents = _load_all("agents")
+    ungrouped = 0
+    for a in agents:
+        if a.get("group_id") == group_id:
+            a["group_id"] = None
+            _upsert("agents", a)
+            ungrouped += 1
+    return {"ok": True, "agents_ungrouped": ungrouped}
+
+
+def cmd_cluster_assign_agent_group(agent_id: int | str,
+                                   group_id: int | None = None) -> dict:
+    """把智能体归纳到某个分组；group_id 传 null/省略=移回"全部"组"""
+    a = _find_agent(agent_id)
+    if not a: return {"error": f"agent {agent_id} not found"}
+    if group_id is not None and not _get_by("agent_groups", group_id):
+        return {"error": f"group {group_id} not found"}
+    a["group_id"] = group_id
+    _upsert("agents", a)
+    return {"ok": True, "agent": {"id": a["id"], "name": a["name"], "group_id": group_id}}
+
+
 # ---- cluster.* 的 OpenAI function calling schema ----
 CLUSTER_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "cluster.list_agents",
-            "description": "列出系统中所有已创建的智能体及其简要信息（id、名称、描述、加载的命令/技能/插件）。",
+            "description": "列出系统中所有已创建的智能体及其简要信息。【不需要任何参数，留空即可】",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
@@ -1146,7 +1701,8 @@ CLUSTER_TOOLS = [
                     "commands": {"type": "array", "items": {"type": "string"}, "description": "可选：这个智能体加载的命令工具列表"},
                     "skills": {"type": "array", "items": {"type": "string"}, "description": "可选：加载的技能列表"},
                     "plugins": {"type": "array", "items": {"type": "string"}, "description": "可选：加载的插件列表"},
-                    "max_tool_rounds": {"type": "integer", "description": "可选：单次回复最大工具调用轮数（默认取全局设置 50）"}
+                    "max_tool_rounds": {"type": "integer", "description": "可选：单次回复最大工具调用轮数（默认取全局设置 50）"},
+                    "group_id": {"type": "integer", "description": "可选：智能体所属分组 id（用 cluster.list_groups 查询）；省略=未分组"}
                 },
                 "required": ["name", "system_prompt"]
             }
@@ -1160,7 +1716,7 @@ CLUSTER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "agent_id": {"type": "integer", "description": "要修改的智能体 id"},
+                    "agent_id": {"type": ["integer", "string"], "description": "要修改的智能体 id 或名称"},
                     "name": {"type": "string"},
                     "description": {"type": "string"},
                     "system_prompt": {"type": "string"},
@@ -1168,7 +1724,8 @@ CLUSTER_TOOLS = [
                     "commands": {"type": "array", "items": {"type": "string"}},
                     "skills": {"type": "array", "items": {"type": "string"}},
                     "plugins": {"type": "array", "items": {"type": "string"}},
-                    "max_tool_rounds": {"type": "integer", "description": "单次回复最大工具调用轮数"}
+                    "max_tool_rounds": {"type": "integer", "description": "单次回复最大工具调用轮数"},
+                    "group_id": {"type": "integer", "description": "所属分组 id（用 cluster.list_groups 查询）"}
                 },
                 "required": ["agent_id"]
             }
@@ -1181,7 +1738,7 @@ CLUSTER_TOOLS = [
             "description": "删除一个智能体，并自动从所有画布中清理掉它对应的节点和连线。",
             "parameters": {
                 "type": "object",
-                "properties": {"agent_id": {"type": "integer", "description": "要删除的智能体 id"}},
+                "properties": {"agent_id": {"type": ["integer", "string"], "description": "要删除的智能体 id 或名称"}},
                 "required": ["agent_id"]
             }
         }
@@ -1190,7 +1747,7 @@ CLUSTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "cluster.list_canvases",
-            "description": "列出所有画布（集群编排图），每张画布显示节点/连线数量。",
+            "description": "列出所有画布（集群编排图），每张画布显示节点/连线数量。【不需要任何参数，留空即可】",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
@@ -1216,7 +1773,7 @@ CLUSTER_TOOLS = [
             "description": "删除一张画布及其所有节点和连线。",
             "parameters": {
                 "type": "object",
-                "properties": {"canvas_id": {"type": "integer", "description": "画布 id"}},
+                "properties": {"canvas_id": {"type": ["integer", "string"], "description": "画布 id 或名称"}},
                 "required": ["canvas_id"]
             }
         }
@@ -1362,6 +1919,72 @@ CLUSTER_TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.list_groups",
+            "description": "列出所有智能体分组及其包含的智能体数量。【不需要任何参数，留空即可】",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.create_group",
+            "description": "新建一个智能体分组，用于在智能体列表里收纳归类。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "分组名称，如「内容创作」「工程研发」"}
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.update_group",
+            "description": "重命名一个智能体分组。group_id 用 cluster.list_groups 查询。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "integer", "description": "分组 id"},
+                    "name": {"type": "string", "description": "新的分组名称"}
+                },
+                "required": ["group_id", "name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.delete_group",
+            "description": "删除一个智能体分组；组内的智能体会自动移回「全部」组（不会被删除）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "integer", "description": "要删除的分组 id"}
+                },
+                "required": ["group_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.assign_agent_group",
+            "description": "把某个智能体归纳到指定分组；group_id 传 null 或省略表示移回「全部」组。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": ["integer", "string"], "description": "智能体 id 或名称"},
+                    "group_id": {"type": "integer", "description": "目标分组 id（用 cluster.list_groups 查询）；null/省略=移回「全部」组"}
+                },
+                "required": ["agent_id"]
+            }
+        }
+    },
 ]
 
 # A2A 工具并入 cluster.* 工具表
@@ -1374,8 +1997,44 @@ CLUSTER_TOOLS.append(CALL_TOOL)
 
 # 合并到全局命令表，让 filter_tools 自动生效
 COMMAND_TOOLS.extend(CLUSTER_TOOLS)
-# 更新旧元数据字典
-COMMAND_META = {t["function"]["name"]: {
-    "label": COMMAND_CN_LABELS.get(t["function"]["name"], t["function"]["name"]),
-    "params": list(t["function"]["parameters"]["properties"].keys()),
-} for t in COMMAND_TOOLS}
+
+# ---- 命令分组（前端命令选择器按组展示，可整组勾选或展开后单独勾选）----
+# 顺序即展示顺序；未列入分组的命令归入「其他」。
+COMMAND_GROUPS = [
+    ("文件操作", [
+        "file.read", "file.write", "file.delete", "file.replace",
+        "file.patch", "file.structure", "file.search", "file.find",
+    ]),
+    ("工作区检索", ["workspace.search"]),
+    ("命令运行", ["cmd.run", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
+    ("集群编排", [
+        "cluster.list_agents", "cluster.create_agent", "cluster.update_agent", "cluster.delete_agent",
+        "cluster.list_groups", "cluster.create_group", "cluster.update_group",
+        "cluster.delete_group", "cluster.assign_agent_group",
+        "cluster.list_canvases", "cluster.create_canvas", "cluster.delete_canvas",
+        "cluster.get_canvas", "cluster.add_node", "cluster.remove_node",
+        "cluster.connect", "cluster.disconnect",
+        "cluster.list_rules", "cluster.create_rule", "cluster.update_rule", "cluster.delete_rule",
+    ]),
+]
+
+# 运行时自动注入的常驻工具：不在智能体配置/默认命令选择器里展示（无需也无法手动勾选）。
+RUNTIME_INJECTED_COMMANDS = {"skill.invoke", "cluster.send_message", "cluster.handoff"}
+
+_NAME_TO_GROUP: dict[str, str] = {}
+for _gname, _names in COMMAND_GROUPS:
+    for _n in _names:
+        _NAME_TO_GROUP[_n] = _gname
+
+COMMAND_META = {}
+for t in COMMAND_TOOLS:
+    name = t["function"]["name"]
+    meta = {
+        "label": COMMAND_CN_LABELS.get(name, name),
+        "params": list(t["function"]["parameters"]["properties"].keys()),
+    }
+    if name in _NAME_TO_GROUP:
+        meta["group"] = _NAME_TO_GROUP[name]
+    if name in RUNTIME_INJECTED_COMMANDS:
+        meta["hidden"] = True
+    COMMAND_META[name] = meta

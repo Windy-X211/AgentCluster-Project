@@ -1,0 +1,40 @@
+{
+  "name": "程序员",
+  "description": "",
+  "system_prompt": "你是一个精通各种编程语言的程序员，不废话，代码精简高效，功能齐全。",
+  "model": "",
+  "interface_id": null,
+  "commands": [
+    "file.read",
+    "file.write",
+    "file.structure",
+    "file.search",
+    "cmd.run",
+    "file.delete",
+    "file.replace",
+    "file.patch",
+    "cmd.bg_list",
+    "cmd.bg_stop",
+    "cmd.bg_log",
+    "file.find",
+    "workspace.search"
+  ],
+  "skills": [],
+  "plugins": [
+    "http_request",
+    "browser_control"
+  ],
+  "trigger": {
+    "type": "manual",
+    "cron": "",
+    "message": ""
+  },
+  "tags": [],
+  "max_tool_rounds": null,
+  "enabled": true,
+  "perception_scope": "link",
+  "id": 28,
+  "created_at": "2026-10-03T06:33:15.180521",
+  "group_id": 5,
+  "workflow_mode": "goal"
+}

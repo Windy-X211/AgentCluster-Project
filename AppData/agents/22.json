@@ -26,5 +26,6 @@
   "tools": [
     "browser_control"
   ],
-  "sort_order": 17
+  "sort_order": 17,
+  "group_id": 2
 }

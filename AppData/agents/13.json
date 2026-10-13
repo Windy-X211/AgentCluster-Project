@@ -23,5 +23,7 @@
   "tools": [
     "browser_control"
   ],
-  "sort_order": 8
+  "sort_order": 8,
+  "perception_scope": "link",
+  "group_id": 4
 }

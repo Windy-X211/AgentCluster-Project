@@ -1,10 +1,50 @@
 """统一的 LLM 调用 - 兼容 OpenAI 格式接口 + function calling"""
-import httpx, json, logging
+import asyncio, httpx, json, logging
 from typing import AsyncGenerator
 
 _logger = logging.getLogger("llm")
 
 _OPENAI_ROLES = {"system", "user", "assistant", "tool"}
+
+import re as _re
+
+# —— 清洗阶段用的正则（无论 known_names 是否为空都生效）——
+_PSEUDO_PROTOCOL_TAG_RE = _re.compile(r"<\|[^|]*\|>")           # <|xxx|> 标签
+_COMMENTARY_TAIL_RE = _re.compile(r"commentary\s*:?")          # commentary 带/不带冒号
+_GARBAGE_PREFIX_RE = _re.compile(r"^(functions?)\.", _re.IGNORECASE)  # functions. 前缀（OpenAI 包装格式）
+_TRAILING_JUNK_RE = _re.compile(r"[^a-zA-Z0-9._-]+$")          # 尾部纯标点/中文等非合法字符
+
+def _clean_tool_name(raw: str, known_names: set[str]) -> str:
+    """从模型输出的脏工具名字符串中提取出真正的工具名。
+
+    模型偶发会把 channel 标签、commentary、functions. 前缀、尾部 :: 等内控 token
+    混入 tool name 字段，例如 "file.write<|channel|>"、"file.writecommentary"、
+    "functions.file.write::"、"cluster.send_messagecommentary:foo"。
+
+    清洗分两阶段：
+      阶段 1（始终生效）：正则剥掉已知垃圾模式——不依赖白名单，快通道也有效。
+      阶段 2（有白名单时）：在清洗后的字符串里查 known_names 子串，精确捞回工具名。
+    """
+    if not raw:
+        return raw
+    s = raw
+    s = _PSEUDO_PROTOCOL_TAG_RE.sub("", s)
+    s = _GARBAGE_PREFIX_RE.sub("", s, count=1)
+    s = _COMMENTARY_TAIL_RE.sub("", s)
+    s = _TRAILING_JUNK_RE.sub("", s).strip()
+    s = s.strip(":-_")
+
+    # 阶段 2：有白名单 → 子串匹配兜底（比纯正则更精准，能捞回 commentary:foo 里的 foo 部分）
+    if known_names:
+        if s in known_names:
+            return s
+        # 按长度降序匹配，优先命中最长候选（避免 "file" 抢了 "file.write"）
+        for candidate in sorted(known_names, key=len, reverse=True):
+            if candidate and candidate in s:
+                return candidate
+        # 子串没命中 → 返回阶段 1 的粗洗结果（白名单校验会拦住）
+
+    return s or raw
 
 
 def _diag_payload(payload: dict, model: str) -> str:
@@ -73,6 +113,9 @@ def _sanitize_payload(payload: dict) -> None:
     # 我们统一规范化到 OpenAI 标准四角色（system/user/assistant/tool），所有模型都接受。
     # 旧规范映射：developer → system，function → tool。
     _ROLE_NORMALIZE = {"developer": "system", "function": "tool"}
+    # 上一段 assistant.tool_calls 中保留下来（合法）的 tool_call id 集合，
+    # 用于把「引用了被丢弃 tool_call」的 tool 消息降级为 user，避免悬空引用被网关 400。
+    pending_tool_ids: set[str] = set()
     for idx in range(len(messages)):
         m = messages[idx]
         if not isinstance(m, dict):
@@ -94,11 +137,17 @@ def _sanitize_payload(payload: dict) -> None:
         # assistant.tool_calls 清洗
         if role == "assistant" and isinstance(m.get("tool_calls"), list):
             cleaned = []
-            for tc in m["tool_calls"]:
+            for j, tc in enumerate(m["tool_calls"]):
                 if not isinstance(tc, dict):
                     continue
                 fn = tc.get("function") or {}
                 if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if not name or not str(name).strip():
+                    # 空/缺工具名 → 无效 tool_call：直接丢弃。
+                    # 不能补空串发出去（上游会以 "function/name cannot be empty" 400 拒绝），
+                    # 也不能靠 setdefault 硬撑 —— 该调用本就没有可执行目标。
                     continue
                 args = fn.get("arguments")
                 if not isinstance(args, str):
@@ -107,19 +156,33 @@ def _sanitize_payload(payload: dict) -> None:
                         args = json.dumps(args, ensure_ascii=False) if args else "{}"
                     except Exception:
                         args = "{}"
-                    fn["arguments"] = args
-                fn.setdefault("name", "")
+                fn["name"] = str(name).strip()
+                fn["arguments"] = args
                 tc["function"] = fn
-                tc.setdefault("id", "")
-                tc.setdefault("type", "function")
+                tc["type"] = "function"
+                if not tc.get("id"):
+                    # 缺 id → 合成一个（部分网关要求非空 id；对应的 tool 消息若无匹配 id 会被降级）
+                    tc["id"] = f"call_{idx}_{j}"
                 cleaned.append(tc)
             if cleaned:
                 m["tool_calls"] = cleaned
+                pending_tool_ids = {tc.get("id", "") for tc in cleaned}
             else:
                 m.pop("tool_calls", None)
-        # tool role 消息必须有 tool_call_id
+                pending_tool_ids = set()
+            continue
+        # tool role 消息：必须匹配到上一条 assistant 的合法 tool_call 才能保留；
+        # 否则（引用了被丢弃的空名调用 / 无主消息）降级为 user，避免网关拒绝。
         if role == "tool":
-            m.setdefault("tool_call_id", "")
+            tc_id = m.get("tool_call_id") or ""
+            if tc_id in pending_tool_ids:
+                # 正常匹配。tool_call_id 已由 runtime 在落库时填充，这里留空串或原值均可。
+                continue
+            content = m.get("content")
+            m.clear()
+            m["role"] = "user"
+            m["content"] = content if content is not None else ""
+            continue
 
 
 async def chat(interface: dict, model: str, messages: list, stream: bool = False, tools: list | None = None,
@@ -222,7 +285,10 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
 
                         # —— 名称首次确定 ——
                         if fn.get("name"):
-                            entry["name"] = fn["name"]
+                            raw_name = fn["name"]
+                            # 清洗伪协议片段（<|channel|>commentary: 等）
+                            cleaned = _clean_tool_name(raw_name, known_tool_names)
+                            entry["name"] = cleaned
                             # 名称首次确定 → 立即发出 tool_call_start，让前端流式显示"正在调用: xxx"
                             if idx not in tc_announced:
                                 tc_announced.add(idx)
@@ -293,6 +359,8 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                                 tc_warnings.setdefault(idx, []).append(res.reason)
 
                             entry["args"] += arg_chunk
+                            # 参数增量实时广播 → 前端可流式显示正在接收的参数内容
+                            yield ("tool_args_delta", {"id": entry["id"], "name": entry.get("name") or "", "delta": arg_chunk, "accumulated": entry["args"]})
 
                     # finish_reason = tool_calls 时，把完整 tool_calls 吐出去
                     finish = chunk["choices"][0].get("finish_reason")
@@ -302,6 +370,17 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                             entry = tc_buf[idx]
                             # 致命错误已经广播过 → 不再 emit tool_call，跳过
                             if idx in tc_invalid:
+                                continue
+                            # 流式结束仍未确定工具名 → 视为非法调用（避免把空名 tool_call 入库，
+                            # 否则下一轮请求会被上游以 "function/name cannot be empty" 拒绝）
+                            if not entry.get("name"):
+                                tc_invalid[idx] = {
+                                    "id": entry["id"], "name": "",
+                                    "raw_args": entry.get("args") or "",
+                                    "reason": "工具调用缺少函数名（function.name 为空），已拦截并跳过执行",
+                                    "pattern_hit": "empty_tool_name",
+                                }
+                                yield ("tool_call_invalid", tc_invalid[idx])
                                 continue
                             args_str = entry.get("args") or "{}"
                             validator = tc_validators.get(idx)
@@ -348,6 +427,9 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
 # —— 自动故障转移：连接断开时切换到下一个模型 ——
 # 可触发切换的 HTTP 状态码（0 = 由网络异常推导，非真实 HTTP 状态）
 _RETRIABLE_STATUS = {0, 408, 409, 429, 500, 502, 503, 504}
+# 429 RPM 限流退避秒数：RPM 按分钟窗口计，立即重试必然再 429，
+# 需要等待跨越至少一个完整窗口（10+20+40=70s），耗尽后仍未恢复才切换候选或透传错误
+_429_BACKOFFS = [10, 20, 40]
 # 可触发切换的网络/传输层异常（httpx.TransportError 覆盖 connect/read/write/timeout/protocol 等）
 
 
@@ -358,7 +440,9 @@ async def chat_with_failover(interface: dict, model: str, messages: list, stream
     机制：
       - 候选模型 = [当前模型] + [interface.models[] 中其余模型]（去重、保持原始顺序）
       - 只有 1 个候选模型 → 同一模型重试 1 次（共 2 次尝试）
-      - 有多个候选模型 → 依次尝试；连接断开 / 超时 / 5xx / 429 时切换到下一个
+      - 有多个候选模型 → 依次尝试；连接断开 / 超时 / 5xx 时切换到下一个
+      - 429（RPM 限流）特殊处理：先退避等待（10s/20s/40s）再重试同一模型，
+        退避耗尽仍未恢复才切换到下一候选；RPM 是按分钟窗口计的，立即重试必然再 429
       - 流式安全：一旦已向调用方 yield 过内容，则锁定该模型不再中途切换
         （中途切换会导致前端收到重复/交错内容），此时直接透传错误
       - 4xx（除 408/409/429）视为请求本身非法 → 不切换，直接透传（换模型也会失败）
@@ -376,45 +460,66 @@ async def chat_with_failover(interface: dict, model: str, messages: list, stream
 
     last_error: dict = {"status": 0, "detail": "无可用模型"}
 
+    # 429 RPM 限流退避计数：跨候选共享，防止单模型场景下退避次数被重置导致无限重试
+    _429_retries_left = list(_429_BACKOFFS)
+
     for attempt_idx, try_model in enumerate(attempts):
         is_last = (attempt_idx == len(attempts) - 1)
-        started = False   # 是否已向调用方产出过内容
-        switched = False  # 是否因可重试错误切到下一候选
-        try:
-            async for kind, payload in chat(interface, try_model, messages, stream, tools, tool_choice):
-                if kind == "error":
-                    status = int(payload.get("status") or 0)
-                    last_error = payload
-                    retriable = (status in _RETRIABLE_STATUS) or status >= 500
-                    # 未产出内容 + 可重试 + 还有候选 → 切换模型
-                    if retriable and not started and not is_last:
-                        _logger.warning("模型 %s 调用失败 (HTTP %s)，切换到下一候选模型", try_model, status)
-                        switched = True
-                        break
-                    # 不可重试 / 已产出内容 / 最后一次 → 透传错误
+        while True:  # 429 退避后重试同一模型；其他可重试错误切到下一候选
+            started = False    # 是否已向调用方产出过内容
+            _err_kind = None   # async for 内收到的错误（None=无错误）
+            _err_payload = None
+            try:
+                async for kind, payload in chat(interface, try_model, messages, stream, tools, tool_choice):
+                    if kind == "error":
+                        _err_kind = kind
+                        _err_payload = payload
+                        break  # 跳出 async for，循环后统一处理
+                    started = True
                     yield (kind, payload)
+                if _err_kind is None:
+                    return  # async for 正常结束 = 本轮成功完成
+                # —— 有错误 → 分类处理 ——
+                status = int(_err_payload.get("status") or 0)
+                last_error = _err_payload
+                # 已产出内容 → 无法重试/切换（前端已收到部分内容），直接透传
+                if started:
+                    yield (_err_kind, _err_payload)
                     return
-                started = True
-                yield (kind, payload)
-            if not switched:
-                return  # 正常完成
-        except httpx.HTTPStatusError as e:
-            # 非流式路径：raise_for_status() 抛出的 HTTP 错误
-            status = e.response.status_code if e.response is not None else 0
-            last_error = {"status": status, "detail": str(e)[:300]}
-            retriable = (status in _RETRIABLE_STATUS) or status >= 500
-            if retriable and not started and not is_last:
-                _logger.warning("模型 %s HTTP %s，切换到下一候选模型", try_model, status)
-                continue
-            raise
-        except httpx.TransportError as e:
-            # 连接断开 / 超时 / 协议错误等传输层异常
-            last_error = {"status": 0, "detail": f"{type(e).__name__}: {e}"}
-            if not started and not is_last:
-                _logger.warning("模型 %s 连接异常 (%s)，切换到下一候选模型", try_model, type(e).__name__)
-                continue
-            raise
-        # 其他异常（配置错误等）不在此捕获，直接向上抛，避免掩盖问题
+                if status == 429 and _429_retries_left:
+                    # 限流：等待 RPM 窗口恢复后重试同一模型（立即重试必然再 429）
+                    wait = _429_retries_left.pop(0)
+                    _logger.warning("模型 %s 调用失败 (HTTP 429)，%.0f 秒后重试同一模型", try_model, wait)
+                    await asyncio.sleep(wait)
+                    continue  # 内层 while：退避后重试同一模型
+                retriable = (status in _RETRIABLE_STATUS) or status >= 500
+                if retriable and not is_last:
+                    _logger.warning("模型 %s 调用失败 (HTTP %s)，切换到下一候选模型", try_model, status)
+                    break  # 退出内层 while → 外层 for 取下一候选
+                # 不可重试 / 429 退避耗尽 / 最后一次 → 透传错误
+                yield (_err_kind, _err_payload)
+                return
+            except httpx.HTTPStatusError as e:
+                # 非流式路径：raise_for_status() 抛出的 HTTP 错误
+                status = e.response.status_code if e.response is not None else 0
+                last_error = {"status": status, "detail": str(e)[:300]}
+                if status == 429 and _429_retries_left and not started:
+                    wait = _429_retries_left.pop(0)
+                    _logger.warning("模型 %s 限流 (HTTP 429)，%.0f 秒后重试同一模型", try_model, wait)
+                    await asyncio.sleep(wait)
+                    continue  # 内层 while：重试同一模型
+                retriable = (status in _RETRIABLE_STATUS) or status >= 500
+                if retriable and not started and not is_last:
+                    _logger.warning("模型 %s HTTP %s，切换到下一候选模型", try_model, status)
+                    break  # 退出内层 while → 外层 for 取下一候选
+                raise
+            except httpx.TransportError as e:
+                # 连接断开 / 超时 / 协议错误等传输层异常
+                last_error = {"status": 0, "detail": f"{type(e).__name__}: {e}"}
+                if not started and not is_last:
+                    _logger.warning("模型 %s 连接异常 (%s)，切换到下一候选模型", try_model, type(e).__name__)
+                    break  # 退出内层 while → 外层 for 取下一候选
+                raise
 
     # 所有候选都失败
     _logger.error("全部候选模型均失败（尝试 %d 次）：%s", len(attempts), last_error)

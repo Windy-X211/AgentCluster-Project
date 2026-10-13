@@ -9,7 +9,12 @@
     "file.read",
     "file.write",
     "file.search",
-    "file.delete"
+    "file.delete",
+    "file.replace",
+    "file.patch",
+    "file.structure",
+    "file.find",
+    "workspace.search"
   ],
   "skills": [],
   "plugins": [],
@@ -26,5 +31,7 @@
     "browser_control"
   ],
   "perception_scope": "link",
-  "sort_order": 9
+  "sort_order": 9,
+  "group_id": 3,
+  "workflow_mode": "none"
 }

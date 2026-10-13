@@ -7,25 +7,151 @@ version: "0.1.0"
 
 description:
   zh_Hans: |
-    统一浏览器控制。支持三种后端模式：
+    统一浏览器控制：可打开网页并自动执行点击 / 输入 / 抓取 / 截图等。四种后端模式：
       - system: 启动系统 Edge/Chrome（独立 context，cookie 持久化）
-      - cdp: 桥接到正在运行的浏览器（共享登录态、cookies、扩展，需浏览器带 --remote-debugging-port=9222 启动）
+      - cdp: 桥接到正在运行的浏览器（共享登录态、cookies、扩展；需浏览器带 --remote-debugging-port=9222 启动）
       - chromium: Playwright 内置 Chromium（干净沙箱）
-      - auto: 自动选择（优先 cdp > system > chromium）
-    action 取值：navigate(打开URL) / click(点击元素) / type(输入文字) / get_text(抓文本) / get_html(抓HTML) / screenshot(截图,返回base64) / evaluate(执行JS) / wait(等待秒数) / close(关闭浏览器) / info(查看当前状态)。
-    selector 用 CSS 选择器，url 以 http(s):// 开头。每次调用返回 {ok, data, current_url}。
-  en_US: "Unified browser control. mode: auto/system/cdp/chromium. action: navigate/click/type/get_text/get_html/screenshot/evaluate/wait/close/info."
+      - auto: 自动选择（优先 cdp > system > chromium），默认。
+
+    ═══════════════════════════════════════════════════════
+    ★★★ 操作模板录制 —— 用户录，智能体用 ★★★
+    ═══════════════════════════════════════════════════════
+    完整流程：
+      1) 智能体调 record_start → 弹出一个独立的 Python 录制面板 + 浏览器内悬浮提示 "● 正在录制"
+      2) 用户在浏览器里正常操作（点击、输入、跳转...）—— 全部操作被自动捕获
+      3) Python 面板实时显示已录步骤，用户可以删除、调序、添加注释
+      4) 用户点击面板的 "完成录制并保存" → 模板 JSON 保存到 templates/
+    之后智能体有两种方式使用模板：
+      • 固定场景（操作一成不变）→ record_template_run(template_name=...) 一键回放
+      • 变动场景（页面可能变了 / 参数不同）→ record_template_load(template_name=...)
+          拿到完整步骤后，智能体自己理解每一步的含义，再灵活地调用 click/type/navigate 等底层 action 执行。
+    ═══════════════════════════════════════════════════════
+
+    **分层 DOM 提取**（省 token、高效）：get_html 默认返回结构化快照（format=snapshot），
+    去掉 script/style/广告/页脚等噪声，只保留按钮/输入框/链接/标题/表格等关键元素，并自动编号 @e1..@eN。
+    后续 click/type/get_text/get_html 的 selector 可直接传 @eN 操作，无需自己拼 CSS/XPath。
+    需看完整 HTML 再按需 format=element, selector=@eN 回填单个元素；format=raw 返回整页原始 HTML（谨慎用）。
+    每次调用返回 {ok, data, current_url}；失败时带 error 字段说明原因。url 需以 http(s):// 开头。
+    每个 action 的用途、必填参数与选择规则见 action 参数的 description。
+  en_US: |
+    Unified browser control. Supports four backend modes:
+      - system: launch system Edge/Chrome (standalone context, persistent cookies)
+      - cdp: bridge to a running browser (shared login state/cookies/extensions; requires --remote-debugging-port=9222)
+      - chromium: Playwright built-in Chromium (clean sandbox)
+      - auto: auto-select (priority: cdp > system > chromium)
+
+    ═══════════════════════════════════════════════════════
+    ★★★ Template Recording — USER records, AGENT uses ★★★
+    ═══════════════════════════════════════════════════════
+    Full workflow:
+      1) Agent calls record_start → a standalone Python recording panel pops up + "● Recording" badge in the browser
+      2) User operates normally in the browser (clicks, types, navigates...) — all actions auto-captured
+      3) Panel shows steps in real time; user can delete / reorder / annotate
+      4) User clicks "Complete & Save" → template JSON saved to templates/
+    Two ways for the agent to use a template later:
+      • Fixed scenario (steps never change) → record_template_run(template_name=...) — replay end-to-end
+      • Dynamic scenario (page may differ / parameters vary) → record_template_load(template_name=...)
+          Agent gets the full step list, understands each step's intent, then flexibly calls click/type/navigate etc.
+    ═══════════════════════════════════════════════════════
+
+    **Layered DOM extraction** (token-efficient): get_html defaults to a structured snapshot
+    (format=snapshot) that strips script/style/ads/footers, keeps only interactive elements
+    (buttons, inputs, links, headings, tables, etc.) and auto-assigns @e1..@eN element IDs.
+    Subsequent click/type/get_text/get_html can use selector=@eN directly — no XPath/CSS needed.
+    Use format=element to fetch the full outerHTML of one element on demand; format=raw returns
+    the whole-page raw HTML (use sparingly). url starts with http(s)://.
+    Per-action purpose, required parameters and selection rules are documented in the action parameter's description.
 
 parameters:
   - name: "action"
     type: string
     required: true
-    description: "操作类型：navigate / click / type / get_text / get_html / screenshot / evaluate / wait / close / info"
-    enum: ["navigate", "click", "type", "get_text", "get_html", "screenshot", "evaluate", "wait", "close", "info"]
+    description: |
+      要执行的操作。各值用途与必填参数：
+        navigate — 在当前活动标签页打开指定 URL（不新开标签页）。必填 url。
+        new_tab — 新建标签页并设为当前活动页。url 可选（提供则在新页跳转，不传则打开空白页）。
+            返回的 active_page_index 即新标签页下标；后续操作自动作用于新标签页。
+            打开新网站时默认使用 new_tab（新开标签页，不影响用户当前页面）；仅当用户明确要求在当前页面跳转时才用 navigate。
+        click — 点击元素。selector 支持两种形式：① @eN（来自 get_html(snapshot) 返回的元素编号，推荐！无需自己拼 CSS/XPath）；② CSS 选择器。
+        coordinate_click — 按归一化坐标点击。必填 x、y，取值 [0.0, 1.0]（0=左/上，1=右/下，相对截图宽高）。
+            适用：目标元素无稳定 CSS 选择器（canvas、图片地图、自绘 UI、动态渲染、选择器反复变化）。
+            流程：先 screenshot（purpose=inspect）截取当前视口 → 在截图中识别目标位置，换算为归一化坐标 →
+            再用本 action 传入 x、y。插件按点击时页面 viewport 实际大小换算成像素坐标后点击，切勿直接传像素。
+        type — 向输入框输入文字。selector 同 click：@eN 或 CSS 选择器。必填 selector、text。
+        get_text — 提取元素文本。selector 同 click：@eN 或 CSS 选择器；缺省取整页 <body> 文本。
+        get_html — **分层 DOM 提取**（省 token、高效，默认 format=snapshot）：
+            format=snapshot（默认）— 返回结构化快照。采集通道覆盖：①语义关键元素（button/input/a/[role=*]/h1..h6 等）
+                ②有 onclick 回调的元素 ③可聚焦 tabindex（排除 -1）④cursor:pointer 且有 onclick/role 的自定义可点击元素。
+                去重后按文档位置排序编号 @e1..@eN，缩进表示层级。标记含义：[clickable]=div/span 自定义可点击按钮（有 onclick 但无语义 role/tag）；
+                [offscreen]=当前视口外；[disabled]=aria-disabled 或 disabled 属性。页面跳转/刷新后编号失效，需重新 snapshot。
+                返回字段：data（快照文本）、element_count、viewport、truncated（是否达 400 上限）。找不到目标元素？
+                先 evaluate(js="return document.querySelector('input,textarea,[contenteditable],[role=button],[onclick]')?.outerHTML") 拿真实 DOM 再判断。
+            format=element — 按需回填单个元素的完整 outerHTML。selector 传 @eN 或 CSS 选择器。已剔除内嵌 script/style。
+            format=raw — 整页/整块原始 HTML（旧行为）。仅在 snapshot/element 无法满足需求时用，token 消耗大。
+        screenshot — 截图。purpose=inspect（默认）仅供智能体查看（不推送到前端对话区）；
+            purpose=share 把截图以 base64 data URL 塞进返回结果，前端直接在右侧对话区显示缩略图（点击可放大），
+            数据一并保存在 AppData 对话记录中，不再写入独立的 screenshots/ 文件夹。识别元素位置前必须先截图。
+        evaluate — 执行 JavaScript。必填 js（要执行的 JS 代码）。
+        wait — 等待若干秒。value 为秒数（默认 1）。用于等页面加载 / 动效。
+        close — 关闭当前浏览器会话。
+        info — 查看当前状态：返回 mode / 当前页 URL / viewport，并枚举所有已打开标签页（index、url、title、是否当前活动页）。用于多标签页定位。
+        focus_tab — 切换当前操作目标标签页。必填 tab_index（来自 info 返回的 index）。
+            调用后，后续 navigate / click / coordinate_click / type / screenshot 等操作全部作用于该标签页。
+            多标签页操作模式：先 info 找到目标标签页 index → focus_tab 切换 → 再执行其他操作。
+
+      —— 操作模板录制（用户录制）——
+      record_start — 开始录制（弹面板）。可选 record_name（模板名称）、record_description（描述）。
+            ⚠️⚠️⚠️ 调完此 action 后你必须立即停止运行，不要调任何其他浏览器 action！⚠️⚠️⚠️
+            这是用户录制：用户自己在浏览器里操作，你负责启动录制 + 告诉用户"录制已开始"。
+            如果你在调完 record_start 后又调 navigate/click/type 等，那是"智能体代录"，不是用户要的"用户录制"。
+            正确的后续流程：
+              ✅ 你应该：①调 record_start → ②告诉用户"录制已开始，请在浏览器里正常操作，完成后回来告诉我" → ③停止，等用户下一条消息
+              ❌ 不要做：调完 record_start 后继续调 navigate 打开页面、调 click 帮用户点、调 type 帮用户输入
+            用户操作完说"好了"/"保存吧"/"完成录制"后，你再回来调 record_complete 保存，或 record_template_run 直接回放。
+            何时触发 record_start：用户说"帮我录制一个模板"/"我想演示一次你来记住"/"把刚才的操作存为模板"。
+            返回值里有 _note 字段会再次提醒你停止。
+      record_status — 查询当前录制状态。返回 {recording, steps[], meta{name,start_url,...}}。
+            智能体可用来实时了解已录了多少步、查看每步的 selector / 描述，
+            或在面板未打开时直接在对话中展示录制进度。
+      record_step_annotate — 给某一步添加注释。必填 step_index（来自 record_status 的 steps[index]），
+            annotation（自由文本，说明这一步的目的；空字符串清除）。
+            正常流程下用户在 Python 面板里直接改，智能体不需要调。
+            但智能体也可以主动调此 action 帮用户补充注释（比如在 record_status 里看到某一步没描述）。
+      record_step_delete — 删除指定步骤。必填 step_index。删除后剩余步骤 index 自动重排。
+            用户在面板里点 🗑 按钮会触发；智能体也可以主动调（比如根据用户说"把第 3 步删了"）。
+      record_step_reorder — 重排步骤顺序。必填 new_order（整数数组，必须是 0..N-1 的一个排列）。
+            例：共 3 步要把第 0 和第 2 步交换，new_order=[2,1,0]。
+      record_complete — 完成录制、保存模板。可选 template_name / record_name / record_description 覆盖元数据。
+            模板 JSON 保存到 AppData/plugins/browser_control/templates/。
+            正常流程下用户在 Python 面板里点 "完成录制并保存"，面板内部调此 action。
+            智能体也可以调（比如用户说"好了，保存吧"而面板在屏幕外）。
+            返回 {ok, template, path, steps_count}。
+      record_cancel — 取消录制（丢弃已录步骤，不保存模板）。
+            智能体和 Python 面板均可调。
+
+      —— 模板管理（智能体用）——
+      record_template_list — 列出所有已保存的模板。返回每个模板的 name / filename / path / description / start_url / final_url / steps_count / created_at。
+            何时用：用户说"我之前录的模板有哪些"、"看看 templates/ 里有什么"。
+      record_template_load — 加载某个模板的完整 JSON。必填 template_name（不带 .json 后缀也可）。
+            ⭐ 场景"学习后灵活执行"：当操作会变动时（页面改版 / 参数不同 / 元素位置可能偏移），
+            不要直接 record_template_run，而是先 load 拿完整步骤 → 智能体逐条理解每一步的含义
+            （比如"在淘宝搜索框输入 iPhone 并回车"）→ 再自己决定怎么用 click/type/navigate 等底层 action 执行。
+            这是最灵活的方式，能自适应页面变化。
+      record_template_run — 直接执行某个模板（回放）。必填 template_name。
+            依次执行模板里的每一步（navigate → click → type → ...），遇到失败立即停止。
+            ⭐ 场景"固定场景一键跑"：当操作完全固定、页面稳定不变时，直接回放最快。
+            不灵活——页面一变就失败。适合登录 / 固定表单 / 固定导航等稳定流程。
+      record_template_delete — 删除某个模板。必填 template_name。删除后不可恢复。
+
+      总结：用户录 → 面板管理 → 保存模板 → 之后智能体根据场景选 run（固定）或 load（灵活）。
+
+      选择规则：先 get_html(format=snapshot) 拿 @eN 编号 → click/type 直接传 selector=@eN；
+      元素细节不够再 format=element, selector=@eN 补 HTML；无稳定元素（canvas/自绘UI）→ screenshot(inspect) 看图 → coordinate_click。
+    enum: ["navigate", "new_tab", "click", "coordinate_click", "focus_tab", "type", "get_text", "get_html", "screenshot", "evaluate", "wait", "close", "info", "record_start", "record_status", "record_step_annotate", "record_step_delete", "record_step_reorder", "record_complete", "record_cancel", "record_template_list", "record_template_load", "record_template_run", "record_template_delete"]
 
   - name: "mode"
     type: string
-    required: false
+    required: true
     description: |
       浏览器后端模式：
         auto     — 自动选择（优先检测 CDP 端点，否则用系统浏览器，最后 Chromium）
@@ -41,8 +167,10 @@ parameters:
     required: false
     description: |
       截图用途（仅 screenshot action 生效）：
-        inspect  — 智能体内部了解页面状况（默认）。不落盘，只把 base64 返回给智能体组装多模态消息，前端不渲染给用户看。
-        share    — 给用户展示。保存到工作区 screenshots/ 目录，返回 file 路径，前端自动渲染图片。
+        inspect — 智能体内部了解页面状况（默认）。不落盘，只把 base64 返回给智能体组装多模态消息，前端不渲染给用户看。
+        share   — 给用户展示。不落盘，直接把 base64 data URL 塞进返回结果（image_data_url 字段），
+                  前端直接在右侧对话区渲染成缩略图，点击可放大查看；数据一并保存在 AppData 对话记录中，
+                  不会写入独立截图文件夹。
       智能体判断规则：自己看图用 inspect；要给用户看、要发报告/文档用 share。
     enum: ["inspect", "share"]
     default: "inspect"
@@ -56,12 +184,32 @@ parameters:
   - name: "url"
     type: string
     required: false
-    description: "navigate 时必填；screenshot 可选：设置后先跳转到该 URL 再截图"
+    description: "navigate 时必填；new_tab 可选（提供则新标签页直接打开该 URL，不传则打开空白页）；screenshot 可选：设置后先跳转到该 URL 再截图"
 
   - name: "selector"
     type: string
     required: false
-    description: "click/type/get_text/get_html/evaluate 时的 CSS 选择器。get_text/get_html 缺省时取整个页面。"
+    description: |
+      元素定位符。支持三种形式（所有使用 selector 的 action 均接受）：
+        1. @eN — 主文档元素编号（来自 get_html(snapshot)），例：@e5、e5。
+        2. @fNeM — iframe 内元素编号（跨域 iframe 里的元素自动带帧前缀），例：@f1e3。
+           fN 是帧号（f0=主文档），eM 是帧内编号。快照里每个 frame 前会显示 --- frame f1: title url=... ---。
+        3. CSS 选择器 — 标准 CSS selector，如 #submit、.btn-primary。
+      click/type/get_text/get_html/evaluate 均接受。get_text/get_html 缺省 selector 时作用于整个页面。
+
+  - name: "format"
+    type: string
+    required: false
+    description: |
+      get_html 的提取格式（其他 action 忽略此参数）：
+        snapshot（默认）— 结构化快照（多帧采集）。
+            先等待 SPA 渲染（iframe 里出现 input 等元素），然后遍历 page.frames 在每个帧里独立采集：
+            DOM 瘦身 + 关键元素编号 @eN（主帧 f0 省略前缀，子帧自动加 @fNeM）。
+            快照输出按帧分组，每组前有 --- frame fN: title url=... --- 头。这是默认首选。
+        element — 按需回填单个元素的完整 outerHTML。selector 传 @eN、@fNeM 或 CSS。
+        raw — 原始 HTML（整页或 selector 指定块）。仅在 snapshot/element 不够时用，token 消耗大。
+    enum: ["snapshot", "element", "raw"]
+    default: "snapshot"
 
   - name: "text"
     type: string
@@ -79,6 +227,30 @@ parameters:
     description: "wait 时要等待的秒数；默认 1"
     default: 1
 
+  - name: "x"
+    type: number
+    required: false
+    description: "coordinate_click 时目标点的归一化横坐标，取值 [0.0, 1.0]，基于截图宽度（0=最左，1=最右）。插件按当前页面 viewport 实时换算：px = round(x * viewport_width)。必须先截图识别元素位置，再传归一化坐标，切勿直接传像素。"
+    default: -1
+
+  - name: "y"
+    type: number
+    required: false
+    description: "coordinate_click 时目标点的归一化纵坐标，取值 [0.0, 1.0]，基于截图高度（0=最上，1=最下）。插件按当前页面 viewport 实时换算：py = round(y * viewport_height)。必须先截图识别元素位置，再传归一化坐标，切勿直接传像素。"
+    default: -1
+
+  - name: "tab_index"
+    type: integer
+    required: false
+    description: "目标标签页的下标，来自 info 返回的 pages 数组中的 index（从 0 开始）。focus_tab 时必填；在操作类 action（navigate/click/coordinate_click/type/get_text/get_html/screenshot/evaluate/wait）中可选——提供则本次操作作用于该标签页，不传则作用于当前活动页。"
+    default: -1
+
+  - name: "switch_active"
+    type: boolean
+    required: false
+    description: "是否把 tab_index 指定的标签页切为当前活动页（bring_to_front 并更新 self._page）。仅当 tab_index 提供时有意义。true=切过去再操作；false（默认）=后台操作，不切换、活动页保持不变。"
+    default: false
+
   - name: "timeout"
     type: number
     required: false
@@ -91,16 +263,82 @@ parameters:
     description: "是否以有头（可见）模式启动浏览器；默认 true。cdp 模式忽略此参数（桥接到已运行的浏览器）。"
     default: true
 
+  # —— 录制/模板相关参数（仅对对应 action 生效）——
+  - name: "record_name"
+    type: string
+    required: false
+    description: "record_start / record_complete 时使用：模板名称（用于保存时的文件名）。record_start 时可选，默认自动生成 timestamp。"
+    default: ""
+
+  - name: "record_description"
+    type: string
+    required: false
+    description: "record_start / record_complete 时使用：模板描述（自由文本，说明模板用途）。"
+    default: ""
+
+  - name: "template_name"
+    type: string
+    required: false
+    description: "record_complete / record_template_load / record_template_run / record_template_delete 时使用：模板名称（不带 .json 后缀也能匹配）。"
+    default: ""
+
+  - name: "step_index"
+    type: integer
+    required: false
+    description: "record_step_annotate / record_step_delete 时使用：要操作的步骤索引（从 record_status 返回的 steps[index] 取）。"
+    default: -1
+
+  - name: "annotation"
+    type: string
+    required: false
+    description: "record_step_annotate 时使用：要给步骤添加/更新的注释文本（空字符串表示清除注释）。"
+    default: ""
+
+  - name: "new_order"
+    type: array
+    required: false
+    description: "record_step_reorder 时使用：整数数组，必须是 0..N-1 的一个排列（N 是当前步骤总数）。例如 [2,1,0] 表示把第 0 步和第 2 步交换。"
+
 outputs:
   - name: "ok"
     type: boolean
     description: "操作是否成功"
   - name: "data"
     type: string
-    description: "操作结果（截图为 base64 字符串，其他为文本/HTML）"
+    description: "操作结果（截图为 base64 字符串；get_html(snapshot) 为结构化快照文本；get_html(element/raw) 为 HTML；get_text 为文本；info 为多行可读摘要）"
+  - name: "format"
+    type: string
+    description: "get_html 时返回实际采用的格式标记：snapshot / element / raw"
+  - name: "element_count"
+    type: integer
+    description: "get_html(snapshot) 时返回快照中编号的元素总数（所有帧合计）"
+  - name: "frames"
+    type: array
+    description: "get_html(snapshot) 时返回：各帧元数据 [{idx, title, url, count, main}, ...]，用于判断元素在哪个 frame"
+  - name: "truncated"
+    type: boolean
+    description: "get_html(snapshot) 时返回：是否有帧达到 400 元素上限"
+  - name: "eid"
+    type: string
+    description: "get_html(element) 且 selector 为 @eN/@fNeM 时回填：带帧前缀的 eid（如 e5 或 f1e3）"
+  - name: "image_data_url"
+    type: string
+    description: "screenshot 且 purpose=share 时返回：完整 data:image/png;base64,... 形式的 data URL，前端用于在对话区渲染缩略图"
+  - name: "purpose"
+    type: string
+    description: "screenshot 时返回实际采用的用途标记：inspect / share"
   - name: "current_url"
     type: string
-    description: "操作后浏览器地址栏 URL"
+    description: "操作后浏览器地址栏 URL（当前活动页）"
   - name: "error"
     type: string
     description: "失败时的错误信息"
+  - name: "pages"
+    type: array
+    description: "info 时返回：所有已打开标签页清单 [{index, url, title, is_active}, ...]"
+  - name: "active_page_index"
+    type: integer
+    description: "info 时返回：当前活动页在 pages 数组中的下标"
+  - name: "viewport"
+    type: object
+    description: "info / get_html(snapshot) 时返回：当前活动页 viewport 尺寸 {w, h}"

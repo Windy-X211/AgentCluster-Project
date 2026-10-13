@@ -1,4 +1,4 @@
-import { marked } from 'marked'
+﻿import { marked } from 'marked'
 
 marked.setOptions({
   gfm: true,
@@ -246,3 +246,36 @@ function _autoOpenExternalInNewTab(html: string): string {
     return `<a${before}${insert}${after}>`
   })
 }
+
+// —— 修复 marked autolink 贪婪吞入尾部 CJK/Unicode 字符的 bug ——
+// marked v18 的 url tokenizer 用 [^\s<]* 匹配裸 URL，再靠 _backpedal 回退尾部 ASCII 标点；
+// 但 _backpedal 只识别 ASCII 标点，导致带全角括号/中文上下文的 URL 一起被吞进 href。
+// 这里重写 url tokenizer：在原始匹配后，从尾部剥离所有非 RFC 3986 合法字符。
+(function patchUrlTokenizer() {
+  const origUrl = marked.Tokenizer.prototype.url
+  function stripInvalidUrlTail(raw: string): string {
+    let end = raw.length
+    for (let i = raw.length - 1; i >= 0; i--) {
+      const ch = raw[i]
+      if (/[a-zA-Z0-9._~:/?#\[\]@!'()*+,;=%-]/.test(ch)) break
+      end = i
+    }
+    return raw.slice(0, end)
+  }
+  marked.Tokenizer.prototype.url = function (e: string) {
+    const result = origUrl.call(this, e)
+    if (!result) return result
+    const stripped = stripInvalidUrlTail(result.raw)
+    if (stripped.length < 8 || !/^(https?:\/\/|www\.|ftp:\/\/|mailto:|xmpp:)/i.test(stripped)) {
+      return result
+    }
+    const scheme = /^www\./i.test(stripped) ? 'http://' : ''
+    return {
+      ...result,
+      raw: stripped,
+      text: stripped,
+      href: scheme + stripped,
+      tokens: [{ type: 'text', raw: stripped, text: stripped }],
+    }
+  }
+})()

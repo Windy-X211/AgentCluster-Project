@@ -24,5 +24,6 @@
   "tools": [
     "browser_control"
   ],
-  "sort_order": 4
+  "sort_order": 4,
+  "group_id": 4
 }

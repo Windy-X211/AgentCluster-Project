@@ -23,5 +23,8 @@
   "tools": [
     "browser_control"
   ],
-  "sort_order": 15
+  "sort_order": 15,
+  "perception_scope": "link",
+  "workflow_mode": "spec",
+  "group_id": 2
 }

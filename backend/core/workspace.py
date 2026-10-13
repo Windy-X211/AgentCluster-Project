@@ -9,18 +9,25 @@
 """
 import os
 import shutil
+import subprocess
+import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 
-from core.file_backup import list_all_ops, restore_op, purge_op, snapshot_before_delete
+from core.file_backup import list_all_ops_cached, restore_op, purge_op, snapshot_before_delete
 from core.store import load
 
-MAX_NODES = 4000
+MAX_NODES = 8000
 MAX_DEPTH = 4
 MAX_CHILDREN = 300   # 单目录最多列出的子项数，超大目录（如浏览器配置）只显示前 N 项
+# 顶层 3 层（工作区根 → 子目录 → 孙目录）不受全局节点预算限制：
+# .git / node_modules 等大目录吃光预算时，只会让更深层级退化为叶子，
+# 保证兄弟文件夹永远看得见、点得开（否则会出现"文件夹存在但点开是空的"）
+GUARANTEE_DEPTH = 2   # _dir_node 的 depth < 该值时无视预算，始终完整列出并展开
 
 
-def _norm(p) -> str:
+def _norm_inner(p) -> str:
     """统一路径标识（Windows 下做 normcase，跨平台稳定匹配）。"""
     try:
         return os.path.normcase(os.path.abspath(str(p)))
@@ -28,22 +35,42 @@ def _norm(p) -> str:
         return str(p)
 
 
+# 路径归一化在每次扫描里会被调用上万次（每个节点一次），abspath 本身不便宜，做记忆化
+@lru_cache(maxsize=200000)
+def _norm_cached(p: str) -> str:
+    return _norm_inner(p)
+
+
+def _norm(p) -> str:
+    return _norm_cached(str(p))
+
+
 def _under(path: str, workdir: str) -> bool:
-    """path 是否落在 workdir 内（含等价目录）。"""
+    """path 是否落在 workdir 内（含等价目录）。
+
+    用 normcase+abspath 的前缀比较（不调用 resolve()：每次 resolve 在 Windows 上
+    会做完整的路径解析/网络盘探测，聚合全部会话 ops 时开销很大）。
+    """
     if not workdir:
         return False
-    try:
-        Path(path).resolve().relative_to(Path(workdir).resolve())
-        return True
-    except Exception:
-        return False
+    a = _norm(path)
+    w = _norm(workdir)
+    return a == w or a.startswith(w + os.sep)
+
+
+_agents_cache = {"at": 0.0, "data": {}}
 
 
 def _agents() -> dict:
-    try:
-        return {a.get("id"): a.get("name") for a in (load("agents") or [])}
-    except Exception:
-        return {}
+    """智能体名映射（短 TTL 缓存：build_tree 每次请求都要用，避免反复读盘解析）。"""
+    now = time.time()
+    if not _agents_cache["data"] or now - _agents_cache["at"] > 2.0:
+        try:
+            _agents_cache["data"] = {a.get("id"): a.get("name") for a in (load("agents") or [])}
+        except Exception:
+            return {}
+        _agents_cache["at"] = now
+    return _agents_cache["data"]
 
 
 def _snapshot_size(snap_dir: str) -> int:
@@ -64,7 +91,7 @@ def _snapshot_size(snap_dir: str) -> int:
 
 
 def _ops_under(workdir: str) -> list:
-    return [op for op in list_all_ops()
+    return [op for op in list_all_ops_cached()
             if op.get("path") and _under(op["path"], workdir)]
 
 
@@ -105,69 +132,227 @@ def _attr_map(ops: list, names: dict) -> dict:
     return attr
 
 
+# ==============================================================
+# 项目树扫描：节点缓存 + rev 版本号
+#
+# - 每个路径的节点对象会被缓存；子项未变（文件 size/mtime 一致）时直接复用旧对象，
+#   前端据此只更新真正变动的行，界面不闪。
+# - 每个工作区维护 rev：树内容有变化时 +1。前端带上次 rev 轮询，
+#   未变化时只回一个极小的 {changed:false}，既实时又省流量。
+# - 扫描用 os.scandir（一次系统调用拿全目录项的 stat），替代旧版每项 3 次 stat。
+# ==============================================================
+_node_cache: dict = {}     # 绝对路径 -> 节点 dict（跨扫描复用，未变的节点保持同一对象）
+_node_cache_lock = threading.Lock()
+_rev_lock = threading.Lock()
+_revs: dict = {}           # workdir -> rev
+_scan_locks: dict = {}     # workdir -> Lock（同工作区扫描串行，保护共享缓存）
+_MAX_NODE_CACHE = 120000
+
+
+def _scan_lock(workdir: str) -> threading.Lock:
+    key = _norm(workdir)
+    with _node_cache_lock:
+        lk = _scan_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _scan_locks[key] = lk
+        return lk
+
+
+def _bump_rev(workdir: str, changed: bool) -> int:
+    key = _norm(workdir or "")
+    with _rev_lock:
+        cur = int(_revs.get(key, 0))
+        if changed:
+            cur += 1
+            _revs[key] = cur
+        return cur
+
+
+def get_rev(workdir: str) -> int:
+    """当前工作区树的版本号（build_tree 内容变化时自增）。"""
+    with _rev_lock:
+        return int(_revs.get(_norm(workdir or ""), 0))
+
+
+def _scan_entries(d: str):
+    """枚举目录入口：(名称, 是否目录, 大小, mtime)；目录不可读返回 None。"""
+    try:
+        out = []
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    st = e.stat(follow_symlinks=False)
+                    out.append((e.name, e.is_dir(follow_symlinks=False), st.st_size, int(st.st_mtime)))
+                except OSError:
+                    continue
+        return out
+    except OSError:
+        return None
+
+
+def _fast_norm(p: str) -> str:
+    """扫描内部的路径归一化：路径都由绝对 root 逐级拼接而来，只需 normcase。"""
+    return os.path.normcase(p)
+
+
+def _child_rel(parent_rel: str, name: str) -> str:
+    return name if not parent_rel else parent_rel + "/" + name
+
+
+def _new_node(name: str, path: str, rel: str, is_dir: bool, mtime: int, size: int) -> dict:
+    return {
+        "name": name or path,
+        "path": path,
+        "rel": rel,
+        "is_dir": is_dir,
+        "created_by": None,
+        "modified_by": None,
+        "last_ts": None,
+        "participants": [],
+        "children": [],
+        "mtime": mtime,
+        "size": 0 if is_dir else size,
+    }
+
+
+def _leaf_node(path: str, rel: str, name: str, is_dir: bool, mtime: int,
+               size: int, counter: dict) -> tuple[dict, bool]:
+    """文件（或超出深度预算的目录）节点：size/mtime 未变则复用缓存对象。"""
+    counter["n"] += 1
+    key = path          # 扫描内所有路径都由同一绝对 root 拼接，无需再归一化
+    old = _node_cache.get(key)
+    if old and old.get("is_dir") == is_dir and old.get("mtime") == mtime and old.get("size") == size:
+        return old, False
+    node = _new_node(name, path, rel, is_dir, mtime, size)
+    _node_cache[key] = node
+    return node, True
+
+
+def _dir_node(path: str, rel: str, name: str, depth: int, counter: dict, seen: set) -> tuple[dict, bool]:
+    """目录节点：子项未变时整支复用旧节点对象（前端合并可整支跳过）。"""
+    key = path
+    seen.add(key)
+    counter["n"] += 1
+    entries = _scan_entries(path) or []
+    old = _node_cache.get(key)
+    old_children = (old or {}).get("children") or []
+    old_by_name = {c.get("name"): c for c in old_children}
+    changed = old is None
+    children = []
+    total = 0
+    shown = 0
+    truncated = False
+    for ename, is_dir, sz, mt in sorted(entries, key=lambda x: (not x[1], x[0].lower())):
+        if shown >= MAX_CHILDREN:
+            truncated = True
+            break
+        over = counter["n"] >= MAX_NODES
+        guaranteed = depth < GUARANTEE_DEPTH
+        if over and not guaranteed:
+            # 预算耗尽且已超出保证展示的层级 → 本目录剩余条目不再列出
+            truncated = True
+            break
+        cpath = path + os.sep + ename
+        crel = _child_rel(rel, ename)
+        if is_dir and depth < MAX_DEPTH and (not over or guaranteed):
+            child, ch = _dir_node(cpath, crel, ename, depth + 1, counter, seen)
+            # 目录可能是"沿用的旧对象"，只能用子树自身的"有变化"结果判断
+            if ch:
+                changed = True
+        else:
+            # 超出深度/预算：目录退化为叶子节点（size=0，不再展开）
+            child, ch = _leaf_node(cpath, crel, ename, is_dir, mt, 0 if is_dir else sz, counter)
+            seen.add(cpath)
+            if ch or old_by_name.get(ename) is not child:
+                changed = True
+        children.append(child)
+        total += child.get("size", 0)
+        shown += 1
+    if [c.get("name") for c in old_children] != [c.get("name") for c in children]:
+        changed = True
+    if bool((old or {}).get("truncated")) != truncated:
+        changed = True
+    if not changed and old is not None:
+        # 整棵子树无变化：沿用旧目录对象
+        return old, False
+    try:
+        mtime_self = int(os.stat(path).st_mtime)
+    except Exception:
+        mtime_self = 0
+    node = _new_node(name, path, rel, True, mtime_self, 0)
+    node["size"] = total
+    node["children"] = children
+    if truncated:
+        node["truncated"] = True
+    _node_cache[key] = node
+    return node, changed
+
+
+def _prune_node_cache(root: str, seen: set) -> bool:
+    """丢弃本次扫描未见到的缓存节点（被删除/移走的路径），并控制缓存总量。
+
+    返回是否有缓存被剔除（= 有东西消失，也算"树变了"）。
+    """
+    prefix = root + os.sep
+    removed = False
+    with _node_cache_lock:
+        if len(_node_cache) > _MAX_NODE_CACHE:
+            _node_cache.clear()
+            return True
+        for k in list(_node_cache):
+            if k not in seen and k.startswith(prefix):
+                _node_cache.pop(k, None)
+                removed = True
+    return removed
+
+
+def _apply_attrs(nodes: list, attr: dict) -> None:
+    """把"参与者/创建者/最后修改者"（来自文件操作记录）挂到节点上。"""
+    for n in nodes:
+        a = attr.get(_fast_norm(n.get("path") or "")) or {}
+        n["created_by"] = a.get("created_by")
+        n["modified_by"] = a.get("modified_by")
+        n["last_ts"] = a.get("last_ts")
+        n["participants"] = a.get("participants", [])
+        if n.get("children"):
+            _apply_attrs(n["children"], attr)
+
+
 def build_tree(workdir: str) -> dict:
-    """以 workdir 为根构建项目树，每个节点带 size/mtime/created_by/modified_by/participants。"""
-    root = Path(workdir) if workdir else None
-    if not root or not root.is_dir():
-        return {"exists": False, "root": str(root) if root else "", "tree": [], "count": 0}
+    """以 workdir 为根构建项目树（增量扫描），每个节点带 size/mtime/创建者/修改者/参与者。
+
+    返回值含 rev：树内容变化时自增，供前端差量轮询。
+    """
+    root = os.path.abspath(workdir) if workdir else ""
+    if not root or not os.path.isdir(root):
+        return {"exists": False, "root": root,
+                "tree": [], "count": 0, "rev": get_rev(workdir or "")}
 
     names = _agents()
     attr = _attr_map(_ops_under(workdir), names)
     counter = {"n": 0}
-
-    def make(path: Path, depth: int) -> dict:
-        # 节点始终创建（顶层兄弟项绝不能被全局预算截断），预算只限制深层的子项遍历
-        counter["n"] += 1
-        rel = path.relative_to(root)
-        is_dir = path.is_dir()
-        a = attr.get(_norm(path)) or {}
-        node = {
-            "name": path.name or str(root),
-            "path": str(path),
-            "rel": "" if str(rel) == "." else rel.as_posix(),
-            "is_dir": is_dir,
-            "created_by": a.get("created_by"),
-            "modified_by": a.get("modified_by"),
-            "last_ts": a.get("last_ts"),
-            "participants": a.get("participants", []),
-            "children": [],
-        }
-        try:
-            node["mtime"] = int(path.stat().st_mtime)
-        except Exception:
-            node["mtime"] = 0
-        if is_dir:
-            node["size"] = 0
-            if depth < MAX_DEPTH and counter["n"] < MAX_NODES:
-                try:
-                    entries = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-                except Exception:
-                    entries = []
-                shown = 0
-                for e in entries:
-                    if counter["n"] >= MAX_NODES or shown >= MAX_CHILDREN:
-                        node["truncated"] = True
-                        break
-                    child = make(e, depth + 1)
-                    node["children"].append(child)
-                    node["size"] += child.get("size", 0)
-                    shown += 1
-        else:
-            try:
-                node["size"] = path.stat().st_size
-            except Exception:
-                node["size"] = 0
-        return node
-
+    seen: set = set()
     tree = []
-    try:
-        entries = sorted(root.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-    except Exception:
-        entries = []
-    # 顶层全部枚举，确保兄弟文件夹都可见
-    for e in entries:
-        tree.append(make(e, 0))
-    return {"exists": True, "root": str(root), "tree": tree, "count": counter["n"]}
+    changed = False
+    with _scan_lock(workdir):
+        entries = _scan_entries(root) or []
+        # 顶层全部枚举，确保兄弟文件夹都可见
+        for name, is_dir, sz, mt in sorted(entries, key=lambda x: (not x[1], x[0].lower())):
+            p = root + os.sep + name
+            if is_dir:
+                node, ch = _dir_node(p, name, name, 0, counter, seen)
+            else:
+                node, ch = _leaf_node(p, name, name, False, mt, sz, counter)
+                seen.add(p)
+            tree.append(node)
+            changed = changed or ch
+        changed = changed or _prune_node_cache(root, seen)
+        if attr:
+            # 无任何文件操作记录的工作区直接跳过（绝大多数轮询都是空 attr）
+            _apply_attrs(tree, attr)
+    rev = _bump_rev(workdir, changed)
+    return {"exists": True, "root": root, "tree": tree, "count": counter["n"], "rev": rev}
 
 
 def list_trash(workdir: str) -> list:
@@ -251,6 +436,72 @@ TEXT_EXTS = {
     "log", "csv", "xml", "env", "ps1", "bat", "sh",
 }
 
+# 可通过"运行"（双击 / 右键）启动的文件扩展名。
+# 值 = 运行该文件所需的命令模板（{f} 会被替换成带引号的绝对路径），
+# 经系统 shell 执行；Windows 下依赖 PATH 中的运行时（python / node / java / powershell 等）。
+RUN_EXTS = {
+    "py": "python {f}",
+    "js": "node {f}",
+    "mjs": "node {f}",
+    "cjs": "node {f}",
+    "ts": "npx tsx {f}",
+    "tsx": "npx tsx {f}",
+    "sh": "bash {f}",
+    "bat": "{f}",
+    "cmd": "{f}",
+    "ps1": "powershell -NoProfile -ExecutionPolicy Bypass -File {f}",
+    "psm1": "powershell -NoProfile -ExecutionPolicy Bypass -File {f}",
+    "html": "__open__ {f}",
+    "htm": "__open__ {f}",
+    "exe": "{f}",
+    "msi": "msiexec /i {f}",
+    "jar": "java -jar {f}",
+}
+
+
+def shell_quote(s: str) -> str:
+    """给路径加双引号，内部双引号做转义。"""
+    return '"' + str(s).replace('"', '\\"') + '"'
+
+
+def build_run_command(abs_path: str, ext: str) -> str | None:
+    """按扩展名把（已解析好的）绝对路径拼成 shell 命令。
+
+    扩展名不在 RUN_EXTS 中返回 None；__open__ 模板会被替换为系统打开命令
+    （Windows: start / macOS: open / Linux: xdg-open）。
+    """
+    import os as _os
+    template = RUN_EXTS.get(ext.lower().lstrip("."))
+    if not template:
+        return None
+    quoted = shell_quote(abs_path)
+    if template == "__open__ {f}":
+        uname = _os.uname().sysname.lower() if hasattr(_os, "uname") else ""
+        opener = "start" if _os.name == "nt" else ("open" if uname.startswith("darwin") else "xdg-open")
+        # Windows 的 start 第一个参数是窗口标题，需显式空标题，否则路径会被当作标题
+        cmd = f'start "" {quoted}' if opener == "start" else f"{opener} {quoted}"
+        return cmd
+    return template.replace("{f}", quoted)
+
+def open_with_system(path: str) -> dict:
+    """用系统默认程序打开文件。
+
+    Windows 用 os.startfile（等价资源管理器双击）；macOS 用 open；Linux 用 xdg-open。
+    """
+    p = Path(path)
+    if not p.exists():
+        return {"error": f"文件不存在：{path}"}
+    try:
+        if os.name == "nt":
+            os.startfile(str(p))
+        else:
+            uname = os.uname().sysname.lower() if hasattr(os, "uname") else ""
+            opener = "open" if uname.startswith("darwin") else "xdg-open"
+            subprocess.Popen([opener, str(p)])
+    except Exception as e:
+        return {"error": f"打开失败：{e}"}
+    return {"ok": True, "path": str(p), "opened": True}
+
 
 def _resolve_under(workdir: str, path: str) -> Path | None:
     """把 path 解析为 workdir 内的绝对路径（防路径穿越）；不在其内返回 None。"""
@@ -322,10 +573,20 @@ def rename_file(workdir: str, path: str, new_name: str) -> dict:
 
 
 def copy_file(workdir: str, src: str, dest_dir: str) -> dict:
-    """复制文件/目录到目标目录（同名自动加" (副本N)"后缀）。"""
-    sp = _resolve_under(workdir, src)
-    if not sp or not sp.exists():
-        return {"error": "源文件不存在"}
+    """复制文件/目录到目标目录（同名自动加" (副本N)"后缀）。
+
+    - src 为绝对路径时按绝对路径使用（用于跨工作区粘贴：从 A 工作区复制后到 B 工作区粘贴）
+    - src 为相对路径时解析到本工作区内
+    - dest_dir 永远限制在工作区内（不允许跨工作区写入）
+    """
+    sp = Path(src)
+    if sp.is_absolute():
+        if not sp.exists():
+            return {"error": f"源文件不存在（跨工作区路径）：{src}"}
+    else:
+        sp = _resolve_under(workdir, src)
+        if not sp or not sp.exists():
+            return {"error": "源文件不存在"}
     dp = _resolve_under(workdir, dest_dir)
     if not dp or not dp.is_dir():
         return {"error": "目标目录不存在"}
