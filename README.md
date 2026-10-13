@@ -127,6 +127,13 @@ npm run dev
 - **Python 3.13+**
 - **Node.js 20+**
 
+### 克隆项目
+
+```bash
+git clone https://github.com/Windy-X211/AgentCluster-Project.git
+cd 智能体集群
+```
+
 ### 一键启动（推荐）
 
 双击根目录下的 **`start.bat`**，托盘程序会自动：
@@ -403,13 +410,12 @@ npm run dev
 - [ ] 插件开发 SDK（标准化第三方插件接入）
 - [ ] 跨平台支持（macOS / Linux 托盘 + 启动器）
 
-## 📄 许可证
-
-MIT License
 
 ## 📞 联系
 
-- Issues：项目 GitHub Issues`
+如有问题或建议，请通过以下方式联系：
+- Issues: 项目 GitHub Issues
+- 邮箱：483636702@qq.com
 
 ## 🙏 致谢
 
