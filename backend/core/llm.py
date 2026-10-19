@@ -4,6 +4,174 @@ from typing import AsyncGenerator
 
 _logger = logging.getLogger("llm")
 
+# 模型退化阈值：连续 N 个 content chunk 清洗后全部为空（模型只吐 <unk> 等内部 token）
+# → 判定流式输出退化，抛异常中止本轮，避免垃圾继续流向前端/污染上下文
+_DEGENERATE_EMPTY_LIMIT = 12
+
+# —— 重复输出检测（模型陷入"复读循环"）——
+# 算法：维护一个滚动的"最近段落"缓冲队列（按句子切分，最多 _REPETITION_PARAGRAPH_WINDOW 段），
+#       每收到一个新句子，就与缓冲区内所有历史句子做规范化相似度比对。
+#       若新句子与某历史句子的相似度 >= _REPETITION_SIMILARITY 阈值 → 计一次"重复命中"；
+#       当连续命中的句子数 >= _REPETITION_MAX_REPEATS 时 → 判定陷入重复循环。
+# 设计取舍：
+#   - 在句子粒度上检测，避免把"单词/短语偶然重复"误判为循环；
+#   - 用字符 n-gram 重叠率做相似度（对换行、缩进、标点差异鲁棒）；
+#   - 只在产出足够内容（累计 >= _REPETITION_MIN_SENTENCES 句）后才启用，避免误伤开头正常内容。
+_REPETITION_PARAGRAPH_WINDOW = 12    # 缓冲区保留的历史句子数
+_REPETITION_SIMILARITY = 0.85        # 相似度阈值：>= 视为"同一句在复读"
+_REPETITION_MAX_REPEATS = 3          # 连续重复命中数：达到即判定循环
+_REPETITION_MIN_SENTENCES = 6        # 至少累计多少句子后才开始检测（防开头误伤）
+_REPETITION_NGRAM_K = 6              # 句子相似度用的 n-gram 长度
+
+
+def _sentence_similarity(a: str, b: str) -> float:
+    """计算两段文本的字符 n-gram 重叠相似度（0.0 ~ 1.0）。
+
+    用于判断模型新输出的句子是否在重复历史句子。对以下差异鲁棒：
+      - 换行/缩进/空白差异（先归一化空白）
+      - 大小写差异（统一转小写）
+    实现：把两段文本拆成固定长度 n-gram 集合，用 Jaccard 相似度。
+    """
+    def _ngrams(s: str, k: int):
+        return {s[i:i + k] for i in range(max(0, len(s) - k + 1))}
+
+    a2 = " ".join(a.split()).lower()
+    b2 = " ".join(b.split()).lower()
+    if not a2 or not b2:
+        return 0.0
+    ka, kb = _ngrams(a2, _REPETITION_NGRAM_K), _ngrams(b2, _REPETITION_NGRAM_K)
+    if not ka or not kb:
+        return 0.0
+    inter = len(ka & kb)
+    union = len(ka | kb)
+    return inter / union if union else 0.0
+
+
+class ModelRepetitionError(RuntimeError):
+    """模型流式输出陷入重复循环（复读同一/近似段落）时抛出。
+
+    供上层中止本轮 LLM 调用并注入纠错反馈后重试，而不是把无限复读内容落库/污染上下文。
+    """
+
+    def __init__(self, message: str, repeated_text: str = "", repeat_count: int = 0):
+        super().__init__(message)
+        self.repeated_text = repeated_text      # 被重复的那段文本（便于上层展示/纠错）
+        self.repeat_count = repeat_count        # 累计重复命中次数
+
+
+class SentenceDetector:
+    """单轮 LLM 调用中的重复句子检测器。
+
+    机制：
+      - 维护一个滚动队列，记录最近 _REPETITION_PARAGRAPH_WINDOW 句子。
+      - 每收到一个新句子（过滤纯空/纯标点）→ 与缓冲区历史句子做相似度比对。
+      - 若相似度 >= _REPETITION_SIMILARITY → 计一次"重复命中"，累加 consecutive_hits。
+      - 连续重复命中数 >= _REPETITION_MAX_REPEATS 时 → 触发 ModelRepetitionError。
+      - 检测在累计 >= _REPETITION_MIN_SENTENCES 句后才启用（避免误伤开头）。
+      - 换行/停顿被视作句子分隔符（按 .!?。\n 等切分）。
+
+    使用：
+      detector = SentenceDetector()
+      if detector.check(text_chunk) is True:
+          raise ModelRepetitionError(...)
+      # else:
+      #   yield text_chunk...
+    """
+
+    def __init__(self):
+        self._history: list[str] = []      # 按出现顺序存储的历史句子
+        self._consecutive_hits: int = 0    # 连续重复命中数
+        self._sentence_count: int = 0      # 累计句子数（仅用于判断是否达到最小阈值）
+        self._pending: str = ""            # 跨 chunk 未完成的尾句（等待下一个 chunk 补全）
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """按标点符号切分文本为句子列表（提升对多轮回复的鲁棒性）。
+
+        注意：regex split 带捕获组会把分隔符（. ！？。等）也作为独立片段返回，
+        这里必须过滤掉纯标点/空白片段，否则单独的 "。" 会被当成一个"句子"参与
+        相似度比对，从而打断连续重复命中计数。
+        """
+        if not text or not text.strip():
+            return []
+        # 按句子结束符 (.!?。！？\n) 分割，保留原始大小写（供 repeated_text 展示用），
+        # 大小写差异由 _sentence_similarity 内部统一转小写处理
+        sentences = _re.split(r'(\n|[.!?。！？]+)', text.strip())
+        # 过滤纯标点/空白片段：至少包含一个字母、数字或汉字才视为有意义句子
+        sentences = [s.strip() for s in sentences if _re.search(r'[^\s\W_]', s)]
+        return sentences
+
+    def check(self, text: str) -> tuple[bool, ModelRepetitionError | None]:
+        """检查新句子是否触发重复循环。
+
+        跨 chunk 处理：上一个 chunk 末尾未完成的句子保存在 _pending，
+        与本 chunk 拼接后再切分，避免把一句拆成两半误判。
+        """
+        if not text or not text.strip():
+            return False, None
+
+        merged = (self._pending + text).strip()
+        parts = self._split_sentences(merged)
+        if not parts:
+            return False, None
+
+        # 末尾片段可能仍未完成（不以句子结束符结尾）→ 留待下一个 chunk
+        last = parts[-1]
+        if merged and last and not _re.search(r'[\n.!?。！？]\s*$', merged):
+            self._pending = last
+            parts = parts[:-1]
+        else:
+            self._pending = ""
+
+        # 逐个句子检测
+        for sentence in parts:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            self._sentence_count += 1
+
+            # 在累计至少 MIN_SENTENCES 句后才启用检测（避免误伤开头）
+            if self._sentence_count < _REPETITION_MIN_SENTENCES:
+                self._history.append(sentence)
+                continue
+
+            # 与缓冲区历史句子做相似度比对
+            repeated = False
+            for hist in self._history[-_REPETITION_PARAGRAPH_WINDOW:]:
+                if _sentence_similarity(sentence, hist) >= _REPETITION_SIMILARITY:
+                    repeated = True
+                    break
+
+            if repeated:
+                # 与历史句子几乎相同 → 记录被重复的文本（用历史句子作为参考）
+                self._consecutive_hits += 1
+                if self._consecutive_hits >= _REPETITION_MAX_REPEATS:
+                    # 触发重复循环错误
+                    return True, ModelRepetitionError(
+                        message=f"模型连续输出 {self._consecutive_hits} 个重复/近似句子，判定陷入重复输出循环",
+                        repeated_text=sentence,
+                        repeat_count=self._consecutive_hits
+                    )
+            else:
+                # 新句子独特 → 重置连续命中计数，并将其加入历史
+                self._consecutive_hits = 0
+                self._history.append(sentence)
+                # 保持缓冲区大小不超过窗口
+                if len(self._history) > _REPETITION_PARAGRAPH_WINDOW:
+                    self._history.pop(0)
+
+        # 未触发错误
+        return False, None
+
+
+class ModelDegenerateError(RuntimeError):
+    """模型流式输出退化为垃圾（连续内部 token / 无意义重复）时抛出。
+
+    供上层中止本轮 LLM 调用并注入纠错反馈后重试，而不是把垃圾内容落库。
+    """
+    pass
+
 _OPENAI_ROLES = {"system", "user", "assistant", "tool"}
 
 import re as _re
@@ -13,6 +181,11 @@ _PSEUDO_PROTOCOL_TAG_RE = _re.compile(r"<\|[^|]*\|>")           # <|xxx|> 标签
 _COMMENTARY_TAIL_RE = _re.compile(r"commentary\s*:?")          # commentary 带/不带冒号
 _GARBAGE_PREFIX_RE = _re.compile(r"^(functions?)\.", _re.IGNORECASE)  # functions. 前缀（OpenAI 包装格式）
 _TRAILING_JUNK_RE = _re.compile(r"[^a-zA-Z0-9._-]+$")          # 尾部纯标点/中文等非合法字符
+# 模型内部 tokenizer 标记（源头拦截，流式输出就干净）
+_MODEL_INTERNAL_TOKEN_RE = _re.compile(
+    r"<\s*[|]?\s*(?:unk(?:now)?|endoftext|startoftext|im_start|im_end|user|assistant|system|tool(?:_call(?:_result)?)?|tool_result|eos|bos)\s*[|]?\s*>",
+    _re.IGNORECASE,
+)
 
 def _clean_tool_name(raw: str, known_names: set[str]) -> str:
     """从模型输出的脏工具名字符串中提取出真正的工具名。
@@ -256,6 +429,8 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                         "payload_diag": _diag_payload(payload, model),
                     })
                     return
+                _empty_streak = 0              # 每次调用重置退化检测
+                _rep_detector = SentenceDetector()  # 初始化重复检测器
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "): continue
                     data = line[6:]
@@ -266,15 +441,32 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                         continue
                     delta = chunk["choices"][0].get("delta", {})
 
-                    # 深度思考模型的 reasoning 通道（不影响普通模型）
+                    # 深度思考模型的 reasoning 通道 — 同样过滤模型内部 token
                     if delta.get("reasoning_content"):
-                        yield ("reasoning", delta["reasoning_content"])
+                        _rtext = _MODEL_INTERNAL_TOKEN_RE.sub("", delta["reasoning_content"])
+                        if _rtext:
+                            yield ("reasoning", _rtext)
 
-                    # 普通 content 原样透传（工具调用只可能出现在 tool_calls 通道；
-                    # 正文里的伪协议串可能是文档内容本身，不做致命拦截，避免误伤）
+                    # 普通 content：先清洗模型内部 token，再透传
+                    # （工具调用只可能出现在 tool_calls 通道；
+                    #   正文里的伪协议串可能是文档内容本身，不做致命拦截，避免误伤）
                     if delta.get("content"):
-                        ctext = delta["content"]
-                        yield ("text", ctext)
+                        ctext = _MODEL_INTERNAL_TOKEN_RE.sub("", delta["content"])
+                        if ctext:  # 清洗后还有内容才 yield，避免空 chunk 白白浪费
+                            # —— 重复检测（在 yield 前检查，避免重复内容下发到前端）——
+                            trigger, rep_error = _rep_detector.check(ctext)
+                            if trigger:
+                                # 触发重复循环错误 → 立即中止本轮，后续内容不再 yield
+                                raise rep_error
+                            _empty_streak = 0
+                            yield ("text", ctext)
+                        else:
+                            # 本 chunk 全为内部 token → 连续空计数；超过阈值判定模型退化
+                            _empty_streak += 1
+                            if _empty_streak >= _DEGENERATE_EMPTY_LIMIT:
+                                raise ModelDegenerateError(
+                                    f"模型连续输出 {_empty_streak} 个纯内部 token（<unk> 等），判定为退化，已中止本轮"
+                                )
 
                     # tool_calls 增量
                     for tc in delta.get("tool_calls") or []:

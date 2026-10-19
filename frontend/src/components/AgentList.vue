@@ -383,7 +383,7 @@ function onGroupDrop(e: DragEvent, g: any) {
             @contextmenu.prevent="onCtx($event, a)">
             <span v-if="activeGroupId === 'all' && a.group_id != null" class="group-badge" :title="groupNameOf(a.group_id)">{{ groupNameOf(a.group_id) }}</span>
             <div class="row">
-              <div class="avatar" :style="{ background: (settings.data.avatar_mode === 'unified') ? 'linear-gradient(135deg, #6ea8ff, #b472ff)' : getAvatarGradient(a.name || a.id) }">{{ (a.name || '?').slice(0, 1).toUpperCase() }}</div>
+              <div class="avatar" :style="{ background: (settings.data.avatar_mode === 'unified') ? 'linear-gradient(135deg, #6376b8, #8d73c4)' : getAvatarGradient(a.name || a.id) }">{{ (a.name || '?').slice(0, 1).toUpperCase() }}</div>
               <div class="meta">
                 <div class="name">{{ a.name }}</div>
                 <div class="desc" v-if="a.description">{{ a.description }}</div>
@@ -467,7 +467,8 @@ function onGroupDrop(e: DragEvent, g: any) {
 .agent-item.drop-after { box-shadow: 0 2px 0 0 var(--accent), 0 -1px 0 0 rgba(110,168,255,0.25); }
 .group-badge { position: absolute; top: 6px; right: 8px; font-size: 10px; padding: 2px 7px; border-radius: 999px; background: rgba(110,168,255,0.14); color: var(--accent-ink); border: 1px solid rgba(110,168,255,0.28); max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
 .row { display: flex; gap: 10px; align-items: center; }
-.avatar { width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 12px; flex-shrink: 0; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+.avatar { position: relative; overflow: hidden; width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 12px; flex-shrink: 0; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.3); box-shadow: inset 0 1px 1px rgba(255,255,255,0.45), inset 0 -3px 6px rgba(0,0,0,0.32), inset 0 0 0 1px rgba(255,255,255,0.08), 0 3px 8px rgba(0,0,0,0.4); }
+.avatar::before { content: ''; position: absolute; inset: 0; background: linear-gradient(165deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.10) 32%, rgba(255,255,255,0) 52%), linear-gradient(0deg, rgba(0,0,0,0.24) 0%, rgba(0,0,0,0) 42%); pointer-events: none; }
 .name { font-size: 13px; font-weight: 500; }
 .desc { font-size: 11px; opacity: .6; margin-top: 2px; }
 .tags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px; }

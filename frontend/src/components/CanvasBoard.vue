@@ -1426,7 +1426,9 @@ defineExpose({ viewportRef, computeNodeBbox })
 }
 .node.speaking .avatar {
   animation: avatarGlow 1.2s ease-in-out infinite;
-  box-shadow: 0 0 12px 3px rgba(180, 114, 255, 0.55);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,0.45),
+              inset 0 -3px 6px rgba(0,0,0,0.32),
+              0 0 12px 3px rgba(180, 114, 255, 0.55);
 }
 
 /* 次要：正在发起/处理 call — 蓝色边框脉冲 */
@@ -1549,7 +1551,8 @@ defineExpose({ viewportRef, computeNodeBbox })
 .b-text.markdown img { max-width: 100%; border-radius: 5px; margin: 3px 0; }
 
 .node-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-.avatar { width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+.avatar { position: relative; overflow: hidden; width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.3); box-shadow: inset 0 1px 1px rgba(255,255,255,0.45), inset 0 -3px 6px rgba(0,0,0,0.32), inset 0 0 0 1px rgba(255,255,255,0.08), 0 3px 8px rgba(0,0,0,0.4); }
+.avatar::before { content: ''; position: absolute; inset: 0; background: linear-gradient(165deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.10) 32%, rgba(255,255,255,0) 52%), linear-gradient(0deg, rgba(0,0,0,0.24) 0%, rgba(0,0,0,0) 42%); pointer-events: none; }
 .name { font-size: 13px; font-weight: 500; }
 .node-actions { display: flex; gap: 4px; }
 .node .btn { backdrop-filter: none; -webkit-backdrop-filter: none; }

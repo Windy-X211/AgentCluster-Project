@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 const props = defineProps<{
   modelValue: string
   options: { name: string; desc: string }[]
+  placeholder?: string
 }>()
 const emit = defineEmits<{ (e: 'update:modelValue', v: string): void }>()
 
@@ -22,7 +23,7 @@ const label = computed(() => {
     const hit = props.options.find(o => o.name === props.modelValue)
     return hit ? hit.name : props.modelValue
   }
-  return '选择参数…'
+  return props.placeholder || '选择参数…'
 })
 const currentOption = computed(() => props.options.find(o => o.name === props.modelValue) || null)
 

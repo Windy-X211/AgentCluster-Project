@@ -27,6 +27,8 @@ def _detect_node_dir() -> Path | None:
 NODE_DIR = _detect_node_dir()
 NODE_BIN = (NODE_DIR / "node.exe") if NODE_DIR else (ROOT / "node-v20.18.0-win-x64" / "node.exe")
 PID_FILE = ROOT / ".agentcluster.pid"
+# 启动状态文件：启动中窗口(launch_splash.py)轮询读取，显示当前启动步骤
+STATUS_FILE = ROOT / ".startup_status"
 
 BACKEND_PORT = int(os.getenv("PORT", "8870"))
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
@@ -39,14 +41,24 @@ backend_proc = None
 frontend_proc = None
 icon: pystray.Icon | None = None
 status_text = "正在启动..."
+# 本托盘进程是否已自动打开过浏览器：仅首次启动成功时自动打开一次，
+# 后续的“重启全部 / 启动服务 / 重复拉起”都不再 webbrowser.open，
+# 避免浏览器最小化后被反复顶起（见 __main__ 中 _already_running 的说明）。
+_auto_opened_browser = False
+# 启动中窗口进程句柄：每次 启动/重启 都会重新拉起一个；上一个还在运行则不重复开
+_splash_proc: subprocess.Popen | None = None
 
 
 # ---------- 工具函数 ----------
 
 def kill_port(port: int) -> bool:
-    """按 netstat 找到占用端口的进程，taskkill 杀掉（尽力而为）"""
+    """按 netstat 找到占用端口的进程，taskkill 杀掉（尽力而为）。
+    CREATE_NO_WINDOW：netstat/taskkill 是控制台程序，不加会在启动时闪黑框。"""
     try:
-        out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
+        out = subprocess.check_output(
+            ["netstat", "-ano"], text=True, errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
         pids = set()
         for line in out.splitlines():
             # 匹配 LISTENING + 精确端口（避免 :5173 误匹配 :51730）
@@ -61,7 +73,11 @@ def kill_port(port: int) -> bool:
                 if pid.isdigit(): pids.add(int(pid))
         for pid in pids:
             if pid == os.getpid(): continue  # 跳过自己
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=3)
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
         time.sleep(0.8)
     except Exception: pass
     return not port_in_use(port)
@@ -111,16 +127,65 @@ def is_running() -> bool:
     return h["backend"] and h["frontend"]
 
 
+# ---------- 启动中窗口（特效加载动画） ----------
+
+def write_status(text: str):
+    """把当前启动步骤写入状态文件，供启动中窗口实时显示。
+
+    约定：普通步骤写 "step|<文案>"；全部结束写 "done|<文案>"（窗口收到 done 后收尾退出）。
+    """
+    try:
+        STATUS_FILE.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clear_status_file():
+    """删除状态文件：启动中窗口发现文件消失即自动退出（用于托盘退出/停止服务）。"""
+    try:
+        STATUS_FILE.unlink()
+    except Exception:
+        pass
+
+
+def _splash_python() -> str:
+    """启动中窗口用无控制台的 pythonw 运行（避免自身闪黑框）。"""
+    exe = sys.executable
+    if os.name == "nt" and exe.lower().endswith("python.exe"):
+        cand = exe[:-len("python.exe")] + "pythonw.exe"
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+
+def _ensure_splash():
+    """拉起启动中窗口：每次 启动/重启 都会显示；上一个还在运行则不重复开。"""
+    global _splash_proc
+    if _splash_proc is not None and _splash_proc.poll() is None:
+        return
+    try:
+        _splash_proc = subprocess.Popen(
+            [_splash_python(), str(ROOT / "launch_splash.py")],
+            cwd=str(ROOT),
+            creationflags=WIN_FLAGS,
+            close_fds=True,
+        )
+    except Exception:
+        _splash_proc = None
+
+
 # ---------- 启动/停止 ----------
 
 def start_backend():
     global backend_proc
     if port_in_use(BACKEND_PORT):
+        write_status("step|检测到旧后端进程，正在清理...")
         print(f"[启动器] {BACKEND_PORT} 被占用，尝试清理...")
         kill_port(BACKEND_PORT)
     if port_in_use(BACKEND_PORT):
         print(f"[启动器] 后端端口 {BACKEND_PORT} 无法清理（可能需管理员权限），跳过启动")
         return False
+    write_status("step|正在启动后端服务...")
     python = sys.executable
     backend_proc = subprocess.Popen(
         [python, "-u", "main.py"],
@@ -131,7 +196,9 @@ def start_backend():
     )
     print(f"[启动器] 后端 PID={backend_proc.pid}，等待端口 {BACKEND_PORT}...")
     ok = wait_port(BACKEND_PORT, timeout=20)
-    if not ok:
+    if ok:
+        write_status("step|后端服务已就绪")
+    else:
         print("[启动器] 后端启动超时，详见 backend/backend.log")
     return ok
 
@@ -139,11 +206,13 @@ def start_backend():
 def start_frontend():
     global frontend_proc
     if port_in_use(5173):
+        write_status("step|检测到旧前端进程，正在清理...")
         print("[启动器] 5173 被占用，尝试清理...")
         kill_port(5173)
     if port_in_use(5173):
         print("[启动器] 前端端口 5173 无法清理，跳过启动")
         return False
+    write_status("step|正在启动前端服务...")
     node_dir = str(NODE_DIR) if NODE_DIR else ""
     env = os.environ.copy()
     if node_dir:
@@ -175,16 +244,23 @@ def start_frontend():
         )
     print(f"[启动器] 前端 PID={frontend_proc.pid}，等待端口 5173...")
     ok = wait_port(5173, timeout=45)  # Vite 冷启动/依赖预构建可能 >20s
-    if not ok:
+    if ok:
+        write_status("step|前端服务已就绪")
+    else:
         print("[启动器] 前端启动超时")
     return ok
 
 
 def start_all():
-    global status_text
+    global status_text, _auto_opened_browser
     print("=" * 50)
     print("  智能体集群 AgentCluster - 一键启动")
     print("=" * 50)
+    # 拉起“启动中”特效窗口，并在各阶段写入状态供其显示
+    _ensure_splash()
+    write_status("step|正在初始化启动器...")
+    # start_all 开头探测：本次启动前前端是否已在服务（说明页面大概率已打开）。
+    frontend_was_up = port_in_use(5173)
     status_text = "正在启动后端..."
     ok1 = start_backend()
     status_text = "正在启动前端..."
@@ -195,10 +271,20 @@ def start_all():
         print(f"\n✅ 全部启动成功！")
         print(f"   前端: {FRONTEND_URL}")
         print(f"   后端: {BACKEND_URL}")
-        # 自动打开浏览器
-        threading.Timer(1.2, lambda: webbrowser.open(FRONTEND_URL + "/#/")).start()
+        # 自动打开浏览器：本进程内最多尝试一次（重启/重复拉起不再弹）；
+        # 且仅当前端此前未在服务（页面还没打开过）时才真正打开，
+        # 否则 webbrowser.open 会把已最小化的浏览器窗口反复顶起（“最小化后又自动出现”）。
+        opened = False
+        if not _auto_opened_browser:
+            _auto_opened_browser = True
+            if not frontend_was_up:
+                opened = True
+                threading.Timer(1.2, lambda: webbrowser.open(FRONTEND_URL + "/#/")).start()
+        # 通知启动窗口收尾：首次启动会顺带打开界面，其余场景仅提示就绪
+        write_status("done|启动完成，正在打开界面..." if opened else "done|✅ 服务已就绪")
     else:
         status_text = f"⚠️ 部分失败 (后端={'OK' if ok1 else 'FAIL'}, 前端={'OK' if ok2 else 'FAIL'})"
+        write_status("done|⚠️ 部分服务启动失败，请查看托盘状态")
     if icon: update_menu()
 
 
@@ -222,16 +308,14 @@ def stop_all():
                 except Exception: pass
     backend_proc = frontend_proc = None
 
-    # 2) 兜底：按端口强制杀
+    # 2) 兜底：按端口强制杀（kill_port 内部已用 CREATE_NO_WINDOW，避免闪 cmd 黑框）
     for port in (BACKEND_PORT, 5173):
         if port_in_use(port):
-            os.system(
-                f'for /f "tokens=5" %a in (\'netstat -aon ^| findstr :{port} ^| findstr LISTENING\') '
-                f'do taskkill /f /pid %a 2>nul'
-            )
+            kill_port(port)
     if PID_FILE.exists():
         try: PID_FILE.unlink()
         except Exception: pass
+    clear_status_file()
     status_text = "⏹ 已停止"
     if icon:
         try: update_menu()
@@ -323,6 +407,7 @@ def on_stop(icon=None, item=None):
 def on_exit(ic=None, item=None):
     """❌ 退出 —— 后台线程停服务，立即关托盘（不等 stop_all 完成）"""
     print("[退出] on_exit")
+    clear_status_file()  # 让还在等待的启动中窗口退出
     # 后台停服务（不阻塞托盘关闭）
     threading.Thread(target=lambda: (stop_all(), sys.exit(0)), daemon=True).start()
     # 立即关托盘
@@ -429,6 +514,7 @@ if __name__ == "__main__":
     try:
         run_tray()
     except Exception as e:
+        clear_status_file()  # 启动窗口别再傻等
         with open(ROOT / "tray_crash.log", "a", encoding="utf-8") as f:
             f.write(f"===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
             f.write(traceback.format_exc())

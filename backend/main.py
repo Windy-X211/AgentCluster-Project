@@ -7,7 +7,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
 
 from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, ROOT
-from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets
+from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug
 
 from datetime import datetime
 
@@ -176,6 +176,7 @@ ROUTES = [
     ("commands", commands.router),
     ("rules", rules.router),
     ("param_presets", param_presets.router),
+    ("plugins_debug", plugins_debug.router),
 ]
 for name, r in ROUTES:
     app.include_router(r, prefix=f"/api/{name}", tags=[name])
@@ -206,9 +207,10 @@ def storage_open(payload: dict):
 
 @app.post("/api/storage/pick_folder")
 def storage_pick_folder(payload: dict):
-    """弹出系统文件夹选择器，返回所选路径（取消返回空串）。"""
+    """弹出系统文件夹选择器，返回所选路径（取消返回空串）。支持自定义对话框标题。"""
     initial = payload.get("initial", "") or ""
-    path = pick_folder(initial)
+    title = payload.get("title") or "选择数据存储位置"
+    path = pick_folder(initial, title)
     return {"path": path}
 
 

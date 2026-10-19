@@ -854,7 +854,7 @@ const userAvatarPhoto = computed(() => (settings.data.user_avatar as string) || 
 function onAvatarContextMenu(e: MouseEvent) {
   e.preventDefault()
   const menuW = 240
-  const menuH = 44
+  const menuH = userAvatarPhoto.value ? 88 : 44
   const pad = 8
   const x = Math.max(pad, Math.min(e.clientX, window.innerWidth - menuW - pad))
   const y = Math.max(pad, Math.min(e.clientY, window.innerHeight - menuH - pad))
@@ -903,6 +903,11 @@ async function handleAvatarPhotoUpload(e: Event) {
   } catch {
     alert('头像照片读取失败，请换一张图片重试')
   }
+}
+
+async function resetAvatarPhoto() {
+  closeAvatarCtx()
+  await settings.update({ user_avatar: '' })
 }
 
 /** 图片等比缩小到 max 边长内，转成 JPEG dataURL（避免原图过大撑爆配置存储） */
@@ -1628,6 +1633,10 @@ onBeforeUnmount(() => {
             <span class="msg-ctx-icon">📷</span>
             <span>{{ userAvatarPhoto ? '更换头像照片' : '设置头像照片' }}</span>
           </div>
+          <div v-if="userAvatarPhoto" class="msg-ctx-item" @click.stop="resetAvatarPhoto">
+            <span class="msg-ctx-icon">↩️</span>
+            <span>恢复默认头像</span>
+          </div>
         </div>
       </Teleport>
       <!-- 消息操作状态提示（删除/撤销的即时反馈） -->
@@ -2092,10 +2101,23 @@ onBeforeUnmount(() => {
 .col-wrap { display: flex; flex-direction: column; gap: 3px; }
 .head-row { display: flex; align-items: center; gap: 6px; }
 .avatar {
+  position: relative; overflow: hidden;
   width: 24px; height: 24px; border-radius: 7px;
   display: flex; align-items: center; justify-content: center;
   font-size: 11px; font-weight: 600; flex-shrink: 0; color: #fff;
   text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,0.45),
+              inset 0 -3px 6px rgba(0,0,0,0.32),
+              inset 0 0 0 1px rgba(255,255,255,0.08),
+              0 3px 8px rgba(0,0,0,0.4);
+}
+.avatar::before {
+  content: '';
+  position: absolute; inset: 0;
+  background:
+    linear-gradient(165deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.10) 32%, rgba(255,255,255,0) 52%),
+    linear-gradient(0deg, rgba(0,0,0,0.24) 0%, rgba(0,0,0,0) 42%);
+  pointer-events: none;
 }
 .avatar.user-avatar {
   width: 24px; height: 24px; border-radius: 7px;

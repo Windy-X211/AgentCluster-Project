@@ -478,17 +478,42 @@ def run_command(command_name: str, **kwargs) -> Any:
 
 
 def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
-                  line_numbers: bool = False) -> dict:
+                  line_numbers: bool = False, start_line: int | None = None,
+                  end_line: int | None = None) -> dict:
+    """读取文件内容，支持完整读取与区域读取。
+
+    区域读取：传 start_line / end_line（1 起的行号，闭区间）只读指定行范围，
+    适合大文件分段查看；line_numbers=True 时行号始终为文件真实行号
+    （区域读取时从 start_line 起），方便配合 file.patch 按锚点定点修改。
+    """
     try:
         p = _resolve(path)
-        text = p.read_text(encoding=encoding, errors="ignore")
+        all_lines = p.read_text(encoding=encoding, errors="ignore").splitlines()
+        total = len(all_lines)
+        region = start_line is not None or end_line is not None
+        if region:
+            s = 1 if start_line is None else max(1, int(start_line))
+            e = total if end_line is None else min(total, int(end_line))
+            if s > total:
+                return {"error": f"start_line={s} 超出文件范围（文件共 {total} 行）",
+                        "path": str(p), "total_lines": total}
+            if s > e:
+                return {"error": f"start_line={s} > end_line={e}，区间无效",
+                        "path": str(p), "total_lines": total}
+            lines = all_lines[s - 1:e]
+        else:
+            s, e, lines = 1, total, all_lines
+        text = "\n".join(lines)
         if line_numbers:
-            # 带行号（1 起，右对齐宽度自适应），方便配合 file.patch 按行定点修改
-            pad = len(str(len(text.splitlines())))
-            text = "\n".join(f"{i + 1:>{pad}}\t{ln}" for i, ln in enumerate(text.splitlines()))
+            # 带文件真实行号（区域读取时行号从 start_line 起，宽度按全文总行数自适应）
+            pad = len(str(total))
+            text = "\n".join(f"{s + i:>{pad}}\t{ln}" for i, ln in enumerate(lines))
         if len(text) > max_chars:
             text = f"...truncated ({len(text)} chars)...\n" + text[-max_chars:]
-        return {"content": text, "path": str(p)}
+        result = {"content": text, "path": str(p)}
+        if region:
+            result["region"] = {"start_line": s, "end_line": e, "total_lines": total}
+        return result
     except Exception as e:
         return {"error": str(e), "resolved": str(_resolve(path))}
 
@@ -825,14 +850,18 @@ def cmd_workspace_search(query: str,
 
 def cmd_skill_invoke(skill_name: str) -> dict:
     """显式调用指定的技能。返回技能内容供LLM参考使用。
-    
-    技能内容将不会自动添加到系统提示词中，仅在通过此命令显式调用时使用。
+
+    渐进式读取：
+      - 一般大小正文（如 lx-music-control）→ 完全返回正文；
+      - 较大正文（如 pptx）→ 只返回目录 toc + 开头预览，
+        具体章节用 cmd_skill_read_section 按需读取。
+    技能内容不会自动添加到系统提示词中，仅在通过此命令显式调用时使用。
     """
     try:
         # 确保技能注册表是最新的
-        from skills import SKILL_REGISTRY, load_skills
+        from skills import SKILL_REGISTRY, load_skills, skill_toc, FULL_READ_LIMIT, PROGRESSIVE_PREVIEW_CHARS
         load_skills()  # 热重载技能
-        
+
         # 查找技能
         if skill_name not in SKILL_REGISTRY:
             # 尝试不同的命名格式
@@ -841,26 +870,94 @@ def cmd_skill_invoke(skill_name: str) -> dict:
                 skill_name = alt_name
             else:
                 return {"error": f"未找到技能: {skill_name}"}
-        
+
         skill_data = SKILL_REGISTRY[skill_name]
-        
+
         # 构建返回结果
         result = {
             "skill_name": skill_name,
             "skill_label": skill_data.get("label", skill_name),
             "description": skill_data.get("description", ""),
-            "prompt": skill_data.get("prompt", ""),
         }
-        
+
+        # 技能文件夹绝对路径：让智能体用绝对路径定位技能内部文件（scripts/references/assets），
+        # 避免因设置了工作区（WORKDIR）导致相对路径解析到错误位置。
+        skill_dir = skill_data.get("_source_dir", "")
+        result["skill_dir"] = skill_dir
+        result["path_note"] = (
+            f"本技能文件夹绝对路径：{skill_dir or '（未知）'}。"
+            "技能正文中的脚本/资源路径均位于该文件夹下，"
+            "读取或运行技能内部文件时请用 skill_dir 拼接绝对路径，切勿按当前工作区（WORKDIR）的相对路径解析。"
+        )
+
+        prompt = skill_data.get("prompt", "")
+        result["body_size"] = len(prompt)
+        if len(prompt) <= FULL_READ_LIMIT:
+            # 一般大小正文：完全读取
+            result["mode"] = "full"
+            result["prompt"] = prompt
+        else:
+            # 较大正文：渐进式读取 —— 先给目录，具体章节用 skill.read_section 按需拉取
+            result["mode"] = "progressive"
+            result["prompt"] = ""  # 不再全文返回，避免大正文一次撑爆上下文
+            result["toc"] = [
+                {"title": t["title"], "level": t["level"], "line": t["line"]}
+                for t in skill_toc(prompt)
+            ]
+            result["preview"] = prompt[:PROGRESSIVE_PREVIEW_CHARS]
+            result["read_note"] = (
+                f"本技能正文较长（{len(prompt)} 字符），已按渐进式读取只返回目录，未返回全文。"
+                "需要某个章节时，用 skill.read_section 传入 skill_name 与 section（章节标题，从上方 toc 选取）"
+                "读取该章节；技能目录内的其他参考文件（如 editing.md / pptxgenjs.md）可直接用 file.read 读取"
+                "（绝对路径由 skill_dir 提供）。不要试图从 preview 推断未给出的章节内容。"
+            )
+
         # 如果技能有scripts目录，也可以提供执行入口信息
         if skill_data.get("_subdirs", {}).get("scripts"):
             result["has_scripts"] = True
-            result["script_note"] = "此技能包含可执行脚本，如需执行请参考技能文档"
-        
+            result["script_note"] = "此技能包含可执行脚本，如需执行请参考技能文档（脚本位于 skill_dir/scripts 下）"
+
         return result
-        
+
     except Exception as e:
         return {"error": f"调用技能失败: {str(e)}"}
+
+
+def cmd_skill_read_section(skill_name: str, section: str, max_chars: int = 6000) -> dict:
+    """渐进式读取：按章节标题读取较大技能（如 pptx）正文的指定部分。
+
+    章节标题从 skill.invoke 返回的 toc 中选取；找不到对应章节时返回错误提示。
+    """
+    try:
+        from skills import SKILL_REGISTRY, load_skills, read_skill_section
+        load_skills()  # 热重载技能
+
+        if skill_name not in SKILL_REGISTRY:
+            # 尝试不同的命名格式
+            alt_name = skill_name.replace("_", "-") if "_" in skill_name else skill_name.replace("-", "_")
+            if alt_name in SKILL_REGISTRY:
+                skill_name = alt_name
+            else:
+                return {"error": f"未找到技能: {skill_name}"}
+
+        data = SKILL_REGISTRY[skill_name]
+        content, meta = read_skill_section(data.get("prompt", ""), section)
+        if not content:
+            return {"error": f"未找到章节: {section}（请从 skill.invoke 返回的 toc 中选取章节标题）", "skill_name": skill_name}
+
+        truncated = len(content) > max_chars
+        if truncated:
+            content = content[:max_chars] + f"\n…（本节过长，已截断，剩余 {len(content) - max_chars} 字符，可调大 max_chars 或缩小 section 范围）…"
+        return {
+            "skill_name": skill_name,
+            "section": meta["title"],
+            "level": meta["level"],
+            "line": meta["line"],
+            "truncated": truncated,
+            "content": content,
+        }
+    except Exception as e:
+        return {"error": f"读取技能章节失败: {str(e)}"}
 
 
 def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = True,
@@ -913,14 +1010,16 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "file.read",
-            "description": "读取指定文件的完整内容。用于查看代码、文档、配置等文本文件。",
+            "description": "读取指定文件的内容。默认返回完整内容；也可以传 start_line / end_line 只读指定行区间（大文件分段查看）。用于查看代码、文档、配置等文本文件。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件的绝对或相对路径，如 ./main.py"},
                     "encoding": {"type": "string", "description": "文件编码，默认 utf-8"},
                     "max_chars": {"type": "integer", "description": "最多返回的字符数，超过会截断"},
-                    "line_numbers": {"type": "boolean", "description": "是否在每行前加 1 起的行号（配合 file.patch 按行定点编辑时建议开启）"}
+                    "line_numbers": {"type": "boolean", "description": "是否在每行前加文件真实行号（区域读取时从 start_line 起；配合 file.patch 按行定点编辑时建议开启）"},
+                    "start_line": {"type": "integer", "description": "可选：起始行号（1 起），只读该行及之后的内容；与 end_line 配合构成闭区间 [start_line, end_line]，适合大文件分段查看"},
+                    "end_line": {"type": "integer", "description": "可选：结束行号（1 起），与 start_line 配合构成闭区间；单独给 end_line 时表示从第 1 行读到此行"}
                 },
                 "required": ["path"]
             }
@@ -930,13 +1029,29 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "skill.invoke",
-            "description": "显式调用指定的技能。技能内容将不会自动添加到系统提示词中，仅在通过此命令显式调用时使用。",
+            "description": "显式调用指定的技能。技能内容不会自动添加到系统提示词中，仅在通过此命令显式调用时返回。一般大小正文（如 lx-music-control）会返回完整正文；较大正文（如 pptx）采用渐进式读取——只返回目录 toc 与开头 preview，不返回全文，需要用 skill.read_section 按需读取具体章节。返回结果还包含技能文件夹绝对路径（skill_dir），读取技能内部文件时必须使用该绝对路径，不能用工作区相对路径。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skill_name": {"type": "string", "description": "要调用的技能名称（对应AppData/skills中的文件夹名）"}
                 },
                 "required": ["skill_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill.read_section",
+            "description": "按章节标题渐进式读取较大技能（如 pptx）正文的指定章节。当 skill.invoke 返回 mode=progressive 时，技能全文不会一次给出，本命令用于按需读取 toc 中的具体章节（section 从 toc 的 title 中选取）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "技能名称（与 skill.invoke 的 skill_name 一致）"},
+                    "section": {"type": "string", "description": "章节标题，可从 skill.invoke 返回的 toc 中选取（支持全文/前缀/包含匹配）"},
+                    "max_chars": {"type": "integer", "description": "单次最多返回的字符数，默认 6000"}
+                },
+                "required": ["skill_name", "section"]
             }
         }
     },
@@ -1092,12 +1207,17 @@ COMMAND_TOOLS = [
         "function": {
             "name": "cmd.run",
             "description": (
-                "在系统 shell 中运行一条命令（Windows cmd / Linux bash）。"
+                "在系统 shell 中运行一条命令（当前环境为 Windows PowerShell 5.1）。"
                 "系统会自动识别长运行命令并以后台方式启动（如 http.server / uvicorn / node / vite / watch 等），"
                 "后台启动时立即返回 pid、端口探活结果，不会阻塞智能体。"
-                "短命令（如 dir / ls / pip install）正常前台执行。"
+                "短命令（如 dir / pip install）正常前台执行。"
                 "也可显式传 background=true 强制后台，或 background=false 强制前台。"
-                "慎用，避免破坏性命令。"
+                "\n\n⚠️ 当前是 Windows PowerShell 5.1 环境："
+                "\n- 不要用 Linux 命令：pwd/cat/ls/grep/find/mkdir -p 均不存在或行为不符，改用 cd/Get-Content/Get-ChildItem/Select-String/New-Item -ItemType Directory -Force"
+                "\n- dir / cd / where.exe 可用（cmd.exe 语法在 PowerShell 也能跑）"
+                "\n- 管道符号用 | 即可；PowerShell 5 不支持 &&，用分号 ; 串联命令"
+                "\n- npm/node 前需确保 PATH 含 E:\\app\\node-v20.18.0-win-x64（见项目规则）"
+                "\n慎用，避免破坏性命令。"
             ),
             "parameters": {
                 "type": "object",
@@ -1165,6 +1285,7 @@ COMMAND_CN_LABELS = {
     "file.find": "🔎 查找文件",
     "workspace.search": "🌐 工作区检索",
     "skill.invoke": "🔧 调用技能",
+    "skill.read_section": "📑 读取技能章节",
     "cmd.run": "🚀 运行命令",
     "cmd.bg_list": "📋 后台进程",
     "cmd.bg_stop": "🛑 停止进程",
@@ -1221,7 +1342,7 @@ def build_plugin_tool(name: str, meta: dict) -> dict:
     }
 
 
-def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict) -> list:
+def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict, skills: list | None = None) -> list:
     """根据 agent 的能力列表，构建要传给 LLM 的 tools。
 
     所有 tool 的 parameters 都强制加 additionalProperties=False，
@@ -1232,13 +1353,17 @@ def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict)
     for t in COMMAND_TOOLS:
         if t["function"]["name"] in cmd_names:
             result.append(_seal_schema(t))
-    # 内置常驻工具：无需在智能体配置里勾选，始终可用。
-    # skill.invoke 是技能的渐进式加载入口（技能正文不进 system prompt，按需显式拉取）。
-    if not any(t["function"]["name"] == "skill.invoke" for t in result):
-        for t in COMMAND_TOOLS:
-            if t["function"]["name"] == "skill.invoke":
-                result.append(_seal_schema(t))
-                break
+    # 技能渐进式加载入口：skill.invoke / skill.read_section（技能正文不进 system prompt，
+    # 按需显式拉取；大正文按章节切分读取）。
+    # 仅当智能体配置了技能（skills 非空）或为未配置的旧数据（skills=None，兼容）时注入；
+    # 明确不勾选任何技能（skills=[]）→ 不注入，未勾选技能就没有技能调用能力。
+    if skills is None or bool(skills):
+        for inject_name in ("skill.invoke", "skill.read_section"):
+            if not any(t["function"]["name"] == inject_name for t in result):
+                for t in COMMAND_TOOLS:
+                    if t["function"]["name"] == inject_name:
+                        result.append(_seal_schema(t))
+                        break
     for pname in (plugin_names or []):
         meta = plugin_registry.get(pname)
         if meta:
@@ -2019,7 +2144,7 @@ COMMAND_GROUPS = [
 ]
 
 # 运行时自动注入的常驻工具：不在智能体配置/默认命令选择器里展示（无需也无法手动勾选）。
-RUNTIME_INJECTED_COMMANDS = {"skill.invoke", "cluster.send_message", "cluster.handoff"}
+RUNTIME_INJECTED_COMMANDS = {"skill.invoke", "skill.read_section", "cluster.send_message", "cluster.handoff"}
 
 _NAME_TO_GROUP: dict[str, str] = {}
 for _gname, _names in COMMAND_GROUPS:

@@ -765,17 +765,20 @@ def open_folder(path: str) -> bool:
         return False
 
 
-def pick_folder(initial: str = "") -> str:
-    """弹出系统文件夹选择对话框，返回所选绝对路径（取消则返回空串）。"""
+def pick_folder(initial: str = "", title: str = "选择数据存储位置") -> str:
+    """弹出系统文件夹选择对话框，返回所选绝对路径（取消则返回空串）。
+
+    title 可自定义对话框标题；initial 若为空或不是已存在目录则忽略，避免 tkinter 报错。
+    """
     try:
         import tkinter as tk
         from tkinter import filedialog
+        initialdir = initial if initial and Path(initial).is_dir() else None
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
         root.update()
-        selected = filedialog.askdirectory(
-            initialdir=initial or None, title="选择数据存储位置")
+        selected = filedialog.askdirectory(initialdir=initialdir, title=title)
         root.destroy()
         return selected or ""
     except Exception as e:

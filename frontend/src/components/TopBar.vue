@@ -12,6 +12,7 @@ import { RouterLink } from 'vue-router'
       </div>
     </div>
     <div class="spacer" />
+    <RouterLink to="/plugins" class="nav-item">🔌 插件调试</RouterLink>
     <RouterLink to="/settings" class="nav-item">⚙ 设置</RouterLink>
   </div>
 </template>

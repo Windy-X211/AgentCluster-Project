@@ -1,6 +1,58 @@
 // 统一 API 客户端
 const BASE = '/api'
 
+// —— 插件调试面板领域类型 ——
+export interface ParamDefinition {
+  name: string
+  type?: string
+  required?: boolean
+  description?: string
+  enum?: unknown[]
+  default?: unknown
+  example?: unknown
+  [extra: string]: unknown
+}
+
+export interface PluginEntry {
+  name: string
+  dir_name?: string
+  label: string
+  description: string
+  tool_description: string
+  version: string
+  author: string
+  icon: string
+  tags: string[]
+  parameters: ParamDefinition[]
+}
+
+export interface FailedEntry {
+  dir_name: string
+  load_error: string
+}
+
+export interface PluginScanResult {
+  root_dir: string
+  plugins: PluginEntry[]
+  failed: FailedEntry[]
+  error: string | null
+}
+
+export interface ExecutionResult {
+  ok: boolean
+  data: unknown
+  error: string | null
+  duration_ms: number
+}
+
+export interface RunLogEntry {
+  timestamp: string
+  plugin_name: string
+  params_summary: string
+  duration_ms: number
+  status: 'ok' | 'err'
+}
+
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const r = await fetch(BASE + path, { headers: { 'Content-Type': 'application/json', ...opts.headers }, ...opts })
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
@@ -43,6 +95,25 @@ export const api = {
       req(`/canvases/${id}/trash/purge`, { method: 'POST', body: JSON.stringify({ items }) }),
     fileRead: (id: number, path: string) =>
       req<any>(`/canvases/${id}/file?path=` + encodeURIComponent(path)),
+    // 二进制文件原始地址（图片 <img> / PDF <iframe> 用；v=修改时间防缓存）
+    fileRawUrl: (id: number, path: string, v?: number) =>
+      BASE + `/canvases/${id}/file/raw?path=` + encodeURIComponent(path) + (v ? `&v=${v}` : ''),
+    // 取二进制内容（xlsx/docx/pptx 等需在前端解析的类型）
+    fileRaw: async (id: number, path: string): Promise<ArrayBuffer> => {
+      const r = await fetch(BASE + `/canvases/${id}/file/raw?path=` + encodeURIComponent(path))
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+      return r.arrayBuffer()
+    },
+    // Office(doc/docx/ppt) 经后端 COM 转 PDF：返回 blob URL 供 iframe 渲染（调用方负责 revoke）
+    fileOfficePdf: async (id: number, path: string): Promise<string> => {
+      const r = await fetch(BASE + `/canvases/${id}/file/office-pdf?path=` + encodeURIComponent(path))
+      if (!r.ok) {
+        let d: any = null
+        try { d = await r.json() } catch { /* 非 JSON 错误体 */ }
+        throw new Error(d?.detail || `${r.status} ${r.statusText}`)
+      }
+      return URL.createObjectURL(await r.blob())
+    },
     fileWrite: (id: number, path: string, content: string) =>
       req(`/canvases/${id}/file`, { method: 'PUT', body: JSON.stringify({ path, content }) }),
     fileRename: (id: number, path: string, newName: string) =>
@@ -67,7 +138,7 @@ export const api = {
           const reader = r.body.getReader()
           const dec = new TextDecoder()
           let buf = ''
-          for (;;) {
+          for (; ;) {
             const { done, value } = await reader.read()
             if (done) break
             buf += dec.decode(value, { stream: true })
@@ -132,7 +203,8 @@ export const api = {
   storage: {
     paths: () => req<any>('/storage/paths'),
     open: (path: string) => req<any>('/storage/open', { method: 'POST', body: JSON.stringify({ path }) }),
-    pickFolder: (initial?: string) => req<any>('/storage/pick_folder', { method: 'POST', body: JSON.stringify({ initial: initial || '' }) }),
+    pickFolder: (initial?: string, title?: string) =>
+      req<{ path: string }>('/storage/pick_folder', { method: 'POST', body: JSON.stringify({ initial: initial || '', title: title || '' }) }),
     setLocation: (path: string) => req<any>('/storage/set_location', { method: 'POST', body: JSON.stringify({ path }) })
   },
   fs: {
@@ -153,5 +225,14 @@ export const api = {
     create: (d: any) => req('/param_presets', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/param_presets/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/param_presets/${id}`, { method: 'DELETE' })
+  },
+  pluginsDebug: {
+    list: (rootDir: string) =>
+      req<PluginScanResult>('/plugins_debug/list', { method: 'POST', body: JSON.stringify({ root_dir: rootDir }) }),
+    run: (rootDir: string, pluginName: string, params: Record<string, unknown>) =>
+      req<ExecutionResult>('/plugins_debug/run', {
+        method: 'POST',
+        body: JSON.stringify({ root_dir: rootDir, plugin_name: pluginName, params })
+      })
   }
 }

@@ -4,7 +4,7 @@
     <!-- 工作区面板（可拖动） -->
     <div class="ws-panel glass" :style="panelStyle" :class="{ embedded: pinned }" ref="panelEl"
          @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
-      <div class="ws-head" @mousedown="startDrag">
+      <div class="ws-head" @mousedown="startDrag" @wheel.stop.prevent="onHeadWheel">
         <span class="ws-ico">🗂</span>
         <div class="ws-titles">
           <div class="ws-title">工作区</div>
@@ -120,7 +120,10 @@
       <template v-if="ctxMenu.row">
         <div class="ws-ctx-title">{{ ctxMenu.row.is_dir ? '📁' : '📄' }} {{ ctxMenu.row.name }}</div>
         <template v-if="!ctxMenu.row.is_dir">
-          <div class="ws-ctx-item" @click="actRun" title="双击文件也可运行/打开">
+          <div v-if="canPreview(ctxMenu.row.name)" class="ws-ctx-item" @click="actPreview"
+               title="用内置简易查看器预览（双击文件同样打开）">👁 预览</div>
+          <div class="ws-ctx-item" @click="actRun"
+               :title="rowIsPy(ctxMenu.row) ? '双击 .py 文件同样打开控制台' : '用系统默认程序打开（双击非程序文件则用内置查看器预览）'">
             {{ rowIsPy(ctxMenu.row) ? '🖥 控制台运行' : '↗️ 默认程序打开' }}
           </div>
           <div class="ws-ctx-item" @click="actEdit">✏️ 编辑</div>
@@ -188,15 +191,20 @@
       </div>
       <div class="ws-modal-foot">
         <span class="ws-modal-hint">拖动标题栏移动 · 回车发送输入 · Esc 关闭</span>
-        <button class="ws-btn" @click="clearConsoleOutput">🧹 清空输出</button>
+        <button class="ws-btn ok" @click="clearConsoleOutput">🧹 清空输出</button>
       </div>
     </div>
   </Teleport>
+
+  <!-- 内置简易查看器（双击非程序文件 / 右键"预览"） -->
+  <FileViewer :canvas-id="canvasId" :file="viewerFile"
+              @close="viewerFile = null" @edit="onViewerEdit" />
 </template>
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { api } from '@/api'
+import FileViewer, { type ViewerFile } from './FileViewer.vue'
 
 // —— 全局单例：坐标契约全部由宿主 MainView 下发，禁止自行推断画布位置 ——
 type Bbox = { x: number; y: number; w: number; h: number; hasNodes: boolean }
@@ -325,6 +333,25 @@ const trashStyle = computed(() => {
 // —— 拖动 ——
 const trashPos = ref<{ x: number; y: number } | null>(null)
 const dragStart = ref<{ clientX: number; clientY: number; base: { x: number; y: number }; trash?: boolean; kind: 'float' | 'pin' } | null>(null)
+
+/**
+ * 工作区顶部（标题栏）滚轮：钉住嵌入画布时 → 缩放画布；
+ * 浮动时保持原行为（不滚动页面）。
+ * 派发一个从 viewport 向上冒泡的合成 wheel 事件，复用 CanvasBoard 的 onWheel 缩放逻辑，
+ * 锚点即鼠标位置，与画布其他区域的滚轮缩放行为一致。
+ */
+function onHeadWheel(e: WheelEvent) {
+  if (!props.pinned || !props.viewportEl) return
+  props.viewportEl.dispatchEvent(new WheelEvent('wheel', {
+    clientX: e.clientX,
+    clientY: e.clientY,
+    deltaX: e.deltaX,
+    deltaY: e.deltaY,
+    deltaMode: e.deltaMode,
+    bubbles: true,
+    cancelable: true,
+  }))
+}
 
 function startDrag(e: MouseEvent) {
   if ((e.target as HTMLElement).closest('button')) return
@@ -539,6 +566,8 @@ watch(() => [props.canvasId, props.workdir], ([id, wd]) => {
 function onRowClick(row: any) { if (row.is_dir) toggleDir(row.path) }
 function onRowDblClick(row: any) {
   if (row.is_dir) { toggleDir(row.path); return }
+  // 非程序文件 → 内置简易查看器；程序文件（py/js/脚本/可执行…）→ 运行/系统打开
+  if (canPreview(row.name)) { openViewer(row); return }
   runFile(row)
 }
 
@@ -618,6 +647,11 @@ function actRun() {
   const row = ctxMenu.value?.row
   closeCtx()
   if (row && !row.is_dir) runFile(row)
+}
+function actPreview() {
+  const row = ctxMenu.value?.row
+  closeCtx()
+  if (row && !row.is_dir) openViewer(row)
 }
 function actCopy() {
   const row = ctxMenu.value?.row
@@ -736,6 +770,7 @@ async function commitRename() {
   busy.value = true
   try {
     await api.canvases.fileRename(cid(), t.path, name)
+    closeViewerIfMatches(t.path)
     await refresh()
   } catch (e: any) {
     alert('重命名失败：' + (e?.message || e))
@@ -751,6 +786,7 @@ async function actDelete() {
   busy.value = true
   try {
     await api.canvases.fileDelete(cid(), row.path)
+    closeViewerIfMatches(row.path)
     await refresh()
     if (trashOpen.value) await loadTrash()
   } catch (e: any) {
@@ -831,11 +867,36 @@ function closeEditor() {
   editor.value = null
 }
 
-// —— 双击文件：.py 开控制台，其他用系统默认程序打开 ——
+// —— 双击文件：非程序文件 → 内置查看器；.py 开控制台；其余程序文件 → 系统打开 ——
 function isPyFile(name: string) {
   return (name.split('.').pop() || '').toLowerCase() === 'py'
 }
 function rowIsPy(row: any) { return !!row && isPyFile(row.name || '') }
+
+// "运行程序"类扩展名（与后端 workspace.RUN_EXTS 对齐）：双击/右键仍走运行或系统打开
+const PROGRAM_EXTS = new Set([
+  'py', 'pyw', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'sh', 'bash', 'bat', 'cmd',
+  'ps1', 'psm1', 'html', 'htm', 'exe', 'msi', 'jar', 'vbs', 'wsf',
+])
+
+/** 是否为可用内置查看器预览的"非运行程序"文件 */
+function canPreview(name: string) {
+  const ext = (name.split('.').pop() || '').toLowerCase()
+  return !PROGRAM_EXTS.has(ext)
+}
+
+// —— 内置查看器 ——
+const viewerFile = ref<ViewerFile | null>(null)
+function openViewer(row: any) {
+  viewerFile.value = { path: row.path, name: row.name, size: row.size || 0, mtime: row.mtime }
+}
+function onViewerEdit(f: ViewerFile) {
+  openEditor({ path: f.path, name: f.name })
+}
+/** 文件被删除/重命名后关闭指向它的查看器，避免显示失效内容 */
+function closeViewerIfMatches(path: string) {
+  if (viewerFile.value?.path === path) viewerFile.value = null
+}
 
 async function runFile(row: any) {
   if (row.is_dir) return
@@ -1129,6 +1190,10 @@ function iconFor(name: string) {
   if (ext === 'md') return '📝'
   if (['txt', 'log'].includes(ext)) return '📄'
   if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext)) return '🖼'
+  if (['xlsx', 'xls', 'csv'].includes(ext)) return '📊'
+  if (['doc', 'docx'].includes(ext)) return '📘'
+  if (['ppt', 'pptx'].includes(ext)) return '📙'
+  if (ext === 'pdf') return '📕'
   return '📎'
 }
 

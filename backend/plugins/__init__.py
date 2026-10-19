@@ -44,7 +44,7 @@ tool.py：标准 run(**kwargs) 返回 dict。
   run_plugin(name, **kwargs) → result dict
   build_plugin_tool(name) → OpenAI function-calling schema（commands.py 调用）
 """
-import importlib.util, sys, re, json
+import importlib.util, sys, re, json, hashlib
 from pathlib import Path
 from typing import Any
 
@@ -288,47 +288,73 @@ def _build_function_schema(tool_yaml: dict, manifest: dict) -> dict | None:
 # ==============================================================
 # 加载 & 注册
 # ==============================================================
-def _register_one(plugin_dir: Path) -> None:
+# tool.py 内容哈希缓存：文件未变时复用旧模块（保留运行态：正在运行的窗口/线程/连接不被重置）
+_PLUGIN_SOURCE_HASH: dict[str, str] = {}
+
+
+def _file_hash(fp: Path) -> str:
+    try:
+        return hashlib.sha256(fp.read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _register_one(plugin_dir: Path) -> dict | None:
+    """注册单个插件，返回注册表条目（失败返回 None）。"""
     manifest_fp = plugin_dir / "manifest.yaml"
     tool_fp = plugin_dir / "tool.yaml"
     tool_py = plugin_dir / "tool.py"
 
     if not manifest_fp.exists() or not tool_fp.exists() or not tool_py.exists():
-        return
+        return None
 
     manifest = _load_yaml_file(manifest_fp)
     tool_yaml = _load_yaml_file(tool_fp)
 
     name = manifest.get("name") or tool_yaml.get("identity", {}).get("name") or plugin_dir.name
     if not name:
-        return
+        return None
 
-    # 动态导入 tool.py
-    spec = importlib.util.spec_from_file_location(f"_plugin_{plugin_dir.name}", tool_py)
-    if spec is None or spec.loader is None:
-        return
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    try:
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    except Exception as e:
-        print(f"[plugins] WARN 执行 {tool_py} 失败：{e}")
-        return
-
-    if not hasattr(mod, "run"):
-        print(f"[plugins] WARN {tool_py} 没有 run() 函数")
-        return
+    # tool.py 内容未变且已注册 → 复用旧 run（保留运行态）；
+    # 只有 tool.py 实际变化时才重新执行模块，让新代码生效。
+    h = _file_hash(tool_py)
+    prev = PLUGIN_REGISTRY.get(name)
+    if (prev is not None and prev.get("_source_tool_py") == str(tool_py)
+            and _PLUGIN_SOURCE_HASH.get(str(tool_py)) == h):
+        run_fn = prev["run"]
+    else:
+        # 动态导入 tool.py（新模块对象替换 sys.modules 里的旧模块）
+        spec = importlib.util.spec_from_file_location(f"_plugin_{plugin_dir.name}", tool_py)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        except Exception as e:
+            print(f"[plugins] WARN 执行 {tool_py} 失败：{e}")
+            return None
+        if not hasattr(mod, "run"):
+            print(f"[plugins] WARN {tool_py} 没有 run() 函数")
+            return None
+        run_fn = mod.run
+        _PLUGIN_SOURCE_HASH[str(tool_py)] = h
 
     # 从 tool.yaml 拿参数列表（兼容旧 PLUGIN_PARAMS 字段）
     params_list: list[dict] = tool_yaml.get("parameters", []) or []
     param_names: list[str] = [p.get("name") for p in params_list if p.get("name")]
-    if not param_names and hasattr(mod, "PLUGIN_PARAMS"):
-        param_names = list(getattr(mod, "PLUGIN_PARAMS", []))
+    if not param_names:
+        mod = sys.modules.get(f"_plugin_{plugin_dir.name}")
+        if mod is not None and hasattr(mod, "PLUGIN_PARAMS"):
+            param_names = list(getattr(mod, "PLUGIN_PARAMS", []))
+        elif prev is not None:
+            param_names = list(prev.get("params", []))
 
     # function calling schema
     fn_schema = _build_function_schema(tool_yaml, manifest)
 
-    PLUGIN_REGISTRY[name] = {
+    return {
+        "name": name,
         "label": _label_or_default(manifest.get("label")) or manifest.get("name", plugin_dir.name),
         "description": _description_or_default(manifest.get("description")),
         "version": manifest.get("version", "0.0.1"),
@@ -338,31 +364,47 @@ def _register_one(plugin_dir: Path) -> None:
         "params": param_names,              # 兼容旧 API
         "parameters": params_list,           # 完整参数定义（带 required/enum/default）
         "function_schema": fn_schema,        # OpenAI function-calling 直接用
-        "run": mod.run,
+        "run": run_fn,
         "_source_dir": str(plugin_dir),
         "_source_tool_py": str(tool_py),
     }
 
 
+def _public_view(registry: dict[str, dict] | None = None) -> dict[str, dict]:
+    """去掉 run / 内部字段，返回可序列化的公开视图。"""
+    registry = PLUGIN_REGISTRY if registry is None else registry
+    return {k: {kk: vv for kk, vv in v.items()
+                if not kk.startswith("_") and kk not in ("run", "name")}
+            for k, v in registry.items()}
+
+
 def load_plugins() -> dict[str, dict]:
-    """扫描 AppData/plugins/*/，重建 PLUGIN_REGISTRY。"""
-    registry: dict[str, dict] = {}
-    if not _plugins_root().exists():
-        globals()["PLUGIN_REGISTRY"] = registry
-        return registry
-    for sub in sorted(_plugins_root().iterdir()):
-        if not sub.is_dir() or sub.name.startswith(("_", ".")):
-            continue
-        _register_one(sub)
-    registry = {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_") and kk != "run"}
-                for k, v in PLUGIN_REGISTRY.items()}
-    globals()["PLUGIN_REGISTRY"] = PLUGIN_REGISTRY  # 保留 run
-    return registry
+    """扫描 AppData/plugins/*/，重建 PLUGIN_REGISTRY（热重载，无需重启）。
+
+    - 已删除的插件目录会从注册表移除
+    - tool.py 内容未变的插件复用旧模块（保留运行态，不重复执行）
+    - tool.py 变化的插件重新执行模块，新代码立即生效
+    """
+    new_registry: dict[str, dict] = {}
+    if _plugins_root().exists():
+        for sub in sorted(_plugins_root().iterdir()):
+            if not sub.is_dir() or sub.name.startswith(("_", ".")):
+                continue
+            entry = _register_one(sub)
+            if entry:
+                new_registry[entry["name"]] = entry
+    # 原地更新：保持 PLUGIN_REGISTRY 对象引用不变，避免其他模块通过
+    # `from plugins import PLUGIN_REGISTRY` 值导入的引用在热重载后变成陈旧对象
+    # （否则注入 LLM 的 schema 与实际 run_plugin 执行入口错位，导致调用插件崩溃）。
+    PLUGIN_REGISTRY.clear()
+    PLUGIN_REGISTRY.update(new_registry)
+    return _public_view(new_registry)
 
 
 def list_plugins() -> dict:
-    """只返回元数据（不含 run 和内部字段），给 /api/commands/plugins 用。"""
-    return {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_") and kk != "run" and kk != "function_schema"}
+    """只返回元数据（不含 run/内部字段/function_schema），给 /api/commands/plugins 用。"""
+    return {k: {kk: vv for kk, vv in v.items()
+                if not kk.startswith("_") and kk not in ("run", "function_schema", "name")}
             for k, v in PLUGIN_REGISTRY.items()}
 
 

@@ -73,6 +73,19 @@ onMounted(async () => {
 })
 
 function openPath(p: string) { api.storage.open(p).catch(() => {}) }
+// 将绝对路径转换为相对存储位置（root）的相对路径，供“路径”列展示
+function relPath(p: string): string {
+  const root = storagePaths.value?.root
+  if (!root || !p) return p
+  const norm = (s: string) => s.replace(/\\/g, '/').replace(/\/+$/, '')
+  const r = norm(root)
+  const pp = norm(p)
+  if (pp.toLowerCase() === r.toLowerCase()) return '.'
+  if (pp.toLowerCase().startsWith(r.toLowerCase() + '/')) {
+    return pp.slice(r.length + 1)
+  }
+  return p
+}
 function openExplorer(p: string) {
   explorerInitial.value = p
   explorerOpen.value = true
@@ -271,7 +284,7 @@ const avatarMode = computed({
 
 function avatarPreviewGradient(name: string): string {
   if (avatarMode.value === 'unified') {
-    return 'linear-gradient(135deg, #6ea8ff, #b472ff)'
+    return 'linear-gradient(135deg, #6376b8, #8d73c4)'
   }
   return getAvatarGradient(name)
 }
@@ -573,54 +586,54 @@ async function togglePreset(p: any) {
         </div>
         <div class="storage-loc-tip">默认位置为项目文件夹中的 AppData 文件夹；切换后应用会按新位置的现有数据接管</div>
         <table class="tbl" v-if="storagePaths">
-          <thead><tr><th>名称</th><th>类型</th><th>路径</th><th>数量</th><th style="width: 120px"></th></tr></thead>
+          <thead><tr><th>名称</th><th>类型</th><th>相对路径</th><th>数量</th><th style="width: 120px"></th></tr></thead>
           <tbody>
             <tr>
               <td>⚙️ 配置设置</td>
               <td class="tag-t">单文件</td>
-              <td class="mono sm-cell">{{ storagePaths.settings_file }}</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.settings_file) }}</td>
               <td class="mono">1</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.root)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.root)">打开</button></td>
             </tr>
             <tr>
               <td>🧠 智能体</td>
               <td class="tag-t">每 agent 一个 json</td>
-              <td class="mono sm-cell">{{ storagePaths.agents_dir }}</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.agents_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.agents ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.agents_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.agents_dir)">打开</button></td>
             </tr>
             <tr>
               <td>🎨 画布（集群编排）</td>
               <td class="tag-t">每 canvas 一个 json</td>
-              <td class="mono sm-cell">{{ storagePaths.canvases_dir }}</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.canvases_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.canvases ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.canvases_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.canvases_dir)">打开</button></td>
             </tr>
             <tr>
               <td>💬 聊天记录</td>
               <td class="tag-t">每 conversation 一个 json</td>
-              <td class="mono sm-cell">{{ storagePaths.conversations_dir }}</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.conversations_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.conversations ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.conversations_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.conversations_dir)">打开</button></td>
             </tr>
             <tr>
               <td>🔌 模型接口</td>
               <td class="tag-t">每 interface 一个 json</td>
-              <td class="mono sm-cell">{{ storagePaths.model_interfaces_dir }}</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.model_interfaces_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.model_interfaces ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.model_interfaces_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.model_interfaces_dir)">打开</button></td>
             </tr>
             <tr>
               <td>⚡ 自定义技能</td>
               <td class="tag-t">每技能一个文件夹</td>
-              <td class="mono sm-cell">{{ storagePaths.skills_dir }}</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.skills_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.skills ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.skills_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.skills_dir)">打开</button></td>
             </tr>
             <tr>
               <td>🧩 自定义插件</td>
               <td class="tag-t">每插件一个文件夹</td>
-              <td class="mono sm-cell">{{ storagePaths.plugins_dir }}</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.plugins_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.plugins ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.plugins_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.plugins_dir)">打开</button></td>
             </tr>
@@ -882,13 +895,26 @@ async function togglePreset(p: any) {
 .preview-item { display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .preview-label { font-size: 11px; opacity: .6; }
 .preview-avatar {
+  position: relative; overflow: hidden;
   width: 36px; height: 36px; border-radius: 8px;
   display: flex; align-items: center; justify-content: center;
   font-size: 14px; font-weight: 600; color: #fff;
   text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,0.45),
+              inset 0 -3px 6px rgba(0,0,0,0.32),
+              inset 0 0 0 1px rgba(255,255,255,0.08),
+              0 3px 8px rgba(0,0,0,0.4);
+}
+.preview-avatar::before {
+  content: '';
+  position: absolute; inset: 0;
+  background:
+    linear-gradient(165deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.10) 32%, rgba(255,255,255,0) 52%),
+    linear-gradient(0deg, rgba(0,0,0,0.24) 0%, rgba(0,0,0,0) 42%);
+  pointer-events: none;
 }
 .preview-avatar.user {
-  background: linear-gradient(135deg, #f97316, #ec4899);
+  background: linear-gradient(135deg, #c47f8d, #ba71a2);
 }
 
 .picker-mask {

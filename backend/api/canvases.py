@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 from core.store import load, upsert, delete_by, get_by, next_id
-from core import workspace, pyconsole
+from core import workspace, pyconsole, office_preview
 import os, threading, asyncio, json
 
 router = APIRouter()
@@ -254,6 +254,59 @@ def read_canvas_file(cid: int, path: str = ""):
     if "error" in r:
         raise HTTPException(400, r["error"])
     return r
+
+
+# 内置查看器可直接返回的二进制类型（白名单：非清单内的扩展名一律拒绝）
+_RAW_EXT_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+    "svg": "image/svg+xml", "ico": "image/x-icon", "avif": "image/avif",
+    "apng": "image/apng",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xls": "application/vnd.ms-excel",
+    "xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+    "csv": "text/csv; charset=utf-8",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "doc": "application/msword",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pdf": "application/pdf",
+}
+_RAW_MAX_BYTES = 50 * 1024 * 1024
+
+
+@router.get("/{cid}/file/raw")
+def raw_canvas_file(cid: int, path: str = "", v: int = 0):
+    """返回工作区内二进制文件原始字节（供内置查看器渲染图片/Office/PDF）。
+
+    仅支持 _RAW_EXT_MIME 白名单扩展名，≤50MB；路径经 _resolve_under 防穿越。
+    """
+    wd = _require_wd(cid)
+    p = workspace._resolve_under(wd, path)
+    if not p or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    ext = p.suffix.lower().lstrip(".")
+    mime = _RAW_EXT_MIME.get(ext)
+    if not mime:
+        raise HTTPException(415, f"不支持的文件类型：.{ext}")
+    if p.stat().st_size > _RAW_MAX_BYTES:
+        raise HTTPException(413, "文件过大（>50MB），无法在线预览")
+    return FileResponse(p, media_type=mime)
+
+
+@router.get("/{cid}/file/office-pdf")
+def office_pdf(cid: int, path: str = ""):
+    """doc/docx/ppt 经本机 Office（COM）转成 PDF，供内置查看器保真渲染（带缓存）。"""
+    wd = _require_wd(cid)
+    p = workspace._resolve_under(wd, path)
+    if not p or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    if p.suffix.lower().lstrip(".") not in office_preview.SUPPORTED_EXTS:
+        raise HTTPException(415, "仅支持 doc / docx / ppt 转换")
+    r = office_preview.convert_to_pdf(str(p))
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return FileResponse(r["pdf"], media_type="application/pdf")
 
 
 @router.put("/{cid}/file")
