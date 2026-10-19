@@ -5,6 +5,7 @@
 /.pytest_cache
 /debug.log
 /tray_debug.log
+/wd_debug.log
 /_deck_shots
 /__pycache__
 **/__pycache__/
@@ -16,6 +17,7 @@
 *.mp4
 /.startup_status
 /backend/*_screen.png
+/backend/Stage1Intro.txt
 /.runtime
 **/.runtime/
 /frontend/node_modules/

@@ -46,12 +46,93 @@ AgentCluster 是一个 **Windows 本地优先** 的多智能体编排平台，�
 - **离线运行**：无需依赖外部服务
 - **单实例托盘**：Windows 命名互斥量防重复启动，避免多 Vite 抢端口互顶
 
+## 🛠 环境搭建
+
+### 1. 安装 Python 3.13+
+
+```bash
+# Windows 推荐使用官方安装包或 scoop
+# scoop 安装
+scoop install python
+
+# 验证安装
+python --version
+pythonw --version
+```
+
+### 2. 安装 Node.js 20+
+
+```bash
+# Windows 推荐使用官方安装包或 scoop
+scoop install nodejs
+
+# 验证安装
+node --version
+npm --version
+```
+
+### 3. 创建 Python 虚拟环境（推荐）
+
+```bash
+cd AgentCluster
+
+# 创建虚拟环境
+python -m venv .venv
+
+# 激活虚拟环境
+# PowerShell
+.\.venv\Scripts\Activate.ps1
+# CMD
+.\.venv\Scripts\activate.bat
+
+# 安装后端依赖
+cd backend
+pip install -r requirements.txt
+```
+
+### 4. 安装前端依赖
+
+```bash
+cd ../frontend
+npm install
+```
+
+### 5. 配置环境变量（可选）
+
+```bash
+# 设置模型 API 密钥（编辑 AppData/settings.json）
+# 或在启动前设置环境变量
+set OPENAI_API_KEY=your-api-key
+set BASE_URL=https://api.openai.com/v1
+```
+
+### 6. 验证安装
+
+```bash
+# 后端验证
+cd backend
+python main.py
+# 访问 http://127.0.0.1:8870/api/health 应返回 {"status": "ok"}
+
+# 前端验证（新终端）
+cd frontend
+npm run dev
+# 访问 http://localhost:5173
+```
+
 ## 🚀 快速开始
 
 ### 环境要求
 - **Windows 10 / 11**（依赖 `pythonw` / 系统托盘）
 - **Python 3.13+**
 - **Node.js 20+**
+
+### 克隆项目
+
+```bash
+git clone https://github.com/Windy-X211/AgentCluster-Project.git
+cd 智能体集群
+```
 
 ### 一键启动（推荐）
 
@@ -274,15 +355,12 @@ npm run dev
 │
 ├── start.bat                   # Windows 一键启动（自动选 pythonw / python）
 ├── start_tray.py               # 系统托盘启动器（单实例 + 健康检查 + 菜单）
-├── 智能体集群.lnk              # 桌面 / 根目录快捷方式
 └── .agentcluster.pid           # 运行时 PID 文件
 ```
 
 ## 🎬 演示
 
-演示视频和截图请查看 `智能体集群介绍/演示图片/` 目录：
-- `cover-slide.png` — 封面展示
-- `feature-slide.png` — 核心能力总览
+演示截图请查看 `介绍/演示图片/` 目录：
 - `image_30.png` — 完整界面展示
 - `image_31.png` — 画布编排界面
 - `image_32.png` — 智能体协作关系
@@ -332,13 +410,12 @@ npm run dev
 - [ ] 插件开发 SDK（标准化第三方插件接入）
 - [ ] 跨平台支持（macOS / Linux 托盘 + 启动器）
 
-## 📄 许可证
-
-MIT License
 
 ## 📞 联系
 
-- Issues：项目 GitHub Issues`
+如有问题或建议，请通过以下方式联系：
+- Issues: 项目 GitHub Issues
+- 邮箱：483636702@qq.com
 
 ## 🙏 致谢
 
