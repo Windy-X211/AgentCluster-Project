@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 from core.store import load, upsert, delete_by, get_by, next_id
-from core import workspace
-import os, threading
+from core import workspace, pyconsole, office_preview
+import os, threading, asyncio, json
 
 router = APIRouter()
 
@@ -184,15 +185,24 @@ def _require_workdir(cid: int):
 
 
 @router.get("/{cid}/workspace")
-def get_workspace(cid: int):
-    """画布工作区项目树：以 canvas.workdir 为根，标注大小/修改时间/创建者/修改者/参与者。"""
+def get_workspace(cid: int, rev: int = -1):
+    """画布工作区项目树：以 canvas.workdir 为根，标注大小/修改时间/创建者/修改者/参与者。
+
+    rev: 上次拿到的树版本号。与当前一致时返回 changed=false（不带 tree），
+    供前端高频轮询做实时更新；rev<0 或已过期则返回全量 tree + 新 rev。
+    """
     cur = _require_workdir(cid)
     wd = cur.get("workdir")
     if not wd:
-        return {"ok": False, "error": "未设置工作区", "workdir": None, "tree": [], "count": 0}
+        return {"ok": False, "error": "未设置工作区", "workdir": None, "tree": [], "count": 0, "rev": 0, "changed": True}
     data = workspace.build_tree(wd)
-    return {"ok": data.get("exists", False), "workdir": wd, "error": "" if data.get("exists") else "工作区目录不存在",
-            "tree": data.get("tree", []), "count": data.get("count", 0)}
+    ok = data.get("exists", False)
+    cur_rev = data.get("rev", 0)
+    if rev >= 0 and rev == cur_rev:
+        return {"ok": ok, "workdir": wd, "error": "" if ok else "工作区目录不存在",
+                "tree": [], "count": data.get("count", 0), "rev": cur_rev, "changed": False}
+    return {"ok": ok, "workdir": wd, "error": "" if ok else "工作区目录不存在",
+            "tree": data.get("tree", []), "count": data.get("count", 0), "rev": cur_rev, "changed": True}
 
 
 @router.get("/{cid}/trash")
@@ -246,6 +256,59 @@ def read_canvas_file(cid: int, path: str = ""):
     return r
 
 
+# 内置查看器可直接返回的二进制类型（白名单：非清单内的扩展名一律拒绝）
+_RAW_EXT_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+    "svg": "image/svg+xml", "ico": "image/x-icon", "avif": "image/avif",
+    "apng": "image/apng",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xls": "application/vnd.ms-excel",
+    "xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+    "csv": "text/csv; charset=utf-8",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "doc": "application/msword",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pdf": "application/pdf",
+}
+_RAW_MAX_BYTES = 50 * 1024 * 1024
+
+
+@router.get("/{cid}/file/raw")
+def raw_canvas_file(cid: int, path: str = "", v: int = 0):
+    """返回工作区内二进制文件原始字节（供内置查看器渲染图片/Office/PDF）。
+
+    仅支持 _RAW_EXT_MIME 白名单扩展名，≤50MB；路径经 _resolve_under 防穿越。
+    """
+    wd = _require_wd(cid)
+    p = workspace._resolve_under(wd, path)
+    if not p or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    ext = p.suffix.lower().lstrip(".")
+    mime = _RAW_EXT_MIME.get(ext)
+    if not mime:
+        raise HTTPException(415, f"不支持的文件类型：.{ext}")
+    if p.stat().st_size > _RAW_MAX_BYTES:
+        raise HTTPException(413, "文件过大（>50MB），无法在线预览")
+    return FileResponse(p, media_type=mime)
+
+
+@router.get("/{cid}/file/office-pdf")
+def office_pdf(cid: int, path: str = ""):
+    """doc/docx/ppt 经本机 Office（COM）转成 PDF，供内置查看器保真渲染（带缓存）。"""
+    wd = _require_wd(cid)
+    p = workspace._resolve_under(wd, path)
+    if not p or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    if p.suffix.lower().lstrip(".") not in office_preview.SUPPORTED_EXTS:
+        raise HTTPException(415, "仅支持 doc / docx / ppt 转换")
+    r = office_preview.convert_to_pdf(str(p))
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return FileResponse(r["pdf"], media_type="application/pdf")
+
+
 @router.put("/{cid}/file")
 def write_canvas_file(cid: int, req: FileWriteReq):
     """写工作区内文本文件（编辑器保存）。"""
@@ -284,3 +347,93 @@ def delete_canvas_file(cid: int, req: FileDeleteReq):
     if "error" in r:
         raise HTTPException(400, r["error"])
     return r
+
+
+@router.post("/{cid}/file/run")
+def run_canvas_file(cid: int, req: FileDeleteReq):
+    """在工作区内"运行"一个文件（双击 / 右键"运行"）。
+
+    - .py → 启动 Python 控制台会话：返回 session_id，前端接入控制台浮窗（输入输出 / 停止 / 运行）；
+    - 其他 → 用系统默认程序打开（等价资源管理器双击）。
+    路径先经 _resolve_under 校验，确保落在工作区内（防路径穿越）。
+    """
+    wd = _require_wd(cid)
+    p = workspace._resolve_under(wd, req.path)
+    if not p or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    if p.suffix.lower().lstrip(".") == "py":
+        r = pyconsole.start(str(p), cwd=wd)
+        if "error" in r:
+            raise HTTPException(400, r["error"])
+        return {"kind": "console", **r}
+    r = workspace.open_with_system(str(p))
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return {"kind": "open", **r}
+
+
+class PyInputReq(BaseModel):
+    text: str = ""
+
+
+class PyStopReq(BaseModel):
+    force: bool = False
+
+
+@router.post("/{cid}/file/pyconsole/{sid}/input")
+def pyconsole_input(cid: int, sid: str, req: PyInputReq):
+    """向 Python 控制台子进程的 stdin 写入文本（模拟键盘输入）。"""
+    _require_wd(cid)
+    r = pyconsole.write(sid, req.text)
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return r
+
+
+@router.post("/{cid}/file/pyconsole/{sid}/stop")
+def pyconsole_stop(cid: int, sid: str, req: PyStopReq = PyStopReq()):
+    """停止 Python 控制台子进程（含其子进程树）。"""
+    _require_wd(cid)
+    r = pyconsole.stop(sid, force=req.force)
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    return r
+
+
+@router.post("/{cid}/file/pyconsole/{sid}/close")
+def pyconsole_close(cid: int, sid: str):
+    """关闭控制台会话：停掉子进程并清理缓冲区。"""
+    _require_wd(cid)
+    return pyconsole.close(sid)
+
+
+@router.get("/{cid}/file/pyconsole/{sid}/stream")
+async def pyconsole_stream(cid: int, sid: str):
+    """SSE 长连接：持续推送控制台输出（type=out）与结束事件（type=exit / closed）。"""
+    _require_wd(cid)
+
+    def _frame(payload: dict) -> str:
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+    async def gen():
+        while True:
+            r = pyconsole.drain(sid)
+            if "error" in r:
+                yield _frame({"type": "closed", "error": r["error"]})
+                return
+            if r["text"]:
+                yield _frame({"type": "out", "text": r["text"]})
+            if r["running"]:
+                await asyncio.sleep(0.08)
+                continue
+            # 进程已退出：管道 EOF 需要一点时间，再收尾拉取残留输出
+            for _ in range(15):
+                d = pyconsole.drain(sid)
+                if not d.get("text"):
+                    break
+                yield _frame({"type": "out", "text": d["text"]})
+                await asyncio.sleep(0.07)
+            yield _frame({"type": "exit", "exit_code": r["exit_code"]})
+            return
+
+    return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")

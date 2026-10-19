@@ -222,18 +222,18 @@ onMounted(() => {
   border: 1px solid rgba(110,168,255,0.25);
 }
 .scope-opt {
-  appearance: none; border: 0; background: transparent; color: #e8ecf4;
+  appearance: none; border: 0; background: transparent; color: rgb(var(--text-rgb));
   font-size: 12px; text-align: left; padding: 7px 10px; border-radius: 6px; cursor: pointer;
 }
 .scope-opt:hover { background: rgba(110,168,255,0.15); }
-.scope-opt.on { background: rgba(110,168,255,0.2); color: #a8c8ff; }
+.scope-opt.on { background: rgba(110,168,255,0.2); color: var(--accent-ink); }
 .scope-agents { border-top: 1px dashed rgba(255,255,255,0.1); margin-top: 4px; padding-top: 4px; max-height: 180px; overflow-y: auto; }
 .scope-agent {
   display: flex; align-items: center; gap: 8px; font-size: 12px;
   padding: 5px 8px; border-radius: 6px; cursor: pointer;
 }
 .scope-agent:hover { background: rgba(255,255,255,0.06); }
-.scope-agent input { accent-color: #6ea8ff; }
+.scope-agent input { accent-color: var(--accent); }
 .scope-empty { font-size: 11px; opacity: .5; padding: 8px; }
 .rules-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
 .rule-item {
@@ -244,7 +244,7 @@ onMounted(() => {
 .rule-item.editing { border-color: rgba(110,168,255,0.45); background: rgba(110,168,255,0.1); }
 .rule-idx {
   flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
-  background: rgba(110,168,255,0.2); color: #a8c8ff;
+  background: rgba(110,168,255,0.2); color: var(--accent-ink);
   font-size: 11px; display: flex; align-items: center; justify-content: center;
   font-family: Consolas, monospace; margin-top: 1px;
 }
@@ -253,10 +253,10 @@ onMounted(() => {
 .rule-meta { display: flex; gap: 6px; flex-wrap: wrap; }
 .tag {
   font-size: 10px; padding: 2px 7px; border-radius: 4px;
-  background: rgba(180,114,255,0.18); color: #d4a8ff;
+  background: rgba(180,114,255,0.18); color: var(--purple-ink);
 }
-.tag.all { background: rgba(110,168,255,0.18); color: #a8c8ff; }
-.tag.off { background: rgba(255,80,80,0.15); color: #ffb0b0; }
+.tag.all { background: rgba(110,168,255,0.18); color: var(--accent-ink); }
+.tag.off { background: rgba(255,80,80,0.15); color: var(--red-ink); }
 .rule-actions { display: flex; gap: 4px; flex-shrink: 0; }
 .rules-empty { text-align: center; font-size: 12px; opacity: .5; padding: 28px 16px; line-height: 1.7; }
 .sm { padding: 3px 8px; font-size: 11px; }

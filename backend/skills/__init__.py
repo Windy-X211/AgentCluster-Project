@@ -44,6 +44,12 @@ _skills_root().mkdir(parents=True, exist_ok=True)
 
 SKILL_REGISTRY: dict[str, dict] = {}
 
+# 技能正文渐进式读取阈值：正文超过该长度时，skill.invoke 只返回目录（toc），
+# 再由 skill.read_section 按需读取具体章节（如 pptx 这类大技能）。
+FULL_READ_LIMIT = 12000
+# 渐进式返回时的开头预览长度（目录 + 开头几节，方便模型快速判断）。
+PROGRESSIVE_PREVIEW_CHARS = 2500
+
 
 # ==============================================================
 # YAML frontmatter 简易解析（标准库没 yaml，用正则足够）
@@ -160,12 +166,72 @@ def load_skills() -> dict:
             fp_name = _frontmatter_field((sub / "SKILL.md").read_text(encoding="utf-8"), "name")
             key = fp_name or sub.name
             registry[key] = data
-    globals()["SKILL_REGISTRY"] = registry
+    # 原地更新：保持 SKILL_REGISTRY 对象引用不变，避免值导入的引用在热重载后陈旧
+    SKILL_REGISTRY.clear()
+    SKILL_REGISTRY.update(registry)
     return registry
 
 
 def list_skills() -> dict:
     return {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in SKILL_REGISTRY.items()}
+
+
+def skill_toc(body: str) -> list[dict]:
+    """从 Markdown 正文提取章节目录（## ~ ##### 级标题），带行号与字符区间。
+
+    每个条目：{title, level, line, start, end}（start/end 为字符偏移，供按需切片）。
+    """
+    toc: list[dict] = []
+    pat = re.compile(r"^(#{2,5})\s+(.*)$", re.MULTILINE)
+    for m in pat.finditer(body):
+        toc.append({
+            "title": m.group(2).strip(),
+            "level": len(m.group(1)),
+            "line": body.count("\n", 0, m.start()) + 1,
+            "start": m.start(),
+            "end": m.end(),
+        })
+    return toc
+
+
+def _normalize_heading(s: str) -> str:
+    """归一化章节标题：去 markdown 修饰符、空白、大小写，便于模糊匹配。"""
+    s = re.sub(r"[*_`#]", "", s).strip().lower()
+    return re.sub(r"\s+", " ", s)
+
+
+def read_skill_section(body: str, section: str) -> tuple[str, dict | None]:
+    """按标题读取正文的一个章节（含该标题，到下一个同级或更高级标题前）。
+
+    匹配优先级：标题全文相等 > 前缀匹配 > 包含匹配。
+    返回 (content, meta)；找不到返回 ("", None)。
+    """
+    toc = skill_toc(body)
+    if not toc:
+        return "", None
+    q = _normalize_heading(section)
+
+    def key(i: int) -> tuple[int, int]:
+        t = _normalize_heading(toc[i]["title"])
+        if t == q:
+            return 0, -i
+        if t.startswith(q):
+            return 1, -i
+        if q in t:
+            return 2, -i
+        return 9, -i
+
+    idx = min(range(len(toc)), key=key)
+    if key(idx)[0] >= 9:
+        return "", None
+    meta = toc[idx]
+    # 章节结束：下一个同层级或更高级（level <= 当前）的标题
+    end = len(body)
+    for j in range(idx + 1, len(toc)):
+        if toc[j]["level"] <= meta["level"]:
+            end = toc[j]["start"]
+            break
+    return body[meta["start"]:end].rstrip(), meta
 
 
 def get_skill_prompt(name: str) -> str:

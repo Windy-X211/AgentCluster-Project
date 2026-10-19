@@ -5,6 +5,7 @@
   C:<id>|<name>|<args>    tool_call 完整（id、名称、JSON参数）→ 参数收齐，结束流式状态
   R:<id>|<content>        tool_result（工具执行结果）
   F:<final_text>          最终完整文本（方便前端完整展示）
+  RESET                   清空本轮已流出的正文/思考（快通道检测到 <continue> 切换慢通道时）
   SPEAK:<agent_id>        切换发言者（画布气泡 / 流动连线跟随）
   A2A:<envelope json>     A2A 消息信封（前端插入信封卡片，新开流式消息）
   DONE                    结束
@@ -12,11 +13,11 @@
   ⚠️ 行协议用 \n 做分隔符，因此 T:/RN: 等载荷文本中的 \n 必须在 yield 前用
      _esc 转义为 \\n，前端收到后用 _unesc 还原。
 """
-import json, asyncio, os, time
+import json, asyncio, os, time, re
 from datetime import datetime
 from typing import Any
 from core.store import load, save, upsert, get_by, next_id
-from core.llm import chat_with_failover as chat
+from core.llm import chat_with_failover as chat, ModelDegenerateError, ModelRepetitionError, _encode_tool_name
 from core.commands import run_command, filter_tools, COMMAND_META, WORKDIR_CTX
 from core.a2a import (
     TURN_CTX, collect_relay_targets, collect_call_targets,
@@ -25,7 +26,6 @@ from core.a2a import (
     _resolve_target,
 )
 from plugins import PLUGIN_REGISTRY, run_plugin
-from core.intent_classifier import classify_intent
 from core.validator import verify_completion
 
 
@@ -35,9 +35,97 @@ def _esc(s: str) -> str:
     return s.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r')
 
 
+# ===== <continue> 续跑标记：快通道动态注入到本轮用户消息（不进 system prompt） =====
+# 机制：快通道把续跑提示**附加在发给模型的当前用户消息末尾**（仅存在于本次请求的
+# 内存 messages 中，不落库、不进历史）；后端流式检测到 <continue> → 自动切换慢通道，
+# 切换时把该提示从用户消息中动态剔除。标记与提示块本身任何情况下都不允许出现在
+# 对话界面 / 落库内容 / LLM 上下文。
+CONTINUE_TAG = "<continue>"
+_CONTINUE_HINT = (
+    "\n\n[系统追加 · 非用户输入 · 任务续跑标记] "
+    "若任务尚未结束（仍有必要步骤未完成、结果不完整），在回复正文最末尾**单独一行**输出：<continue>；"
+    "仅当任务已全部完成、无需任何后续操作时才不输出。"
+    "该标记仅供系统自动识别，不会展示给用户——不要向用户提及或解释它，"
+    "输出时一行只有这一个标记，不附加任何其他文字。"
+)
+_CONTINUE_RE = re.compile(r"<\s*continue\s*>", re.I)
+# 流式判定用：从 '<' 起、到缓冲末尾为止，是否仍可能是未写完的 <continue> 前缀
+_CONTINUE_PARTIAL_RE = re.compile(
+    r"^<\s*(?:c(?:o(?:n(?:t(?:i(?:n(?:u(?:e)?)?)?)?)?)?)?)?\s*$", re.I
+)
+# 模型内部 tokenizer 标记：<unk> / <|endoftext|> / <|im_start|> / <|user|> 等
+# 这些 token 永远不应该出现在正常文本里，必须清洗掉防止污染上下文
+_MODEL_TOKEN_RE = re.compile(
+    r"<\s*[|]?\s*(?:unk(?:now)?|endoftext|startoftext|im_start|im_end|user|assistant|system|tool(?:_call(?:_result)?)?|tool_result|eos|bos)\s*[|]?\s*>",
+    re.I,
+)
+# 连续 30+ 个相同字符/短序列的垃圾重复（模型崩溃时会疯狂重复某个 token，如 80 个 <unk>、50 个 : 等）
+# 阈值 30 避免误杀 Markdown 分隔线（--- 只有 3 个）
+_GARBAGE_REPEAT_RE = re.compile(r"(.{1,3})\1{30,}")
+
+
+def strip_continue(text):
+    """动态剔除：连同 <continue> 标记、续跑提示块、模型内部 token 一起移除。
+
+    - 提示块：快通道只注入在本次请求的用户消息里，正常不落库；此处兜底，
+      防止模型复述指令时把整块提示带回上下文/输出。
+    - 标记：大小写/标签内空白不敏感。
+    - 模型内部 token：<unk> / <|endoftext|> 等 tokenizer 标记，防止污染上下文。
+    - 垃圾重复：模型崩溃时的连续相同字符（如 80 个 <unk>、大量 `(` 等），整体移除。
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if _CONTINUE_HINT in text:
+        text = text.replace(_CONTINUE_HINT, "")
+    text = _CONTINUE_RE.sub("", text)
+    # 模型内部 token 全量清洗（<unk> 等）
+    text = _MODEL_TOKEN_RE.sub("", text)
+    # 连续 20+ 个相同字符/短序列 → 整体移除（模型 token 流崩溃标志）
+    text = _GARBAGE_REPEAT_RE.sub("", text)
+    return text
+
+
+class _ContinueScanner:
+    """流式 <continue> 剥离器：标记可能被拆分到多个 chunk，需缓存尾部未判定字符。
+
+    feed() 返回可安全下发的文本；close() 在流结束时吐出缓存（未写完的前缀原样保留）；
+    found 表示流中是否出现过完整标记。
+    """
+
+    def __init__(self):
+        self._buf = ""
+        self.found = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        buf = self._buf + text
+        out: list[str] = []
+        i = 0
+        n = len(buf)
+        while i < n:
+            if buf[i] == "<":
+                m = _CONTINUE_RE.match(buf, i)
+                if m:
+                    self.found = True
+                    i = m.end()
+                    continue
+                # 缓冲末尾可能是未写完的标记前缀（如 "<cont"）→ 暂存等下一个 chunk
+                if _CONTINUE_PARTIAL_RE.match(buf, i):
+                    break
+            out.append(buf[i])
+            i += 1
+        self._buf = buf[i:]
+        return "".join(out)
+
+    def close(self) -> str:
+        s, self._buf = self._buf, ""
+        return s
+
+
 # ===== 分层自适应循环参数 =====
 MAX_VERIFY_RETRIES = 3    # 验证器不通过时，最多让模型修正几轮
-FAST_PATH_NO_TOOLS = True # 快通道不注入 tools（简单任务不需要工具调用能力）
+FAST_PATH_NO_TOOLS = False # 快通道也允许使用工具（与慢通道一致注入 tools + tool_choice=auto）
 
 # ===== A2A 消息接力参数 =====
 A2A_MAX_RELAY_DEPTH = 6   # 消息接力（cluster.send_message / 自动回复）允许的最大 relay 深度；
@@ -116,12 +204,31 @@ def _data_url_from_file(path: str) -> str | None:
     return f"data:{mime};base64,{b64}"
 
 
+def _guess_image_mime_from_b64_prefix(b64_head: str) -> str | None:
+    """从 base64 字符串前 16 字符推断图片 MIME type。
+
+    兜底识别：当工具返回 data 是纯 base64 却漏了 content_type/mime 时用。
+    覆盖桌面控制 screenshot（PNG）、浏览器截图（PNG）、WebP、JPEG、GIF 等常见格式。
+    """
+    if b64_head.startswith("iVBORw0KGgo"):   # PNG 魔数 \x89PNG
+        return "image/png"
+    if b64_head.startswith("/9j/"):           # JPEG 魔数 \xFF\xD8\xFF
+        return "image/jpeg"
+    if b64_head.startswith("R0lGOD"):         # GIF87a / GIF89a 魔数
+        return "image/gif"
+    if b64_head.startswith("UklGR"):          # WebP RIFF....WEBP
+        return "image/webp"
+    return None
+
+
 def _build_image_followup(result: Any) -> dict | None:
     """从 tool result 里提取图片，返回一条 user role 的多模态消息。
 
-    识别两种来源：
-      1. result["file"] —— 插件返回的落盘文件路径（如 browser_control screenshot）
-      2. result["data"]  —— base64 字符串且 content-type 暗示图片（如 tool.yaml outputs 标注 images）
+    识别三种来源（覆盖所有已知截图工具 + 兜底）：
+      1. result["file"] —— 插件返回的落盘文件路径（browser_control save 模式）
+      2. result["data"] —— base64 且 content_type/mime 暗示图片，或已是 data URL
+      3. result["data"] —— 纯 base64 长字符串，无 mime hint，通过 base64 前缀推断
+         （兜底 desktop_control inspect 等工具可能漏写 content_type 的情况）
 
     返回 OpenAI 规范的多模态 user message 字典；没识别到图片返回 None。
     图片塞 content 数组里紧跟一张 text 说明，让模型知道这是工具返回的结果图片。
@@ -138,17 +245,25 @@ def _build_image_followup(result: Any) -> dict | None:
         if url:
             data_urls.append(url)
 
-    # —— 来源 2：result["data"] 是 base64 图片（且没有 file 字段时回退用它） ——
+    # —— 来源 2 & 3：result["data"] 是 base64 图片 ——
     if not data_urls:
         data_field = result.get("data")
         mime_hint = result.get("content_type") or result.get("mime") or ""
         if isinstance(data_field, str) and len(data_field) > 1000:
-            # 纯 base64（不含 data: 前缀）且 mime 暗示图片 → 组装 data URL
-            if mime_hint and mime_hint.startswith("image/") and "," not in data_field[:50]:
-                data_urls.append(f"data:{mime_hint};base64,{data_field}")
-            # 已经是 data URL 格式 → 直接用
-            elif data_field.startswith("data:image/"):
+            if data_field.startswith("data:image/"):
+                # 已经是 data URL → 直接用
                 data_urls.append(data_field)
+            elif "," not in data_field[:50]:
+                # 纯 base64（不含 data: 前缀）
+                guessed_mime: str | None = None
+                if mime_hint and mime_hint.startswith("image/"):
+                    # 工具自描述带 mime → 优先信任
+                    guessed_mime = mime_hint
+                else:
+                    # 兜底：用 base64 前几个字符推断图片类型
+                    guessed_mime = _guess_image_mime_from_b64_prefix(data_field[:16])
+                if guessed_mime:
+                    data_urls.append(f"data:{guessed_mime};base64,{data_field}")
 
     if not data_urls:
         return None
@@ -160,41 +275,85 @@ def _build_image_followup(result: Any) -> dict | None:
     for url in data_urls[:4]:  # 最多 4 张，防止撑爆
         content.append({"type": "image_url", "image_url": {"url": url, "detail": "low"}})
 
-    return {"role": "user", "content": content}
+    return {"role": "user", "content": content, "_img_followup": True}
 
 
-def _truncate_tool_result(result: Any) -> str:
+def _strip_prev_image_followups(messages: list[dict], keep_from_idx: int = 0) -> list[dict]:
+    """把 messages 里**之前轮次**追加的图片多模态 followup 替换为简短占位文本。
+
+    修复 keep_last 缺陷：改用 keep_from_idx 明确保留哪一段——index >= keep_from_idx
+    的 img_followup 是"当前轮刚追加、LLM 还没看过的"，保留原样；
+    index < keep_from_idx 的是之前轮次的，替换为占位文本。
+
+    典型调用方式：
+      - 每轮 chat() 之前，keep_from_idx = 上一轮工具执行完后的 messages 长度
+        （即 messages 中本轮 tool result / img_followup 起点的 index）。
+
+    额外职责：返回前 pop 掉所有消息里的 `_img_followup` 内部标记。
+    这个标记只用于轮次间的识别，不应进入 LLM API payload。
+    """
+    stripped: list[dict] = []
+    for idx, m in enumerate(messages):
+        # 先复制并清理标记
+        entry = {k: v for k, v in m.items() if k != "_img_followup"}
+        if m.get("_img_followup") and idx < keep_from_idx:
+            old_content = m.get("content")
+            # 统计原 content 里图片数量（占位提示里带上，方便模型回忆"之前有几张图"）
+            img_count = 0
+            if isinstance(old_content, list):
+                for part in old_content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        img_count += 1
+            placeholder = (
+                f"[上一轮工具返回的 {img_count} 张图片已省略，"
+                f"完整内容仅在当轮 LLM 调用时提供过。如需重新查看请重新调用工具。]"
+            )
+            entry["content"] = placeholder
+        stripped.append(entry)
+    return stripped
+
+
+def _truncate_tool_result(result: Any, is_image: bool = False) -> str:
     """把工具执行结果序列化成 JSON，并对大字段做智能截断。
 
+    Args:
+        result: 工具原始返回值
+        is_image: 调用方已确认这是图片型 result（`_build_image_followup` 能命中）。
+                  True 时直接 pop 掉所有 base64/data URL 字段，tool role 消息里
+                  只留极简 `[图片]`，完整图已通过多模态 user 消息发送。
+
     核心策略：
-      - base64 截图：只保留前 BASE64_KEEP_HEAD 字符 + 总长度说明（LLM 看了也没用它直接读 base64）
-      - data 字段（通常是文本/HTML/JSON）：超过 TOOL_RESULT_MAX_CHARS 就截断
-      - 整体兜底：序列化后超过 TOOL_RESULT_MAX_CHARS 再全局截一次
+      - 图片型 result：所有 base64/data URL 字段一律 pop（data / image_data_url / _note），
+        只留 data: "[图片]"。解释性文字模型自己从多模态消息里能拿到。
+      - 非图片但疑似 base64：保留前 BASE64_KEEP_HEAD 字符 + 总长度说明。
+      - data 字段（文本/HTML/JSON）：超过 TOOL_RESULT_MAX_CHARS 就截断。
+      - 整体兜底：序列化后超过 TOOL_RESULT_MAX_CHARS 再全局截一次。
     """
     if isinstance(result, dict):
-        # base64 识别：浏览器截图/文件读取常见
-        data = result.get("data")
-        if isinstance(data, str) and len(data) > 4000 and all(
-            c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n" for c in data[:200]
-        ):
-            # 疑似 base64（截图）：只保留前缀 + 总长度说明
-            truncated_data = data[:BASE64_KEEP_HEAD] + f"...[base64 截断，原始长度 {len(data)} 字符]"
-            result = {**result, "data": truncated_data}
-            # 有 file 字段（截图落盘）时，附加说明让 agent 知道图片在哪
-            shot_file = result.get("file")
-            if shot_file:
-                result["_note"] = (
-                    f"截图已保存到: {shot_file}（用 file.read(path='{shot_file}') 可读取图片二进制，"
-                    f"或直接打开查看）。完整 base64 已截断，不在对话历史里重复。"
-                )
-            else:
-                result["_note"] = "截图 base64 已截断，如需完整数据请重新 screenshot 并自行保存。"
-        elif isinstance(data, str) and len(data) > TOOL_RESULT_MAX_CHARS:
-            result = {**result, "data": data[:TOOL_RESULT_MAX_CHARS] + f"...[截断，原始 {len(data)} 字符]"}
-        # html 字段兜底
-        html = result.get("html")
-        if isinstance(html, str) and len(html) > TOOL_RESULT_MAX_CHARS:
-            result = {**result, "html": html[:TOOL_RESULT_MAX_CHARS] + f"...[截断，原始 {len(html)} 字符]"}
+        if is_image:
+            # —— 图片：pop 掉所有含 base64 的长字段 ——
+            # 插件可能塞 data、image_data_url 任何一种，或者两种都塞；统一清掉，
+            # tool role 消息里完全不承载图片二进制。
+            result = {
+                k: v for k, v in result.items()
+                if k not in ("data", "image_data_url", "_note")
+            }
+            result["data"] = "[图片]"
+        else:
+            # —— 非图片：按原策略处理 ——
+            data = result.get("data")
+            if isinstance(data, str) and len(data) > 4000 and all(
+                c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n" for c in data[:200]
+            ):
+                # 疑似 base64（但不是图片）：只保留前缀 + 总长度说明
+                truncated_data = data[:BASE64_KEEP_HEAD] + f"...[base64 截断，原始长度 {len(data)} 字符]"
+                result = {**result, "data": truncated_data}
+            elif isinstance(data, str) and len(data) > TOOL_RESULT_MAX_CHARS:
+                result = {**result, "data": data[:TOOL_RESULT_MAX_CHARS] + f"...[截断，原始 {len(data)} 字符]"}
+            # html 字段兜底
+            html = result.get("html")
+            if isinstance(html, str) and len(html) > TOOL_RESULT_MAX_CHARS:
+                result = {**result, "html": html[:TOOL_RESULT_MAX_CHARS] + f"...[截断，原始 {len(html)} 字符]"}
 
     result_str = json.dumps(result, ensure_ascii=False)
     if len(result_str) > TOOL_RESULT_MAX_CHARS:
@@ -373,7 +532,7 @@ def _cancel_pending_child_tasks(turn: dict | None) -> None:
 
 
 def _agent_tools(agent: dict) -> list:
-    return filter_tools(agent.get("commands", []), agent.get("plugins", []), PLUGIN_REGISTRY)
+    return filter_tools(agent.get("commands", []), agent.get("plugins", []), PLUGIN_REGISTRY, agent.get("skills"))
 
 
 def _tool_capability_brief(tools: list) -> str:
@@ -392,7 +551,7 @@ def _tool_capability_brief(tools: list) -> str:
                     break
         if len(desc) > 80:
             desc = desc[:77] + "..."
-        lines.append(f"- {name}：{desc or '（无描述）'}")
+        lines.append(f"- {_encode_tool_name(name)}：{desc or '（无描述）'}")
     return "\n".join(lines)
 
 
@@ -475,39 +634,46 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
     if rules:
         numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(rules, 1))
         parts.append(f"\n## 规章制度（集群工作流程与规则，必须遵守）\n{numbered}")
-    # 技能 prompt 拼接（如果有）
-    skills = agent.get("skills", [])
-    if skills:
-        from skills import SKILL_REGISTRY
-        skill_prompts = []
+    # 技能 prompt 拼接（渐进式加载）
+    # Level 1（发现）：只把 name + description 放进 system prompt，零 token 成本，让模型知道有哪些技能可用。
+    # Level 2（激活）：SKILL.md 正文**不**自动拼入 system prompt；模型判断相关时必须用 skill.invoke
+    #   显式调用，工具按正文大小返回：一般正文返回全文，较大正文（如 pptx）只返回目录 toc + 预览。
+    # Level 3（执行）：大技能用 skill.read_section 按章节标题按需读取；
+    #   需要 scripts/ / references/ / assets/ 时再用 file.read 读技能目录内文件。
+    # 范围：agent 显式配置了 skills 就用配置的子集，否则回退到全部已注册技能
+    # （skill.invoke 是常驻工具，不配置也应能按需调用任意技能）。
+    try:
+        from skills import SKILL_REGISTRY, load_skills
+        load_skills()  # 热重载：用户在对话中新增/修改技能后立即可见
+        # 范围：agent 显式配置了 skills 就用配置的子集；
+        #   None（旧数据/从未保存过）→ 回退到全部已注册技能索引；
+        #   []（用户明确不勾选）→ 不注入任何技能索引（skill.invoke 常驻工具仍可用）
+        wanted = agent.get("skills")
+        names = sorted(SKILL_REGISTRY.keys()) if wanted is None else [s for s in wanted if SKILL_REGISTRY.get(s)]
         skill_index = []
-        for s in skills:
+        for s in names:
             meta = SKILL_REGISTRY.get(s)
             if not meta:
                 continue
-            if meta.get("description"):
-                skill_index.append(f"- {meta.get('label') or s}：{meta['description']}")
-            if meta.get("prompt"):
-                body = meta["prompt"]
-                # 能力参数预设：技能的可选参数以文字描述附加进技能提示，仅供模型参考
-                try:
-                    from core.param_presets import get_optional_desc
-                    optional = get_optional_desc("skill", s)
-                    if optional:
-                        extra = ("\n\n【能力参数预设 · 可选参数（仅供模型参考选择）】\n"
-                                 + "\n".join(f"- {k}：{v}" for k, v in optional.items()))
-                        body = body + extra
-                except Exception:
-                    pass
-                skill_prompts.append(f"--- 技能：{meta.get('label') or s} ---\n{body}")
+            label = meta.get("label") or s
+            desc = meta.get("description", "")
+            skill_index.append(f"- {label}（skill_name={s}）：{desc}" if desc else f"- {label}（skill_name={s}）")
         if skill_index:
-            parts.append("\n## 技能索引（任务相关时优先考虑加载/遵循对应技能）\n" + "\n".join(skill_index))
-        if skill_prompts:
-            parts.append("\n## 你加载了以下技能，请结合使用：\n" + "\n\n".join(skill_prompts))
+            parts.append(
+                "\n## 可用技能（索引，不含正文）\n"
+                "下列技能**不会**自动加载到你的上下文。任务与某个技能相关时，"
+                "用 skill.invoke 并传入其 skill_name 获取技能指令，再按指令执行；"
+                "一般大小技能会返回完整正文；较大技能（如 pptx）只返回目录 toc 与开头预览，"
+                "需用 skill.read_section 按章节标题按需读取具体章节，不要从预览中猜测未给出的内容。"
+                "不要凭猜测使用未加载的技能内容。\n"
+                + "\n".join(skill_index)
+            )
+    except Exception as e:
+        print(f"[agent_runtime] WARN 技能索引构建失败：{e}")
     # 工具能力：完整清单 + 主动调用规则（按任务自动选工具，不等用户点名）
     if tools:
         capability = _tool_capability_brief(tools)
-        tool_names = [t["function"]["name"] for t in tools]
+        tool_names = [_encode_tool_name(t["function"]["name"]) for t in tools]
         parts.append(
             "\n## 可用工具（已注入为 function calling — 必须按需直接调用）\n"
             "你拥有下列工具。遇到需要它们才能更好完成的任务时，"
@@ -524,7 +690,17 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         parts.append("\n## 能力\n你当前没有额外工具，直接基于角色知识与对话上下文回答即可。")
     if cluster_context:
         parts.append(f"\n【集群上下文】{cluster_context}")
-    return "\n".join(parts)
+    prompt = "\n".join(parts)
+    # 面向模型的工具名统一替换为上游合法名（下划线），与注入的 tools schema 保持一致，
+    # 避免模型从示例文本模仿点号名（file.read / cluster.send_message 等）导致上游网关 400。
+    for _t in tools or []:
+        _fn = _t.get("function") or {}
+        _nm = _fn.get("name") or ""
+        if _nm:
+            _enc = _encode_tool_name(_nm)
+            if _enc != _nm:
+                prompt = prompt.replace(_nm, _enc)
+    return prompt
 
 
 def _execute_tool(name: str, arguments: dict,
@@ -1051,7 +1227,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     if mode == "linked" and canvas:
         cluster_context, speaker_names = _build_cluster_context(canvas, agent)
     _wd_probe = turn.get("_wd_probe") if turn else None
-    messages.append({"role": "system", "content": _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe)})
+    system_prompt_base = _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe)
+    messages.append({"role": "system", "content": system_prompt_base})
     for m in conv.get("messages", []):
         # a2a 信封只用于前端展示，不进 LLM 历史（未知 role 会被接口拒绝）
         if m.get("role") == "a2a":
@@ -1060,8 +1237,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         _m_role = m.get("role")
         if not _m_role or _m_role not in ("system", "user", "assistant", "tool"):
             continue
-        # tool role / tool_calls 历史也要带上
-        content = _truncate_history_content(m.get("content", ""))
+        # tool role / tool_calls 历史也要带上（上下文中的 <continue> 标记一律剥离）
+        content = strip_continue(_truncate_history_content(m.get("content", "")))
         if mode == "linked" and _m_role == "assistant" and m.get("agent_id") and content:
             # 给历史消息标注发言者，让智能体分得清谁说了什么
             name = speaker_names.get(m["agent_id"])
@@ -1072,6 +1249,9 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         if m.get("tool_call_id"): entry["tool_call_id"] = m["tool_call_id"]
         messages.append(entry)
     messages.append({"role": "user", "content": user_input})
+    # 本轮用户消息的引用：快通道在其末尾动态附加 <continue> 续跑提示（仅本次请求的
+    # 内存 messages，不写入 conv）；进入慢通道时用它把提示动态剔除。
+    user_msg_ref = messages[-1]
 
     # 保存用户消息（接力段的 user 输入是 A2A 信封渲染文本，前端聊天区过滤）
     user_entry = {"role": "user", "content": user_input, "ts": datetime.utcnow().isoformat()}
@@ -1105,20 +1285,20 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     assistant_reasoning = ""  # 让循环外可访问
     _last_assistant_text = ""  # 让循环外可访问
 
-    # ===== 分层自适应路由：先判断快/慢通道 =====
-    # linked 集群模式默认走复杂通道（可能需要 A2A 消息），跳过分类节省 token
-    intent_route = "complex"
-    intent_method = "default"
-    if mode != "linked":
-        try:
-            intent = await classify_intent(interface, model, user_input, tools, cluster_mode=False)
-            intent_route = intent["route"]
-            intent_method = intent.get("method", "llm")
-        except Exception:
-            intent_route = "complex"
+    # ===== 分层自适应路由：默认快通道 =====
+    # 非 linked 模式一律从快通道开始（把 <continue> 续跑提示动态附加到当前用户消息）；
+    # 输出检测到 <continue>、意外触发工具调用或上游错误时自动降级/切换慢通道。
+    # linked 集群模式涉及 A2A 接力/移交，保持直接走慢通道。
+    intent_route = "complex" if mode == "linked" else "simple"
 
     # —— 快通道：简单问答，单次推理直接返回 ——
     if intent_route == "simple":
+        # 快通道：续跑提示动态附加到本轮用户消息末尾（不放进 system prompt；
+        # 落库的 user_entry 保持原始输入，历史里永远看不到这段提示）
+        user_msg_ref["content"] = user_input + _CONTINUE_HINT
+        # 确认日志：在 backend.log 可直接核实提示已动态注入（慢通道/linked 模式无此行）
+        print(f"[runtime] 快通道注入续跑标记到用户消息: user_len={len(user_input)}, "
+              f"hint_attached={user_msg_ref['content'].endswith(_CONTINUE_HINT)}")
         # 快通道可以选择不注入 tools（模型就不会输出 tool_calls）
         fast_tools = None if FAST_PATH_NO_TOOLS else (tools or None)
         fast_tool_choice = "none" if FAST_PATH_NO_TOOLS else "auto"
@@ -1127,16 +1307,22 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         fast_reasoning_parts = []
         fast_tool_calls = []
         _fast_upstream_error = False
+        fast_text_scan = _ContinueScanner()
+        fast_reason_scan = _ContinueScanner()
 
         try:
             async for kind, payload in chat(interface, model, messages, stream=True,
                                              tools=fast_tools, tool_choice=fast_tool_choice):
                 if kind == "text":
-                    fast_content_parts.append(payload)
-                    yield f"T:{_esc(payload)}\n"
+                    _delta = fast_text_scan.feed(payload)
+                    if _delta:
+                        fast_content_parts.append(_delta)
+                        yield f"T:{_esc(_delta)}\n"
                 elif kind == "reasoning":
-                    fast_reasoning_parts.append(payload)
-                    yield f"RN:{_esc(payload)}\n"
+                    _delta = fast_reason_scan.feed(payload)
+                    if _delta:
+                        fast_reasoning_parts.append(_delta)
+                        yield f"RN:{_esc(_delta)}\n"
                 elif kind == "tool_call_start":
                     # 名称已确定，参数仍在流式 → 前端立刻显示"正在调用: xxx"
                     yield f"TS:{payload.get('name') or ''}\n"
@@ -1154,6 +1340,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     if payload.get("payload_diag"):
                         yield f"RN:【快通道诊断】{payload['payload_diag'][:800]}\n"
                     _fast_upstream_error = True
+        except ModelRepetitionError as _rep:
+            # 快通道检测到重复循环 → 降级到慢通道重试（慢通道有多轮循环 + 纠错机制）
+            yield f"RN:⚠️ 快通道模型输出重复循环（连续重复 {_rep.repeat_count} 句），降级到慢通道重试\n"
+            _fast_upstream_error = True
         except Exception as e:
             err_msg = f"❌ LLM 调用失败：{e}"
             yield f"E:{err_msg}\n"
@@ -1164,12 +1354,13 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             yield "DONE\n"
             return
 
-        fast_text = "".join(fast_content_parts)
-        assistant_reasoning = "".join(fast_reasoning_parts).strip()
+        fast_content_parts.append(fast_text_scan.close())
+        fast_reasoning_parts.append(fast_reason_scan.close())
+        fast_text = strip_continue("".join(fast_content_parts))
+        assistant_reasoning = strip_continue("".join(fast_reasoning_parts).strip())
 
         if fast_tool_calls:
             # 降级：把刚收到的 tool_call 当作慢通道第一轮的开始，执行后继续循环
-            yield f"RN:（快通道意外触发工具调用，自动降级到慢通道处理）\n"
             _last_assistant_text = fast_text
             assistant_msg_fast: dict = {"role": "assistant", "content": fast_text,
                                          "tool_calls": fast_tool_calls, "ts": datetime.utcnow().isoformat()}
@@ -1186,11 +1377,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                                       conv_id=conversation_id,
                                       tool_call_id=tc["id"],
                                       agent_id=agent.get("id"))
-                result_str = _truncate_tool_result(result)
+                # 先判断是不是图片：一次调用同时给 truncate 和 followup 用，避免重复 I/O
+                img_followup = _build_image_followup(result)
+                result_str = _truncate_tool_result(result, is_image=(img_followup is not None))
                 tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
                 messages.append(tool_msg)
-                # 多模态：tool result 带图片 → 追加一条 user role 多模态消息（tool role 不支持 images）
-                img_followup = _build_image_followup(result)
                 if img_followup:
                     messages.append(img_followup)
                 conv["messages"].append({**tool_msg, "ts": datetime.utcnow().isoformat(),
@@ -1203,6 +1394,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 # 快通道上游 400 → 直接降级到慢通道循环（不存空 assistant 消息）
                 # 慢通道会重新调用 LLM，且带上 tools —— payload 不同，有可能成功
                 yield "RN:（快通道上游错误，降级到慢通道重试）\n"
+            elif fast_text_scan.found or fast_reason_scan.found:
+                # 模型输出了 <continue> → 任务未结束：清掉前端已流出的快通道内容，
+                # 不入库、不 return，直接落入下方慢通道循环继续处理
+                yield "RESET\n"
+                yield "RN:（检测到任务未完成标记，自动切换到慢通道继续处理）\n"
             else:
                 # 快通道正常结束
                 final_text_parts.append(fast_text)
@@ -1221,7 +1417,17 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 return
 
     # —— 慢通道：多轮 Tool Call Loop + 独立验证器 ——
+    # 慢通道不携带续跑提示：把快通道附加到用户消息上的提示动态剔除
+    # （linked 直连慢通道时 content 本就等于 user_input，剔除是幂等的）
+    user_msg_ref["content"] = user_input
     verify_retry_count = 0  # 验证器未通过时的修正轮数
+    # 图片省略边界：本轮 tool 执行起点的 messages index。
+    # chat 前 strip 时，index < _tool_round_start 的 img_followup → 替换为占位
+    # （已被之前 LLM 看过）；>= _tool_round_start 的保留完整（当前轮刚追加，本轮 LLM 还没看过）。
+    # 初始化为 0：进入 for 循环时 messages 里所有 img_followup（linked / 快通道降级追加的）
+    # 都还没被 LLM 看过，第一轮 chat 前全部保留。
+    _tool_round_start = 0
+    _text_history: list[str] = []  # 记录每轮 assistant 纯文本签名，用于循环检测
 
     for round_idx in range(max_tool_rounds):
         is_last_round = (round_idx == max_tool_rounds - 1)
@@ -1233,18 +1439,41 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         assistant_content_parts = []
         assistant_reasoning_parts_round = []
         assistant_tool_calls = []
+        round_text_scan = _ContinueScanner()
+        round_reason_scan = _ContinueScanner()
         # 实时检测：本轮中收集到的非法工具调用（用于流式结束后注入纠错反馈）
         _round_invalid_calls: list[dict] = []
         _upstream_error = False  # 上游返回非 200（如 400）时置位，跳过本轮后续处理
 
+        # —— 每轮 LLM 调用前：把之前轮次追加的图片多模态 followup 替换为占位文本 ——
+        # 完整 base64 data URL 只在图片产生的当轮让 LLM 看到即可，后续轮次继续携带
+        # 会让 context 被几万字节的 data URL 撑爆。替换后保留对话链条结构，但 token 开销
+        # 降到几乎为零。最近一轮的图片 followup 保留（本轮 LLM 还没回过，必须让它看到）。
+        messages = _strip_prev_image_followups(messages, keep_from_idx=_tool_round_start)
+
+        _gen = chat(interface, model, messages, stream=True, tools=tools or None, tool_choice=tool_choice)
+        _garbage_hits = 0        # 流式重复垃圾命中次数
+        _garbage_buf = ""        # 滚动文本窗口（用于重复字符检测）
+        _garbage_aborted = False # 是否因流式垃圾中止本轮
         try:
-            async for kind, payload in chat(interface, model, messages, stream=True, tools=tools or None, tool_choice=tool_choice):
+            async for kind, payload in _gen:
                 if kind == "text":
-                    assistant_content_parts.append(payload)
-                    yield f"T:{_esc(payload)}\n"
+                    _delta = round_text_scan.feed(payload)
+                    if _delta:
+                        assistant_content_parts.append(_delta)
+                        _garbage_buf = (_garbage_buf + _delta)[-400:]
+                        yield f"T:{_esc(_delta)}\n"
+                        # 重复字符窗口检测：清洗后仍透传的 `::::`/`((((` 等累积到 30+ 重复串 → 判定退化
+                        if _GARBAGE_REPEAT_RE.search(_garbage_buf):
+                            _garbage_hits += 1
+                            if _garbage_hits >= 3:
+                                _garbage_aborted = True
+                                break
                 elif kind == "reasoning":
-                    assistant_reasoning_parts_round.append(payload)
-                    yield f"RN:{_esc(payload)}\n"
+                    _delta = round_reason_scan.feed(payload)
+                    if _delta:
+                        assistant_reasoning_parts_round.append(_delta)
+                        yield f"RN:{_esc(_delta)}\n"
                 elif kind == "tool_call_start":
                     # 名称首次确定即广播（参数还在流）→ 画布气泡/聊天区立刻显示"正在调用: xxx"
                     yield f"TS:{payload.get('name') or ''}\n"
@@ -1265,6 +1494,39 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     if _diag:
                         yield f"RN:【诊断】{_diag[:1500]}\n"
                     _upstream_error = True
+        except ModelRepetitionError as _rep:
+            # 流式输出重复循环（模型复读同一/近似段落）→ 中止本轮，注入纠错反馈，进入下一轮
+            try:
+                await _gen.aclose()  # 关闭上游流
+            except Exception:
+                pass
+            assistant_content_parts.append(round_text_scan.close())
+            assistant_text = strip_continue("".join(assistant_content_parts))
+            assistant_msg = {"role": "assistant", "content": assistant_text, "ts": datetime.utcnow().isoformat()}
+            if is_relay:
+                stored = {**assistant_msg, "agent_id": agent.get("id"), "relay": True}
+            else:
+                stored = {**assistant_msg, "agent_id": agent.get("id")}
+            conv["messages"].append(stored)
+            messages.append(assistant_msg)
+            # 注入纠错提示：告诉模型已检测到复读循环，立即停止输出
+            rep_correction = (
+                "[系统检测 · 流式输出重复循环]\n"
+                "你本轮的流式输出中检测到连续重复/近似段落，已被系统中止。"
+                "**立即行动**：停止复读输出，不要再输出相同或近似的内容。\n"
+                "当前任务仍未完成，请直接进入下一阶段——执行我们需要你做的实际工作，不要继续规划或重复之前的表述。"
+            )
+            messages.append({"role": "user", "content": rep_correction})
+            _text_history.append(assistant_text[:800].strip())
+            yield f"RN:⚠️ 模型流式输出重复循环（连续重复 {_rep.repeat_count} 句），已中止本轮并注入纠错反馈。\n"
+            logger.warning("[agent_runtime] ModelRepetitionError round=%d: %s | repeated=%r",
+                           round_idx, _rep, _rep.repeated_text[:120])
+            # 注入纠错后进入下一轮处理
+            continue
+        except ModelDegenerateError as _de:
+            # 模型流式输出退化（连续纯内部 token）→ 中止本轮，保留已收到的有效内容，注入纠错
+            yield f"RN:⚠️ 模型流式输出退化（{_de}），已主动中止本轮。\n"
+            logger.warning("[agent_runtime] ModelDegenerateError round=%d: %s", round_idx, _de)
         except Exception as e:
             # LLM 调用失败（网关不通/超时等）— 输出错误 + 落库 + DONE，防止生成器中断导致前端卡死
             err_msg = f"❌ 第 {round_idx + 1} 轮 LLM 调用失败：{e}"
@@ -1289,8 +1551,36 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             yield "DONE\n"
             return
 
-        assistant_text = "".join(assistant_content_parts)
-        assistant_reasoning = "".join(assistant_reasoning_parts_round).strip()
+        # 流式重复垃圾窗口检测触发 → 中止了本轮 LLM 流；保留已收到的有效内容，注入纠错后进入下一轮
+        if _garbage_aborted:
+            try:
+                await _gen.aclose()  # break 后显式关闭上游流，释放 httpx 连接
+            except Exception:
+                pass
+            assistant_content_parts.append(round_text_scan.close())
+            assistant_text = strip_continue("".join(assistant_content_parts))
+            assistant_msg = {"role": "assistant", "content": assistant_text, "ts": datetime.utcnow().isoformat()}
+            if is_relay:
+                stored = {**assistant_msg, "agent_id": agent.get("id"), "relay": True}
+            else:
+                stored = {**assistant_msg, "agent_id": agent.get("id")}
+            conv["messages"].append(stored)
+            messages.append(assistant_msg)
+            _garbage_correction = (
+                "[系统检测 · 流式输出退化]\n"
+                "你上一轮的流式输出中检测到大量重复/无意义字符（连续内部 token 或垃圾重复），已被系统中止。\n"
+                "**立即行动**：请用工具执行实质操作——写代码（file.write）、运行脚本（cmd.run）。"
+                "不要重复规划，不要输出相同内容，直接进入执行阶段。"
+            )
+            messages.append({"role": "user", "content": _garbage_correction})
+            _text_history.append(assistant_text[:800].strip())
+            yield f"RN:（检测到流式输出退化，已中止并注入纠错反馈）\n"
+            continue
+
+        assistant_content_parts.append(round_text_scan.close())
+        assistant_reasoning_parts_round.append(round_reason_scan.close())
+        assistant_text = strip_continue("".join(assistant_content_parts))
+        assistant_reasoning = strip_continue("".join(assistant_reasoning_parts_round).strip())
         _last_assistant_text = assistant_text
 
         # 把 assistant 消息入库（仅当有 tool_calls 时 —— 否则统一走循环外的 final 保存）
@@ -1304,6 +1594,41 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 stored["relay"] = True
             conv["messages"].append(stored)
         messages.append(assistant_msg)
+
+        # —— 输出循环检测：纯文本输出 + 与前 2 轮任意一轮高度相似 → 注入"立即执行"纠错反馈 ——
+        if not assistant_tool_calls and assistant_text.strip() and round_idx >= 1:
+            _curr_sig = assistant_text[:800].strip()
+            # 和最近 2 轮签名逐一比较（防止模型在两种相似输出间交替）
+            _loop_hit = False
+            for _prev_sig in _text_history[-2:]:
+                if not _prev_sig or not _curr_sig:
+                    continue
+                _min_len = min(len(_prev_sig), len(_curr_sig))
+                _match = 0
+                for i in range(_min_len):
+                    if _prev_sig[i] == _curr_sig[i]:
+                        _match += 1
+                    else:
+                        break
+                _ratio = _match / max(len(_curr_sig), 1)
+                if _ratio > 0.55 and len(_curr_sig) > 80:
+                    _loop_hit = True
+                    break
+            if _loop_hit:
+                _loop_correction = (
+                    "[系统检测 · 输出循环]\n"
+                    "你本轮的回复与之前轮次高度相似，看起来陷入了重复规划/思考的循环。\n"
+                    "**立即行动**：不要再规划、不要重复相同的 Outline。请用工具执行实质操作——"
+                    "写代码（file.write）、运行脚本（cmd.run）、或调用其他工具产出实际文件。\n"
+                    "规划只输出一次就够了，现在直接进入执行阶段。"
+                )
+                messages.append({"role": "user", "content": _loop_correction})
+                yield f"RN:（检测到输出循环，已注入纠错反馈）\n"
+                logger.warning(
+                    "[agent_runtime] 输出循环被触发 round=%d", round_idx,
+                )
+        # 记录本轮文本签名供后续轮次比较
+        _text_history.append(assistant_text[:800].strip())
 
         # —— 实时检测纠错：本轮若发现非法工具调用，注入 system 反馈让模型修正 ——
         if _round_invalid_calls:
@@ -1337,6 +1662,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
         # —— 有 tool_calls → 执行并回灌，继续循环 ——
         if assistant_tool_calls:
+            # 记录本轮 tool result / img_followup 追加的起点 index。
+            # 下一轮 chat 前 strip 时，index >= 此值的 img_followup 要保留
+            # （本轮刚追加，本轮 LLM 还没看过）；< 此值的是之前轮次的，替换为占位。
+            _tool_round_start = len(messages)
             for tc in assistant_tool_calls:
                 fn = tc["function"]
                 try:
@@ -1347,11 +1676,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                                       conv_id=conversation_id,
                                       tool_call_id=tc["id"],
                                       agent_id=agent.get("id"))
-                result_str = _truncate_tool_result(result)
+                # 先判断是不是图片：一次调用同时给 truncate 和 followup 用，避免重复 I/O
+                img_followup = _build_image_followup(result)
+                result_str = _truncate_tool_result(result, is_image=(img_followup is not None))
                 tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
                 messages.append(tool_msg)
-                # 多模态：tool result 带图片 → 追加一条 user role 多模态消息（tool role 不支持 images）
-                img_followup = _build_image_followup(result)
                 if img_followup:
                     messages.append(img_followup)
                 tool_entry = {**tool_msg, "ts": datetime.utcnow().isoformat()}
@@ -1360,6 +1689,12 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 conv["messages"].append(tool_entry)
                 yield f"R:{tc['id']}|{result_str}\n"
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
+
+            # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
+            # 否则模型每轮工具之间"过渡解说文字"都会触发一次验证器（上一条工具常有
+            # 未消化的报错 → deterministic blocked），3 次配额会被无进展地耗光，
+            # 导致"强制采纳"把整个运行提前掐死在任务中途。
+            verify_retry_count = 0
 
             # —— 串行/并行模式：cluster.send_message 后的行为差异 ——
             if mode == "linked" and canvas:
@@ -1467,7 +1802,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         mark_envelope_done(conversation_id, env.get("message_id"))
 
     # 存最终 assistant 文字（如果最后一轮没文字但执行了工具，前端可以不展示）
-    final_text = "".join(final_text_parts)
+    final_text = strip_continue("".join(final_text_parts))
     # 去掉首尾连续空行，保留中间换行
     final_text = final_text.strip("\n")
     final_entry = {

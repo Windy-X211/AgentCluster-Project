@@ -4,7 +4,8 @@ import { api } from '@/api'
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
     data: {} as any,
-    commandsMeta: {} as any,   // {name: {label, params}}
+    commandsMeta: {} as any,   // {name: {label, params, group?, hidden?}}
+    commandGroups: [] as string[],  // 命令分组展示顺序
     skillsMeta: {} as any,     // {name: {label, description, prompt, version, triggers, tags}}
     pluginsMeta: {} as any,    // {name: {label, params, description}}
   }),
@@ -13,6 +14,7 @@ export const useSettingsStore = defineStore('settings', {
       this.data = await api.settings.get()
       const caps = await api.capabilities.all()
       this.commandsMeta = caps.commands || {}
+      this.commandGroups = caps.command_groups || []
       this.skillsMeta = caps.skills || {}
       this.pluginsMeta = caps.plugins || {}
     },
@@ -21,6 +23,7 @@ export const useSettingsStore = defineStore('settings', {
       await api.capabilities.reload()
       const caps = await api.capabilities.all()
       this.commandsMeta = caps.commands || {}
+      this.commandGroups = caps.command_groups || []
       this.skillsMeta = caps.skills || {}
       this.pluginsMeta = caps.plugins || {}
     },

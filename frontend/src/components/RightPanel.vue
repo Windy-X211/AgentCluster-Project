@@ -2,14 +2,15 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
-import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups } from '@/stores/conversation'
+import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
 import { renderMarkdown } from '@/utils/markdown'
+import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
 import { api } from '@/api'
 
-/** 去掉消息首尾纯空行（保留中间换行）—— 用于修复气泡顶部空白 */
+/** 去掉消息首尾纯空行（保留中间换行）—— 用于修复气泡顶部空白；顺带剥离 <continue> 续跑标记 */
 function trimMsgContent(s: string | undefined): string {
   if (!s) return ''
-  return s.replace(/^\s*\n+/, '').replace(/\n+\s*$/, '')
+  return stripContinueTag(s).replace(/^\s*\n+/, '').replace(/\n+\s*$/, '')
 }
 /** 消息泡泡 Markdown 渲染（用户/助手统一走这里，含流式光标） */
 function msgBubbleHtml(m: any): string {
@@ -34,11 +35,89 @@ const input = ref('')
 const currentAgentId = ref<number | null>(null)
 const msgBox = ref<HTMLElement | null>(null)
 const taRef = ref<HTMLTextAreaElement | null>(null)
+// 工作区拖拽到输入框：填入文件/文件夹绝对路径
+const chatDropHover = ref(false)
+let chatDragDepth = 0
+/** 从 dataTransfer 取路径：优先工作区自定义类型，其次 file:// 列表（资源管理器拖入），最后纯文本 */
+function dropPathFromEvent(e: DragEvent): string {
+  const dt = e.dataTransfer
+  if (!dt) return ''
+  const own = dt.getData('application/x-agentcluster-path')
+  if (own) return own
+  const uri = dt.getData('text/uri-list')
+  if (uri) {
+    const line = uri.split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'))[0] || ''
+    if (line.toLowerCase().startsWith('file://')) {
+      try {
+        // file:///F:/a/b.txt → /F:/a/b.txt → 去掉开头斜杠（Windows 盘符路径）
+        return decodeURIComponent(new URL(line).pathname).replace(/^\//, '')
+      } catch { /* 解析失败走下面 */ }
+    }
+  }
+  const plain = (dt.getData('text/plain') || '').trim()
+  // 纯文本只有像单行路径时才采用，避免把整段聊天文本塞进输入框
+  if (plain && !plain.includes('\n') && plain.length < 512 && /[\\/]/.test(plain)) return plain
+  return ''
+}
+/** 把文本插入到输入框光标处（前后自动补空格），并把光标移到插入内容之后 */
+function insertAtCursor(text: string) {
+  const ta = taRef.value
+  if (!ta) {
+    input.value = input.value ? input.value.replace(/\s*$/, ' ') + text : text
+    return
+  }
+  const s = ta.selectionStart ?? input.value.length
+  const en = ta.selectionEnd ?? s
+  const before = input.value.slice(0, s)
+  const after = input.value.slice(en)
+  const padB = before && !/\s$/.test(before) ? ' ' : ''
+  const padA = after && !/^\s/.test(after) ? ' ' : ''
+  input.value = before + padB + text + padA + after
+  nextTick(() => {
+    ta.focus()
+    const pos = (before + padB + text).length
+    ta.setSelectionRange(pos, pos)
+  })
+}
+function onChatDragEnter() {
+  chatDragDepth++
+  chatDropHover.value = true
+}
+function onChatDragLeave() {
+  chatDragDepth = Math.max(0, chatDragDepth - 1)
+  if (!chatDragDepth) chatDropHover.value = false
+}
+function onChatDrop(e: DragEvent) {
+  chatDragDepth = 0
+  chatDropHover.value = false
+  const path = dropPathFromEvent(e)
+  if (!path) return
+  e.preventDefault()
+  insertAtCursor(path)
+}
 const renameId = ref<number | null>(null)
 const renameVal = ref('')
 const convsCollapsed = ref(true) // 对话记录列表默认折叠（展开时浮层覆盖画布）
-const canvasesCollapsed = ref(false) // 画布列表默认展开
+const canvasesCollapsed = ref(true) // 画布列表默认折叠
 const convDesc = ref(true) // 对话记录排序：true = 新在上，false = 新在下
+
+// 图片灯箱：purpose=share 的截图缩略图点击后放大查看
+const lightboxSrc = ref<string | null>(null)
+const lightboxOpen = ref(false)
+function openLightbox(src: string) {
+  if (!src) return
+  lightboxSrc.value = src
+  lightboxOpen.value = true
+}
+function closeLightbox() {
+  lightboxOpen.value = false
+  // 延迟清空：让关闭动画先播放
+  setTimeout(() => { lightboxSrc.value = null }, 200)
+}
+function onLightboxKey(e: KeyboardEvent) {
+  if (lightboxOpen.value && e.key === 'Escape') closeLightbox()
+}
+if (typeof window !== 'undefined') window.addEventListener('keydown', onLightboxKey)
 
 // 对话列表浮层的 right 偏移量跟随右侧面板宽度变化
 const convFloatStyle = computed(() => ({ right: `${layout.rightWidth + 10}px` }))
@@ -50,8 +129,187 @@ const ctxMenu = ref({ show: false, x: 0, y: 0, id: 0 as number | null })
 // 画布列表右键菜单
 const cvCtxMenu = ref({ show: false, x: 0, y: 0, id: 0 as number | null })
 
+// ============ 智能体分组下拉 ============
+const agentDdOpen = ref(false)
+const agentTriggerEl = ref<HTMLElement | null>(null)
+const ddPopEl = ref<HTMLElement | null>(null)
+const chatPaneEl = ref<HTMLElement | null>(null)
+const ddPosStyle = ref<Record<string, string>>({})
+/** 按分组分列：第 0 列「全部」= 无组智能体；其余每列一个自定义组 */
+const agentGroupsByColumn = computed(() => {
+  const out: { id: 'all' | number; name: string; agents: any[] }[] = [
+    { id: 'all', name: '全部', agents: agents.list.filter(a => a.group_id == null) }
+  ]
+  for (const g of agents.groups) {
+    out.push({ id: g.id, name: g.name, agents: agents.list.filter(a => a.group_id === g.id) })
+  }
+  return out
+})
+function currentAgentName(): string {
+  if (currentAgentId.value == null) return '选择智能体'
+  return agents.list.find(a => a.id === currentAgentId.value)?.name || '选择智能体'
+}
+function toggleAgentDd() { agentDdOpen.value = !agentDdOpen.value }
+function updateDdPos() {
+  const pop = ddPopEl.value
+  const pane = chatPaneEl.value
+  const input = pane?.querySelector('.chat-input') as HTMLElement | null
+  if (!pop || !pane) return
+  const paneR = pane.getBoundingClientRect()
+  const popH = pop.offsetHeight || 300
+  const inputTop = input ? input.getBoundingClientRect().top : paneR.bottom
+  const popBottom = inputTop - 6
+  let top = popBottom - popH
+  // 上方不够时翻到下方
+  const spaceAbove = inputTop - 8
+  if (top < 8 && popH > spaceAbove) {
+    top = inputTop + 6
+  }
+  ddPosStyle.value = {
+    position: 'fixed',
+    left: paneR.left + 'px',
+    width: paneR.width + 'px',
+    top: top + 'px',
+  }
+}
+function onAgentDdOutside(e: MouseEvent) {
+  if (!agentDdOpen.value) return
+  const tgt = e.target as Node
+  if (agentTriggerEl.value && agentTriggerEl.value.contains(tgt)) return
+  if (ddPopEl.value && ddPopEl.value.contains(tgt)) return
+  agentDdOpen.value = false
+}
+function selectAgent(id: number) {
+  currentAgentId.value = id
+  agentDdOpen.value = false
+}
+
+// —— 分组列横向滑杆：自定义底部滑块，支持拖拽 / 点击轨道翻页 ——
+const ddScrollEl = ref<HTMLElement | null>(null)
+const ddScrollLeft = ref(0)
+const ddScrollW = ref(0)
+const ddClientW = ref(0)
+
+const ddNeedsSlider = computed(() => ddScrollW.value > ddClientW.value + 1)
+const ddThumbW = computed(() => {
+  if (!ddNeedsSlider.value || ddClientW.value === 0) return 0
+  return Math.max(28, Math.round(ddClientW.value * ddClientW.value / ddScrollW.value))
+})
+const ddMaxScroll = computed(() => Math.max(0, ddScrollW.value - ddClientW.value))
+const ddMaxThumbLeft = computed(() => Math.max(0, ddClientW.value - ddThumbW.value))
+const ddThumbLeft = computed(() => {
+  if (ddMaxScroll.value <= 0) return 0
+  return Math.round((ddScrollLeft.value / ddMaxScroll.value) * ddMaxThumbLeft.value)
+})
+const ddThumbStyle = computed(() => ({
+  left: ddThumbLeft.value + 'px',
+  width: ddThumbW.value + 'px',
+}))
+
+function syncDdMetrics() {
+  const el = ddScrollEl.value
+  if (!el) return
+  ddScrollW.value = el.scrollWidth
+  ddClientW.value = el.clientWidth
+  ddScrollLeft.value = el.scrollLeft
+}
+function onDdScroll() {
+  const el = ddScrollEl.value
+  if (!el) return
+  ddScrollLeft.value = el.scrollLeft
+}
+function onDdWheel(e: WheelEvent) {
+  // 鼠标滚轮在列区内转为横向滚动（默认竖向会触发页面滚动）
+  const el = ddScrollEl.value
+  if (!el) return
+  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+    e.preventDefault()
+    el.scrollLeft += e.deltaY
+    ddScrollLeft.value = el.scrollLeft
+  }
+}
+
+let ddDragging = false
+let ddDragStartX = 0
+let ddDragStartLeft = 0
+function onThumbDown(e: MouseEvent) {
+  if (!ddNeedsSlider.value) return
+  e.preventDefault()
+  e.stopPropagation()
+  ddDragging = true
+  ddDragStartX = e.clientX
+  ddDragStartLeft = ddThumbLeft.value
+  window.addEventListener('mousemove', onThumbMove)
+  window.addEventListener('mouseup', onThumbUp)
+}
+function onThumbMove(e: MouseEvent) {
+  if (!ddDragging) return
+  const el = ddScrollEl.value
+  if (!el) return
+  const dx = e.clientX - ddDragStartX
+  const newLeft = Math.max(0, Math.min(ddMaxThumbLeft.value, ddDragStartLeft + dx))
+  const newScroll = ddMaxScroll.value > 0
+    ? (newLeft / ddMaxThumbLeft.value) * ddMaxScroll.value
+    : 0
+  el.scrollLeft = newScroll
+  ddScrollLeft.value = newScroll
+}
+function onThumbUp() {
+  ddDragging = false
+  window.removeEventListener('mousemove', onThumbMove)
+  window.removeEventListener('mouseup', onThumbUp)
+}
+function onTrackDown(e: MouseEvent) {
+  if ((e.target as HTMLElement)?.classList.contains('dd-thumb')) return
+  const el = ddScrollEl.value
+  if (!el) return
+  const trackRect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const clickX = e.clientX - trackRect.left
+  const thumbCenter = ddThumbLeft.value + ddThumbW.value / 2
+  const page = ddClientW.value * 0.8
+  if (clickX < thumbCenter) el.scrollLeft = Math.max(0, ddScrollLeft.value - page)
+  else el.scrollLeft = Math.min(ddMaxScroll.value, ddScrollLeft.value + page)
+  ddScrollLeft.value = el.scrollLeft
+}
+
+// 弹层打开时测量；列内容变化时也需要重新测量（用 watch）
+watch(agentDdOpen, async (open) => {
+  if (open) {
+    await nextTick()
+    updateDdPos()
+    syncDdMetrics()
+  } else {
+    if (ddScrollEl.value) ddScrollEl.value.scrollLeft = 0
+    ddScrollLeft.value = 0
+  }
+})
+watch([() => agents.list, () => agents.groups, agentGroupsByColumn], async () => {
+  if (agentDdOpen.value) {
+    await nextTick()
+    syncDdMetrics()
+  }
+})
+function onWinResizeDd() { if (agentDdOpen.value) { updateDdPos(); syncDdMetrics() } }
+onMounted(() => {
+  document.addEventListener('mousedown', onAgentDdOutside)
+  window.addEventListener('resize', onWinResizeDd)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', onAgentDdOutside)
+  window.removeEventListener('resize', onWinResizeDd)
+  window.removeEventListener('mousemove', onThumbMove)
+  window.removeEventListener('mouseup', onThumbUp)
+})
+// ============ 智能体分组下拉 end ============
+
 const conv = computed(() => convs.currentData())
 const canvas = computed(() => canvases.current)
+// 运行中对话所属的画布 id（用于画布列表显示"运行中"标志）
+const runningCanvasId = computed<number | null>(() => {
+  if (convs.running) return convs.runCanvasId ?? null
+  if (convs.streaming) return convs.currentData()?.canvas_id ?? null
+  return null
+})
 // 展示用：始终按最后一条消息时间降序
 const sortedConvs = computed(() => {
   const base = sortConvsByActivity(convs.list)
@@ -71,8 +329,46 @@ const seqMap = computed(() => {
 // ② relay 过滤：排除发给其他智能体的接力消息，A2A 信封卡片保留
 const visibleMsgs = computed(() => (conv.value?.messages || []).filter((m: any) => !m.relay))
 
+/** 渲染项：以"用户消息"为分界线，把每两条用户消息之间的全部智能体输出
+ *  （assistant 消息 + a2a 信封组，按原顺序）整合成一个 turn：
+ *  - { type:'user', msg, idx }
+ *  - { type:'turn', start, end, children:[ {kind:'assistant',msg,idx} | {kind:'a2a',key,items,latest} ] }
+ *  turn 内的全部内容收进同一个固定大小"过程框"流式展示（详见过程窗口逻辑）。 */
+const renderItems = computed(() => {
+  const msgs = visibleMsgs.value
+  const out: any[] = []
+  let i = 0
+  while (i < msgs.length) {
+    const m = msgs[i] as any
+    if (m.role === 'user') { out.push({ type: 'user', msg: m, idx: i }); i++; continue }
+    // 一轮智能体输出：从 user 消息之后开始，直到下一条 user 消息为止
+    const start = i
+    const children: any[] = []
+    while (i < msgs.length && (msgs[i] as any).role !== 'user') {
+      const m2 = msgs[i] as any
+      if (m2.role === 'tool_call' || m2.role === 'tool_result') { i++; continue }
+      if (m2.role === 'a2a') {
+        // 连续的 a2a 信封合并成一组（保留原两级折叠样式）
+        const grp: any = { kind: 'a2a', key: 'a2ag-' + i, items: [], latest: m2.envelope }
+        while (i < msgs.length && (msgs[i] as any).role === 'a2a') {
+          grp.items.push({ msg: msgs[i] as any, idx: i })
+          grp.latest = (msgs[i] as any).envelope
+          i++
+        }
+        children.push(grp)
+      } else {
+        children.push({ kind: 'assistant', msg: m2, idx: i })
+        i++
+      }
+    }
+    out.push({ type: 'turn', start, end: i - 1, children })
+  }
+  return out
+})
+
 // ③ 连续工具调用分组折叠 + A2A 信封折叠
 const expandedA2a = ref(new Set<number>())
+const expandedA2aGroup = ref(new Set<string>())  // 连续信封组的「一级展开」状态
 const toolBarOpen = ref(new Set<number>())
 const toolDetailOpen = ref(new Map<number, string>())
 
@@ -129,7 +425,12 @@ function toolsOfAssistant(assistantIdx: number): any[] {
     if (!hasVirtual) {
       const lastCall = [...archived].reverse().find((x: any) => x.role === 'tool_call')
       if (!lastCall) {
-        return [{ role: 'tool_call', name: speakingTool.value.name, tool_call_id: '_virtual_running', args: {}, _running: speakingTool.value.phase || 'args' }, ...archived]
+        // 虚拟 pill 的 args 实时反映 streamingArgs：流式参数增长时直接显示出来，
+        // 不再只显示"参数流式中…"文字提示。streamingArgs 为空时 args={} 走提示兜底。
+        const sa = speakingTool.value?.streamingArgs || ''
+        let vArgs: any = {}
+        if (sa) { try { vArgs = JSON.parse(sa) } catch { vArgs = { _raw: sa } } }
+        return [{ role: 'tool_call', name: speakingTool.value.name, tool_call_id: '_virtual_running', args: vArgs, _running: speakingTool.value.phase || 'args' }, ...archived]
       }
     }
   }
@@ -148,14 +449,37 @@ function hasTools(idx: number): boolean {
   const tools = toolsOfAssistant(idx)
   return tools.some((t: any) => t.role === 'tool_call')
 }
+/** 提取 assistant 消息下所有 purpose=share 的截图 data URL（渲染成对话区缩略图用） */
+function shareScreenshotsOfAssistant(idx: number): string[] {
+  const out: string[] = []
+  const tools = toolsOfAssistant(idx)
+  for (const t of tools) {
+    if (t.role !== 'tool_result') continue
+    // 优先读顶层 image_data_url（后端 purpose=share 时显式带上），
+    // 兜底从 result JSON 里取 image_data_url / data（含 content_type=image 时）
+    if (t.image_data_url) out.push(t.image_data_url)
+    else if (t.result?.image_data_url) out.push(t.result.image_data_url)
+  }
+  return out
+}
 function toolBarIsOpen(idx: number): boolean {
-  if (toolBarOpen.value.has(idx)) return true
-  if (convs.streaming && isLastAssistant(idx) && hasTools(idx)) return true
-  return false
+  return toolBarOpen.value.has(idx)
 }
 function toggleToolBar(idx: number) {
   const s = new Set(toolBarOpen.value)
-  if (s.has(idx)) s.delete(idx); else s.add(idx)
+  if (s.has(idx)) {
+    s.delete(idx)
+  } else {
+    s.add(idx)
+    // 展开工具行时，自动展开当前正在执行的工具详情（流式参数立即可见）
+    const tools = toolsOfAssistant(idx)
+    const running = tools.find((t: any) => t.role === 'tool_call' && toolIsRunning(t))
+    if (running) {
+      const m = new Map(toolDetailOpen.value)
+      m.set(idx, running.tool_call_id)
+      toolDetailOpen.value = m
+    }
+  }
   toolBarOpen.value = s
 }
 function toggleToolDetail(assistantIdx: number, tcId: string) {
@@ -167,6 +491,249 @@ function toggleToolDetail(assistantIdx: number, tcId: string) {
 function toolDetailIsOpen(assistantIdx: number, tcId: string): boolean {
   return toolDetailOpen.value.get(assistantIdx) === tcId
 }
+
+// ============ 过程窗口（流式期间展开固定大小，停止后折叠为 "(>过程)"） ============
+// 设计：以"用户消息"为分界线，每两条用户消息之间的全部智能体输出（多条 assistant 消息、
+// 深度思考 / 流式正文 / 工具行 / 截图 / a2a 信封）按原顺序整合进【同一个】固定大小"过程框"
+// 流式展示；停止输出时，把本轮最后一条带正文的 assistant "提出来"作为正常气泡渲染，
+// 过程框自动折叠为紧贴智能体名称后的 "(>过程)" 文字（无边框、字号字体差异化），点击重新展开。
+const processOpen = ref(new Set<number>())   // 键 = turn.start
+/** 过程窗口 DOM 引用：用于流式时自动滚到底部（键 = turn.start） */
+const processBoxes = new Map<number, HTMLElement>()
+/** 把某个过程框贴到内容底部（仅流式中、且用户未主动上滑时）。 */
+function stickProcessBox(el: HTMLElement | null | undefined) {
+  if (!el || !convs.streaming) return
+  const now = Date.now()
+  const last = (el as any).__lastUserScroll || 0
+  if (now - last > 5000) (el as any).__stickBottom = true
+  if ((el as any).__stickBottom === false) return
+  ;(el as any).__autoScrolling = true
+  el.scrollTop = el.scrollHeight
+  requestAnimationFrame(() => { (el as any).__autoScrolling = false })
+}
+/** 过程框内容监听：思考流 / 正文 / 工具行 / 图片等任何 DOM 变动后重新贴底，
+ *  避免"跟随时底部自己开一条空隙"（只靠 scrollKey 单次 rAF 补底不够）。 */
+function ensureProcessWatcher(el: HTMLElement) {
+  if (!(el as any).__procObserved) {
+    ;(el as any).__procObserved = true
+    // 一帧内的多次变动合并成一次贴底（避免每次 mutation 都强制回流）
+    const mo = new MutationObserver(() => {
+      if ((el as any).__procRaf) return
+      ;(el as any).__procRaf = requestAnimationFrame(() => {
+        ;(el as any).__procRaf = 0
+        stickProcessBox(el)
+      })
+    })
+    mo.observe(el, { childList: true, subtree: true, characterData: true })
+    ;(el as any).__procMo = mo
+  }
+  el.querySelectorAll('img').forEach(img => {
+    if ((img as any).__procStick) return
+    ;(img as any).__procStick = true
+    img.addEventListener('load', () => stickProcessBox(el), { once: true })
+  })
+}
+function onProcessBox(turnStart: number, el: HTMLElement | null) {
+  const prev = processBoxes.get(turnStart)
+  if (prev && prev !== el) (prev as any).__procMo?.disconnect?.()
+  if (el) {
+    processBoxes.set(turnStart, el)
+    // 内联 :ref 在每次重渲染都会重新触发；仅初次挂载时默认跟随底部，
+    // 不覆盖用户手动上滑后设置的 __stickBottom=false
+    if (typeof (el as any).__stickBottom !== 'boolean') (el as any).__stickBottom = true
+    ensureProcessWatcher(el)
+  } else processBoxes.delete(turnStart)
+}
+/** 用户在过程框内滑动即脱离自动跟随；记录最近一次滑动时间，5s 无滑动后恢复跟随。
+ *  注意：我们自己写的 scrollTop 也会触发 scroll 事件，那种不算"用户滑动"，必须忽略，
+ *  否则每次自动滚底都会把自己标记成脱离，导致永远贴不住底部。
+ *  判定用"距底部距离"而不是纯时序标记：程序滚底后 dist≈0 一定不算用户滑动；
+ *  用户手动滚回底部则自动恢复跟随。 */
+function onProcessScroll(turnStart: number, e: Event) {
+  const el = e.target as HTMLElement
+  if (!el) return
+  if ((el as any).__autoScrolling) return
+  const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+  if (dist <= 4) {   // 仍在底部 → 保持（或恢复）跟随
+    ;(el as any).__stickBottom = true
+    return
+  }
+  ;(el as any).__stickBottom = false
+  ;(el as any).__lastUserScroll = Date.now()
+}
+/** 所有"轮"的边界（每两条用户消息之间的非用户消息区间）—— 用于按轮归属判断 */
+const turns = computed(() => {
+  const msgs = visibleMsgs.value
+  const list: { start: number, end: number }[] = []
+  let i = 0
+  while (i < msgs.length) {
+    if ((msgs[i] as any).role === 'user') { i++; continue }
+    const start = i
+    while (i < msgs.length && (msgs[i] as any).role !== 'user') i++
+    list.push({ start, end: i - 1 })
+  }
+  return list
+})
+function turnOf(idx: number): { start: number, end: number } | null {
+  for (const t of turns.value) {
+    if (idx >= t.start && idx <= t.end) return t
+  }
+  return null
+}
+/** 本轮（最近一条 user 消息之后）的起始索引 */
+function turnStartIdx(): number {
+  const msgs = visibleMsgs.value
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if ((msgs[i] as any)?.role === 'user') return i + 1
+  }
+  return 0
+}
+/** 该 turn 是否仍在流式（用于强制过程框展开，避免工具行/思考中途消失） */
+function isTurnActive(turnStart: number): boolean {
+  if (!convs.streaming) return false
+  return turnStart === turnStartIdx()
+}
+/** 该 assistant 是否被"提出来"作为最终正文气泡：仅在其所属轮彻底停止后、
+ *  且是"该轮最后一条带正文的 assistant"时成立。流式未结束一律留在过程框里 */
+function isPromotedMessage(idx: number): boolean {
+  const msgs = visibleMsgs.value
+  const m = msgs[idx] as any
+  if (!m || m.role !== 'assistant') return false
+  const t = turnOf(idx)
+  if (!t) return false
+  if (isTurnActive(t.start)) return false
+  if (isStreamingMsg(m)) return false
+  if (!trimMsgContent(m.content)) return false
+  for (let i = t.end; i >= t.start; i--) {
+    const x = msgs[i] as any
+    if (x?.role === 'assistant' && trimMsgContent(x.content)) return i === idx
+  }
+  return false
+}
+/** 该轮是否含有"过程"内容（任一子块的思考 / 工具 / 截图 / 非末条正文 / a2a 信封） */
+function turnHasContent(turn: any): boolean {
+  if (!turn) return false
+  for (const ch of turn.children) {
+    if (ch.kind === 'a2a') return true
+    const m = ch.msg as any
+    if ((m.reasoning || '').trim()) return true
+    if (hasTools(ch.idx)) return true
+    if (shareScreenshotsOfAssistant(ch.idx).length) return true
+    if (trimMsgContent(m.content) && !isPromotedMessage(ch.idx)) return true
+  }
+  return false
+}
+/** 本轮"提出来"的 assistant 索引（停止后最后一条带正文的 assistant）；流式中或无正文返回 -1 */
+function turnPromotedIdx(turn: any): number {
+  if (!turn || isTurnActive(turn.start)) return -1
+  for (let j = turn.children.length - 1; j >= 0; j--) {
+    const ch = turn.children[j]
+    if (ch.kind === 'assistant' && trimMsgContent(ch.msg.content)) return ch.idx
+  }
+  return -1
+}
+function turnPromotedMsg(turn: any): any {
+  const idx = turnPromotedIdx(turn)
+  return idx >= 0 ? visibleMsgs.value[idx] : null
+}
+/** 本轮最后一条 assistant 子块索引（用于右键菜单定位）；无则 turn.start */
+function turnLastAssistantIdx(turn: any): number {
+  if (!turn) return 0
+  for (let j = turn.children.length - 1; j >= 0; j--) {
+    const ch = turn.children[j]
+    if (ch.kind === 'assistant') return ch.idx
+  }
+  return turn.start
+}
+/** 轮首智能体名（取第一个 assistant 子块） */
+function turnName(turn: any): string {
+  const ch = turn?.children?.find((c: any) => c.kind === 'assistant')
+  return ch ? (agentNameOf(ch.msg.agent_id) || '') : ''
+}
+function turnAvatar(turn: any): string {
+  return (turnName(turn) || '智能体').slice(0, 1).toUpperCase()
+}
+
+function turnAvatarGradient(turn: any): string {
+  const mode = settings.data.avatar_mode || 'differentiated'
+  if (mode === 'unified') {
+    return 'linear-gradient(135deg, #6ea8ff, #b472ff)'
+  }
+  const ch = turn?.children?.find((c: any) => c.kind === 'assistant')
+  const agentId = ch?.msg?.agent_id || turnName(turn) || '智能体'
+  return getAvatarGradient(agentId)
+}
+
+function userAvatarGradient(): string {
+  const mode = settings.data.avatar_mode || 'differentiated'
+  if (mode === 'unified') {
+    return 'linear-gradient(135deg, #6ea8ff, #b472ff)'
+  }
+  return 'linear-gradient(135deg, #f97316, #ec4899)'
+}
+/** 子块智能体名标签：仅当与"上一个 assistant 子块"的 agent 不同时返回名字（标注接力切换） */
+function childAgentLabel(child: any, turn: any): string {
+  if (child.kind !== 'assistant') return ''
+  let prevAgent: any = null
+  for (const c of turn.children) {
+    if (c === child) {
+      if (prevAgent == null) return ''
+      const cur = agentNameOf(child.msg.agent_id)
+      const pre = agentNameOf(prevAgent)
+      return cur && cur !== pre ? cur : ''
+    }
+    if (c.kind === 'assistant') prevAgent = c.msg.agent_id
+  }
+  return ''
+}
+/** 该轮是否完全无内容可渲染（用于 .empty 隐藏整块） */
+function turnEmpty(turn: any): boolean {
+  if (isTurnActive(turn.start)) return false
+  if (turnPromotedIdx(turn) >= 0) return false
+  return !turnHasContent(turn)
+}
+/** 过程框是否处于"展开"状态：本轮流式中强制展开；停止后由 processOpen 决定 */
+function isProcessOpen(turnStart: number): boolean {
+  if (isTurnActive(turnStart)) return true
+  return processOpen.value.has(turnStart)
+}
+/** 是否渲染过程框：本轮流式中（承载流式光标 / 工具行）或停止后用户主动展开且有过程内容 */
+function showProcessWindow(turnStart: number, turn: any): boolean {
+  if (isTurnActive(turnStart)) {
+    return turn.children.some((ch: any) => ch.kind === 'assistant' && isStreamingMsg(ch.msg)) || turnHasContent(turn)
+  }
+  return turnHasContent(turn) && processOpen.value.has(turnStart)
+}
+/** 是否显示 "(>过程)" 折叠钮：仅停止后且有过程内容时（流式中过程框始终展开，无需折叠钮） */
+function showProcToggle(turnStart: number, turn: any): boolean {
+  if (isTurnActive(turnStart)) return false
+  return turnHasContent(turn)
+}
+function toggleProcess(turnStart: number) {
+  const s = new Set(processOpen.value)
+  if (s.has(turnStart)) s.delete(turnStart); else s.add(turnStart)
+  processOpen.value = s
+}
+// —— 过程框内的"思考过程"：默认单行（流式中循环覆盖、停止后截断首行），点击展开全文 ——
+const thinkOpen = ref(new Set<number>())   // 键 = assistant 子块 idx
+function thinkIsOpen(idx: number): boolean {
+  return thinkOpen.value.has(idx)
+}
+function toggleThink(idx: number) {
+  const s = new Set(thinkOpen.value)
+  if (s.has(idx)) s.delete(idx); else s.add(idx)
+  thinkOpen.value = s
+}
+function scrollProcessBoxesToBottom() {
+  if (!convs.streaming) return
+  for (const [turnStart, el] of processBoxes) {
+    const turn = renderItems.value.find((it: any) => it.type === 'turn' && it.start === turnStart)
+    if (!turn) continue
+    if (!isTurnActive(turnStart)) continue
+    stickProcessBox(el)
+  }
+}
+
 function toolIsRunning(tc: any): boolean {
   if (tc._running) return true
   if (tc.role !== 'tool_call') return false
@@ -178,7 +745,7 @@ function toolIsRunning(tc: any): boolean {
 }
 
 const latestToolInfoMap = computed(() => {
-  const map = new Map<number, { name: string; running: boolean; total: number; index: number } | null>()
+  const map = new Map<number, { name: string; running: boolean; total: number; index: number; fileName: string } | null>()
   const msgs = visibleMsgs.value
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i] as any
@@ -190,11 +757,13 @@ const latestToolInfoMap = computed(() => {
     const runningIdx = calls.findIndex((t: any) => toolIsRunning(t))
     const pickedIdx = runningIdx >= 0 ? runningIdx : calls.length - 1
     const picked = calls[pickedIdx]
+    const fileName = extractToolFileName(picked.name, picked.args || {})
     map.set(i, {
-      name: toolLabel(picked.name),
+      name: toolLabel(picked.name, picked.args || {}),
       running: runningIdx >= 0,
-      total: calls.length,          // 总工具调用数
-      index: pickedIdx,             // 当前展示的是第几个（0-based）
+      total: calls.length,
+      index: pickedIdx,
+      fileName,
     })
   }
   return map
@@ -204,11 +773,30 @@ function latestToolInfo(idx: number) {
 }
 
 function prettyArgs(args: any): string { try { return JSON.stringify(args, null, 2) } catch { return String(args) } }
-function prettyResult(result: any): string { try { return JSON.stringify(result, null, 2) } catch { return String(result) } }
+function prettyResult(result: any): string {
+  // share 截图结果里塞着完整 base64 data URL（用于缩略图渲染 + 落库），
+  // 展开详情时把这几个字段替换成占位提示，避免详情面板出现几万字节的 base64 墙。
+  let v = result
+  if (v && typeof v === 'object' && (v.purpose === 'share' || v.image_data_url)) {
+    v = { ...v }
+    if (typeof v.image_data_url === 'string') v.image_data_url = '[base64 data URL，已用于缩略图渲染]'
+    if (typeof v.data === 'string' && v.data.length > 4000) v.data = `[base64 ${v.data.length} chars，已用于缩略图渲染]`
+  }
+  try { return JSON.stringify(v, null, 2) } catch { return String(result) }
+}
 function toggleA2a(idx: number) {
   const s = new Set(expandedA2a.value)
   if (s.has(idx)) s.delete(idx); else s.add(idx)
   expandedA2a.value = s
+}
+
+function toggleA2aGroup(key: string) {
+  const s = new Set(expandedA2aGroup.value)
+  if (s.has(key)) s.delete(key); else s.add(key)
+  expandedA2aGroup.value = s
+}
+function isA2aGroupOpen(key: string): boolean {
+  return expandedA2aGroup.value.has(key)
 }
 
 // ==============================================================
@@ -229,7 +817,7 @@ interface FileOp {
   restored_at?: string
 }
 
-const msgCtxMenu = ref<{ x: number; y: number; msgIdx: number } | null>(null)
+const msgCtxMenu = ref<{ x: number; y: number; msgIdx: number; role: string } | null>(null)
 const msgMenuEl = ref<HTMLElement | null>(null)
 
 function onMsgContextMenu(e: MouseEvent, idx: number) {
@@ -237,9 +825,12 @@ function onMsgContextMenu(e: MouseEvent, idx: number) {
   const menuW = 260
   const menuH = 60
   const pad = 8
+  const msgs = visibleMsgs.value
+  const m = msgs[idx]
+  const role = m?.role || ''
   const x = Math.max(pad, Math.min(e.clientX, window.innerWidth - menuW - pad))
   const y = Math.max(pad, Math.min(e.clientY, window.innerHeight - menuH - pad))
-  msgCtxMenu.value = { x, y, msgIdx: idx }
+  msgCtxMenu.value = { x, y, msgIdx: idx, role }
   // 渲染后再按实际尺寸精确校正，避免估算偏差导致超出屏幕
   nextTick(() => {
     const el = msgMenuEl.value
@@ -254,6 +845,142 @@ function onMsgContextMenu(e: MouseEvent, idx: number) {
   })
 }
 function closeMsgCtx() { msgCtxMenu.value = null }
+
+// —— 用户头像右键菜单：设置/更换头像照片 ——
+const avatarCtxMenu = ref<{ x: number; y: number } | null>(null)
+const avatarMenuEl = ref<HTMLElement | null>(null)
+const userAvatarPhoto = computed(() => (settings.data.user_avatar as string) || '')
+
+function onAvatarContextMenu(e: MouseEvent) {
+  e.preventDefault()
+  const menuW = 240
+  const menuH = userAvatarPhoto.value ? 88 : 44
+  const pad = 8
+  const x = Math.max(pad, Math.min(e.clientX, window.innerWidth - menuW - pad))
+  const y = Math.max(pad, Math.min(e.clientY, window.innerHeight - menuH - pad))
+  avatarCtxMenu.value = { x, y }
+  nextTick(() => {
+    const el = avatarMenuEl.value
+    const v = avatarCtxMenu.value
+    if (!el || !v) return
+    const r = el.getBoundingClientRect()
+    let nx = v.x
+    let ny = v.y
+    if (r.right > window.innerWidth - pad) nx = Math.max(pad, window.innerWidth - r.width - pad)
+    if (r.bottom > window.innerHeight - pad) ny = Math.max(pad, window.innerHeight - r.height - pad)
+    if (nx !== v.x || ny !== v.y) avatarCtxMenu.value = { ...v, x: nx, y: ny }
+  })
+}
+function closeAvatarCtx() { avatarCtxMenu.value = null }
+
+const avatarInput = ref<HTMLInputElement | null>(null)
+
+function triggerAvatarPhotoUpload() {
+  closeAvatarCtx()
+  if (!avatarInput.value) {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/*'
+    input.style.display = 'none'
+    input.addEventListener('change', handleAvatarPhotoUpload)
+    document.body.appendChild(input)
+    avatarInput.value = input
+  }
+  avatarInput.value.click()
+}
+
+async function handleAvatarPhotoUpload(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (avatarInput.value) {
+    avatarInput.value.remove()
+    avatarInput.value = null
+  }
+  if (!file) return
+  try {
+    const dataUrl = await shrinkToDataUrl(file, 256)
+    await settings.update({ user_avatar: dataUrl })
+  } catch {
+    alert('头像照片读取失败，请换一张图片重试')
+  }
+}
+
+async function resetAvatarPhoto() {
+  closeAvatarCtx()
+  await settings.update({ user_avatar: '' })
+}
+
+/** 图片等比缩小到 max 边长内，转成 JPEG dataURL（避免原图过大撑爆配置存储） */
+function shrinkToDataUrl(file: File, max = 256): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      try {
+        const iw = img.width || 1
+        const ih = img.height || 1
+        const scale = Math.min(1, max / Math.max(iw, ih))
+        const w = Math.max(1, Math.round(iw * scale))
+        const h = Math.max(1, Math.round(ih * scale))
+        const c = document.createElement('canvas')
+        c.width = w
+        c.height = h
+        const ctx = c.getContext('2d')
+        if (!ctx) return reject(new Error('canvas unsupported'))
+        ctx.drawImage(img, 0, 0, w, h)
+        resolve(c.toDataURL('image/jpeg', 0.85))
+      } catch (err) { reject(err) }
+    }
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('invalid image')) }
+    img.src = url
+  })
+}
+
+// —— 删除单条消息：截断到这条之前 ——
+const msgOpStatus = ref('')
+async function deleteMessageFromCtx() {
+  const menu = msgCtxMenu.value
+  closeMsgCtx()
+  if (!menu) return
+  const c = conv.value
+  if (!c) return
+  const m = visibleMsgs.value[menu.msgIdx]
+  if (!m) return
+  const preview = (m.content || '').replace(/\s+/g, ' ').trim().slice(0, 30)
+  if (!confirm(`删除这条消息？\n\n「${preview || '(空)'}」\n\n仅删除该条消息本身，其余对话保留。`)) return
+  msgOpStatus.value = '正在删除…'
+  const r = await convs.deleteMessage(menu.msgIdx)
+  if (r.ok) {
+    msgOpStatus.value = r.removed && r.removed > 1
+      ? `✅ 已删除（含 ${r.removed} 条工具结果，智能体不再记得此轮）`
+      : '✅ 已删除'
+  } else {
+    msgOpStatus.value = '❌ 删除失败: ' + (r.msg || '未知错误')
+  }
+  setTimeout(() => { msgOpStatus.value = '' }, 3000)
+}
+
+// —— 撤销：删除该用户消息及之后的所有对话，并还原之后的所有文件操作 ——
+async function undoFromCtx() {
+  const menu = msgCtxMenu.value
+  closeMsgCtx()
+  if (!menu) return
+  const c = conv.value
+  if (!c) return
+  const m = visibleMsgs.value[menu.msgIdx]
+  if (!m) return
+  const preview = (m.content || '').replace(/\s+/g, ' ').trim().slice(0, 30)
+  if (!confirm(`撤销这条用户消息？\n\n「${preview || '(空)'}」\n\n该消息及其后的所有对话都会被删除，之后智能体修改的文件会被还原。`)) return
+  msgOpStatus.value = '正在撤销…'
+  const r = await convs.undoFromUserMessage(menu.msgIdx)
+  if (r.ok) {
+    msgOpStatus.value = `✅ 已撤销${r.restoredOps ? `（还原 ${r.restoredOps} 项文件操作）` : ''}`
+  } else {
+    msgOpStatus.value = '❌ 撤销失败: ' + (r.msg || '未知错误')
+  }
+  setTimeout(() => { msgOpStatus.value = '' }, 4000)
+}
 
 const fileOpsDlg = ref<{ open: boolean; loading: boolean; ops: FileOp[]; sinceTs: string; msgContent: string }>(
   { open: false, loading: false, ops: [], sinceTs: '', msgContent: '' }
@@ -370,15 +1097,101 @@ function friendlyOp(op: string): string {
   return map[op] ?? op
 }
 
-// ③ 流式自动滚动：streaming + 最后消息内容长度 + 消息数
+// ③ 流式自动滚动：streaming + 最后消息内容长度 + 消息数 + 工具参数流式长度
+//   用户停留在底部附近时自动贴底；用户上滑即脱离，不再抢滚动焦点（避免"锁底"）
+const BOTTOM_THRESHOLD = 48
+const stickBottom = ref(true)
+
+function isNearBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_THRESHOLD
+}
+function onMessagesScroll() {
+  const el = msgBox.value
+  if (!el) return
+  stickBottom.value = isNearBottom(el)
+}
+function scrollToBottom() {
+  const el = msgBox.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+function followBottom() {
+  if (stickBottom.value) scrollToBottom()
+}
+
+// ④ 本轮输出完毕：把"提出来"的最终正文气泡滚到可视区顶部第一行，便于用户从头阅读
+function scrollToTurnBubbleTop() {
+  const el = msgBox.value
+  if (!el) return
+  const turns = el.querySelectorAll<HTMLElement>('.msg.assistant.turn')
+  const target = turns[turns.length - 1]?.querySelector<HTMLElement>('.promoted-bubble')
+  if (!target) return
+  const delta = target.getBoundingClientRect().top - el.getBoundingClientRect().top
+  el.scrollTop = Math.max(0, el.scrollTop + delta - 8)
+}
+
+// 工具参数流式输出：贴近底部自动跟随，用户上滑即脱离
+function onStreamingArgsScroll(e: Event) {
+  const el = e.target as HTMLElement
+  if (!el || !el.classList.contains('tr-streaming-args')) return
+  ;(el as any).__stickBottom = isNearBottom(el)
+}
+function scrollStreamingArgsToBottom() {
+  const root = msgBox.value
+  if (!root) return
+  root.querySelectorAll<HTMLElement>('.tr-streaming-args').forEach(el => {
+    if ((el as any).__stickBottom === false) return
+    el.scrollTop = el.scrollHeight
+  })
+}
+
 const scrollKey = computed(() => {
   const msgs = conv.value?.messages || []
   const last = msgs[msgs.length - 1]
-  return `${convs.streaming ? 1 : 0}:${msgs.length}:${(last?.content || '').length}`
+  return `${convs.streaming ? 1 : 0}:${msgs.length}:${(last?.content || '').length}:${speakingTool.value?.streamingArgs?.length || 0}`
 })
 watch(scrollKey, async () => {
   await nextTick()
-  if (msgBox.value) msgBox.value.scrollTop = msgBox.value.scrollHeight
+  followBottom()
+  requestAnimationFrame(scrollStreamingArgsToBottom)
+  requestAnimationFrame(scrollProcessBoxesToBottom)
+})
+
+// 流式结束（本轮收尾）时：自动折叠本轮的过程框 → 让 "(>过程)" 折叠态生效。
+// 只收敛「本轮」（turnStartIdx），不影响用户此前手动展开的历史轮次过程框。
+// 折叠后把最终正文气泡滚到第一行；用户上滑过则不打扰。
+let _wasStreamingForProc = false
+watch(() => convs.streaming, async (v) => {
+  if (_wasStreamingForProc && !v) {
+    const s = new Set(processOpen.value)
+    s.delete(turnStartIdx())
+    processOpen.value = s
+    const stick = stickBottom.value
+    await nextTick()
+    await new Promise((r) => requestAnimationFrame(() => r(null)))
+    if (stick) {
+      scrollToTurnBubbleTop()
+      stickBottom.value = false
+    }
+  }
+  _wasStreamingForProc = v
+})
+
+// 切换对话记录时：滚动到底部，并默认选中当前会话最新一条回复的智能体
+watch(() => convs.current, async (id) => {
+  if (id == null) return
+  await nextTick()
+  // 切换对话记录：回到最新一条，并恢复底部跟随
+  stickBottom.value = true
+  scrollToBottom()
+  const data = convs.currentData()
+  const msgs = data?.messages || []
+  const lastAssistant = [...msgs].reverse().find(
+    (m: any) => m.role === 'assistant' && m.agent_id != null
+  )
+  if (lastAssistant && lastAssistant.agent_id != null) {
+    currentAgentId.value = lastAssistant.agent_id
+    convs.selectedAgentId = lastAssistant.agent_id
+  }
 })
 
 // ① 节点💬直接对话：回填选中智能体并聚焦输入框
@@ -395,8 +1208,12 @@ async function send() {
   const text = input.value.trim(); if (!text) return
   input.value = ''  // ← 立刻清空，不等流式结束
   const agentId = currentAgentId.value ?? agents.list[0]?.id; if (!agentId) return alert('请先新建智能体')
+  stickBottom.value = true   // 自己发的消息必须可见
   await convs.send(agentId, text)
-  setTimeout(() => msgBox.value && (msgBox.value.scrollTop = msgBox.value.scrollHeight), 50)
+  setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
+}
+function sendStop() {
+  convs.stopSend()
 }
 function formatResult(r: any): string {
   if (!r) return '(空)'
@@ -409,38 +1226,8 @@ function agentNameOf(agentId: number | null | undefined): string {
 function kindLabel(kind: string): string {
   return ({ handoff: '成果移交', message: '交流讨论', artifact: '成果' } as Record<string, string>)[kind] || kind
 }
-function toolLabel(name: string): string {
-  if (!name) return name
-  const map: Record<string, string> = {
-    'cluster.list_agents': '📋 列出智能体',
-    'cluster.create_agent': '✨ 创建智能体',
-    'cluster.update_agent': '✏️ 更新智能体',
-    'cluster.delete_agent': '🗑 删除智能体',
-    'cluster.list_canvases': '📋 列出画布',
-    'cluster.create_canvas': '🎨 创建画布',
-    'cluster.delete_canvas': '🗑 删除画布',
-    'cluster.get_canvas': '🔍 查看画布',
-    'cluster.add_node': '➕ 添加节点',
-    'cluster.remove_node': '➖ 移除节点',
-    'cluster.connect': '🔗 连接节点',
-    'cluster.disconnect': '✂️ 断开连线',
-    'cluster.list_rules': '📜 列出规章制度',
-    'cluster.create_rule': '📜 新增规章制度',
-    'cluster.update_rule': '✏️ 修改规章制度',
-    'cluster.delete_rule': '🗑 删除规章制度',
-    'cluster.handoff': '🤝 A2A 移交',
-    'cluster.send_message': '💬 发送消息',
-    'file.read': '📖 读文件',
-    'file.write': '✍️ 写文件',
-    'file.patch': '🩹 补丁编辑',
-    'file.delete': '🗑 删文件',
-    'file.replace': '🔧 替换文本',
-    'file.search': '🔍 搜索内容',
-    'file.structure': '🗂 文件树',
-    'cmd.run': '⚙️ 运行命令',
-  }
-  return map[name] ?? name
-}
+// 工具行标签直接用 conversation.ts 的统一 toolLabel（已内置伪协议清洗 + settings meta 查询）
+// 不再维护本地硬编码映射，避免和画布/对话区行为分叉
 async function newConv(mode: 'independent' | 'linked') {
   const names: Record<string, string> = { independent: '独立对话', linked: '集群对话' }
   // 重置画布上下文：清空当前画布绑定的集群对话历史（画布气泡的数据源）
@@ -483,6 +1270,69 @@ async function deleteCanvas(id: number) {
 async function commitRenameCanvas() {
   if (renameId.value != null && renameVal.value.trim()) await canvases.rename(renameId.value, renameVal.value.trim())
   renameId.value = null
+}
+
+/**
+ * 格式化文件路径for显示：如果空间够完整显示，如果空间不够则从两端显示（保留文件名）
+ * @param path 文件路径
+ * @param type 'summary' 用于摘要行，'detail' 用于详情行
+ * @returns 格式化后的文件路径
+ */
+function formatFilePath(path: string, type: 'summary' | 'detail'): string {
+  if (!path) return '';
+  
+  // 根据CSS中的max-width和font-size估算最大字符数
+  let maxChars: number;
+  if (type === 'summary') {
+    // .tr-filename: max-width: 140px; font-size: 10px
+    maxChars = Math.floor(140 / 10); // 14
+  } else {
+    // .tr-filename-mini: max-width: 100px; font-size: 9.5px
+    maxChars = Math.floor(100 / 9.5); // 10
+  }
+  
+  // 如果路径短于等于最大字符数，直接返回
+  if (path.length <= maxChars) {
+    return path;
+  }
+  
+  // 提取文件名（路径的最后一部分）
+  const lastSlashIndex = Math.max(
+    path.lastIndexOf('\\'),
+    path.lastIndexOf('/')
+  );
+  
+  let fileName = '';
+  let pathPrefix = '';
+  
+  if (lastSlashIndex !== -1) {
+    fileName = path.substring(lastSlashIndex + 1);
+    pathPrefix = path.substring(0, lastSlashIndex + 1); // 包含斜杠
+  } else {
+    // 没有斜杠，整个路径就是文件名
+    fileName = path;
+    pathPrefix = '';
+  }
+  
+  // 如果文件名本身就超过了最大字符数，那就只返回文件名的末尾部分
+  if (fileName.length >= maxChars) {
+    // 如果即使是文件名也太长，就截断文件名的末尾
+    return fileName.substring(0, maxChars - 3) + '...';
+  }
+  
+  // 计算可以用于路径前缀的字符数
+  // 需要留出3个字符给省略号，以及文件名本身
+  const availableForPrefix = maxChars - 3 - fileName.length;
+  
+  if (availableForPrefix <= 0) {
+    // 空间不够显示路径前缀，只显示省略号+文件名
+    return '...' + fileName;
+  }
+  
+  // 取路径前缀的开头availableForPrefix个字符
+  const prefixPart = pathPrefix.substring(0, Math.min(pathPrefix.length, availableForPrefix));
+  
+  return prefixPart + '...' + fileName;
 }
 
 // —— 画布列表拖拽排序 ——
@@ -549,9 +1399,9 @@ async function deleteSelected() {
   await convs.removeMany(selectedIds.value)
   exitSel()
 }
-function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); convsCollapsed.value = true }
+function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true }
 function onDocKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); convsCollapsed.value = true; if (selMode.value) exitSel() }
+    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel() }
 }
 
 onMounted(async () => {
@@ -566,6 +1416,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   document.removeEventListener('click', onDocClick)
   document.removeEventListener('keydown', onDocKey)
+  if (typeof window !== 'undefined') window.removeEventListener('keydown', onLightboxKey)
 })
 </script>
 
@@ -605,6 +1456,7 @@ onBeforeUnmount(() => {
           </template>
           <template v-else>
             <span class="cv-label" @dblclick.stop="startRenameCanvas(c.id, c.name)">🎨 {{ c.name }}</span>
+            <span v-if="runningCanvasId === c.id" class="cv-running" title="正在运行">●</span>
             <span class="cv-count">{{ c.nodes?.length || 0 }}</span>
           </template>
           <span v-if="canvases.list.length > 1" class="del" @click.stop="deleteCanvas(c.id)">×</span>
@@ -624,13 +1476,13 @@ onBeforeUnmount(() => {
     </Teleport>
     <div class="divider" ></div>
     <!-- 对话 -->
-    <div class="chat-pane">
+    <div class="chat-pane" ref="chatPaneEl">
       <div class="chat-header">
         <div class="section-title conv-title">
           <button class="collapse-btn" type="button"
                   @click.stop="convsCollapsed = !convsCollapsed"
                   :title="convsCollapsed ? '展开对话记录（覆盖在画布上）' : '折叠对话记录'">
-            {{ convsCollapsed ? '▾' : '▸' }}
+            {{ convsCollapsed ? '▸' : '▾' }}
           </button>
           <span class="conv-title-text">对话</span>
           <span class="conv-count">{{ convs.list.length }}</span>
@@ -699,8 +1551,19 @@ onBeforeUnmount(() => {
              ref="msgMenuEl"
              class="msg-ctx-menu"
              :style="{ left: msgCtxMenu.x + 'px', top: msgCtxMenu.y + 'px' }"
-             @click.stop @mousedown.stop>
-          <div class="msg-ctx-item" @click.stop="openFileOpsFromMsg">
+              @click.stop @mousedown.stop>
+          <!-- 删除消息（所有消息通用） -->
+          <div class="msg-ctx-item" @click.stop="deleteMessageFromCtx">
+            <span class="msg-ctx-icon">🗑</span>
+            <span>删除此消息</span>
+          </div>
+          <!-- 撤销（仅用户消息） -->
+          <div v-if="msgCtxMenu.role === 'user'" class="msg-ctx-item" @click.stop="undoFromCtx">
+            <span class="msg-ctx-icon">↩️</span>
+            <span>撤销此消息及之后对话（并还原文件）</span>
+          </div>
+          <!-- 查看文件操作历史（仅用户消息） -->
+          <div v-if="msgCtxMenu.role === 'user'" class="msg-ctx-item" @click.stop="openFileOpsFromMsg">
             <span class="msg-ctx-icon">📂</span>
             <span>查看此消息后的文件操作历史</span>
           </div>
@@ -759,111 +1622,264 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </Teleport>
-      <div class="chat-box" ref="msgBox">
+      <!-- 用户头像右键菜单（更换照片） -->
+      <Teleport to="body">
+        <div v-if="avatarCtxMenu"
+             ref="avatarMenuEl"
+             class="msg-ctx-menu"
+             :style="{ left: avatarCtxMenu.x + 'px', top: avatarCtxMenu.y + 'px' }"
+             @click.stop @mousedown.stop>
+          <div class="msg-ctx-item" @click.stop="triggerAvatarPhotoUpload">
+            <span class="msg-ctx-icon">📷</span>
+            <span>{{ userAvatarPhoto ? '更换头像照片' : '设置头像照片' }}</span>
+          </div>
+          <div v-if="userAvatarPhoto" class="msg-ctx-item" @click.stop="resetAvatarPhoto">
+            <span class="msg-ctx-icon">↩️</span>
+            <span>恢复默认头像</span>
+          </div>
+        </div>
+      </Teleport>
+      <!-- 消息操作状态提示（删除/撤销的即时反馈） -->
+      <Teleport to="body">
+        <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
+      </Teleport>
+      <div class="chat-box" ref="msgBox" @scroll.passive="onMessagesScroll">
         <div v-if="!conv" class="no-conv">请新建对话</div>
-        <!-- ============ 消息列表 ============ -->
-        <template v-for="(m, idx) in visibleMsgs" :key="m.ts + '-' + idx">
-          <!-- 跳过 tool_call / tool_result：它们被归属到前面最近的 assistant 消息下 -->
-          <template v-if="m.role !== 'tool_call' && m.role !== 'tool_result'">
-
-            <!-- ===== 用户消息（靠右） ===== -->
-            <div v-if="m.role === 'user'" class="msg user" @contextmenu.prevent.stop="onMsgContextMenu($event, idx)">
-              <div class="role" title="用户">👤</div>
-              <div class="bubble markdown user-bubble" v-html="msgBubbleHtml(m)"></div>
-              <span class="hint-right">右键查看文件操作历史</span>
+        <!-- ============ 消息列表 ============
+             tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
+             连续 a2a 信封合并成一组，默认折叠为一条摘要（两级展开） -->
+        <template v-for="(it, ri) in renderItems" :key="ri">
+          <!-- ===== 用户消息（靠右，作为每轮智能体输出的分界） ===== -->
+          <div v-if="it.type === 'user'" class="msg user" @contextmenu.prevent.stop="onMsgContextMenu($event, it.idx)">
+            <div class="avatar user-avatar" :style="{ background: userAvatarGradient() }"
+                 @contextmenu.prevent.stop="onAvatarContextMenu($event)">
+              <img v-if="userAvatarPhoto" class="avatar-photo" :src="userAvatarPhoto" alt="U" />
+              <template v-else>U</template>
             </div>
+            <div class="bubble markdown user-bubble" v-html="msgBubbleHtml(it.msg)"></div>
+            <span class="hint-right">右键删除/撤销</span>
+          </div>
 
-            <!-- ===== A2A 信封卡片 ===== -->
-            <div v-else-if="m.role === 'a2a'" class="tool-card a2a">
-              <div class="tc-header a2a-toggle" @click="toggleA2a(idx)">
-                <span class="tc-ico">🤝</span>
-                <span class="tc-name">{{ kindLabel(m.envelope?.kind) }}</span>
-                <span class="a2a-route">{{ m.envelope?.from?.name }} → {{ m.envelope?.to?.name }}</span>
-                <span class="tc-id">{{ m.envelope?.protocol }} · {{ m.envelope?.task?.state }}</span>
-                <span class="tg-chev">{{ expandedA2a.has(idx) ? '▾' : '▸' }}</span>
+          <!-- ===== 一轮智能体输出（靠左）=====
+               以"用户消息"为分界：本轮（两条用户消息之间）的全部智能体连续输出
+               （多条 assistant 的思考/正文/工具行/截图 + a2a 信封）按原顺序整合进
+               【同一个】固定大小"过程框"流式展示；停止时把末条带正文的 assistant
+               提出作为正常气泡，过程框折叠为名称后的 "(>过程)" -->
+          <div v-else-if="it.type === 'turn'"
+               class="msg assistant turn"
+               :class="{ empty: turnEmpty(it), streaming: isTurnActive(it.start) }"
+               @contextmenu.prevent.stop="onMsgContextMenu($event, turnLastAssistantIdx(it))">
+            <div class="col-wrap">
+              <!-- 头像 + 名字行 + 过程折叠钮（每轮只出现一次，无边框、字号字体差异化） -->
+              <div class="head-row">
+                <div class="avatar" :style="{ background: turnAvatarGradient(it) }">{{ turnAvatar(it) }}</div>
+                <div v-if="turnName(it)" class="who-assistant">{{ turnName(it) }}</div>
+                <span v-if="showProcToggle(it.start, it)"
+                      class="proc-toggle"
+                      :class="{ open: isProcessOpen(it.start) }"
+                      @click.stop="toggleProcess(it.start)">{{ isProcessOpen(it.start) ? '(▾过程)' : '(>过程)' }}</span>
               </div>
-              <div v-if="expandedA2a.has(idx)" class="a2a-body">
-                <div class="a2a-meta">
-                  <span class="a2a-chip">{{ m.envelope?.task_id }}</span>
-                  <span class="a2a-chip dim">{{ m.envelope?.message_id }}</span>
-                </div>
-                <template v-for="(p, pi) in m.envelope?.parts || []" :key="pi">
-                  <div v-if="p.type === 'text'" class="a2a-text">{{ p.text }}</div>
-                  <details v-else-if="p.type === 'artifact'" class="tc-body" open>
-                    <summary>📎 {{ p.name }}（{{ p.mime_type }}）</summary>
-                    <pre>{{ p.content }}</pre>
-                  </details>
-                </template>
-              </div>
-            </div>
 
-            <!-- ===== 助手消息（靠左）===== -->
-            <div v-else-if="m.role === 'assistant'"
-                 class="msg assistant"
-                 :class="{ empty: !trimMsgContent(m.content) && !isStreamingMsg(m) && !hasTools(idx), streaming: isStreamingMsg(m) }">
-              <div class="col-wrap">
-                <!-- 头像 + 名字行 -->
-                <div class="head-row">
-                  <div class="avatar">{{ (agentNameOf(m.agent_id) || '?').slice(0,1).toUpperCase() }}</div>
-                  <div v-if="agentNameOf(m.agent_id)" class="who-assistant">{{ agentNameOf(m.agent_id) }}</div>
-                </div>
+              <!-- 过程框：固定大小 + 内部滚动，整合本轮全部智能体输出（顺序保持）；
+                   展开时位于折叠钮下方、最终正文气泡上方 -->
+              <div v-if="showProcessWindow(it.start, it)" class="process-window">
+                <div class="process-body"
+                     :ref="(el) => onProcessBox(it.start, el as HTMLElement | null)"
+                     @scroll.passive="onProcessScroll(it.start, $event)">
+                  <template v-for="ch in it.children" :key="ch.kind === 'a2a' ? ch.key : ('a-' + ch.idx)">
 
-                <!-- 文本泡泡：有内容走 markdown 渲染；有工具但没内容则省略泡泡；无内容无工具但在流式显示光标 -->
-                <template v-if="trimMsgContent(m.content)">
-                  <div class="bubble markdown" v-html="msgBubbleHtml(m)"></div>
-                </template>
-                <div v-else-if="isStreamingMsg(m) && !hasTools(idx)" class="bubble streaming-placeholder">
-                  <span class="stream-cursor">▌</span>
-                </div>
-
-                <!-- 工具调用行：只在有真实 tool_call 时出现，汇总 pill + 可展开历史清单 -->
-                <div v-if="hasTools(idx)" class="tool-row">
-                  <div class="tr-summary"
-                       :class="{ open: toolBarIsOpen(idx), running: latestToolInfo(idx)?.running }"
-                       @click="toggleToolBar(idx)">
-                    <span class="tr-icon" :class="{ spinning: latestToolInfo(idx)?.running }">{{ latestToolInfo(idx)?.running ? '⟳' : '✓' }}</span>
-                    <span class="tr-summary-name">{{ latestToolInfo(idx)?.name }}</span>
-                    <span class="tr-status">{{ latestToolInfo(idx)?.running ? '执行中' : '已完成' }}</span>
-                    <span class="tr-count">共 {{ latestToolInfo(idx)?.total || 0 }} 个工具</span>
-                    <span class="tr-chev">{{ toolBarIsOpen(idx) ? '▾' : '▸' }}</span>
-                  </div>
-                  <div v-if="toolBarIsOpen(idx)" class="tr-items">
-                    <div v-for="t in toolsOfAssistant(idx)" :key="t.tool_call_id || ('tc-' + idx + '-' + t.name)" class="tr-item">
-                      <div v-if="t.role === 'tool_call'" class="tr-pill"
-                           :class="{ running: toolIsRunning(t), expanded: toolDetailIsOpen(idx, t.tool_call_id) }"
-                           @click="toggleToolDetail(idx, t.tool_call_id)">
-                        <span class="tr-icon" :class="{ spinning: toolIsRunning(t) }">{{ toolIsRunning(t) ? '⟳' : '✓' }}</span>
-                        <span class="tr-name">{{ toolLabel(t.name) }}</span>
-                        <span class="tr-toggle">{{ toolDetailIsOpen(idx, t.tool_call_id) ? '▾' : '▸' }}</span>
+                    <!-- a2a 信封组：保留原两级折叠样式，作为本轮过程的一部分按顺序展示 -->
+                    <div v-if="ch.kind === 'a2a'" class="a2a-group-wrap">
+                      <!-- 多条时的组摘要头 -->
+                      <div v-if="ch.items.length > 1" class="tool-card a2a a2a-group" :class="{ open: isA2aGroupOpen(ch.key) }">
+                        <div class="tc-header a2a-toggle" @click="toggleA2aGroup(ch.key)">
+                          <span class="tc-ico">🤝</span>
+                          <span class="tc-name">连续信封 ×{{ ch.items.length }}</span>
+                          <span class="a2a-route">{{ ch.latest?.from?.name }} → {{ ch.latest?.to?.name }}</span>
+                          <span class="tg-chev">{{ isA2aGroupOpen(ch.key) ? '▾' : '▸' }}</span>
+                        </div>
                       </div>
-                      <div v-if="t.role === 'tool_call' && toolDetailIsOpen(idx, t.tool_call_id)" class="tr-detail">
-                        <div class="tr-block"><div class="tr-block-title">参数</div><pre>{{ prettyArgs(t.args) }}</pre></div>
-                        <template v-for="res in toolsOfAssistant(idx).filter(x => x.role === 'tool_result' && x.tool_call_id === t.tool_call_id)" :key="res.tool_call_id + '-r'">
-                          <div class="tr-block"><div class="tr-block-title">📥 结果</div><pre>{{ prettyResult(res.result) }}</pre></div>
-                        </template>
-                        <div v-if="toolIsRunning(t)" class="tr-block running">
-                          <span class="ti-spinner"></span><span>执行中…{{ speakingTool?.phase === 'args' ? '（参数流式中）' : '' }}</span>
+                      <!-- 信封卡片列表：单条直接显示；多条需一级展开 -->
+                      <div v-if="ch.items.length === 1 || isA2aGroupOpen(ch.key)" class="a2a-group-body" :class="{ single: ch.items.length === 1 }">
+                        <div v-for="sub in ch.items" :key="sub.idx" class="tool-card a2a">
+                          <div class="tc-header a2a-toggle" @click="toggleA2a(sub.idx)">
+                            <span class="tc-ico">{{ ch.items.length > 1 ? '✉️' : '🤝' }}</span>
+                            <span class="tc-name">{{ kindLabel(sub.msg.envelope?.kind) }}</span>
+                            <span class="a2a-route">{{ sub.msg.envelope?.from?.name }} → {{ sub.msg.envelope?.to?.name }}</span>
+                            <span class="tc-id">{{ sub.msg.envelope?.task?.state }}</span>
+                            <span class="tg-chev">{{ expandedA2a.has(sub.idx) ? '▾' : '▸' }}</span>
+                          </div>
+                          <div v-if="expandedA2a.has(sub.idx)" class="a2a-body">
+                            <div class="a2a-meta">
+                              <span class="a2a-chip">{{ sub.msg.envelope?.task_id }}</span>
+                              <span class="a2a-chip dim">{{ sub.msg.envelope?.message_id }}</span>
+                            </div>
+                            <template v-for="(p, pi) in sub.msg.envelope?.parts || []" :key="pi">
+                              <div v-if="p.type === 'text'" class="a2a-text">{{ p.text }}</div>
+                              <details v-else-if="p.type === 'artifact'" class="tc-body" open>
+                                <summary>📎 {{ p.name }}（{{ p.mime_type }}）</summary>
+                                <pre>{{ p.content }}</pre>
+                              </details>
+                            </template>
+                          </div>
                         </div>
                       </div>
                     </div>
+
+                    <!-- assistant 子块（思考 / 正文 / 截图 / 工具行，原样式与顺序不变） -->
+                    <template v-else>
+                      <!-- 接力切换发言者时，在窗口内标注当前智能体名 -->
+                      <div v-if="childAgentLabel(ch, it)" class="child-agent-label">{{ childAgentLabel(ch, it) }}</div>
+
+                      <!-- 思考过程：流式中保留单行循环覆盖；停止后折叠态只显示"思考"二字，点击展开全文 -->
+                      <div v-if="(ch.msg.reasoning || '').trim()" class="think-stream clickable"
+                           :class="{ open: thinkIsOpen(ch.idx) }"
+                           @click.stop="toggleThink(ch.idx)"
+                           :title="thinkIsOpen(ch.idx) ? '点击收起思考过程' : '点击展开思考过程'">
+                        <span class="think-icon">🧠</span>
+                        <span class="think-text">{{ isStreamingMsg(ch.msg) ? cyclicWindow(stripContinueTag(ch.msg.reasoning), 70) : '思考' }}</span>
+                        <span v-if="isStreamingMsg(ch.msg)" class="think-cursor">▌</span>
+                        <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
+                      </div>
+                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full">
+                        <pre class="think-full-text">{{ stripContinueTag(ch.msg.reasoning) }}</pre>
+                      </div>
+
+                      <!-- 流式正文（仅流式中，带光标）—— 始终在过程框内流式显示 -->
+                      <div v-if="isStreamingMsg(ch.msg) && trimMsgContent(ch.msg.content)" class="bubble markdown" v-html="msgBubbleHtml(ch.msg)"></div>
+                      <div v-else-if="isStreamingMsg(ch.msg) && !hasTools(ch.idx) && !(ch.msg.reasoning || '').trim()" class="bubble streaming-placeholder">
+                        <span class="stream-cursor">▌</span>
+                      </div>
+                      <!-- 非末条正文（停止后留在过程框里，未被提出） -->
+                      <div v-else-if="!isStreamingMsg(ch.msg) && !isPromotedMessage(ch.idx) && trimMsgContent(ch.msg.content)" class="bubble markdown" v-html="msgBubbleHtml(ch.msg)"></div>
+
+                      <!-- Share 截图缩略图：purpose=share 的 screenshot 结果挂在 assistant 消息下，
+                           点开可放大查看；数据保存在 AppData 对话记录里，不再写独立截图文件夹 -->
+                      <div v-if="shareScreenshotsOfAssistant(ch.idx).length" class="share-shots">
+                        <div v-for="(src, si) in shareScreenshotsOfAssistant(ch.idx)" :key="si" class="share-shot">
+                          <img :src="src" alt="browser screenshot" loading="lazy"
+                               class="share-shot-img"
+                               @click.stop="openLightbox(src)" />
+                        </div>
+                      </div>
+
+                      <!-- 工具调用行：只在有真实 tool_call 时出现，汇总 pill + 可展开历史清单（保持原有样式与顺序） -->
+                      <div v-if="hasTools(ch.idx)" class="tool-row">
+                        <div class="tr-summary"
+                             :class="{ open: toolBarIsOpen(ch.idx), running: latestToolInfo(ch.idx)?.running }"
+                             @click="toggleToolBar(ch.idx)">
+                          <span class="tr-icon" :class="{ spinning: latestToolInfo(ch.idx)?.running }">{{ latestToolInfo(ch.idx)?.running ? '⟳' : '✓' }}</span>
+                          <span class="tr-summary-name">{{ latestToolInfo(ch.idx)?.name }}<template v-if="latestToolInfo(ch.idx)?.fileName"> <span class="tr-filename">（{{ formatFilePath(latestToolInfo(ch.idx)?.fileName || '', 'summary') }}）</span></template></span>
+                          <span class="tr-count" v-if="latestToolInfo(ch.idx)?.total && latestToolInfo(ch.idx)!.total! > 1">共 {{ latestToolInfo(ch.idx)?.total }} 个工具</span>
+                          <span class="tr-chev">{{ toolBarIsOpen(ch.idx) ? '▾' : '▸' }}</span>
+                        </div>
+                        <div v-if="toolBarIsOpen(ch.idx)" class="tr-items">
+                          <div v-for="(t, toolIndex) in toolsOfAssistant(ch.idx).filter(t => t.role === 'tool_call')" :key="t.tool_call_id || ('tc-' + ch.idx + '-' + t.name)" class="tr-item">
+                            <div class="tr-pill"
+                                 :class="{ running: toolIsRunning(t), expanded: toolDetailIsOpen(ch.idx, t.tool_call_id) }"
+                                 @click="toggleToolDetail(ch.idx, t.tool_call_id)">
+                              <span class="tr-icon" :class="{ spinning: toolIsRunning(t) }">{{ toolIsRunning(t) ? '⟳' : '✓' }}</span>
+                              <span class="tr-name">
+                                <template v-if="latestToolInfo(ch.idx)?.total && (latestToolInfo(ch.idx)?.total ?? 0) > 1">
+                                  {{ toolIndex + 1 }}. 
+                                </template>
+                                {{ toolLabel(t.name, t.args) }}<template v-if="extractToolFileName(t.name, t.args)"> <span class="tr-filename-mini">（{{ formatFilePath(extractToolFileName(t.name, t.args), 'detail') }}）</span></template>
+                              </span>
+                              <span class="tr-toggle">{{ toolDetailIsOpen(ch.idx, t.tool_call_id) ? '▾' : '▸' }}</span>
+                            </div>
+                            <div v-if="toolDetailIsOpen(ch.idx, t.tool_call_id)" class="tr-detail">
+                              <div class="tr-block">
+                                <div class="tr-block-title">参数</div>
+                                <!-- 虚拟 pill（参数流式中）：直接流式打印累计的原始 JSON 片段（打字机效果） -->
+                                <pre v-if="t.tool_call_id === '_virtual_running' && speakingTool?.streamingArgs" class="tr-streaming-args" @scroll.passive="onStreamingArgsScroll">{{ speakingTool.streamingArgs }}</pre>
+                                <div v-else-if="t.tool_call_id === '_virtual_running'" class="tr-arg-streaming"><span class="ti-spinner"></span>参数流式中…</div>
+                                <pre v-else-if="prettyArgs(t.args) && prettyArgs(t.args) !== '{}'">{{ prettyArgs(t.args) }}</pre>
+                                <pre v-else>{{ prettyArgs(t.args) || '（无参数）' }}</pre>
+                              </div>
+                              <template v-for="res in toolsOfAssistant(ch.idx).filter(x => x.role === 'tool_result' && x.tool_call_id === t.tool_call_id)" :key="res.tool_call_id + '-r'">
+                                <div class="tr-block"><div class="tr-block-title">📥 结果</div><pre>{{ prettyResult(res.result) }}</pre></div>
+                              </template>
+                              <div v-if="toolIsRunning(t)" class="tr-block running">
+                                <span class="ti-spinner"></span><span>执行中…{{ speakingTool?.phase === 'args' ? '（参数流式中）' : '' }}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+
+                  </template>
+                </div>
+              </div>
+
+              <!-- 提出来：本轮末条带正文的 assistant（停止后）作为正常气泡原样渲染 -->
+              <div v-if="turnPromotedMsg(it)" class="bubble markdown promoted-bubble" v-html="msgBubbleHtml(turnPromotedMsg(it))"></div>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Share 截图灯箱：缩略图点击后放大查看，点空白或按 Esc 关闭 -->
+      <Teleport to="body">
+        <div v-if="lightboxOpen && lightboxSrc" class="lightbox" @click.self="closeLightbox">
+          <div class="lightbox-inner">
+            <img :src="lightboxSrc" alt="screenshot full view" class="lightbox-img" />
+            <button class="lightbox-close" type="button" @click.stop="closeLightbox" title="关闭 (Esc)">✕</button>
+          </div>
+        </div>
+      </Teleport>
+
+      <div class="chat-input" :class="{ 'drop-hover': chatDropHover }"
+           @dragenter.prevent="onChatDragEnter" @dragover.prevent
+           @dragleave.prevent="onChatDragLeave" @drop.prevent="onChatDrop">
+        <div class="row1">
+          <div class="agent-dd">
+            <button type="button" class="agent-dd-trigger" ref="agentTriggerEl" @click.stop="toggleAgentDd"
+                    :title="currentAgentName()">
+              <span class="dd-icon">🧠</span>
+              <span class="dd-name">{{ currentAgentName() }}</span>
+              <span class="dd-chev" :class="{ open: agentDdOpen }">▾</span>
+            </button>
+            <Teleport to="body">
+              <div v-if="agentDdOpen" class="agent-dd-pop" ref="ddPopEl" :style="ddPosStyle" @click.stop>
+                <div class="dd-cols-wrap" ref="ddScrollEl"
+                     @scroll.passive="onDdScroll"
+                     @wheel="onDdWheel">
+                  <div class="dd-col" v-for="col in agentGroupsByColumn" :key="col.id">
+                    <div class="dd-col-head">
+                      <span class="dd-col-name">{{ col.name }}</span>
+                      <span class="dd-col-count">{{ col.agents.length }}</span>
+                    </div>
+                    <div class="dd-col-list">
+                      <div v-for="a in col.agents" :key="a.id"
+                           class="dd-item"
+                           :class="{ active: currentAgentId === a.id }"
+                           @click="selectAgent(a.id)"
+                           :title="a.name">
+                        <span class="dd-item-dot"></span>
+                        <span class="dd-item-name">{{ a.name }}</span>
+                      </div>
+                      <div v-if="!col.agents.length" class="dd-empty">—</div>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="ddNeedsSlider" class="dd-slider">
+                  <div class="dd-track" @mousedown="onTrackDown">
+                    <div class="dd-thumb" :style="ddThumbStyle"
+                         @mousedown.stop="onThumbDown"></div>
                   </div>
                 </div>
               </div>
-            </div>
-
-          </template>
-        </template>
-      </div>
-      <div class="chat-input">
-        <div class="row1">
-          <select class="input sm" v-model="currentAgentId">
-            <option v-for="a in agents.list" :key="a.id" :value="a.id">🧠 {{ a.name }}</option>
-          </select>
+            </Teleport>
+          </div>
           <span class="cur-title">{{ conv ? convDisplayName(conv) : '— 未选择 —' }}</span>
         </div>
         <div class="row2">
           <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" ></textarea>
-          <button class="btn send" :disabled="convs.streaming" @click="send">发送</button>
+          <button v-if="!convs.streaming" class="btn send" @click="send" aria-label="发送消息">发送</button>
+          <button v-else class="btn send stop-btn" @click="sendStop" aria-label="停止输出">
+            <span class="stop-icon" aria-hidden="true"></span>
+          </button>
         </div>
       </div>
     </div>
@@ -872,7 +1888,9 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .right-panel { display: flex; flex-direction: column; overflow: hidden; }
-.canvases-pane { padding: 4px 6px; }
+.canvases-pane { padding: 4px 0; }
+/* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
+.canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
 .cv-list { padding: 2px 4px; max-height: 180px; overflow-y: auto; }
 .cv-item { padding: 6px 10px; border-radius: 8px; font-size: 12px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 6px; position: relative; }
 .cv-item:hover { background: rgba(255,255,255,0.05); }
@@ -881,15 +1899,17 @@ onBeforeUnmount(() => {
 .cv-item[draggable="true"]:active { cursor: grabbing; }
 .cv-item.dragging { opacity: .4; }
 /* 拖拽落点指示线：上/下各一条高亮边 */
-.cv-item.drop-before { box-shadow: 0 -2px 0 0 #6ea8ff, 0 1px 0 0 rgba(110,168,255,0.25); }
-.cv-item.drop-after { box-shadow: 0 2px 0 0 #6ea8ff, 0 -1px 0 0 rgba(110,168,255,0.25); }
+.cv-item.drop-before { box-shadow: 0 -2px 0 0 var(--accent), 0 1px 0 0 rgba(110,168,255,0.25); }
+.cv-item.drop-after { box-shadow: 0 2px 0 0 var(--accent), 0 -1px 0 0 rgba(110,168,255,0.25); }
 .cv-item .cv-label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .cv-item .cv-label:hover::after { content: ' ✎'; opacity: .35; font-size: 11px; }
-.cv-item .cv-count { font-size: 10px; opacity: .6; flex-shrink: 0; font-family: Consolas, monospace; }
+.cv-item .cv-count { font-size: 11px; flex-shrink: 0; font-family: Consolas, monospace; padding: 1px 6px; border-radius: 999px; background: rgba(180,114,255,0.15); color: var(--purple-ink); border: 1px solid rgba(180,114,255,0.3); line-height: 1.5; font-weight: 600; }
+.cv-item .cv-running { flex-shrink: 0; font-size: 10px; color: #4ade80; line-height: 1; animation: cvPulse 1.2s ease-in-out infinite; }
+@keyframes cvPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
 .cv-item .del { opacity: 0; font-size: 14px; flex-shrink: 0; color: rgba(232,236,244,0.7); }
 .cv-item:hover .del { opacity: .6; }
 .cv-item .del:hover { opacity: 1; color: #ff9090; }
-.cv-rename { width: 100%; font-size: 12px; padding: 2px 6px; border-radius: 4px; background: rgba(0,0,0,0.3); border: 1px solid rgba(110,168,255,0.4); color: #fff; }
+.cv-rename { width: 100%; font-size: 12px; padding: 2px 6px; border-radius: 4px; background: rgba(0,0,0,0.3); border: 1px solid rgba(110,168,255,0.4); color: rgb(var(--text-rgb)); }
 .divider { height: 1px; background: rgba(255,255,255,0.08); margin: 4px 10px; }
 
 .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
@@ -916,19 +1936,30 @@ onBeforeUnmount(() => {
 .conv-title-text { flex-shrink: 0; }
 .flex-spacer { flex: 1; min-width: 0; }
 .collapse-btn { flex-shrink: 0; width: 22px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; color: rgba(232,236,244,0.7); font-size: 11px; cursor: pointer; line-height: 1; }
-.collapse-btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+.collapse-btn:hover { background: rgba(255,255,255,0.08); color: rgb(var(--text-rgb)); }
 /* 排序方向切换按钮：↓ 新在上（倒序）／↑ 旧在上（顺序） */
-.sort-btn { flex-shrink: 0; width: 22px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; color: #6ea8ff; font-size: 12px; cursor: pointer; line-height: 1; }
+.sort-btn { flex-shrink: 0; width: 22px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; color: var(--accent); font-size: 12px; cursor: pointer; line-height: 1; }
 .sort-btn:hover { background: rgba(110,168,255,0.18); color: #dce8ff; }
-.conv-count { font-size: 10px; opacity: .5; font-family: Consolas, monospace; flex-shrink: 0; }
+.conv-count {
+  font-size: 11px;
+  font-family: Consolas, monospace;
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(110,168,255,0.15);
+  color: var(--accent-ink);
+  border: 1px solid rgba(110,168,255,0.3);
+  line-height: 1.5;
+  font-weight: 600;
+}
 .new-conv-bar { display: flex; gap: 4px; flex-shrink: 0; padding: 0; margin-left: auto; }
-.btn.purple { background: rgba(180,114,255,0.15); border-color: rgba(180,114,255,0.35); color: #d4a8ff; }
+.btn.purple { background: rgba(180,114,255,0.15); border-color: rgba(180,114,255,0.35); color: var(--purple-ink); }
 .btn.purple:hover { background: rgba(180,114,255,0.25); }
-.btn.danger { background: rgba(255,80,80,0.18); border-color: rgba(255,80,80,0.4); color: #ffb0b0; }
+.btn.danger { background: rgba(255,80,80,0.18); border-color: rgba(255,80,80,0.4); color: var(--red-ink); }
 .btn.danger:hover { background: rgba(255,80,80,0.3); }
 .btn.danger:disabled { opacity: .4; cursor: not-allowed; }
 .sel-bar { flex-shrink: 0; display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: rgba(255,80,80,0.08); border-top: 1px dashed rgba(255,80,80,0.25); border-bottom: 1px dashed rgba(255,80,80,0.25); }
-.sel-count { font-size: 11px; color: #ffb0b0; flex-shrink: 0; }
+.sel-count { font-size: 11px; color: var(--red-ink); flex-shrink: 0; }
 .conv-list-wrap { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 4px 6px 6px; }
 .conv-item { padding: 6px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; display: flex; align-items: center; gap: 6px; margin-bottom: 2px; position: relative; }
 /* 对话序号：纯文本小字，低调不抢行内其它标签的视觉 */
@@ -945,9 +1976,9 @@ onBeforeUnmount(() => {
 .conv-item .del { opacity: 0; font-size: 14px; flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
 .mode-tag { font-size: 10px; padding: 1px 5px; border-radius: 4px; background: rgba(255,255,255,0.1); flex-shrink: 0; }
-.mode-tag.linked { background: rgba(180,114,255,0.2); color: #d4a8ff; }
+.mode-tag.linked { background: rgba(180,114,255,0.2); color: var(--purple-ink); }
 
-.chat-box { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.chat-box { flex: 1; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 10px; }
 .no-conv { text-align: center; opacity: .5; margin: 30px auto; font-size: 13px; }
 
 /* ============ 消息容器 ============ */
@@ -966,17 +1997,138 @@ onBeforeUnmount(() => {
   border-top-left-radius: 4px;
 }
 .msg.assistant.streaming .bubble { border-color: rgba(110,168,255,0.4); box-shadow: 0 0 0 1px rgba(110,168,255,0.1); }
+/* 思考过程：单行（流式打字机 / 停止后截断首行），点击展开全文 */
+.think-stream {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 7px;
+  background: rgba(180,114,255,0.08);
+  border: 1px solid rgba(180,114,255,0.22);
+  font-size: 11px; color: rgba(232,236,244,0.65);
+  max-width: 100%; min-width: 0;
+}
+.think-stream.clickable { cursor: pointer; transition: background .15s, border-color .15s; }
+.think-stream.clickable:hover { background: rgba(180,114,255,0.15); border-color: rgba(180,114,255,0.38); }
+.think-stream.open { border-color: rgba(180,114,255,0.42); }
+.think-icon { flex-shrink: 0; font-size: 11px; }
+.think-text {
+  flex: 1; min-width: 0;
+  overflow: hidden; white-space: nowrap;
+  font-style: italic; letter-spacing: 0.2px;
+}
+.think-cursor {
+  flex-shrink: 0; color: var(--accent-2); font-weight: 600;
+  animation: cursorBlink 1s steps(2) infinite;
+}
+.think-chev { flex-shrink: 0; font-size: 10px; color: rgba(180,114,255,0.75); }
+/* 点击展开后的思考全文：自然高度，由过程框内部滚动条统一处理滚动 */
+.think-full {
+  margin-top: -3px;
+  padding: 6px 9px;
+  background: rgba(180,114,255,0.05);
+  border: 1px solid rgba(180,114,255,0.16);
+  border-radius: 7px;
+}
+.think-full-text {
+  margin: 0;
+  white-space: pre-wrap; word-break: break-word;
+  font-size: 10.5px; line-height: 1.5;
+  color: rgba(232,236,244,0.72);
+  font-family: Consolas, monospace;
+}
+
+/* ============ 过程窗口：流式中展开的固定大小框，停止后折叠为 "(>过程)" 文字 ============ */
+/* 折叠钮：紧贴智能体名称，无边框、纯文字，字体/字号与名称差异化 */
+.proc-toggle {
+  margin-left: 3px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 9.5px;
+  line-height: 1;
+  letter-spacing: 0.3px;
+  color: rgba(232,236,244,0.42);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: color .15s, transform .15s;
+}
+.proc-toggle:hover { color: var(--accent-ink); transform: translateY(-1px); }
+.proc-toggle.open { color: var(--purple-ink); }
+
+/* 过程框内：接力切换发言者时标注当前智能体名（与轮首不同时显示） */
+.child-agent-label {
+  align-self: flex-start;
+  margin: 4px 2px 0;
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  color: rgba(232, 236, 244, 0.5);
+}
+
+/* 过程框本体：固定高度 + 内部滚动，外观像一个小窗口 */
+.process-window {
+  margin-top: 5px;
+  height: 260px;
+  width: 100%;
+  background: rgba(255,255,255,0.028);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.process-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(110,168,255,0.28) transparent;
+  /* 禁用浏览器滚动锚定：上方内容（工具行展开/图片加载）变化时锚定会把视口
+     从底部"顶开"，表现为跟随时底部莫名出现空隙 */
+  overflow-anchor: none;
+}
+.process-body::-webkit-scrollbar { width: 5px; }
+.process-body::-webkit-scrollbar-thumb { background: rgba(110,168,255,0.28); border-radius: 999px; }
+.process-body::-webkit-scrollbar-track { background: transparent; }
 
 .col-wrap { display: flex; flex-direction: column; gap: 3px; }
 .head-row { display: flex; align-items: center; gap: 6px; }
 .avatar {
+  position: relative; overflow: hidden;
   width: 24px; height: 24px; border-radius: 7px;
-  background: linear-gradient(135deg, #6ea8ff, #b472ff);
   display: flex; align-items: center; justify-content: center;
   font-size: 11px; font-weight: 600; flex-shrink: 0; color: #fff;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,0.45),
+              inset 0 -3px 6px rgba(0,0,0,0.32),
+              inset 0 0 0 1px rgba(255,255,255,0.08),
+              0 3px 8px rgba(0,0,0,0.4);
+}
+.avatar::before {
+  content: '';
+  position: absolute; inset: 0;
+  background:
+    linear-gradient(165deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.10) 32%, rgba(255,255,255,0) 52%),
+    linear-gradient(0deg, rgba(0,0,0,0.24) 0%, rgba(0,0,0,0) 42%);
+  pointer-events: none;
+}
+.avatar.user-avatar {
+  width: 24px; height: 24px; border-radius: 7px;
+  background: linear-gradient(135deg, #f97316, #ec4899);
+  overflow: hidden;
+}
+.avatar .avatar-photo {
+  width: 100%; height: 100%;
+  object-fit: cover; display: block; border-radius: inherit;
 }
 .who-assistant { font-size: 11.5px; color: rgba(232,236,244,0.75); opacity: .9; line-height: 1; }
-.role { font-size: 16px; }
 
 /* ============ 消息泡泡（基础） ============ */
 .bubble {
@@ -1007,7 +2159,7 @@ onBeforeUnmount(() => {
   min-height: 14px;
   line-height: 1;
 }
-.bubble.streaming-placeholder .stream-cursor { color: #6ea8ff; }
+.bubble.streaming-placeholder .stream-cursor { color: var(--accent); }
 
 /* 空输出提示 */
 .bubble.empty-bubble {
@@ -1020,43 +2172,204 @@ onBeforeUnmount(() => {
   padding: 6px 12px;
 }
 
-.chat-input { padding: 8px 12px; border-top: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; gap: 6px; }
+.chat-input { padding: 8px 12px; border-top: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; gap: 6px; transition: background .15s, box-shadow .15s; }
+/* 拖拽文件悬停时的高亮提示 */
+.chat-input.drop-hover { background: rgba(110, 168, 255, 0.1); box-shadow: inset 0 0 0 1px rgba(110, 168, 255, 0.45); }
 .row1 { display: flex; gap: 6px; align-items: center; }
 .cur-title { font-size: 11px; opacity: .6; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ============ 智能体分组下拉（一组一列） ============ */
+.agent-dd { position: relative; flex-shrink: 0; display: inline-flex; align-items: center; }
+.agent-dd-trigger {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 28px; padding: 0 10px;
+  font-size: 12px; font-family: inherit;
+  color: rgba(232,236,244,0.92);
+  background: rgba(110,168,255,0.10);
+  border: 1px solid rgba(110,168,255,0.28);
+  border-radius: 6px;
+  cursor: pointer;
+  max-width: 250px;
+  min-width: 0;
+  transition: background .15s, border-color .15s;
+}
+.agent-dd-trigger:hover { background: rgba(110,168,255,0.18); border-color: rgba(110,168,255,0.45); }
+.agent-dd-trigger .dd-icon { font-size: 12px; flex-shrink: 0; }
+.agent-dd-trigger .dd-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 200px;
+}
+.agent-dd-trigger .dd-chev {
+  font-size: 10px; color: rgba(232,236,244,0.5);
+  flex-shrink: 0; transition: transform .15s;
+}
+.agent-dd-trigger .dd-chev.open { transform: rotate(180deg); color: var(--accent-ink); }
+
+.agent-dd-pop {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: min(420px, calc(100vh - 180px));
+  background: rgba(16, 22, 40, 0.98);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  padding: 6px;
+  animation: ddFadeIn .12s ease-out;
+}
+@keyframes ddFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+/* 横向滚动列容器：隐藏原生滚动条，由底部滑杆接管 */
+.dd-cols-wrap {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1;
+  min-height: 0;
+  /* 关键：允许在交叉轴上收缩到比列内容更窄，从而触发 overflow-x */
+  min-width: 0;
+  padding: 2px 2px 4px;
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* IE10+ */
+}
+.dd-cols-wrap::-webkit-scrollbar { display: none; }
+
+.dd-col {
+  flex: 1 1 192px;
+  max-width: none;
+  min-width: 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: rgba(0,0,0,0.22);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.dd-col-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 5px 8px 4px;
+  background: rgba(110,168,255,0.10);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+}
+.dd-col-name {
+  font-size: 11.5px; font-weight: 600; color: var(--accent-ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dd-col-count {
+  font-size: 10px; font-family: Consolas, monospace;
+  background: rgba(255,255,255,0.08); color: rgba(232,236,244,0.7);
+  padding: 1px 6px; border-radius: 999px; line-height: 1.4;
+  flex-shrink: 0;
+}
+.dd-col-list {
+  overflow-y: auto;
+  padding: 3px;
+  max-height: 340px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.dd-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 7px; border-radius: 5px;
+  font-size: 12px; color: rgba(232,236,244,0.88);
+  cursor: pointer;
+  transition: background .12s;
+}
+.dd-item:hover { background: rgba(110,168,255,0.18); color: rgb(var(--text-rgb)); }
+.dd-item.active {
+  background: rgba(110,168,255,0.28);
+  color: rgb(var(--text-rgb));
+  box-shadow: inset 0 0 0 1px rgba(110,168,255,0.4);
+}
+.dd-item-dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  flex-shrink: 0;
+}
+.dd-item-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.dd-empty {
+  padding: 8px; font-size: 11px; opacity: .35;
+  text-align: center;
+}
+
+/* ============ 底部横向滑杆 ============ */
+.dd-slider {
+  flex-shrink: 0;
+  padding: 4px 6px 2px;
+  margin-top: 2px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+.dd-track {
+  position: relative;
+  height: 8px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+}
+.dd-track:hover { background: rgba(255,255,255,0.12); }
+.dd-thumb {
+  position: absolute;
+  top: 0; left: 0;
+  height: 8px;
+  min-width: 28px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  cursor: grab;
+  transition: filter .15s;
+}
+.dd-thumb:hover { filter: brightness(1.12); }
+.dd-thumb:active { cursor: grabbing; filter: brightness(1.2); }
 .row2 { display: flex; gap: 6px; align-items: flex-end; }
 .sm { padding: 3px 8px; font-size: 11px; }
 .input-ta { min-height: 44px; max-height: 100px; resize: vertical; font-family: inherit; }
 .msg.assistant.empty { display: none; }
 .tool-card { max-width: 95%; margin: 4px 0; align-self: flex-start; border-radius: 10px; padding: 8px 12px; border: 1px solid rgba(255,255,255,0.1); font-size: 12px; }
+/* 连续 a2a 信封组：一级展开后逐条列出（嵌套缩进 + 左侧竖线提示层级） */
+.a2a-group-wrap { display: flex; flex-direction: column; gap: 4px; margin: 4px 0; min-width: 0; }
+.a2a-group-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.a2a-group-body:not(.single) { margin-left: 4px; padding-left: 10px; border-left: 2px solid rgba(180,114,255,0.35); }
+.a2a-group.open { border-color: rgba(180,114,255,0.65); }
 .tc-card { background: rgba(110,168,255,0.1); border-color: rgba(110,168,255,0.25); }
 .tr-card { background: rgba(100,220,160,0.08); border-color: rgba(100,220,160,0.25); align-self: flex-start; }
 .a2a-card { background: rgba(180,114,255,0.12); border-color: rgba(180,114,255,0.4); }
-.a2a-card .tc-title { color: #d4a8ff; }
-.a2a-route { font-weight: 600; color: #d4a8ff; text-transform: none; letter-spacing: 0; font-size: 12px; }
-.a2a-state { margin-left: auto; font-family: Consolas, monospace; font-size: 10px; background: rgba(180,114,255,0.2); color: #d4a8ff; padding: 1px 6px; border-radius: 3px; text-transform: none; }
+.a2a-card .tc-title { color: var(--purple-ink); }
+.a2a-route { font-weight: 600; color: var(--purple-ink); text-transform: none; letter-spacing: 0; font-size: 12px; }
+.a2a-state { margin-left: auto; font-family: Consolas, monospace; font-size: 10px; background: rgba(180,114,255,0.2); color: var(--purple-ink); padding: 1px 6px; border-radius: 3px; text-transform: none; }
 .a2a-text { font-size: 12px; line-height: 1.55; white-space: pre-wrap; margin-top: 6px; max-height: 180px; overflow-y: auto; }
 .a2a-art summary { cursor: pointer; font-size: 11px; opacity: .7; margin-top: 6px; user-select: none; }
 .a2a-art summary::-webkit-details-marker { display: none; }
 .tc-head { display: flex; gap: 6px; align-items: center; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: rgba(232,236,244,0.6); }
 .tc-icon { font-size: 14px; }
 .tc-title { font-weight: 600; }
-.tc-name { font-family: Consolas, monospace; font-size: 12px; background: rgba(0,0,0,0.3); padding: 2px 8px; border-radius: 4px; color: #a8c8ff; text-transform: none; letter-spacing: 0; margin-left: 4px; }
+.tc-name { font-family: Consolas, monospace; font-size: 12px; background: rgba(0,0,0,0.3); padding: 2px 8px; border-radius: 4px; color: var(--accent-ink); text-transform: none; letter-spacing: 0; margin-left: 4px; }
 .tc-args { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .arg-chip { background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 11px; display: inline-flex; gap: 2px; }
-.ak { color: #d4a8ff; }
-.av { color: #e8ecf4; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ak { color: var(--purple-ink); }
+.av { color: rgb(var(--text-rgb)); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tc-error { color: #ff9090; background: rgba(255,80,80,0.15); padding: 1px 6px; border-radius: 3px; font-size: 10px; }
-.tr-body { font-family: Consolas, monospace; font-size: 11px; background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; color: #80e4b8; }
+.tr-body { font-family: Consolas, monospace; font-size: 11px; background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; color: var(--green-ink); }
 
 /* —— 助手消息下的工具行 —— */
 .tool-row { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
 .tr-summary { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 9px; background: rgba(110,168,255,0.08); border: 1px solid rgba(110,168,255,0.22); cursor: pointer; font-size: 11px; color: rgba(232,236,244,0.72); user-select: none; width: fit-content; max-width: 100%; transition: background .15s; }
 .tr-summary:hover { background: rgba(110,168,255,0.18); }
-.tr-summary:hover .tr-chev { color: #a8c8ff; }
+.tr-summary:hover .tr-chev { color: var(--accent-ink); }
 .tr-summary.open { background: rgba(110,168,255,0.22); border-color: rgba(110,168,255,0.45); color: rgba(232,236,244,0.95); }
-.tr-summary.open .tr-chev { color: #a8c8ff; }
-.tr-summary.running { border-color: rgba(110,168,255,0.55); background: rgba(110,168,255,0.12); color: #a8c8ff; }
-.tr-summary.running .tr-icon { color: #a8c8ff; }
+.tr-summary.open .tr-chev { color: var(--accent-ink); }
+.tr-summary.running { border-color: rgba(110,168,255,0.55); background: rgba(110,168,255,0.12); color: var(--accent-ink); }
+.tr-summary.running .tr-icon { color: var(--accent-ink); }
 .tr-summary-name { font-weight: 500; color: rgba(232,236,244,0.92); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
 .tr-status { font-size: 10px; opacity: .6; flex-shrink: 0; }
 .tr-items { display: flex; flex-direction: column; gap: 3px; padding-left: 2px; }
@@ -1065,12 +2378,12 @@ onBeforeUnmount(() => {
 .tr-label { opacity: .75; }
 .tr-list { display: inline-flex; gap: 2px; flex-wrap: wrap; max-width: 220px; overflow: hidden; }
 .tr-chip { font-size: 10px; padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,0.28); color: rgba(232,236,244,0.7); white-space: nowrap; }
-.tr-chip.more { background: rgba(110,168,255,0.2); color: #a8c8ff; }
+.tr-chip.more { background: rgba(110,168,255,0.2); color: var(--accent-ink); }
 .tr-chev { color: rgba(232,236,244,0.4); font-size: 10px; margin-left: 3px; transition: color .15s; }
 .tr-item { display: flex; flex-direction: column; gap: 2px; }
 .tr-pill { display: flex; align-items: center; gap: 5px; padding: 2px 7px; border-radius: 7px; background: rgba(0,0,0,0.18); border: 1px solid rgba(255,255,255,0.08); cursor: pointer; font-size: 10.5px; color: rgba(232,236,244,0.85); user-select: none; }
 .tr-pill:hover { background: rgba(0,0,0,0.28); border-color: rgba(110,168,255,0.3); }
-.tr-pill.running { border-color: rgba(110,168,255,0.55); background: rgba(110,168,255,0.1); color: #a8c8ff; }
+.tr-pill.running { border-color: rgba(110,168,255,0.55); background: rgba(110,168,255,0.1); color: var(--accent-ink); }
 .tr-pill.expanded { border-color: rgba(110,168,255,0.4); }
 .tr-icon { width: 11px; text-align: center; font-size: 10px; transition: transform .3s; }
 .tr-icon.spinning { display: inline-block; animation: tiSpin .8s linear infinite; }
@@ -1079,16 +2392,71 @@ onBeforeUnmount(() => {
 .tr-toggle { color: rgba(232,236,244,0.4); font-size: 10px; flex-shrink: 0; }
 .tr-detail { padding-left: 12px; border-left: 2px solid rgba(110,168,255,0.2); margin-top: 2px; display: flex; flex-direction: column; gap: 3px; }
 .tr-block { padding: 3px 7px; border-radius: 5px; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.07); font-size: 10.5px; }
-.tr-block.running { display: inline-flex; align-items: center; gap: 5px; background: rgba(110,168,255,0.1); border-color: rgba(110,168,255,0.3); color: #a8c8ff; padding: 2px 7px; width: fit-content; }
+.tr-block.running { display: inline-flex; align-items: center; gap: 5px; background: rgba(110,168,255,0.1); border-color: rgba(110,168,255,0.3); color: var(--accent-ink); padding: 2px 7px; width: fit-content; }
+.tr-arg-streaming { display: inline-flex; align-items: center; gap: 5px; color: var(--accent-ink); font-size: 10px; }
+.tr-arg-streaming-wrap { display: flex; flex-direction: column; gap: 2px; }
+.tr-streaming-args { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 10px; max-height: 180px; overflow-y: auto; color: rgb(var(--text-rgb)); opacity: .9; padding: 0 0 10px; }
+.tr-filename { color: var(--green-ink); font-size: 10px; font-family: Consolas, monospace; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+.tr-filename-mini { color: var(--green-ink); font-size: 9.5px; font-family: Consolas, monospace; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
 .tr-block-title { font-size: 9.5px; opacity: .65; margin-bottom: 1px; font-family: Consolas, monospace; }
 .tr-block pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 10px; max-height: 180px; overflow-y: auto; }
-.ti-spinner { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid rgba(110,168,255,0.25); border-top-color: #6ea8ff; animation: tiSpin .8s linear infinite; flex-shrink: 0; display: inline-block; }
+.ti-spinner { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid rgba(110,168,255,0.25); border-top-color: var(--accent); animation: tiSpin .8s linear infinite; flex-shrink: 0; display: inline-block; }
+
+/* Share 截图缩略图：purpose=share 的截图直接挂在对话流里，点击可放大 */
+.share-shots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.share-shot { position: relative; border-radius: 6px; overflow: hidden; border: 1px solid rgba(110,168,255,0.35); background: rgba(0,0,0,0.35); cursor: zoom-in; transition: transform .15s ease, box-shadow .15s ease; }
+.share-shot:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.35); border-color: rgba(110,168,255,0.6); }
+.share-shot-img { display: block; max-width: 260px; max-height: 160px; width: auto; height: auto; object-fit: contain; }
 .a2a-toggle { cursor: pointer; user-select: none; }
 .a2a-toggle:hover { opacity: 0.85; }
-.send { height: 34px; padding: 0 16px; }
+.send { flex-shrink: 0; padding: 0 18px; height: 40px; min-width: 64px; line-height: 1.2; display: inline-flex; align-items: center; justify-content: center; }
+/* 流式中：发送按钮变形为「停止」——虚线环旋转 + 中心方块脉冲，
+   点击后 abort 后端 fetch，send() 的 catch/finally 会补 "[已停止]" 并复位状态 */
+.send.stop-btn {
+  padding: 0; width: 52px; min-width: 52px;
+  background: linear-gradient(135deg, rgba(255,90,110,0.55), rgba(255,60,80,0.55));
+  border: 1px solid rgba(255,140,150,0.7);
+  color: rgb(var(--text-rgb));
+  animation: stopBtnPulse 1.4s ease-in-out infinite;
+}
+.send.stop-btn:hover {
+  transform: translateY(-1px) scale(1.03);
+  box-shadow: 0 4px 18px rgba(255,80,100,0.45);
+}
+.send.stop-btn .stop-icon {
+  position: relative; width: 14px; height: 14px; border-radius: 3px;
+  background: #fff;
+  box-shadow: 0 0 8px rgba(255,255,255,0.55);
+  animation: stopIconPulse 1.4s ease-in-out infinite;
+}
+.send.stop-btn .stop-icon::before,
+.send.stop-btn .stop-icon::after {
+  content: ''; position: absolute; inset: -6px; border-radius: 50%;
+  border: 1.5px dashed rgba(255,255,255,0.65);
+  animation: stopRingSpin 3s linear infinite;
+}
+.send.stop-btn .stop-icon::after {
+  inset: -10px; border-style: dotted;
+  border-color: rgba(255,255,255,0.35);
+  animation: stopRingSpin 6s linear infinite reverse;
+}
+@keyframes stopBtnPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,80,100,0.5); }
+  50%       { box-shadow: 0 0 0 6px rgba(255,80,100,0); }
+}
+@keyframes stopIconPulse {
+  0%, 100% { transform: scale(1);   opacity: 1;   }
+  50%      { transform: scale(0.75); opacity: 0.85; }
+}
+@keyframes stopRingSpin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
 .empty { text-align: center; padding: 16px; font-size: 12px; opacity: .5; }
 
 .hint-right { font-size: 10px; opacity: .35; align-self: flex-end; margin-left: 8px; user-select: none; pointer-events: none; }
+
+
 </style>
 
 <style>
@@ -1131,7 +2499,7 @@ onBeforeUnmount(() => {
   overflow-x: auto; margin: 6px 0; border: 1px solid rgba(255,255,255,0.1);
   max-height: 400px;
 }
-.bubble.markdown pre code { background: none; padding: 0; color: #e8ecf4; font-size: 11.5px; white-space: pre; word-break: normal; }
+.bubble.markdown pre code { background: none; padding: 0; color: rgb(var(--text-rgb)); font-size: 11.5px; white-space: pre; word-break: normal; }
 
 /* —— 引用块 —— */
 .bubble.markdown blockquote {
@@ -1142,7 +2510,7 @@ onBeforeUnmount(() => {
 
 /* —— 链接（核心：默认 target=_blank 由 JS 注入，这里管视觉）—— */
 .bubble.markdown a {
-  color: #a8c8ff;
+  color: var(--accent-ink);
   text-decoration: underline;
   text-underline-offset: 2px;
   transition: color .15s, background-color .15s;
@@ -1151,7 +2519,7 @@ onBeforeUnmount(() => {
   border-radius: 3px;
 }
 .bubble.markdown a:hover {
-  color: #d4a8ff;
+  color: var(--purple-ink);
   background: rgba(110,168,255,0.12);
 }
 .bubble.markdown a:active { color: #ffb088; }
@@ -1194,7 +2562,7 @@ onBeforeUnmount(() => {
 .bubble.markdown img { max-width: 100%; border-radius: 6px; margin: 4px 0; border: 1px solid rgba(255,255,255,0.1); display: inline-block; }
 
 /* —— GFM task list —— */
-.bubble.markdown li input[type="checkbox"] { margin-right: 5px; vertical-align: middle; accent-color: #6ea8ff; }
+.bubble.markdown li input[type="checkbox"] { margin-right: 5px; vertical-align: middle; accent-color: var(--accent); }
 .bubble.markdown li input[type="checkbox"] + * { vertical-align: middle; }
 
 /* —— details/summary —— */
@@ -1213,7 +2581,7 @@ onBeforeUnmount(() => {
 .bubble.markdown kbd {
   font-family: Consolas, "Courier New", monospace; font-size: 11px;
   background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.25);
-  border-radius: 4px; padding: 1px 5px; color: #e8ecf4;
+  border-radius: 4px; padding: 1px 5px; color: rgb(var(--text-rgb));
 }
 
 /* —— 流式输出光标 —— */
@@ -1221,7 +2589,7 @@ onBeforeUnmount(() => {
 .stream-cursor {
   display: inline-block;
   margin-left: 2px;
-  color: #6ea8ff;
+  color: var(--accent);
   font-weight: 700;
   animation: cursorBlink 1s steps(2) infinite;
 }
@@ -1234,7 +2602,7 @@ onBeforeUnmount(() => {
   display: flex; flex-direction: column; gap: 2px;
 }
 .ctx-menu button {
-  appearance: none; border: 0; background: transparent; color: #e8ecf4;
+  appearance: none; border: 0; background: transparent; color: rgb(var(--text-rgb));
   font-size: 12px; text-align: left; padding: 6px 10px; border-radius: 6px; cursor: pointer;
 }
 .ctx-menu button:hover { background: rgba(110,168,255,0.2); }
@@ -1260,6 +2628,25 @@ onBeforeUnmount(() => {
 }
 .msg-ctx-item:hover { background: rgba(110,168,255,0.2); }
 .msg-ctx-icon { font-size: 14px; }
+
+/* 消息操作状态提示（右上角浮动） */
+.msg-op-status {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 2000;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(20, 26, 44, 0.95);
+  border: 1px solid rgba(110,168,255,0.35);
+  color: rgb(var(--text-rgb));
+  font-size: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: toastFadeIn .2s ease-out;
+}
+@keyframes toastFadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
 
 /* —— 文件操作历史还原对话框 —— */
 .modal-backdrop {
@@ -1324,10 +2711,10 @@ onBeforeUnmount(() => {
 .op-row.restored { opacity: .55; }
 .op-row .op-cb { flex-shrink: 0; }
 .op-ico { font-size: 14px; flex-shrink: 0; }
-.op-type { font-weight: 600; color: #a8c8ff; flex-shrink: 0; }
+.op-type { font-weight: 600; color: var(--accent-ink); flex-shrink: 0; }
 .op-agent {
   font-size: 11px; padding: 1px 6px; border-radius: 4px;
-  background: rgba(180,114,255,0.15); color: #d4a8ff;
+  background: rgba(180,114,255,0.15); color: var(--purple-ink);
   flex-shrink: 0; max-width: 120px; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;
 }
@@ -1344,7 +2731,7 @@ onBeforeUnmount(() => {
 .op-restore { flex-shrink: 0; }
 .op-restored-tag {
   font-size: 11px; padding: 2px 8px; border-radius: 4px;
-  background: rgba(100,220,160,0.15); color: #80e4b8;
+  background: rgba(100,220,160,0.15); color: var(--green-ink);
   flex-shrink: 0;
 }
 
@@ -1370,4 +2757,40 @@ onBeforeUnmount(() => {
 .btn.sm.danger:disabled { opacity: .4; cursor: not-allowed; }
 .btn.sm.ghost { padding: 3px 8px; font-size: 11px; background: transparent; }
 .btn.sm.ghost:hover { background: rgba(255,255,255,0.08); }
+
+/* Share 截图灯箱：全屏遮罩 + 居中图片 + 右上角关闭按钮 */
+.lightbox {
+  position: fixed; inset: 0; z-index: 10000;
+  background: rgba(8, 10, 18, 0.92);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  animation: lightboxFade .18s ease-out;
+  padding: 24px;
+}
+.lightbox-inner {
+  position: relative;
+  max-width: 100%; max-height: 100%;
+  display: flex; align-items: center; justify-content: center;
+}
+.lightbox-img {
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+  border: 1px solid rgba(255,255,255,0.12);
+}
+.lightbox-close {
+  position: absolute; top: -14px; right: -14px;
+  width: 34px; height: 34px; border-radius: 50%;
+  background: rgba(28, 32, 44, 0.96); color: rgb(var(--text-rgb));
+  border: 1px solid rgba(255,255,255,0.18);
+  cursor: pointer; font-size: 15px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background .15s ease;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+.lightbox-close:hover { background: rgba(255,80,80,0.28); border-color: rgba(255,80,80,0.55); color: #ff9090; }
+@keyframes lightboxFade { from { opacity: 0; } to { opacity: 1; } }
 </style>

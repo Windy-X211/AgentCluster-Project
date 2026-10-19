@@ -37,8 +37,17 @@ def _deterministic_check(user_input: str, tool_history: list[dict],
         # 没调用工具 → 纯知识回答，不需要工具验证
         return {"passed": True, "blocked": False, "issues": [], "evidence": ""}
 
-    # 检查每个工具调用的结果
+    # 只检查每个工具名的**最近一次**执行结果。
+    # 长任务的单轮内会累积大量试错调用（早期命令失败、后来修正成功）；若全量扫描，
+    # 残余的历史报错会永久触发 deterministic_blocked —— 即使任务事实上已完成、
+    # 最新调用全部成功，也会陷入"验证未通过"的死循环反馈。
+    # "早期失败是否真被后续操作解决"这种语义判断交给 Phase 2 的 LLM 验证器。
+    _latest_by_tool: dict[str, dict] = {}
     for th in tool_history:
+        _latest_by_tool[th.get("name") or "unknown"] = th
+
+    # 检查每个工具最近一次调用的结果
+    for th in _latest_by_tool.values():
         result = th.get("result") or {}
         args = th.get("args") or {}
         name = th.get("name", "unknown")

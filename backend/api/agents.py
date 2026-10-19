@@ -20,7 +20,9 @@ class AgentIn(BaseModel):
     max_tool_rounds: int | None = None  # 单次回复最大工具调用轮数，None=跟随全局设置
     enabled: bool | None = None  # 停用/启用；None=不修改（create 时默认 True）
     perception_scope: str = "link"  # "link"（仅连线邻居感知，默认）或 "global"（感知画布全体成员）
+    workflow_mode: str = "none"  # "none"(默认) | "plan" | "spec" | "goal" —— Trae Work 式工作流模式
     sort_order: int | None = None  # 列表排序权重；None=未排序，按 id 兜底排到末尾
+    group_id: int | None = None  # 所属分组 id；None=未分组（在"全部"组中）
 
 
 class ReorderReq(BaseModel):

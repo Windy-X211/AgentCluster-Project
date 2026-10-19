@@ -8,7 +8,18 @@ const emit = defineEmits<{ close: [] }>()
 const agents = useAgentStore()
 const settings = useSettingsStore()
 const models = useModelStore()
-const form = ref<any>({ ...props.agent, perception_scope: props.agent?.perception_scope || 'link' })
+function initForm(a: any) {
+  return {
+    ...a,
+    commands: [...(a?.commands || [])],
+    skills: [...(a?.skills || [])],
+    plugins: [...(a?.plugins || [])],
+    perception_scope: a?.perception_scope || 'link',
+    workflow_mode: a?.workflow_mode || 'none',
+    group_id: a?.group_id ?? null,
+  }
+}
+const form = ref<any>(initForm(props.agent))
 
 // 联动: 选中 interface_id 后，模型下拉自动填充该接口的 models
 const currentInterface = computed(() => models.list.find((m: any) => m.id === form.value.interface_id))
@@ -31,17 +42,18 @@ function onInterfaceChange(id: number | null) {
 // picker 类型: 'commands' | 'skills' | 'plugins'
 const pickerOpen = ref<string | null>(null)
 const selectedKeys = ref<Set<string>>(new Set())
+const collapsedGroups = ref<Set<string>>(new Set())
 
-watch(() => props.agent, (v) => { form.value = { ...v, perception_scope: v?.perception_scope || 'link' } }, { deep: true })
+watch(() => props.agent, (v) => { if (v) form.value = initForm(v) })
 
-// 三种能力的"可选项"（去掉已添加的）
+// 三种能力的"可选项"（去掉已添加的；命令同时隐藏运行时注入的常驻工具）
 const availableByType = (type: string) => {
   const source = type === 'commands' ? settings.commandsMeta
                : type === 'skills'   ? settings.skillsMeta
                                      : settings.pluginsMeta
   const added = new Set((form.value[type] || []) as string[])
   return Object.entries(source as Record<string, any>)
-    .filter(([k]) => !added.has(k))
+    .filter(([k, v]) => !added.has(k) && !(type === 'commands' && (v as any).hidden))
     .map(([k, v]) => ({
       key: k,
       label: v.label || k,
@@ -51,11 +63,51 @@ const availableByType = (type: string) => {
 }
 const currentPickerItems = computed(() => pickerOpen.value ? availableByType(pickerOpen.value) : [])
 
+// 命令选择器分组（仅 commands；skills/plugins 返回 null 走扁平列表）
+const currentPickerGroups = computed(() => {
+  if (!pickerOpen.value || pickerOpen.value !== 'commands') return null
+  const items = availableByType('commands')
+  const byGroup = new Map<string, any[]>()
+  for (const it of items) {
+    const g = (settings.commandsMeta[it.key] || {}).group || '其他'
+    if (!byGroup.has(g)) byGroup.set(g, [])
+    byGroup.get(g)!.push(it)
+  }
+  const order = [...(settings.commandGroups || [])]
+  for (const g of byGroup.keys()) if (!order.includes(g)) order.push(g)
+  return order.filter(g => byGroup.has(g)).map(g => ({ name: g, items: byGroup.get(g)! }))
+})
+function toggleGroupExpand(name: string) {
+  const s = new Set(collapsedGroups.value)
+  if (s.has(name)) s.delete(name)
+  else s.add(name)
+  collapsedGroups.value = s
+}
+function isGroupSelected(group: { name: string; items: any[] }) {
+  return group.items.length > 0 && group.items.every(it => selectedKeys.value.has(it.key))
+}
+function isGroupIndeterminate(group: { name: string; items: any[] }) {
+  const cnt = group.items.filter(it => selectedKeys.value.has(it.key)).length
+  return cnt > 0 && cnt < group.items.length
+}
+function toggleGroup(group: { name: string; items: any[] }) {
+  if (isGroupSelected(group)) {
+    group.items.forEach(it => selectedKeys.value.delete(it.key))
+  } else {
+    group.items.forEach(it => selectedKeys.value.add(it.key))
+  }
+}
+
 function pickerTitle(type: string) {
   return type === 'commands' ? '选择命令' : type === 'skills' ? '选择技能' : '选择插件'
 }
 
-function openPicker(type: string) { selectedKeys.value = new Set(); pickerOpen.value = type }
+function openPicker(type: string) {
+  selectedKeys.value = new Set()
+  pickerOpen.value = type
+  // 命令组默认折叠，点击展开后单独勾选
+  collapsedGroups.value = type === 'commands' ? new Set(settings.commandGroups || []) : new Set()
+}
 function closePicker() { pickerOpen.value = null; selectedKeys.value = new Set() }
 function togglePick(key: string) {
   if (selectedKeys.value.has(key)) selectedKeys.value.delete(key)
@@ -102,6 +154,7 @@ async function save() {
   form.value.skills = form.value.skills || []
   form.value.plugins = form.value.plugins || []
   form.value.perception_scope = form.value.perception_scope || 'link'
+  form.value.workflow_mode = form.value.workflow_mode || 'none'
   // 工具调用最大轮数：空 = 跟随全局设置
   const r = form.value.max_tool_rounds
   form.value.max_tool_rounds = (r === '' || r == null || Number.isNaN(Number(r)))
@@ -146,6 +199,20 @@ async function remove() {
           <select class="input" v-model="form.perception_scope">
             <option value="link">仅连线邻居（默认）</option>
             <option value="global">画布全体成员</option>
+          </select>
+        </label>
+        <label>工作流模式
+          <select class="input" v-model="form.workflow_mode">
+            <option value="none">无（普通对话）</option>
+            <option value="plan">Plan · 先出计划，确认后再执行</option>
+            <option value="spec">Spec · 规格/任务/验收三件套驱动</option>
+            <option value="goal">Goal · 目标驱动，自评达成度收敛</option>
+          </select>
+        </label>
+        <label>分组
+          <select class="input" v-model="form.group_id">
+            <option :value="null">未分组</option>
+            <option v-for="g in agents.groups" :key="g.id" :value="g.id">{{ g.name }}</option>
           </select>
         </label>
         <label class="full">系统提示词<textarea class="input ta" v-model="form.system_prompt" /></label>
@@ -210,19 +277,49 @@ async function remove() {
             <span class="picker-sub">共 {{ currentPickerItems.length }} 项</span>
           </div>
           <div class="picker-list">
-            <label v-for="item in currentPickerItems" :key="item.key"
-                   :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
-              <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
-              <div class="pi-body">
-                <div class="pi-label">
-                  {{ item.label }}
-                  <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
+            <!-- 命令：按分组展示，可整组勾选或展开后单独勾选 -->
+            <template v-if="currentPickerGroups">
+              <div v-for="g in currentPickerGroups" :key="g.name" class="picker-group">
+                <div class="pg-head" @click="toggleGroupExpand(g.name)">
+                  <input type="checkbox"
+                         :checked="isGroupSelected(g)"
+                         :indeterminate="isGroupIndeterminate(g)"
+                         @click.stop="toggleGroup(g)" />
+                  <span class="pg-name">{{ g.name }}</span>
+                  <span class="pg-count">{{ g.items.length }}</span>
+                  <span class="pg-arrow">{{ collapsedGroups.has(g.name) ? '▸' : '▾' }}</span>
                 </div>
-                <div class="pi-key">{{ item.key }}</div>
-                <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
+                <div v-if="!collapsedGroups.has(g.name)" class="pg-items">
+                  <label v-for="item in g.items" :key="item.key"
+                         :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
+                    <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
+                    <div class="pi-body">
+                      <div class="pi-label">{{ item.label }}</div>
+                      <div class="pi-key">{{ item.key }}</div>
+                      <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
+                    </div>
+                  </label>
+                </div>
               </div>
-            </label>
-            <div v-if="currentPickerItems.length === 0" class="hint-empty">全部已添加</div>
+              <div v-if="currentPickerGroups.length === 0" class="hint-empty">全部已添加</div>
+            </template>
+
+            <!-- 技能 / 插件：扁平列表 -->
+            <template v-else>
+              <label v-for="item in currentPickerItems" :key="item.key"
+                     :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
+                <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
+                <div class="pi-body">
+                  <div class="pi-label">
+                    {{ item.label }}
+                    <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
+                  </div>
+                  <div class="pi-key">{{ item.key }}</div>
+                  <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
+                </div>
+              </label>
+              <div v-if="currentPickerItems.length === 0" class="hint-empty">全部已添加</div>
+            </template>
           </div>
           <div class="picker-actions">
             <button class="btn ghost" @click="closePicker">取消</button>
@@ -258,9 +355,9 @@ async function remove() {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 10px 3px 10px; border-radius: 999px; font-size: 12px; cursor: default;
   border: 1px solid rgba(255,255,255,0.15);
-  &.blue   { background: rgba(110,168,255,0.18);  color: #a8c8ff; border-color: rgba(110,168,255,0.3); }
-  &.purple { background: rgba(180,114,255,0.18); color: #d4a8ff; border-color: rgba(180,114,255,0.3); }
-  &.green  { background: rgba(100,220,160,0.18); color: #80e4b8; border-color: rgba(100,220,160,0.3); }
+  &.blue   { background: rgba(110,168,255,0.18);  color: var(--accent-ink); border-color: rgba(110,168,255,0.3); }
+  &.purple { background: rgba(180,114,255,0.18); color: var(--purple-ink); border-color: rgba(180,114,255,0.3); }
+  &.green  { background: rgba(100,220,160,0.18); color: var(--green-ink); border-color: rgba(100,220,160,0.3); }
   .x { margin-left: 4px; opacity: .7; font-weight: bold; cursor: pointer; padding: 0 2px; &:hover { opacity: 1; } }
 }
 .hint-empty { font-size: 12px; opacity: .45; padding: 4px 0; }
@@ -288,10 +385,22 @@ async function remove() {
   font-size: 14px; font-weight: 600; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 10px; }
 .picker-sub { font-size: 11px; opacity: .5; font-weight: normal; }
 .picker-list { overflow-y: auto; flex: 1; }
+.picker-group { margin-bottom: 4px; }
+.pg-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border-radius: 8px; cursor: pointer;
+  background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+  &:hover { background: rgba(255,255,255,0.06); }
+  input { accent-color: var(--accent); flex-shrink: 0; }
+}
+.pg-name { font-size: 13px; font-weight: 600; flex: 1; }
+.pg-count { font-size: 11px; opacity: .5; }
+.pg-arrow { font-size: 11px; opacity: .6; width: 12px; text-align: center; }
+.pg-items { padding-left: 10px; border-left: 1px solid rgba(255,255,255,0.06); margin-left: 8px; }
 .picker-item { display: flex; gap: 10px; padding: 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; border: 1px solid transparent; font-size: 12px;
   &:hover { background: rgba(255,255,255,0.04); }
   &.selected { background: rgba(110,168,255,0.15); border-color: rgba(110,168,255,0.3); }
-  input { accent-color: #6ea8ff; flex-shrink: 0; margin-top: 3px; }
+  input { accent-color: var(--accent); flex-shrink: 0; margin-top: 3px; }
 }
 .pi-body { flex: 1; min-width: 0; }
 .pi-label { font-size: 13px; font-weight: 500; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }

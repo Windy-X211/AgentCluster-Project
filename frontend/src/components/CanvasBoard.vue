@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { useCanvasStore, useAgentStore, useConvStore } from '@/stores'
+import { useCanvasStore, useAgentStore, useConvStore, useSettingsStore } from '@/stores'
 import { api } from '@/api'
-import { toolLabel, type ToolCallPhase } from '@/stores/conversation'
+import { toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, type ToolCallPhase } from '@/stores/conversation'
 import { renderMarkdown } from '@/utils/markdown'
+import { getAvatarGradient } from '@/utils/avatar'
 
 const canvases = useCanvasStore()
 const agents = useAgentStore()
 const convs = useConvStore()
+const settings = useSettingsStore()
 import AgentEditDialog from './AgentEditDialog.vue'
 import RulesDialog from './RulesDialog.vue'
 
@@ -44,7 +46,7 @@ const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5
 const dragging = ref<{ node: any; dx: number; dy: number } | null>(null)
 // 连线中
 const linking = ref<{ from: number; mouseX: number; mouseY: number } | null>(null)
-// 画布平移（中键或空格+左键）
+// 画布平移（左键）
 const panning = ref<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
 const spaceDown = ref(false)
 
@@ -58,7 +60,7 @@ const renameEdit = ref(false)
 const renameValue = ref('')
 const newCanvasDialog = ref(false)
 const newCanvasName = ref('')
-const toolbarCollapsed = ref(false)
+const toolbarCollapsed = ref(true)
 const rulesOpen = ref(false)
 const wdOpen = ref(false)
 const wdPath = ref('')
@@ -66,6 +68,15 @@ const browsing = ref(false)
 
 // AgentEditDialog 打开状态
 const editingAgent = ref<any>(null)
+
+// 头像渐变色（根据avatar_mode决定）
+const avatarGradient = computed(() => {
+  const mode = settings.data.avatar_mode || 'differentiated'
+  if (mode === 'unified') {
+    return (name: string) => 'linear-gradient(135deg, #6ea8ff, #b472ff)'
+  }
+  return (name: string) => getAvatarGradient(name)
+})
 
 // 触发设置
 const triggerDlg = ref(false)
@@ -88,7 +99,18 @@ const bubbleConv = computed(() => {
   return list.length ? list[list.length - 1] : null
 })
 
-type BubbleChunk = { kind: 'reasoning' | 'call' | 'text'; text: string }
+type BubbleChunk = {
+  kind: 'reasoning' | 'call' | 'text' | 'tool'
+  text?: string
+  streaming?: boolean        // reasoning 专用：正在流式 → 单行流水；否则不显示
+  toolName?: string
+  toolRunning?: boolean
+  toolArgs?: any
+  toolResult?: any
+  toolPhase?: 'args' | 'exec'
+  toolFileName?: string      // 文件操作类工具：文件名
+  toolStreamingArgs?: string // 参数流式中：累计的原始 JSON 片段
+}
 
 function bubbleFor(node: any): { chunks: BubbleChunk[]; streaming: boolean } | null {
   const conv = bubbleConv.value
@@ -101,25 +123,63 @@ function bubbleFor(node: any): { chunks: BubbleChunk[]; streaming: boolean } | n
   const chunks: BubbleChunk[] = []
   let hasStreaming = false
 
+  const hasResult = (tcId: string) => msgs.some((m: any) => m.role === 'tool_result' && m.tool_call_id === tcId)
+  const findResult = (tcId: string) => msgs.find((m: any) => m.role === 'tool_result' && m.tool_call_id === tcId)?.result
+
+  // —— 先建立"本智能体作为发送方的 A2A 信封目标集合" ——
+  // 成功发送的 send_message 会同时存在一条 tool_call 和一条 a2a 信封，
+  // 这里先把后者的目标名和 agent_id 都收集好，后面遇到对应的 tool_call 就跳过，避免重复渲染。
+  // 失败的 send_message 没有 A2A 信封 → 集合里找不到 → 仍显示工具调用（告知用户尝试过发送）。
+  const a2aTargets = new Set<string>()
   for (const m of msgs) {
-    // ==== 1. 自己的深度思考（优先于正文显示在顶部，折叠/展开） ====
-    if (m.role === 'assistant' && (m as any).agent_id === aid && (m as any).reasoning?.trim()) {
-      chunks.push({ kind: 'reasoning', text: _stripAnno((m as any).reasoning) })
+    if (m.role === 'a2a') {
+      const env = (m as any).envelope || {}
+      const isSender = (m as any).from_agent_id === aid || env?.from?.agent_id === aid
+      if (isSender) {
+        if (env?.to?.name) a2aTargets.add(String(env.to.name))
+        if (env?.to?.agent_id) a2aTargets.add(String(env.to.agent_id))
+      }
+    }
+  }
+
+  for (const m of msgs) {
+    // ==== 1. 自己的深度思考 —— 仅流式时以单行流水呈现，思考完毕即隐藏 ====
+    if (m.role === 'assistant' && (m as any).agent_id === aid && m.streaming && (m as any).reasoning?.trim()) {
+      chunks.push({ kind: 'reasoning', text: _stripAnno(stripContinueTag((m as any).reasoning)), streaming: true })
       if (m.streaming) hasStreaming = true
     }
 
-    // ==== 2. 自己发的 cluster.send_message（我发给别人的消息） ====
+    // ==== 2. 自己发的 cluster.send_message（沟通工具，显示消息预览） ====
+    // 如果该发送已成功产生 A2A 信封 → 跳过（避免重复，信封会在下面的块渲染）
     if (m.role === 'tool_call' && (m as any).agent_id === aid
         && (m as any).name === 'cluster.send_message') {
       const args = (m as any).args || {}
       const toName = args.to_agent != null ? String(args.to_agent) : '?'
       const msg = (args.message || '').trim()
-      if (msg) chunks.push({ kind: 'call', text: `📤 → ${toName}：${msg}` })
+      if (msg && !a2aTargets.has(toName)) {
+        chunks.push({ kind: 'call', text: `📤 → ${toName}：${msg}` })
+      }
+    }
+
+    // ==== 2b. 其他工具调用 → 用和对话界面一样的工具行样式，按输出顺序排列 ====
+    if (m.role === 'tool_call' && (m as any).agent_id === aid
+        && (m as any).name !== 'cluster.send_message') {
+      const tcId = (m as any).tool_call_id
+      const running = !hasResult(tcId)
+      const args = (m as any).args || {}
+      chunks.push({
+        kind: 'tool',
+        toolName: toolLabel((m as any).name, args),
+        toolRunning: running,
+        toolArgs: args,
+        toolResult: findResult(tcId),
+        toolFileName: extractToolFileName((m as any).name, args),
+      })
     }
 
     // ==== 3. 自己的正文回复 ====
     if (m.role === 'assistant' && (m as any).agent_id === aid && (m.content || '').trim()) {
-      chunks.push({ kind: 'text', text: m.content!.trim() })
+      chunks.push({ kind: 'text', text: stripContinueTag(m.content).trim() })
       if (m.streaming) hasStreaming = true
     }
 
@@ -138,16 +198,31 @@ function bubbleFor(node: any): { chunks: BubbleChunk[]; streaming: boolean } | n
     }
   }
 
-  // 还在流式输出（刚 SPEAK 切换后，assistant 正文还没到）或正在调用能力
-  const hasToolCall = !!toolCallFor(node)
-  if (convs.streaming && convs.speakingAgent === aid && conv.id === convs.current) {
-    if (!chunks.length && !hasToolCall) {
+  // 正在流式调用的工具（TS:/C: 到达但还没 push tool_call 消息的瞬间）→ 追加到末尾
+  const liveTC = toolCallFor(node)
+  if (liveTC) {
+    const hasLive = chunks.some(c => c.kind === 'tool' && c.toolName === toolLabel(liveTC.name, liveTC.streamingArgs) && c.toolRunning)
+    if (!hasLive) {
+      chunks.push({
+        kind: 'tool',
+        toolName: toolLabel(liveTC.name, liveTC.streamingArgs),
+        toolRunning: true,
+        toolArgs: {},
+        toolPhase: liveTC.phase,
+        toolStreamingArgs: liveTC.streamingArgs,
+      })
+      hasStreaming = true
+    }
+  }
+
+  if (convs.streaming && convs.speakingAgents.has(aid) && conv.id === convs.current) {
+    if (!chunks.length && !liveTC) {
       return { chunks: [], streaming: true }
     }
   }
 
-  if (!chunks.length && !hasToolCall) return null
-  return { chunks, streaming: hasStreaming || hasToolCall }
+  if (!chunks.length && !liveTC) return null
+  return { chunks, streaming: hasStreaming || !!liveTC }
 }
 
 function clipBubble(t: string): string {
@@ -160,15 +235,28 @@ function toolCallFor(node: any): ToolCallPhase | null {
   const conv = bubbleConv.value
   if (!conv) return null
   const aid = node.agent_id
-  if (!(convs.streaming && convs.speakingAgent === aid && conv.id === convs.current)) return null
+  if (!(convs.streaming && convs.speakingAgents.has(aid) && conv.id === convs.current)) return null
   return convs.toolCalls[aid] || null
 }
 
+// 运行/流式状态按画布隔离：只有"运行中对话所属画布"才显示运行态
+const runningCanvasId = computed<number | null>(() => {
+  if (convs.running) return convs.runCanvasId ?? null
+  if (convs.streaming) return convs.currentData()?.canvas_id ?? null
+  return null
+})
+const runningOnThisCanvas = computed(() => {
+  const cid = canvas.value?.id
+  if (cid == null) return false
+  return runningCanvasId.value === cid
+})
+
 // 节点活跃状态 → 用于视觉特效
 // 优先级：speaking(正在输出 token) > calling(正在发起/处理 call) > waiting(集群在跑但自己闲置)
+// 并行模式下可同时有多个节点处于 speaking（一个发送方同时唤起 N 个接收方）
 function nodeState(agentId: number): 'speaking' | 'calling' | 'waiting' | null {
-  if (!convs.running && !convs.streaming) return null
-  if (convs.streaming && convs.speakingAgent === agentId) return 'speaking'
+  if (!runningOnThisCanvas.value) return null
+  if (convs.streaming && convs.speakingAgents.has(agentId)) return 'speaking'
   const edges = convs.callEdges || []
   if (edges.some(d => d.from === agentId || d.to === agentId)) return 'calling'
   return 'waiting'
@@ -176,6 +264,7 @@ function nodeState(agentId: number): 'speaking' | 'calling' | 'waiting' | null {
 
 // call 进行中：仅「调用方 → 对方」的一条连线流动；对方开始输出后（store 移除该条）结束
 function isEdgeActive(e: any): boolean {
+  if (!runningOnThisCanvas.value) return false
   if (!convs.streaming || !convs.callEdges.length) return false
   const from = nodes.value.find((x: any) => x.id === e.from_node)
   const to = nodes.value.find((x: any) => x.id === e.to_node)
@@ -283,7 +372,7 @@ function releaseWillMove() {
   willMove.value = false
 }
 function startPan(e: MouseEvent) {
-  if (e.button !== 1 && !(e.button === 0 && spaceDown.value)) return
+  if (e.button !== 0) return
   if ((e.target as HTMLElement).closest('.node, .btn, input, label, select, textarea, canvas-toolbar, .ws-panel, .ws-trash, .ws-ctx, .ws-modal-bg')) return
   kickWillMove(false)
   panning.value = { sx: e.clientX, sy: e.clientY, ox: tx.value, oy: ty.value }
@@ -457,6 +546,9 @@ async function doChat(node: any, mode: 'independent' | 'linked') {
   }
   convs.current = conv!.id
   // 自动和它对话：选中该智能体 + 聚焦输入框
+  // 等 RightPanel 的 convs.current async watcher 跑完（它会用「最新回复的智能体」覆盖 selectedAgentId），
+  // 再写入我们指定的 agent_id，避免被那个默认选中逻辑冲掉。
+  await nextTick()
   convs.selectedAgentId = node.agent_id
   convs.focusChatAt = Date.now()
 }
@@ -511,10 +603,10 @@ async function saveTrigger() {
   })
   triggerDlg.value = false
 }
-// ⑤ 运行/停止
+// ⑤ 运行/停止（按画布隔离：仅在当前画布处于运行态时才停止）
 function toggleRun() {
   if (!canvas.value) return
-  if (convs.running || convs.streaming) convs.stopRun()
+  if (runningOnThisCanvas.value) convs.stopRun()
   else convs.startRun(canvas.value.id)
 }
 
@@ -820,6 +912,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('mouseup', onMouseUpGlobal)
   window.removeEventListener('mousemove', onMouseMove)
+  // 清理所有气泡上挂的延迟恢复定时器，避免销毁后定时器仍持有 DOM
+  resetBubbleStick()
 })
 
 watch([tx, ty], () => { nextTick(syncGrid) }, { immediate: true })
@@ -858,6 +952,7 @@ const vTransform = computed(() => {
 })
 
 // ③ 气泡流式自动滚到底：发言者流式内容长度 + 消息数 + speakingAgent + 能力调用状态变化
+//   speakingAgents.size 让"并行时新增一个接收方"也能触发滚动跟随
 const bubbleScrollKey = computed(() => {
   const conv = bubbleConv.value
   if (!conv) return '0'
@@ -867,8 +962,56 @@ const bubbleScrollKey = computed(() => {
     if (m.role === 'assistant' && m.streaming) streamLen += (m.content || '').length
   }
   const tcKey = Object.entries(convs.toolCalls).map(([k, v]) => `${k}:${(v as any).name}:${(v as any).phase}`).join('|')
-  return `${convs.streaming ? 1 : 0}:${convs.speakingAgent ?? 0}:${convs.handoffActive ? 1 : 0}:${msgs.length}:${streamLen}:${tcKey}`
+  return `${convs.streaming ? 1 : 0}:${convs.speakingAgent ?? 0}:${convs.speakingAgents.size}:${convs.handoffActive ? 1 : 0}:${msgs.length}:${streamLen}:${tcKey}`
 })
+
+// 气泡底部跟随：默认贴底；用户上滑即脱离，停止滑动 5s 后自动恢复跟随
+const BUBBLE_BOTTOM_THRESHOLD = 32
+const BUBBLE_RESUME_DELAY_MS = 5000
+
+function isBubbleNearBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= BUBBLE_BOTTOM_THRESHOLD
+}
+
+function _clearFollowTimer(el: HTMLElement) {
+  const t = (el as any).__followTimer
+  if (t) { clearTimeout(t); (el as any).__followTimer = null }
+}
+
+function _scheduleResume(el: HTMLElement) {
+  _clearFollowTimer(el)
+  ;(el as any).__followTimer = setTimeout(() => {
+    (el as any).__followTimer = null
+    // 5s 内用户没再滚 → 恢复跟随，立刻把最新内容拉到底
+    if (!isBubbleNearBottom(el)) {
+      el.scrollTop = el.scrollHeight
+    }
+    ;(el as any).__stickBottom = undefined
+  }, BUBBLE_RESUME_DELAY_MS)
+}
+
+function onBubbleScroll(e: Event) {
+  const el = e.target as HTMLElement
+  if (!el || !el.classList.contains('node-bubble')) return
+  if (isBubbleNearBottom(el)) {
+    // 滑回底部 → 取消待执行的恢复定时器，立即恢复跟随
+    _clearFollowTimer(el)
+    ;(el as any).__stickBottom = undefined
+  } else {
+    // 用户主动上滑 → 脱离跟随，启动 5s 无滑动后恢复的定时器
+    ;(el as any).__stickBottom = false
+    _scheduleResume(el)
+  }
+}
+
+function resetBubbleStick() {
+  const root = boardRef.value
+  if (!root) return
+  root.querySelectorAll<HTMLElement>('.node-bubble').forEach(el => {
+    _clearFollowTimer(el)
+    ;(el as any).__stickBottom = undefined
+  })
+}
 
 function scrollBubblesToBottom() {
   const root = boardRef.value
@@ -876,6 +1019,7 @@ function scrollBubblesToBottom() {
   // 只自动贴底「正在流式输出的发言者」那个气泡，已完成的让用户自由滚动
   if (!convs.streaming) return
   root.querySelectorAll<HTMLElement>('.node-bubble.streaming').forEach(el => {
+    if ((el as any).__stickBottom === false) return
     el.scrollTop = el.scrollHeight
   })
 }
@@ -898,11 +1042,15 @@ watch(bubbleScrollKey, async () => {
 watch(() => bubbleConv.value?.id, async (id) => {
   if (id == null) return
   await nextTick()
+  resetBubbleStick()
   requestAnimationFrame(scrollAllBubblesToBottom)
 }, { immediate: true })
 
 // 流式过程中持续贴底（token 逐段到达时 key 可能不变的兜底）
-watch(() => [convs.streaming, convs.speakingAgent] as const, async ([sp]) => {
+watch(() => [convs.streaming, convs.speakingAgent] as const, async ([sp], oldVal) => {
+  // 新一轮流式开始时复位全部气泡的贴底状态（尊重用户此前在某气泡内的手动滚动）
+  const prevSp = oldVal?.[0]
+  if (sp && !prevSp) resetBubbleStick()
   if (!sp) return
   while (convs.streaming) {
     await nextTick()
@@ -933,9 +1081,9 @@ defineExpose({ viewportRef, computeNodeBbox })
           <span class="canvas-mini" :title="'当前画布：' + canvas?.name">🎨 {{ canvas?.name }}</span>
         </div>
         <div class="toolbar-right">
-          <button class="btn ghost run-btn" :class="{ stop: convs.running || convs.streaming }"
+          <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
                   @click.stop="toggleRun">
-            {{ convs.running || convs.streaming ? '⏹' : '▶' }}
+            {{ runningOnThisCanvas ? '⏹' : '▶' }}
           </button>
           <button class="btn ghost em-collapsed" @click.stop="toggleExecMode"
                   :title="canvas?.execution_mode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行'">
@@ -958,10 +1106,10 @@ defineExpose({ viewportRef, computeNodeBbox })
           </template>
         </div>
         <div class="toolbar-right">
-          <button class="btn ghost run-btn" :class="{ stop: convs.running || convs.streaming }"
+          <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
                   @click.stop="toggleRun"
-                  :title="convs.running ? '停止：中止定时/文字触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时/文字）运行集群'">
-            {{ convs.running || convs.streaming ? '⏹ 停止' : '▶ 运行' }}
+                  :title="runningOnThisCanvas ? '停止：中止定时/文字触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时/文字）运行集群'">
+            {{ runningOnThisCanvas ? '⏹ 停止' : '▶ 运行' }}
           </button>
           <div class="exec-mode-toggle" @click.stop
                :title="canvas?.execution_mode === 'parallel' ? '并行：发送消息后继续运行' : '串行：发送消息后停止运行'">
@@ -980,7 +1128,6 @@ defineExpose({ viewportRef, computeNodeBbox })
           <button class="btn ghost" @click.stop="rulesOpen = true" title="📋 规章制度">📋 规则</button>
           <span class="zoom-indicator" :class="{ panning: spaceDown }">
             🔍 {{ Math.round(scale * 100) }}%
-            <span class="zoom-tip" v-if="spaceDown"> 拖动平移中…</span>
           </span>
           <button class="btn ghost" @click.stop="canvases.saveCurrent()" title="保存画布">💾</button>
           <button class="btn ghost" @click.stop="confirmRemoveCanvas" title="删除此画布">🗑</button>
@@ -1031,27 +1178,28 @@ defineExpose({ viewportRef, computeNodeBbox })
            @mouseup="endLink($event, n.id)"
            @dblclick="toggleBubble(n)"
            @contextmenu="showCtxMenu($event, n)">
-        <!-- 消息气泡：双击节点可隐藏；流式输出中强制显示 -->
-        <div v-if="bubbleFor(n) && (!bubbleHidden[n.id] || bubbleFor(n)?.streaming)"
-             class="node-bubble" :class="{ streaming: bubbleFor(n)?.streaming }" @wheel.stop>
-          <!-- 能力调用流式状态：名称已确定即显示（不等参数收齐），参数收齐后切换为"执行中" -->
-          <div v-if="toolCallFor(n)" class="b-tool-status"
-               :class="'b-tool-' + toolCallFor(n)!.phase">
-            <span class="b-tool-ico">{{ toolCallFor(n)!.phase === 'args' ? '🔧' : '⚙️' }}</span>
-            <span class="b-tool-text">
-              {{ toolCallFor(n)!.phase === 'args' ? '正在调用' : '执行中' }}：
-              <span class="b-tool-name">{{ toolLabel(toolCallFor(n)!.name) }}</span>
-              <span v-if="toolCallFor(n)!.phase === 'args'" class="b-tool-dots">…</span>
-            </span>
-          </div>
+        <!-- 消息气泡：双击节点可隐藏；流式输出中也尊重用户的隐藏设置 -->
+        <div v-if="bubbleFor(n) && !bubbleHidden[n.id]"
+             class="node-bubble" :class="{ streaming: bubbleFor(n)?.streaming }"
+             @wheel.stop @scroll="onBubbleScroll">
           <!-- 深度思考 chunk（灰底折叠块，有区别特效） -->
           <div v-for="(chunk, ci) in bubbleFor(n)!.chunks" :key="ci"
                class="b-chunk" :class="'b-' + chunk.kind">
             <template v-if="chunk.kind === 'reasoning'">
-              <details class="b-reason"><summary>🧠 思考过程</summary>{{ chunk.text }}</details>
+              <div class="b-think">
+                <span class="b-think-icon">🧠</span>
+                <span class="b-think-text">{{ cyclicWindow(chunk.text || '', 50) }}</span>
+                <span class="b-think-cursor">▌</span>
+              </div>
             </template>
             <template v-else-if="chunk.kind === 'call'">
               <span class="b-call">{{ chunk.text }}</span>
+            </template>
+            <template v-else-if="chunk.kind === 'tool'">
+              <div class="b-tool-row" :class="{ running: chunk.toolRunning }">
+                <span class="b-tool-icon" :class="{ spinning: chunk.toolRunning }">{{ chunk.toolRunning ? '⟳' : '✓' }}</span>
+                <span class="b-tool-label">{{ chunk.toolName }}<template v-if="chunk.toolFileName"> <span class="b-tool-fn">（{{ chunk.toolFileName }}）</span></template></span>
+              </div>
             </template>
             <template v-else>
               <span class="b-text markdown" v-html="renderMarkdown(chunk.text)"></span>
@@ -1059,7 +1207,7 @@ defineExpose({ viewportRef, computeNodeBbox })
           </div>
         </div>
         <div class="node-head">
-          <div class="avatar">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
+          <div class="avatar" :style="{ background: avatarGradient(agentById(n.agent_id)?.name || n.agent_id) }">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
           <div class="name">{{ agentById(n.agent_id)?.name || '未知' }}</div>
           <span v-if="agentById(n.agent_id)?.enabled === false" class="off-tag" title="已停用">⏸</span>
         </div>
@@ -1175,7 +1323,7 @@ defineExpose({ viewportRef, computeNodeBbox })
     </Teleport>
 
     <div v-if="!nodes.length" class="hint">从左侧拖拽智能体到此处开始编排集群<br/>
-      <span class="hint-shortcuts">滚轮缩放 · 空格+左键 或 中键 拖动画布 · 右键节点操作 · 双击连线删除</span>
+      <span class="hint-shortcuts">滚轮缩放 · 左键 拖动画布 · 右键节点操作 · 双击连线删除</span>
     </div>
 
     <RulesDialog :open="rulesOpen" @close="rulesOpen = false" />
@@ -1278,7 +1426,9 @@ defineExpose({ viewportRef, computeNodeBbox })
 }
 .node.speaking .avatar {
   animation: avatarGlow 1.2s ease-in-out infinite;
-  box-shadow: 0 0 12px 3px rgba(180, 114, 255, 0.55);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,0.45),
+              inset 0 -3px 6px rgba(0,0,0,0.32),
+              0 0 12px 3px rgba(180, 114, 255, 0.55);
 }
 
 /* 次要：正在发起/处理 call — 蓝色边框脉冲 */
@@ -1312,7 +1462,7 @@ defineExpose({ viewportRef, computeNodeBbox })
   50%      { opacity: 1;    transform: scale(1.15); }
 }
 
-.node-bubble { position: absolute; bottom: calc(100% + 12px); left: 50%; transform: translateX(-50%); width: 230px; padding: 8px 10px; font-size: 11.5px; line-height: 1.5; color: #dfe6f2; white-space: pre-wrap; word-break: break-word; background: rgba(18, 24, 38, 0.94); border: 1px solid rgba(110, 168, 255, 0.4); border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); max-height: 140px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; pointer-events: auto; z-index: 6; cursor: default; scrollbar-width: thin; scrollbar-color: rgba(110,168,255,0.5) transparent; animation: bubbleIn 0.25s ease; }
+.node-bubble { position: absolute; bottom: calc(100% + 12px); left: 50%; transform: translateX(-50%); width: 230px; padding: 8px 10px 16px; font-size: 11.5px; line-height: 1.5; color: #dfe6f2; white-space: pre-wrap; word-break: break-word; background: rgba(18, 24, 38, 0.94); border: 1px solid rgba(110, 168, 255, 0.4); border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); max-height: 140px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; pointer-events: auto; z-index: 6; cursor: default; scrollbar-width: thin; scrollbar-color: rgba(110,168,255,0.5) transparent; animation: bubbleIn 0.25s ease; }
 .node-bubble::-webkit-scrollbar { width: 6px; }
 .node-bubble::-webkit-scrollbar-track { background: transparent; }
 .node-bubble::-webkit-scrollbar-thumb { background: rgba(110,168,255,0.45); border-radius: 3px; }
@@ -1326,43 +1476,42 @@ defineExpose({ viewportRef, computeNodeBbox })
 .b-chunk + .b-chunk { margin-top: 6px; }
 .b-text { display: block; white-space: pre-wrap; }
 .b-call { display: block; font-size: 11px; color: #d4a8ff; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
-/* 深度思考 — 灰底 + 可折叠 + 展开后有区别的斜体/低对比度 */
-.b-reason { background: rgba(255,255,255,0.035); border: 1px dashed rgba(255,255,255,0.15); border-radius: 6px; padding: 3px 6px; font-size: 10.5px; color: rgba(232,236,244,0.55); line-height: 1.45; }
-.b-reason summary { cursor: pointer; user-select: none; font-size: 10.5px; color: rgba(232,236,244,0.55); padding: 0 0 2px; font-style: italic; }
-.b-reason summary:hover { color: rgba(232,236,244,0.8); }
-.b-reason summary::-webkit-details-marker { display: none; }
-.b-reason::before { content: '…'; font-style: italic; }
-.b-reason[open]::before { content: ''; }
-.b-reason[open] summary { border-bottom: 1px dashed rgba(255,255,255,0.1); margin-bottom: 4px; padding-bottom: 2px; }
+/* 深度思考流水 — 单行流式打字机效果，思考完毕即消失 */
+.b-think {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px; border-radius: 6px;
+  background: rgba(180,114,255,0.08);
+  border: 1px solid rgba(180,114,255,0.22);
+  font-size: 10.5px; color: rgba(232,236,244,0.55);
+  max-width: 100%; min-width: 0;
+}
+.b-think-icon { flex-shrink: 0; font-size: 10.5px; }
+.b-think-text {
+  flex: 1; min-width: 0;
+  overflow: hidden; white-space: nowrap;
+  font-style: italic; letter-spacing: 0.2px;
+}
+.b-think-cursor {
+  flex-shrink: 0; color: #b472ff; font-weight: 600;
+  animation: cursorBlink 1s steps(2) infinite;
+}
 
-/* —— 能力调用流式状态条 —— */
-.b-tool-status {
-  display: flex; align-items: center; gap: 5px;
-  font-size: 11px; line-height: 1.4; border-radius: 6px; padding: 4px 6px;
-  margin-bottom: 6px;
+/* —— 气泡内工具行（和对话界面 tr-pill 同样式） —— */
+.b-tool-row {
+  display: flex; align-items: center; gap: 5px; padding: 3px 8px;
+  border-radius: 8px; background: rgba(0,0,0,0.18);
+  border: 1px solid rgba(255,255,255,0.08);
+  font-size: 11px; color: rgba(232,236,244,0.85); user-select: none;
 }
-.b-tool-status + .b-chunk { margin-top: 0; }
-/* 参数还在流式：蓝色脉动，提示"正在调用" */
-.b-tool-args {
-  background: rgba(110,168,255,0.12); border: 1px solid rgba(110,168,255,0.45);
-  color: #a8c8ff;
+.b-tool-row.running {
+  border-color: rgba(110,168,255,0.55); background: rgba(110,168,255,0.1); color: #a8c8ff;
 }
-.b-tool-args .b-tool-dots { animation: toolDots 1s steps(2) infinite; }
-/* 参数收齐、执行中：紫色态 */
-.b-tool-exec {
-  background: rgba(180,114,255,0.14); border: 1px solid rgba(180,114,255,0.45);
-  color: #d4a8ff;
-}
-.b-tool-ico { flex-shrink: 0; }
-.b-tool-name { font-weight: 600; }
-.b-tool-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.b-tool-dots { color: inherit; }
-@keyframes toolDots { 50% { opacity: 0.25; } }
-.bubble.streaming .b-tool-args { animation: toolPulse 1.4s ease-in-out infinite; }
-@keyframes toolPulse {
-  0%, 100% { border-color: rgba(110,168,255,0.45); }
-  50%      { border-color: rgba(110,168,255,0.85); }
-}
+.b-tool-icon { width: 12px; text-align: center; font-size: 11px; transition: transform .3s; }
+.b-tool-icon.spinning { display: inline-block; animation: tiSpin .8s linear infinite; }
+@keyframes tiSpin { to { transform: rotate(360deg); } }
+.b-tool-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.b-tool-fn { color: #80e4b8; font-size: 10px; font-family: Consolas, monospace; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; flex-shrink: 0; }
+.b-tool-status-text { font-size: 10px; opacity: .65; flex-shrink: 0; }
 
 /* —— 气泡内 Markdown —— */
 .b-text.markdown { white-space: normal; word-break: break-word; }
@@ -1402,7 +1551,8 @@ defineExpose({ viewportRef, computeNodeBbox })
 .b-text.markdown img { max-width: 100%; border-radius: 5px; margin: 3px 0; }
 
 .node-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-.avatar { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #6ea8ff, #b472ff); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; }
+.avatar { position: relative; overflow: hidden; width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.3); box-shadow: inset 0 1px 1px rgba(255,255,255,0.45), inset 0 -3px 6px rgba(0,0,0,0.32), inset 0 0 0 1px rgba(255,255,255,0.08), 0 3px 8px rgba(0,0,0,0.4); }
+.avatar::before { content: ''; position: absolute; inset: 0; background: linear-gradient(165deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.10) 32%, rgba(255,255,255,0) 52%), linear-gradient(0deg, rgba(0,0,0,0.24) 0%, rgba(0,0,0,0) 42%); pointer-events: none; }
 .name { font-size: 13px; font-weight: 500; }
 .node-actions { display: flex; gap: 4px; }
 .node .btn { backdrop-filter: none; -webkit-backdrop-filter: none; }

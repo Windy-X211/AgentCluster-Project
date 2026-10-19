@@ -2,85 +2,91 @@
 
 > **用自然语言描述你的团队，在画布上把它们连成一张协作网——本地运行、数据自持、能力持续扩展。**
 
-AgentCluster 是一个本地优先的多智能体编排平台，将「组团队、派活儿、协作交接」这一套管理学原样搬到 AI 身上。通过可视化画布编排智能体集群，实现复杂任务的协同解决。
+AgentCluster 是一个 **Windows 本地优先** 的多智能体编排平台，把「组团队、派活儿、协作交接」这套管理学原样搬到 AI 身上。通过可视化画布编排智能体集群，实现复杂任务的协同解决。系统托盘一键启停前后端 + 自动打开浏览器，数据全部本地 JSON 存储。
 
 ## ✨ 特性
 
 ### 🎨 画布编排
 - **无限画布**：自由拖拽节点，创建复杂的智能体网络
 - **可视化协作**：节点代表智能体，连线代表成果流向
-- **串行/并行执行**：灵活切换执行模式
+- **串行 / 并行执行**：灵活切换执行模式
 - **拖拽优化**：鼠标移出画布边界仍能平滑拖动
+- **感知范围**：`link` 感知（仅连线邻居）或 `global` 感知（画布全体），节点右键可切换
+
+### 🗂 画布工作区
+- **独立工作目录**：每个画布绑定一个 `workdir`，智能体按画布隔离读写文件
+- **内置文件浏览器**：浏览 / 编辑 / 重命名 / 复制 / 删除工作区文件
+- **一键运行**：直接运行脚本文件，Python 交互式控制台支持实时输入 / 停止
+- **回收站**：删除文件进入回收站，可恢复或彻底清理
+- **快照备份**：写文件自动留存快照，误改可回溯（`AppData/file_backups/`）
 
 ### 🤝 A2A 消息协议
-- **自研 a2a-lite 协议**：结构化信封消息系统
-- **任务接力**：智能体间自动传递任务和成果
-- **讨论机制**：`cluster.discuss` 支持多智能体协作讨论
-- **消息可视化**：对话中实时展示消息流转
+- **自研 a2a-lite 协议**：结构化信封消息系统（`backend/core/a2a.py`）
+- **讨论与往返**：`cluster.discuss` / `cluster.send_message` 支持多智能体协作讨论与多轮往返
+- **消息可视化**：对话中实时展示消息流转（from → to 信封卡片）
 
-### 🔧 三类能力扩展
-1. **命令工具**：文件读写、命令执行、长运行进程
-2. **技能系统**：小说创作、角色扮演等专业技能
-3. **插件生态**：浏览器控制、SMTP 邮件、HTTP 请求
+### 🔧 能力扩展
+1. **命令工具**：文件读写 / 替换 / 查找、命令执行、长运行进程后台化与探活
+2. **技能系统**：小说创作、角色扮演、Web 演示页面生成（内置 + `AppData/skills/`）
+3. **插件生态**：浏览器控制、SMTP 邮件、HTTP 请求（Dify 兼容清单）
+### 🧩 组织与治理
+- **智能体分组**：左侧分组管理，支持拖拽排序
+- **规则系统**：按画布隔离的规章制度，注入成员上下文（`AppData/rules/`）
+- **参数预设**：模型参数预设一键套用（`AppData/param_presets/`）
+- **存储位置可切换**：一键迁移 / 接管数据根目录
+
+### 🎯 智能感知的运行时
+- **快慢双通道**：默认快通道（把 `<continue>` 续跑提示动态附加到本轮用户消息，不占系统提示词），检测到该标记自动切换慢通道并动态剔除提示与标记
+- **自动验证**：独立验证器（`validator.py` + `tool_stream_validator.py`）确保任务完成度
+- **工作流模式**：`plan` / `spec` / `goal` 三种模式，配套工具、状态机与阶段提示词
 
 ### 🔒 本地优先
 - **数据自持**：全部数据存储在本地 JSON 文件
-- **隐私安全**：参数加密，密钥永不出本地
+- **隐私安全**：参数加密（Fernet），密钥永不出本地（`backend/.runtime/param_preset.key`）
 - **离线运行**：无需依赖外部服务
-
-### 🎯 智能感知的运行时
-- **意图分类**：快慢双通道意图识别
-- **自动验证**：独立验证器确保任务完成度
-- **感知范围配置**：link 感知（仅邻居）或 global 感知（画布全体）
+- **单实例托盘**：Windows 命名互斥量防重复启动，避免多 Vite 抢端口互顶
 
 ## 🚀 快速开始
 
 ### 环境要求
-- Python 3.13+
-- Node.js 20+
-- Windows 系统
+- **Windows 10 / 11**（依赖 `pythonw` / 系统托盘）
+- **Python 3.13+**
+- **Node.js 20+**
 
-### 安装
+### 一键启动（推荐）
 
-1. **克隆项目**
+双击根目录下的 **`start.bat`**，托盘程序会自动：
+
+1. 检测端口 8870 / 5173 占用情况，端口冲突自动换端口
+2. 后台启动 FastAPI 后端 + Vite 前端
+3. 健康检查通过后自动打开浏览器到 `http://localhost:5173`
+4. 系统托盘常驻，可启动 / 停止 / 重启 / 打开界面 / 强制退出
+
+### 手动启动（开发用）
+
 ```bash
-git clone <repository-url>
-cd 智能体集群
-```
-
-2. **启动后端**
-```bash
+# 1) 后端（http://127.0.0.1:8870）
 cd backend
 pip install -r requirements.txt
 python main.py
-```
-后端将在 `http://127.0.0.1:8870` 启动
 
-3. **启动前端**
-```bash
+# 2) 前端（http://localhost:5173）
 cd frontend
 npm install
 npm run dev
 ```
-前端将在 `http://localhost:5173` 启动
-
-4. **一键启动**（Windows）
-双击 `start.bat` 自动启动前后端和托盘程序
 
 ## 📖 使用指南
 
 ### 四步搭建集群
 
-1. **描述你的团队**
+1. **描述你的团队**  
    用自然语言描述角色分工，例如："产品经理 + 程序员 + QA"
-
-2. **编排师自动搭建**
+2. **编排师自动搭建**  
    内置编排师智能体自动创建智能体、编写提示词、建立连线
-
-3. **运行整队协作**
+3. **运行整队协作**  
    启动画布，各成员通过 A2A 消息接力工作
-
-4. **迭代进化**
+4. **迭代进化**  
    随时调整角色、连线、感知范围，集群越用越顺手
 
 ### 核心功能
@@ -92,7 +98,7 @@ npm run dev
 - **运行控制**：单节点运行、集群整体运行
 
 #### 对话界面
-- **流式输出**：实时显示智能体思考和执行过程
+- **流式输出**：实时显示智能体思考和执行过程（HTTP + SSE）
 - **消息溯源**：每条回复清楚标注来源智能体
 - **集群模式**：与整个集群对话，或指定单个智能体
 
@@ -100,113 +106,231 @@ npm run dev
 - **系统提示词**：自定义智能体行为和角色
 - **能力绑定**：关联命令、技能、插件
 - **触发规则**：配置任务触发条件
-- **感知范围**：link（仅连线邻居）或 global（画布全体）
+- **感知范围**：`link`（仅连线邻居）或 `global`（画布全体）
+
+#### 托盘菜单
+| 菜单项 | 说明 |
+|--------|------|
+| 状态 | 实时健康检查（✅ / ⚠️ / ⏹） |
+| 🚀 启动服务 | 拉起后端 + 前端 + 浏览器 |
+| 🔄 重启全部 | 优雅 terminate → 兜底 taskkill |
+| ⏹ 停止全部服务 | 停止子进程 + 释放端口 |
+| 🌐 打开界面 | 前端 |
+| ⚙ 后端健康检查 | `/api/health` |
+| ❌ 退出 (停服务) | 后台线程停服务，立即关托盘 |
+| ⚠️ 强制关闭托盘 | 只关托盘，子进程留给用户手动清理 |
 
 ## 🏗️ 架构
 
 ```
 ┌─────────────────────────────────────────┐
+│ Windows 系统托盘启动器                   │
+│ - start.bat                             │
+│ - start_tray.py (pystray)               │
+│ - 单实例互斥量 + 端口探活 + 健康轮询      │
+└─────────────────┬───────────────────────┘
+                  │
+┌─────────────────▼───────────────────────┐
 │ Vue 3 SPA 前端                          │
-│ - CanvasBoard 无限画布                 │
-│ - MainChat 流式对话                     │
+│ - CanvasBoard 无限画布                  │
+│ - MainView 流式对话（标明来源智能体）   │
 │ - AgentEditDialog 智能体配置            │
+│ - FileExplorerDialog 画布文件浏览器     │
+│ - RulesDialog 规则 / ParamSelect 预设   │
+│ - TopBar / RightPanel / WorkspaceOverlay │
 └─────────────────┬───────────────────────┘
                   │ HTTP + SSE
 ┌─────────────────▼───────────────────────┐
 │ FastAPI 后端 (localhost:8870)           │
-│ - /api/agents 智能体管理                │
-│ - /api/canvases 画布管理                │
-│ - /api/conversations 对话管理           │
+│ - 9 个数据域路由                        │
+│   agents / canvases / conversations     │
+│   rules / param_presets / agent_groups  │
+│   models / commands / settings          │
+│ - 存储管理 + 带白名单的文件浏览器         │
+│ - /api/fs/* 工作区文件读写接口           │
 └─────────────────┬───────────────────────┘
                   │ 调度 + function calling
 ┌─────────────────▼───────────────────────┐
 │ Core Engine (backend/core)              │
 │ - agent_runtime 运行时引擎              │
 │ - a2a 消息协议                          │
-│ - commands 工具链                       │
-│ - intent_classifier 意图分类            │
-│ - validator 独立验证器                  │
+│ - commands 工具链 + pyconsole 控制台    │
+│ - workflows plan/spec/goal 状态机       │
+│ - intent_classifier 意图分类（备用未接线）│
+│ - validator + tool_stream_validator     │
+│ - param_presets + vault 加密             │
+│ - workspace + file_backup 快照备份      │
+│ - store 统一数据访问 + llm 多模型容错    │
 └─────────────────┬───────────────────────┘
 ┌─────────────────▼───────────────────────┐
 │ 扩展层                                  │
-│ - 插件：浏览器/SMTP/HTTP               │
-│ - 技能：小说创作/角色扮演               │
-│ - 存储：AppData JSON + 加密             │
+│ - 插件：browser_control / SMTP / HTTP   │
+│ - 技能：小说创作 / 角色扮演 / Web 演示  │
+│ - 规划：MCP 外部服务器接入 + 插件市场    │
+│ - 存储：AppData JSON + Fernet 加密      │
 └─────────────────────────────────────────┘
 ```
 
 ### 技术栈
 
 **后端**
-- FastAPI 0.110+
 - Python 3.13
+- FastAPI 0.110+ / Uvicorn 0.29+
 - Pydantic 2.6+
+- APScheduler 3.10+
+- HTTPX 0.27+ / PyPDF 4.0+
 - 本地 JSON 存储 + Fernet 加密
 
 **前端**
-- Vue 3.4+
+- Vue 3.4+ / Vue Router 4.3+
 - Vite 5.4+
-- Pinia 状态管理
-- Vue Router 4.3+
+- Pinia 2.1+ 状态管理
+- VueUse 10.11+
 - TypeScript 5.5+
+- SCSS（`styles/liquid.scss`）
+
+**桌面 / 启动器**
+- `pystray` 系统托盘
+- `pythoncom` / `win32com` 快捷方式生成
+- Windows 命名互斥量（单实例）
 
 ## 📁 项目结构
 
 ```
 智能体集群/
-├── backend/                 # FastAPI 后端
-│   ├── api/                # API 路由
-│   │   ├── agents.py       # 智能体接口
-│   │   ├── canvases.py     # 画布接口
-│   │   └── ...
-│   ├── core/               # 核心引擎
-│   │   ├── agent_runtime.py # 运行循环
-│   │   ├── a2a.py          # A2A 协议
-│   │   ├── commands.py     # 命令工具
-│   │   └── ...
-│   ├── plugins/            # 插件系统
-│   └── skills/             # 技能包
-├── frontend/               # Vue 3 前端
+├── backend/                    # FastAPI 后端
+│   ├── api/                    # API 路由（9 个数据域）
+│   │   ├── agents.py           # 智能体接口
+│   │   ├── agent_groups.py     # 智能体分组接口
+│   │   ├── canvases.py         # 画布接口（含工作区文件 / 控制台）
+│   │   ├── commands.py         # 能力清单 / 插件接口
+│   │   ├── conversations.py    # 对话接口
+│   │   ├── models.py           # 模型接口
+│   │   ├── param_presets.py    # 参数预设接口
+│   │   ├── rules.py            # 规章制度接口
+│   │   └── settings.py         # 设置接口
+│   ├── core/                   # 核心引擎
+│   │   ├── agent_runtime.py    # 运行循环（工具循环 + 流式输出）
+│   │   ├── a2a.py              # A2A 信封协议（discuss / send_message）
+│   │   ├── commands.py         # 命令工具链 + cluster.* 编排工具
+│   │   ├── workflows.py        # plan / spec / goal 工作流状态机
+│   │   ├── pyconsole.py        # Python 交互式控制台
+│   │   ├── intent_classifier.py# 意图分类（备用未接线）
+│   │   ├── validator.py        # 独立验证器
+│   │   ├── tool_stream_validator.py # 工具流式校验
+│   │   ├── param_presets.py    # 参数预设业务
+│   │   ├── vault.py            # 参数加密（Fernet）
+│   │   ├── workspace.py        # 工作区文件管理
+│   │   ├── file_backup.py      # 写文件快照备份
+│   │   ├── store.py            # 统一数据访问
+│   │   └── llm.py              # 多模型容错接入
+│   ├── plugins/                # 插件桥接
+│   │   ├── http_request.py     # HTTP 请求插件
+│   │   ├── send_email.py       # SMTP 邮件插件
+│   │   ├── mcp_bridge.py       # MCP 服务器桥接（规划中）
+│   │   └── mcp_marketplace.py  # MCP 插件市场（规划中）
+│   ├── skills/                 # 内置技能
+│   │   ├── novel_writing.py    # 小说创作
+│   │   └── role_playing.py     # 角色扮演
+│   ├── mcp_vendor/             # MCP Python 二方包（已 vendored，待接通）
+│   ├── .runtime/               # 运行时密钥（param_preset.key）
+│   ├── main.py                 # FastAPI 入口（含 /api/fs/* 文件接口）
+│   └── requirements.txt
+│
+├── frontend/                   # Vue 3 前端
 │   ├── src/
-│   │   ├── components/     # UI 组件
-│   │   ├── views/          # 页面视图
-│   │   └── stores/         # Pinia 状态
+│   │   ├── components/         # CanvasBoard / MainView / AgentEditDialog /
+│   │   │                       # FileExplorerDialog / RulesDialog /
+│   │   │                       # ParamSelect / TopBar / RightPanel /
+│   │   │                       # WorkspaceOverlay / AgentList
+│   │   ├── views/              # Home.vue / Settings.vue
+│   │   ├── stores/             # Pinia 状态（agent/canvas/conversation/
+│   │   │                       # rules/model/settings/layout）
+│   │   ├── composables/        # 可复用组合式函数
+│   │   ├── styles/liquid.scss  # 液态玻璃风格样式
+│   │   ├── utils/              # avatar.ts / markdown.ts
+│   │   ├── api.ts              # HTTP 客户端封装
+│   │   ├── router.ts           # 路由
+│   │   └── App.vue
+│   ├── public/                 # icon.png 等静态资源
+│   ├── vite.config.ts
 │   └── package.json
-├── AppData/                # 用户数据存储
-│   ├── agents/             # 智能体配置
-│   ├── canvases/           # 画布配置
-│   ├── conversations/      # 对话记录
-│   └── plugins/            # 插件配置
-└── start.bat              # Windows 一键启动
+│
+├── AppData/                    # 用户数据存储（可切换位置）
+│   ├── settings.json           # 全局设置
+│   ├── mcp_servers.json        # MCP 服务器配置（预留，待接通）
+│   ├── agents/                 # 智能体配置
+│   ├── agent_groups/           # 智能体分组
+│   ├── canvases/               # 画布配置 + 工作区文件
+│   ├── conversations/          # 对话记录
+│   ├── rules/                  # 规章制度
+│   ├── workflows/              # 工作流状态（plan/spec/goal）
+│   ├── file_backups/           # 文件快照备份
+│   ├── skills/                 # 技能包（SKILL.md）
+│   ├── plugins/                # 插件（manifest / tool.yaml / tool.py）
+│   ├── model_interfaces/       # 模型接口配置
+│   ├── param_presets/          # 参数预设
+│   └── _legacy/                # 迁移前的旧格式数据
+│
+├── start.bat                   # Windows 一键启动（自动选 pythonw / python）
+├── start_tray.py               # 系统托盘启动器（单实例 + 健康检查 + 菜单）
+├── 智能体集群.lnk              # 桌面 / 根目录快捷方式
+└── .agentcluster.pid           # 运行时 PID 文件
 ```
 
 ## 🎬 演示
 
-演示视频和截图请查看 `演示图片/` 目录：
-- `image_30.png` - 完整界面展示
-- `image_31.png` - 画布编排界面
-- `image_32.png` - 智能体协作关系
-- `image_33.png` - 集群配置面板
+演示视频和截图请查看 `智能体集群介绍/演示图片/` 目录：
+- `cover-slide.png` — 封面展示
+- `feature-slide.png` — 核心能力总览
+- `image_30.png` — 完整界面展示
+- `image_31.png` — 画布编排界面
+- `image_32.png` — 智能体协作关系
+- `image_33.png` — 集群配置面板
 
-产品介绍 PPT：`AgentCluster-产品介绍-实拍.html`
+产品介绍 PPT：`智能体集群介绍/AgentCluster-产品介绍-实拍.html`
+
+## 🛠 常见问题
+
+**Q：启动时浏览器反复弹出？**  
+托盘通过 Windows 命名互斥量（`Local\AgentCluster_Tray_SingleInstance`）保证单实例。若仍出现多实例，通常是老进程未退出——先运行「⚠️ 强制关闭托盘」再重试。
+
+**Q：端口被占用怎么办？**  
+启动器会自动探测 8870 / 5173，冲突时会换端口；托盘状态栏显示 ⚠️ 时请检查 `tray_startup.log` / `debug.log`。
+
+**Q：数据能搬到别的机器吗？**  
+把整个 `AppData/` 目录拷走即可（含加密密钥在 `backend/.runtime/`，一起拷）。也可以在「设置 → 存储位置」一键迁移数据根目录。
 
 ## 🤝 贡献
 
 欢迎贡献代码、报告问题或提出建议！
 
 1. Fork 项目
-2. 创建特性分支 (`git checkout -b feature/xxx`)
-3. 提交更改 (`git commit -m 'Add xxx'`)
-4. 推送分支 (`git push origin feature/xxx`)
+2. 创建特性分支 `git checkout -b feature/xxx`
+3. 提交更改 `git commit -m "Add xxx"`
+4. 推送分支 `git push origin feature/xxx`
 5. 提交 Pull Request
 
 ## 📝 开发路线图
 
-- [ ] 多模型支持优化
-- [ ] 集群模板市场
-- [ ] 协作编辑模式
-- [ ] 性能监控面板
-- [ ] 插件开发 SDK
+**已完成**
+- [x] 画布工作目录与内置文件浏览器（运行 / 编辑 / 回收站）
+- [x] 规章制度系统（按画布隔离）
+- [x] 参数预设 + 智能体分组
+- [x] 工作流模式（plan / spec / goal）
+- [x] Python 交互式控制台
+- [x] 工具流式校验器（防止工具调用参数被幻觉 / 截断）
+- [x] 写文件快照备份、存储位置可切换
+- [x] Windows 系统托盘单实例启动器（start_tray.py）
+- [x] 多模型容错接入（core/llm.py）
+
+**规划中**
+- [ ] MCP 外部服务器接入 + 插件市场（backend/mcp_vendor 已 vendored，待接通）
+- [ ] 集群模板市场（一键复用编排方案）
+- [ ] 协作编辑模式（多人同画布）
+- [ ] 性能监控面板（运行时指标可视化）
+- [ ] 插件开发 SDK（标准化第三方插件接入）
+- [ ] 跨平台支持（macOS / Linux 托盘 + 启动器）
 
 ## 📄 许可证
 
@@ -214,9 +338,7 @@ MIT License
 
 ## 📞 联系
 
-如有问题或建议，请通过以下方式联系：
-- Issues: 项目 GitHub Issues
-- 文档: `/.trae/specs/agent-cluster-polish/`
+- Issues：项目 GitHub Issues`
 
 ## 🙏 致谢
 
@@ -224,4 +346,4 @@ MIT License
 
 ---
 
-**AgentCluster v0.2** - 让 AI 团队像人类团队一样协作
+**AgentCluster v2.0.0** — 让 AI 团队像人类团队一样协作

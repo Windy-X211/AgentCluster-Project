@@ -1,4 +1,8 @@
+/AppData/
 /.trae
+/.arts
+/.codeartsdoer
+/.pytest_cache
 /debug.log
 /tray_debug.log
 /_deck_shots
@@ -9,6 +13,9 @@
 **/*.pyd
 *.log
 *.pid
+*.mp4
+/.startup_status
+/backend/*_screen.png
 /.runtime
 **/.runtime/
 /frontend/node_modules/
