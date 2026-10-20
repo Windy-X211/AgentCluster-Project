@@ -1863,7 +1863,7 @@ onBeforeUnmount(() => {
               <template v-else>U</template>
             </div>
             <div class="bubble markdown user-bubble" v-html="msgBubbleHtml(it.msg)"></div>
-            <span class="hint-right">右键删除/撤销</span>
+
           </div>
 
           <!-- ===== 一轮智能体输出（靠左）=====
