@@ -1,4 +1,6 @@
-/AppData/
+/AppData/*
+!/AppData/plugins/
+!/AppData/skills/
 /.trae
 /.arts
 /.codeartsdoer

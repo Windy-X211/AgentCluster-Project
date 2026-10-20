@@ -1,0 +1,76 @@
+# send_email 插件的 tool 定义
+identity:
+  name: "send_email"
+  author: "AgentCluster"
+version: "0.0.1"
+
+description:
+  zh_Hans: "通过 SMTP 发送文本邮件。可直接用 provider 预设（qq/163/gmail/outlook/exmail），也可手动指定 smtp_server/port/ssl。password 通常是邮箱授权码而非登录密码。"
+  en_US: "Send plain-text email via SMTP. Use provider preset or specify custom server/port/ssl."
+
+parameters:
+  - name: "provider"
+    type: string
+    required: false
+    description: "可选：快速选择预设。qq / 163 / gmail / outlook / exmail"
+    enum: ["qq", "163", "gmail", "outlook", "exmail"]
+
+  - name: "smtp_server"
+    type: string
+    required: false
+    description: "SMTP 服务器地址（provider 有值时可省略）"
+
+  - name: "smtp_port"
+    type: integer
+    required: false
+    default: 465
+    description: "SMTP 端口（provider 有值时可省略）"
+
+  - name: "use_ssl"
+    type: boolean
+    required: false
+    default: true
+    description: "是否 SSL 加密（provider 有值时可省略）"
+
+  - name: "username"
+    type: string
+    required: true
+    description: "邮箱账号（一般是完整邮箱地址）"
+
+  - name: "password"
+    type: string
+    required: true
+    description: "授权码 / SMTP 密码（不是邮箱登录密码）"
+
+  - name: "from_addr"
+    type: string
+    required: false
+    description: "发件人显示地址，默认用 username"
+
+  - name: "to_addrs"
+    type: string
+    required: true
+    description: "收件人列表，逗号或中文分号分隔"
+
+  - name: "subject"
+    type: string
+    required: false
+    default: "(无主题)"
+    description: "邮件主题"
+
+  - name: "body"
+    type: string
+    required: false
+    default: ""
+    description: "邮件正文（纯文本）"
+
+outputs:
+  - name: "ok"
+    type: boolean
+    description: "是否发送成功"
+  - name: "sent_to"
+    type: array
+    description: "实际收件人列表"
+  - name: "error"
+    type: string
+    description: "失败原因（成功时不存在）"

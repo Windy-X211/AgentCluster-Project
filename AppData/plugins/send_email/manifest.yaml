@@ -1,0 +1,14 @@
+# send_email 插件 — Dify 兼容 manifest.yaml
+version: "0.0.1"
+type: "plugin"
+name: "send_email"
+label:
+  zh_Hans: "发送邮箱"
+  en_US: "Send Email"
+author: "AgentCluster"
+description:
+  zh_Hans: "通过 SMTP 发送文本邮件。内置 QQ/163/Gmail/Outlook/企业邮箱预设。"
+  en_US: "Send plain-text email via SMTP. Presets for QQ, 163, Gmail, Outlook."
+version_code: 1
+icon: "📧"
+tags: ["email", "smtp", "notification"]
