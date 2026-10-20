@@ -1063,6 +1063,7 @@ export const useConvStore = defineStore('conv', {
             msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
           }
         }
+
       } else if (line.startsWith('F:')) {
         // 最终完整文本（通常前端不需要，已经有流式拼接了）
         this._callTargetOutputted(cid)

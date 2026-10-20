@@ -228,11 +228,18 @@ def _handle_txt2img(kwargs: dict) -> dict:
     seed, info_text, _ = _extract_seed_and_info(data)
     files = _save_images([str(x) for x in images], save_dir, seed)
 
+    image_data_url = None
+    if files:
+        from urllib.parse import quote
+        image_data_url = f"/api/fs/image?path={quote(str(files[0]), safe='')}"
+
     return {
         "ok": True,
         "action": "txt2img",
         "file": files[0] if files else None,
         "files": files,
+        "image_data_url": image_data_url,
+        "purpose": "share" if files else None,
         "count": len(files),
         "seed": seed,
         "prompt": payload["prompt"],
@@ -292,11 +299,18 @@ def _handle_img2img(kwargs: dict) -> dict:
     seed, info_text, _ = _extract_seed_and_info(data)
     files = _save_images([str(x) for x in images], save_dir, seed)
 
+    image_data_url = None
+    if files:
+        from urllib.parse import quote
+        image_data_url = f"/api/fs/image?path={quote(str(files[0]), safe='')}"
+
     return {
         "ok": True,
         "action": "img2img",
         "file": files[0] if files else None,
         "files": files,
+        "image_data_url": image_data_url,
+        "purpose": "share" if files else None,
         "count": len(files),
         "seed": seed,
         "denoising_strength": payload["denoising_strength"],

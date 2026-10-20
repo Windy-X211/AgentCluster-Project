@@ -331,12 +331,14 @@ def _truncate_tool_result(result: Any, is_image: bool = False) -> str:
     """
     if isinstance(result, dict):
         if is_image:
-            # —— 图片：pop 掉所有含 base64 的长字段 ——
-            # 插件可能塞 data、image_data_url 任何一种，或者两种都塞；统一清掉，
-            # tool role 消息里完全不承载图片二进制。
+            # —— 图片：pop 掉 base64 data 和 _note ——
+            # image_data_url 如果是 data: 开头的大 base64 → pop（太大会撑爆 R: 行）
+            # 如果是短 URL（如 /api/fs/image?path=...）→ 保留，前端直接用它渲染缩略图
+            _iu = result.get("image_data_url")
+            _pop_iu = isinstance(_iu, str) and _iu.startswith("data:")
             result = {
                 k: v for k, v in result.items()
-                if k not in ("data", "image_data_url", "_note")
+                if k not in ("data", "_note") and not (k == "image_data_url" and _pop_iu)
             }
             result["data"] = "[图片]"
         else:
@@ -1387,6 +1389,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 conv["messages"].append({**tool_msg, "ts": datetime.utcnow().isoformat(),
                                          **({"relay": True} if is_relay else {})})
                 yield f"R:{tc['id']}|{result_str}\n"
+
                 tool_history.append({"name": tc["name"], "args": args, "result": result})
             # 进入慢通道循环
         else:
@@ -1688,6 +1691,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     tool_entry["relay"] = True
                 conv["messages"].append(tool_entry)
                 yield f"R:{tc['id']}|{result_str}\n"
+
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
 
             # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
