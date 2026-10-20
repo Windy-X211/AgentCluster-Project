@@ -289,18 +289,96 @@ watch([() => agents.list, () => agents.groups, agentGroupsByColumn], async () =>
     syncDdMetrics()
   }
 })
-function onWinResizeDd() { if (agentDdOpen.value) { updateDdPos(); syncDdMetrics() } }
+function onWinResizeDd() { if (agentDdOpen.value) { updateDdPos(); syncDdMetrics() }; modelDdOpen.value = false }
 onMounted(() => {
   document.addEventListener('mousedown', onAgentDdOutside)
+  document.addEventListener('mousedown', onModelDdOutside)
   window.addEventListener('resize', onWinResizeDd)
 })
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onAgentDdOutside)
+  document.removeEventListener('mousedown', onModelDdOutside)
   window.removeEventListener('resize', onWinResizeDd)
   window.removeEventListener('mousemove', onThumbMove)
   window.removeEventListener('mouseup', onThumbUp)
 })
 // ============ 智能体分组下拉 end ============
+
+// ============ 模型快速切换下拉（接口 + 具体模型，修改当前选中智能体） ============
+const modelDdOpen = ref(false)
+const modelTriggerEl = ref<HTMLElement | null>(null)
+const modelPopEl = ref<HTMLElement | null>(null)
+const modelPosStyle = ref<Record<string, string>>({})
+
+const currentAgent = computed(() => agents.list.find((a: any) => a.id === currentAgentId.value) || null)
+
+/** 当前选中智能体的模型标签：接口名 · 具体模型名；未指定接口时用「默认」 */
+function currentModelLabel(): string {
+  const a = currentAgent.value
+  if (!a) return '选择模型'
+  const mi = models.list.find((m: any) => m.id === a.interface_id)
+  const modelName = a.model || mi?.default_model || ''
+  if (!modelName) return mi?.name || '默认'
+  return `${mi?.name || '?'} · ${modelName}`
+}
+
+/** 接口下可选模型列表：default_model 兜底置顶 */
+function ifaceModelList(mi: any): string[] {
+  const list = [...(mi?.models || [])]
+  if (mi?.default_model && !list.includes(mi.default_model)) list.unshift(mi.default_model)
+  return list
+}
+
+/** 该接口/模型是否是当前智能体正在使用的 */
+function isModelActive(ifaceId: number, modelName: string): boolean {
+  const a = currentAgent.value
+  if (!a || a.interface_id !== ifaceId) return false
+  if (a.model === modelName) return true
+  if (!a.model) {
+    const mi = models.list.find((m: any) => m.id === ifaceId)
+    return mi?.default_model === modelName
+  }
+  return false
+}
+
+async function selectModel(ifaceId: number, modelName: string) {
+  const a = currentAgent.value
+  modelDdOpen.value = false
+  if (!a) return
+  await agents.update(a.id, { ...a, interface_id: ifaceId, model: modelName })
+}
+
+function toggleModelDd() { modelDdOpen.value = !modelDdOpen.value }
+
+function updateModelDdPos() {
+  const pop = modelPopEl.value
+  const trigger = modelTriggerEl.value
+  if (!pop || !trigger) return
+  const tr = trigger.getBoundingClientRect()
+  const popH = pop.offsetHeight || 320
+  let top = tr.top - popH - 6
+  if (top < 8) top = tr.bottom + 6
+  modelPosStyle.value = {
+    position: 'fixed',
+    left: tr.left + 'px',
+    width: '300px',
+    maxWidth: (window.innerWidth - tr.left - 8) + 'px',
+    top: top + 'px',
+  }
+}
+
+function onModelDdOutside(e: MouseEvent) {
+  if (!modelDdOpen.value) return
+  const tgt = e.target as Node
+  if (modelTriggerEl.value && modelTriggerEl.value.contains(tgt)) return
+  if (modelPopEl.value && modelPopEl.value.contains(tgt)) return
+  modelDdOpen.value = false
+}
+
+watch(modelDdOpen, async (open) => {
+  if (open) { await nextTick(); updateModelDdPos() }
+})
+// ============ 模型快速切换下拉 end ============
 
 const conv = computed(() => convs.currentData())
 const canvas = computed(() => canvases.current)
@@ -939,6 +1017,37 @@ function shrinkToDataUrl(file: File, max = 256): Promise<string> {
 
 // —— 删除单条消息：截断到这条之前 ——
 const msgOpStatus = ref('')
+// —— 复制消息文本到剪贴板（用户/智能体消息通用） ——
+async function copyMessageFromCtx() {
+  const menu = msgCtxMenu.value
+  closeMsgCtx()
+  if (!menu) return
+  const m = visibleMsgs.value[menu.msgIdx]
+  const text = (m?.content || '').replace(/\s+$/, '')
+  if (!text) {
+    msgOpStatus.value = '（该消息无文本可复制）'
+    setTimeout(() => { msgOpStatus.value = '' }, 2000)
+    return
+  }
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    msgOpStatus.value = '✅ 已复制到剪贴板'
+  } catch {
+    msgOpStatus.value = '❌ 复制失败'
+  }
+  setTimeout(() => { msgOpStatus.value = '' }, 2000)
+}
 async function deleteMessageFromCtx() {
   const menu = msgCtxMenu.value
   closeMsgCtx()
@@ -980,6 +1089,71 @@ async function undoFromCtx() {
     msgOpStatus.value = '❌ 撤销失败: ' + (r.msg || '未知错误')
   }
   setTimeout(() => { msgOpStatus.value = '' }, 4000)
+}
+
+// —— 编辑用户消息（仅最新一条）：撤销本轮对话并重新发送修改内容 ——
+const editDlg = ref<{ open: boolean; content: string; agentId: number | null; msgIdx: number }>(
+  { open: false, content: '', agentId: null, msgIdx: -1 }
+)
+
+/** 该用户消息是否是最新一条用户消息（其后不再有 user 消息） */
+function isLastUserMsg(idx: number): boolean {
+  const msgs = visibleMsgs.value
+  if (!msgs[idx] || msgs[idx].role !== 'user') return false
+  for (let i = idx + 1; i < msgs.length; i++) {
+    if (msgs[i].role === 'user') return false
+  }
+  return true
+}
+
+/** 该用户消息之后第一个 assistant 的 agent_id（作为重新发送的目标智能体） */
+function agentIdAfterUserMsg(rawIdx: number): number | null {
+  const msgs = conv.value?.messages || []
+  for (let i = rawIdx + 1; i < msgs.length; i++) {
+    const x = msgs[i]
+    if (x.role === 'assistant' && x.agent_id != null) return x.agent_id
+  }
+  return null
+}
+
+function editMessageFromCtx() {
+  const menu = msgCtxMenu.value
+  if (!menu) return
+  const c = conv.value
+  const m = visibleMsgs.value[menu.msgIdx]
+  if (!c || !m || m.role !== 'user') return
+  let rawIdx = (c.messages || []).indexOf(m)
+  if (rawIdx < 0) rawIdx = menu.msgIdx
+  const agentId = agentIdAfterUserMsg(rawIdx) ?? currentAgentId.value ?? agents.list[0]?.id ?? null
+  closeMsgCtx()
+  editDlg.value = { open: true, content: m.content || '', agentId, msgIdx: menu.msgIdx }
+}
+
+async function confirmEditMessage() {
+  const dlg = editDlg.value
+  const text = (dlg.content || '').trim()
+  if (!text) {
+    msgOpStatus.value = '❌ 内容不能为空'
+    setTimeout(() => { msgOpStatus.value = '' }, 2000)
+    return
+  }
+  if (dlg.agentId == null) {
+    editDlg.value = { ...dlg, open: false }
+    msgOpStatus.value = '❌ 找不到目标智能体'
+    setTimeout(() => { msgOpStatus.value = '' }, 2000)
+    return
+  }
+  editDlg.value = { ...dlg, open: false }
+  msgOpStatus.value = '正在撤销并重新发送…'
+  const r = await convs.undoFromUserMessage(dlg.msgIdx)
+  if (!r.ok) {
+    msgOpStatus.value = '❌ 撤销失败: ' + (r.msg || '未知错误')
+    setTimeout(() => { msgOpStatus.value = '' }, 3000)
+    return
+  }
+  stickBottom.value = true
+  await convs.send(dlg.agentId, text)
+  setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
 }
 
 const fileOpsDlg = ref<{ open: boolean; loading: boolean; ops: FileOp[]; sinceTs: string; msgContent: string }>(
@@ -1401,7 +1575,7 @@ async function deleteSelected() {
 }
 function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true }
 function onDocKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel() }
+    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false }
 }
 
 onMounted(async () => {
@@ -1552,6 +1726,16 @@ onBeforeUnmount(() => {
              class="msg-ctx-menu"
              :style="{ left: msgCtxMenu.x + 'px', top: msgCtxMenu.y + 'px' }"
               @click.stop @mousedown.stop>
+          <!-- 复制（所有消息通用） -->
+          <div class="msg-ctx-item" @click.stop="copyMessageFromCtx">
+            <span class="msg-ctx-icon">📋</span>
+            <span>复制</span>
+          </div>
+          <!-- 修改（仅用户最新一条消息） -->
+          <div v-if="msgCtxMenu.role === 'user' && isLastUserMsg(msgCtxMenu.msgIdx)" class="msg-ctx-item" @click.stop="editMessageFromCtx">
+            <span class="msg-ctx-icon">✏️</span>
+            <span>修改此消息并重新发送</span>
+          </div>
           <!-- 删除消息（所有消息通用） -->
           <div class="msg-ctx-item" @click.stop="deleteMessageFromCtx">
             <span class="msg-ctx-icon">🗑</span>
@@ -1618,6 +1802,28 @@ onBeforeUnmount(() => {
                 </div>
               </template>
               <div v-if="restoreResult" class="restore-result">{{ restoreResult }}</div>
+            </div>
+          </div>
+        </div>
+      </Teleport>
+      <!-- 编辑用户消息对话框（修改后撤销本轮并重新发送） -->
+      <Teleport to="body">
+        <div v-if="editDlg.open" class="modal-backdrop" @click.self="editDlg.open = false">
+          <div class="modal edit-msg-modal" @click.stop>
+            <div class="modal-header">
+              <span class="modal-title">✏️ 修改消息并重新发送</span>
+              <button class="btn sm ghost" @click="editDlg.open = false">✕</button>
+            </div>
+            <div class="modal-sub">
+              保存后将撤销这条用户消息及其后智能体的回复（含还原文件操作），并把新内容重新发送给智能体。
+            </div>
+            <div class="modal-body">
+              <textarea class="input input-ta edit-msg-ta" v-model="editDlg.content" placeholder="输入修改后的内容..."
+                        @keydown.ctrl.enter.prevent="confirmEditMessage" @keydown.meta.enter.prevent="confirmEditMessage"></textarea>
+            </div>
+            <div class="edit-msg-actions">
+              <button class="btn ghost" @click="editDlg.open = false">取消</button>
+              <button class="btn" @click="confirmEditMessage">修改并重新发送</button>
             </div>
           </div>
         </div>
@@ -1868,6 +2074,37 @@ onBeforeUnmount(() => {
                     <div class="dd-thumb" :style="ddThumbStyle"
                          @mousedown.stop="onThumbDown"></div>
                   </div>
+                </div>
+              </div>
+            </Teleport>
+          </div>
+          <!-- 模型快速切换下拉（接口 + 具体模型，作用于当前选中智能体） -->
+          <div class="model-dd">
+            <button type="button" class="agent-dd-trigger model-dd-trigger" ref="modelTriggerEl"
+                    :disabled="!currentAgent"
+                    :title="currentAgent ? '切换当前智能体使用的模型' : '请先选择智能体'"
+                    @click.stop="toggleModelDd">
+              <span class="dd-icon">🔌</span>
+              <span class="dd-name">{{ currentModelLabel() }}</span>
+              <span class="dd-chev" :class="{ open: modelDdOpen }">▾</span>
+            </button>
+            <Teleport to="body">
+              <div v-if="modelDdOpen" class="agent-dd-pop model-dd-pop" ref="modelPopEl" :style="modelPosStyle" @click.stop>
+                <div v-if="!models.list.length" class="dd-empty">暂无模型接口，请到「设置」页配置</div>
+                <div v-else class="model-iface-list">
+                  <template v-for="mi in models.list" :key="mi.id">
+                    <div class="model-iface-head">
+                      <span class="model-iface-name" :title="mi.name">{{ mi.name }}</span>
+                      <span class="dd-col-count">{{ ifaceModelList(mi).length }}</span>
+                    </div>
+                    <div v-for="mid in ifaceModelList(mi)" :key="mid"
+                         class="dd-item model-item" :class="{ active: isModelActive(mi.id, mid) }"
+                         @click="selectModel(mi.id, mid)">
+                      <span class="dd-item-dot"></span>
+                      <span class="dd-item-name">{{ mid }}</span>
+                      <span v-if="mi.default_model === mid" class="model-default-tag">默认</span>
+                    </div>
+                  </template>
                 </div>
               </div>
             </Teleport>
@@ -2331,6 +2568,32 @@ onBeforeUnmount(() => {
 }
 .dd-thumb:hover { filter: brightness(1.12); }
 .dd-thumb:active { cursor: grabbing; filter: brightness(1.2); }
+/* ============ 模型快速切换下拉 ============ */
+.model-dd { position: relative; flex-shrink: 0; display: inline-flex; align-items: center; }
+.model-dd-trigger { color: rgba(180, 200, 245, 0.92); background: rgba(180,114,255,0.10); border-color: rgba(180,114,255,0.28); max-width: 200px; }
+.model-dd-trigger:hover { background: rgba(180,114,255,0.18); border-color: rgba(180,114,255,0.45); }
+.model-dd-trigger:disabled { opacity: .5; cursor: not-allowed; }
+.model-dd-trigger:disabled:hover { background: rgba(180,114,255,0.10); border-color: rgba(180,114,255,0.28); }
+.model-dd-pop { max-height: min(420px, calc(100vh - 140px)); }
+.model-iface-list { overflow-y: auto; max-height: min(400px, calc(100vh - 160px)); display: flex; flex-direction: column; gap: 2px; }
+.model-iface-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 6px 8px 4px; margin-top: 2px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+.model-iface-head:first-child { margin-top: 0; border-top: none; }
+.model-iface-name {
+  font-size: 11.5px; font-weight: 600; color: var(--purple-ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.model-item { padding-left: 14px; }
+.model-item.active { background: rgba(180,114,255,0.24); box-shadow: inset 0 0 0 1px rgba(180,114,255,0.4); }
+.model-default-tag {
+  flex-shrink: 0; font-size: 10px; color: var(--purple-ink);
+  background: rgba(180,114,255,0.18); border: 1px solid rgba(180,114,255,0.3);
+  padding: 0 5px; border-radius: 999px; line-height: 1.5;
+}
+
 .row2 { display: flex; gap: 6px; align-items: flex-end; }
 .sm { padding: 3px 8px; font-size: 11px; }
 .input-ta { min-height: 44px; max-height: 100px; resize: vertical; font-family: inherit; }
@@ -2683,6 +2946,20 @@ onBeforeUnmount(() => {
   line-height: 1.5;
 }
 .modal-body { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+
+/* —— 编辑用户消息对话框 —— */
+.modal.edit-msg-modal {
+  width: 560px;
+  max-width: 94vw;
+  max-height: 86vh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.edit-msg-ta { min-height: 120px; resize: vertical; font-family: inherit; }
+.edit-msg-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 12px 16px; border-top: 1px solid rgba(255,255,255,0.08);
+}
 
 /* 工具栏 */
 .ops-toolbar {

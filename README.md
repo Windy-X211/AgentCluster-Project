@@ -423,4 +423,4 @@ npm run dev
 
 ---
 
-**AgentCluster v2.0.1** — 让 AI 团队像人类团队一样协作
+**AgentCluster v2.0.1** — 让 AI 团队像人类团队一样协作！！！
