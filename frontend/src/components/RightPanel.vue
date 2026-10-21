@@ -568,19 +568,45 @@ function hasTools(idx: number): boolean {
   const tools = toolsOfAssistant(idx)
   return tools.some((t: any) => t.role === 'tool_call')
 }
-/** 提取 assistant 消息下所有 purpose=share 的截图 data URL（渲染成对话区缩略图用） */
-function shareScreenshotsOfAssistant(idx: number): string[] {
-  const out: string[] = []
+/** 提取 assistant 消息下 tool_result 的所有图片引用（data_url / file 路径），供对话区缩略图渲染。
+ *  覆盖：后端 I: 行 image_refs、历史持久化 images 字段、以及兜底 legacy 的 image_data_url 字段。 */
+function imageRefsOfAssistant(idx: number): Array<{ type: 'data_url' | 'file'; src: string }> {
+  const out: Array<{ type: 'data_url' | 'file'; src: string }> = []
+  const seen = new Set<string>()
+  const add = (r: { type: 'data_url' | 'file'; src: string }) => {
+    if (r.src && !seen.has(r.src)) { seen.add(r.src); out.push(r) }
+  }
   const tools = toolsOfAssistant(idx)
   for (const t of tools) {
     if (t.role !== 'tool_result') continue
-    // 优先读顶层 image_data_url（后端 purpose=share 时显式带上），
-    // 兜底从 result JSON 里取 image_data_url / data（含 content_type=image 时）
-    if (t.image_data_url) out.push(t.image_data_url)
-    else if (t.result?.image_data_url) out.push(t.result.image_data_url)
+    // 1) 新通道：后端 I: 行 / 持久化 images 字段 → image_refs
+    const refs = t.image_refs || t.images
+    if (Array.isArray(refs)) {
+      for (const r of refs) {
+        if (r?.type === 'data_url' || r?.type === 'file') add(r)
+      }
+    }
+    // 2) 兜底 legacy：顶层 image_data_url（browser_control share 模式）
+    if (typeof t.image_data_url === 'string') {
+      add({ type: 'data_url', src: t.image_data_url })
+    }
+    // 3) 兜底 legacy：result JSON 里的 image_data_url（旧版可能直接塞在 result 里）
+    if (typeof t.result?.image_data_url === 'string') {
+      add({ type: 'data_url', src: t.result.image_data_url })
+    }
   }
   return out
 }
+/** 把图片引用解析为可用于 <img src=> 的 URL：
+ *  data_url → 原样返回；file 路径 → 走后端 /api/fs/image 接口按需加载 */
+function resolveImgSrc(ref: { type: 'data_url' | 'file'; src: string }): string {
+  if (ref?.type === 'file' && ref.src) {
+    return `/api/fs/image?path=${encodeURIComponent(ref.src)}`
+  }
+  return ref?.src || ''
+}
+/** @deprecated 用 imageRefsOfAssistant 替代。保留引用以兼容潜在的旧调用点。 */
+const shareScreenshotsOfAssistant = imageRefsOfAssistant
 function toolBarIsOpen(idx: number): boolean {
   return toolBarOpen.value.has(idx)
 }
@@ -2001,13 +2027,15 @@ onBeforeUnmount(() => {
                       <!-- 非末条正文（停止后留在过程框里，未被提出） -->
                       <div v-else-if="!isStreamingMsg(ch.msg) && !isPromotedMessage(ch.idx) && trimMsgContent(ch.msg.content)" class="bubble markdown" v-html="msgBubbleHtml(ch.msg)"></div>
 
-                      <!-- Share 截图缩略图：purpose=share 的 screenshot 结果挂在 assistant 消息下，
-                           点开可放大查看；数据保存在 AppData 对话记录里，不再写独立截图文件夹 -->
-                      <div v-if="shareScreenshotsOfAssistant(ch.idx).length" class="share-shots">
-                        <div v-for="(src, si) in shareScreenshotsOfAssistant(ch.idx)" :key="si" class="share-shot">
-                          <img :src="src" alt="browser screenshot" loading="lazy"
+                      <!-- 工具返回图片缩略图：覆盖本地生图（sd_webui）、浏览器截图（browser_control）、
+                           桌面截图（desktop_control）、网络下载图片等所有能返回图片的插件/技能。
+                           data_url 直接嵌 <img>，file 路径走 /api/fs/image 按需加载。
+                           点击放大查看（复用灯箱） -->
+                      <div v-if="imageRefsOfAssistant(ch.idx).length" class="share-shots">
+                        <div v-for="(ref, si) in imageRefsOfAssistant(ch.idx)" :key="si" class="share-shot">
+                          <img :src="resolveImgSrc(ref)" :alt="'tool result image ' + (si + 1)" loading="lazy"
                                class="share-shot-img"
-                               @click.stop="openLightbox(src)" />
+                               @click.stop="openLightbox(resolveImgSrc(ref))" />
                         </div>
                       </div>
 

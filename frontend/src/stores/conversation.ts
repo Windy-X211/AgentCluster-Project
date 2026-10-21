@@ -61,8 +61,12 @@ export interface RichMsg {
   image_data_url?: string
   image_content_type?: string
   purpose?: string
-  // 工具生成的图片本地路径列表（通过 IMAGE: 流式行传输），前端用 /api/fs/image 加载
+  // 历史兼容：上游 IMAGE: 流式行留下的本地文件路径数组，fetch 时映射到 image_refs
   images?: string[]
+  /** 统一的图片引用列表（后端 I: 行 / 持久化 images 字段）。
+   *  type="data_url" → src 是 data:image/...base64 直接渲染
+   *  type="file" → src 是本地绝对路径，前端通过 /api/fs/image 加载 */
+  image_refs?: Array<{ type: 'data_url' | 'file'; src: string }>
 }
 
 // —— 简化 cron 匹配：5 字段（分 时 日 月 周），支持 * , - / ——
@@ -546,7 +550,13 @@ export const useConvStore = defineStore('conv', {
       // 防止之前异常中断被持久化的 streaming:true 在重开后渲染成"空泡泡+永久闪烁光标"
       for (const c of list) {
         for (const m of c?.messages || []) {
-          if (m && typeof m === 'object' && m.streaming) m.streaming = false
+          if (m && typeof m === 'object') {
+            if (m.streaming) m.streaming = false
+            // 后端持久化字段 images → 前端统一 image_refs
+            if (!m.image_refs && Array.isArray(m.images) && m.images.length) {
+              m.image_refs = m.images
+            }
+          }
         }
       }
       this.list = sortConvsByActivity(list)
@@ -689,7 +699,7 @@ export const useConvStore = defineStore('conv', {
       if (this.current == null) await this.create()
       const c = this.currentData()
       const cid = this.current!  // 捕获本次发送的会话 id：整个流程（含 finally）都按此 id 操作，
-                                  // 用户中途切换会话不会影响本流的收尾与状态复位
+      // 用户中途切换会话不会影响本流的收尾与状态复位
 
       // 文字触发：运行中且命中某智能体的 message 触发 → 替换目标
       if (this.running) {
@@ -929,7 +939,8 @@ export const useConvStore = defineStore('conv', {
       if (line.startsWith('E:')) {
         // 后端错误行（LLM 调用失败/运行时异常/上游 HTTP 错误）→ 必须呈现给用户，
         // 否则表现为"无缘无故停止运行"
-        const text = line.slice(2)
+        // ⚠️ 后端 _esc 转义了 err_msg 内的 \n/\r/\\（防止多行异常详情破坏行协议），这里用 _unesc 还原
+        const text = _unesc(line.slice(2))
         if (lastAssistant && lastAssistant.role === 'assistant' && lastAssistant.streaming) {
           lastAssistant.content = ((lastAssistant.content || '') + (lastAssistant.content ? '\n\n' : '') + text)
         } else {
@@ -1066,21 +1077,37 @@ export const useConvStore = defineStore('conv', {
             msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
           }
         }
-
+      } else if (line.startsWith('I:')) {
+        // 图片引用（紧接 R: 行之后）：id|{json refs}
+        const rest = line.slice(2); const sep = rest.indexOf('|')
+        const tcId = rest.slice(0, sep), refsJson = rest.slice(sep + 1)
+        let refs: any[] = []
+        try { refs = JSON.parse(refsJson) } catch { refs = [] }
+        if (!Array.isArray(refs)) refs = []
+        // 找到刚刚的 tool_result 消息（按 tcId 匹配，取最后一条），把图片引用挂上去
+        let target: RichMsg | undefined
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i]
+          if (m.role === 'tool_result' && m.tool_call_id === tcId) { target = m; break }
+        }
+        if (target) target.image_refs = refs
       } else if (line.startsWith('IMAGE:')) {
-        // 工具生成的图片本地路径：IMAGE:<file_path>
-        // 挂到最近一条 assistant 消息的 images 数组上，前端用 /api/fs/image 加载渲染
-        const imgPath = line.slice(6)
+        // 历史协议兼容：工具生成的图片本地路径 IMAGE:<file_path>
+        // 转换为新格式 image_refs={type:'file', src:<path>} 挂到最近的 tool_result
+        const imgPath = line.slice(6).trim()
         if (imgPath) {
-          let ai = msgs.length - 1
-          while (ai >= 0 && msgs[ai].role !== 'assistant') ai--
-          if (ai >= 0) {
-            const a = msgs[ai] as any
-            if (!a.images) a.images = []
-            a.images.push(imgPath)
+          let targetIdx = -1
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role === 'tool_result') { targetIdx = i; break }
+          }
+          if (targetIdx >= 0) {
+            const t = msgs[targetIdx] as RichMsg
+            if (!t.image_refs) t.image_refs = []
+            if (!t.image_refs.find(r => r.src === imgPath)) {
+              t.image_refs.push({ type: 'file', src: imgPath })
+            }
           }
         }
-
       } else if (line.startsWith('F:')) {
         // 最终完整文本（通常前端不需要，已经有流式拼接了）
         this._callTargetOutputted(cid)
@@ -1099,7 +1126,8 @@ export const useConvStore = defineStore('conv', {
         _closeTailAssistant(msgs)
         // 信封带双 agent_id：from.agent_id=发送方（画布源节点也应显示这条"我发出的"消息）
         //                 to.agent_id=接收方（画布目标节点应显示这条"我收到的"消息）
-        msgs.push({ role: 'a2a', envelope: env, ts: new Date().toISOString(),
+        msgs.push({
+          role: 'a2a', envelope: env, ts: new Date().toISOString(),
           agent_id: env?.to?.agent_id ?? curAgent ?? undefined,   // 主 agent_id 存接收方，给接收方节点显示
           from_agent_id: env?.from?.agent_id ?? undefined,       // 发送方，给源节点也显示"我发的"
         } as any)

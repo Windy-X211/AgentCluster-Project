@@ -3,7 +3,10 @@
   T:<text>                普通文本
   TS:<name>               tool_call 开始（名称首次确定，参数仍在流式中）→ 前端可流式显示"正在调用: xxx"
   C:<id>|<name>|<args>    tool_call 完整（id、名称、JSON参数）→ 参数收齐，结束流式状态
-  R:<id>|<content>        tool_result（工具执行结果）
+  R:<id>|<content>        tool_result（工具执行结果，截断后不含图片二进制）
+  I:<id>|<refs_json>      图片引用（可选，紧接 R: 行；refs_json = [{type, src}, ...]）
+                          type="data_url" src=data:image/...（完整 base64）
+                          type="file"   src=本地图片绝对路径
   F:<final_text>          最终完整文本（方便前端完整展示）
   RESET                   清空本轮已流出的正文/思考（快通道检测到 <continue> 切换慢通道时）
   SPEAK:<agent_id>        切换发言者（画布气泡 / 流动连线跟随）
@@ -13,7 +16,7 @@
   ⚠️ 行协议用 \n 做分隔符，因此 T:/RN: 等载荷文本中的 \n 必须在 yield 前用
      _esc 转义为 \\n，前端收到后用 _unesc 还原。
 """
-import json, asyncio, os, time, re
+import json, asyncio, os, time, re, logging
 from datetime import datetime
 from typing import Any
 from core.store import load, save, upsert, get_by, next_id
@@ -27,6 +30,8 @@ from core.a2a import (
 )
 from plugins import PLUGIN_REGISTRY, run_plugin
 from core.validator import verify_completion
+
+logger = logging.getLogger("agent_runtime")
 
 
 def _esc(s: str) -> str:
@@ -45,6 +50,9 @@ _CONTINUE_HINT = (
     "\n\n[系统追加 · 非用户输入 · 任务续跑标记] "
     "若任务尚未结束（仍有必要步骤未完成、结果不完整），在回复正文最末尾**单独一行**输出：<continue>；"
     "仅当任务已全部完成、无需任何后续操作时才不输出。"
+    "⚠️ 以下情形一律【不输出】此标记——寒暄/问候（你好、早上好、嗨等）、感谢、"
+    "纯知识问答、简单解释、确认/否认、闲聊：这类输入随你的回复即告完成，无需后续操作。"
+    "仅当确实仍需调用工具或继续多步骤操作时才输出该标记。"
     "该标记仅供系统自动识别，不会展示给用户——不要向用户提及或解释它，"
     "输出时一行只有这一个标记，不附加任何其他文字。"
 )
@@ -221,49 +229,127 @@ def _guess_image_mime_from_b64_prefix(b64_head: str) -> str | None:
     return None
 
 
-def _build_image_followup(result: Any) -> dict | None:
-    """从 tool result 里提取图片，返回一条 user role 的多模态消息。
+def _extract_data_urls(result: Any) -> list[str]:
+    """从 tool result 里提取所有可转为 data URL 的图片，返回 data URL 列表。
 
-    识别三种来源（覆盖所有已知截图工具 + 兜底）：
-      1. result["file"] —— 插件返回的落盘文件路径（browser_control save 模式）
+    识别来源（覆盖所有已知截图/生图工具 + 兜底）：
+      1. result["image_data_url"] —— 已是完整 data URL（browser_control share 模式）
       2. result["data"] —— base64 且 content_type/mime 暗示图片，或已是 data URL
       3. result["data"] —— 纯 base64 长字符串，无 mime hint，通过 base64 前缀推断
          （兜底 desktop_control inspect 等工具可能漏写 content_type 的情况）
+    """
+    data_urls: list[str] = []
+    if not isinstance(result, dict):
+        return data_urls
 
-    返回 OpenAI 规范的多模态 user message 字典；没识别到图片返回 None。
-    图片塞 content 数组里紧跟一张 text 说明，让模型知道这是工具返回的结果图片。
+    # —— 来源 1：result["image_data_url"] 已是 data URL ——
+    idu = result.get("image_data_url")
+    if isinstance(idu, str) and idu.startswith("data:image/"):
+        data_urls.append(idu)
+
+    # —— 来源 2 & 3：result["data"] 是 base64 图片 ——
+    data_field = result.get("data")
+    mime_hint = result.get("content_type") or result.get("mime") or ""
+    if isinstance(data_field, str) and len(data_field) > 1000:
+        if data_field.startswith("data:image/"):
+            data_urls.append(data_field)
+        elif "," not in data_field[:50]:
+            # 纯 base64（不含 data: 前缀）
+            guessed_mime: str | None = None
+            if mime_hint and mime_hint.startswith("image/"):
+                guessed_mime = mime_hint
+            else:
+                guessed_mime = _guess_image_mime_from_b64_prefix(data_field[:16])
+            if guessed_mime:
+                data_urls.append(f"data:{guessed_mime};base64,{data_field}")
+
+    return data_urls
+
+
+def _extract_image_refs(result: Any) -> list[dict]:
+    """从 tool result 里提取图片引用（data URL 或本地文件路径），供前端缩略图渲染。
+
+    返回标准格式列表，最多 8 张，防止撑爆流式行：
+      {"type": "data_url", "src": "data:image/png;base64,..."}  —— 图片 <512KB 时直接嵌 data URL
+      {"type": "file", "src": "F:/path/to/image.png"}          —— 大图片或非图片扩展名保留路径
+
+    策略：优先转 data_url（前端零依赖直接显示），超过 512KB 的图片走 file 路径让
+    前端用 /api/fs/image 按需加载，避免流式行爆炸。
+    """
+    MAX_EMBED_BYTES = 512 * 1024  # data URL 嵌入上限（512KB 原图 → ~683KB base64，流式行安全阈值）
+    refs: list[dict] = []
+    if not isinstance(result, dict):
+        return refs
+
+    seen: set[str] = set()  # 去重
+
+    def _add(entry: dict) -> None:
+        key = entry.get("src", "")
+        if not key or key in seen:
+            return
+        seen.add(key)
+        refs.append(entry)
+
+    def _try_file_to_data_url(p: str) -> dict | None:
+        """尝试把本地图片文件转成 data_url；文件不存在/非图片/过大 → 返回 None。"""
+        try:
+            if not os.path.isfile(p):
+                return None
+            mime = _mime_from_path(p)
+            if not mime:
+                return None
+            if os.path.getsize(p) > MAX_EMBED_BYTES:
+                return None  # 大文件保留路径
+            with open(p, "rb") as f:
+                raw = f.read()
+            if not _looks_like_image(raw):
+                return None
+            import base64 as _b64
+            b64 = _b64.b64encode(raw).decode("ascii")
+            return {"type": "data_url", "src": f"data:{mime};base64,{b64}"}
+        except Exception:
+            return None
+
+    # —— 本地文件路径（result["file"] + result["files"] 数组）——
+    for p in [result.get("file") or "", *(result.get("files") or [])]:
+        p = str(p).strip()
+        if not p:
+            continue
+        url_entry = _try_file_to_data_url(p)
+        if url_entry:
+            _add(url_entry)
+        else:
+            # 转不成 data URL → 保留 file 路径（前端走 /api/fs/image）
+            _add({"type": "file", "src": p})
+
+    # —— data URL ——
+    for url in _extract_data_urls(result):
+        if url:
+            _add({"type": "data_url", "src": url})
+
+    return refs[:8]
+
+
+def _build_image_followup(result: Any) -> dict | None:
+    """从 tool result 里提取图片，返回一条 user role 的多模态消息。
+
+    用 _extract_data_urls 拿到所有 data URL（覆盖 image_data_url / data 两种字段），
+    再加上 result["file"] 路径转成的 data URL，统一组装多模态 content。
     """
     if not isinstance(result, dict):
         return None
 
     data_urls: list[str] = []
 
-    # —— 来源 1：result["file"] 是本地图片路径 ——
+    # —— 本地文件 → data URL ——
     file_path = result.get("file")
     if isinstance(file_path, str) and file_path:
         url = _data_url_from_file(file_path)
         if url:
             data_urls.append(url)
 
-    # —— 来源 2 & 3：result["data"] 是 base64 图片 ——
-    if not data_urls:
-        data_field = result.get("data")
-        mime_hint = result.get("content_type") or result.get("mime") or ""
-        if isinstance(data_field, str) and len(data_field) > 1000:
-            if data_field.startswith("data:image/"):
-                # 已经是 data URL → 直接用
-                data_urls.append(data_field)
-            elif "," not in data_field[:50]:
-                # 纯 base64（不含 data: 前缀）
-                guessed_mime: str | None = None
-                if mime_hint and mime_hint.startswith("image/"):
-                    # 工具自描述带 mime → 优先信任
-                    guessed_mime = mime_hint
-                else:
-                    # 兜底：用 base64 前几个字符推断图片类型
-                    guessed_mime = _guess_image_mime_from_b64_prefix(data_field[:16])
-                if guessed_mime:
-                    data_urls.append(f"data:{guessed_mime};base64,{data_field}")
+    # —— 统一提取 data URL 字段 ——
+    data_urls.extend(_extract_data_urls(result))
 
     if not data_urls:
         return None
@@ -1206,6 +1292,8 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
         except Exception as e:
             # 兜底：_agent_reply_inner 里如果有漏网异常（非 chat 层，比如 upsert 失败），
             # 也要把错误传出去 + DONE，保证 SSE 流正常结束
+            import traceback as _tb
+            print(f"[agent_runtime] _agent_reply_inner 漏网异常: {e}\n{_tb.format_exc()}", flush=True)
             yield f"E:❌ 运行时异常：{e}\n"
             yield "DONE\n"
     finally:
@@ -1406,11 +1494,18 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 messages.append(tool_msg)
                 if img_followup:
                     messages.append(img_followup)
-                conv["messages"].append({**tool_msg, "ts": datetime.utcnow().isoformat(),
-                                         **({"relay": True} if is_relay else {})})
+                # 提取图片引用（供前端缩略图渲染，不受 truncate 影响）
+                img_refs = _extract_image_refs(result)
+                tool_entry = {**tool_msg, "ts": datetime.utcnow().isoformat(),
+                              **({"relay": True} if is_relay else {})}
+                if img_refs:
+                    tool_entry["images"] = img_refs
+                conv["messages"].append(tool_entry)
+                # ⚠️ JSON 行（R:/I:/C:/A2A:）都不做 _esc——json.dumps 自己转义引号/反斜杠/换行，
+                #    直接嵌 f-string 即可；只有纯文本行（T:/RN:）才需要 _esc 防止破坏行分隔。
                 yield f"R:{tc['id']}|{result_str}\n"
-                for _ip in _extract_image_paths(result):
-                    yield f"IMAGE:{_ip}\n"
+                if img_refs:
+                    yield f"I:{tc['id']}|{json.dumps(img_refs, ensure_ascii=False)}\n"
                 tool_history.append({"name": tc["name"], "args": args, "result": result})
             # 进入慢通道循环
         else:
@@ -1553,8 +1648,9 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             logger.warning("[agent_runtime] ModelDegenerateError round=%d: %s", round_idx, _de)
         except Exception as e:
             # LLM 调用失败（网关不通/超时等）— 输出错误 + 落库 + DONE，防止生成器中断导致前端卡死
-            err_msg = f"❌ 第 {round_idx + 1} 轮 LLM 调用失败：{e}"
-            yield f"E:{err_msg}\n"
+            logger.exception("[agent_runtime] LLM 调用失败 round=%d model=%s", round_idx + 1, model)
+            err_msg = f"❌ 第 {round_idx + 1} 轮 LLM 调用失败：{type(e).__name__}: {e}"
+            yield f"E:{_esc(err_msg)}\n"
             # 入库错误 assistant 消息，保留已有的 tool_history
             conv["messages"].append({
                 "role": "assistant", "content": err_msg, "ts": datetime.utcnow().isoformat(),
@@ -1707,13 +1803,18 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 messages.append(tool_msg)
                 if img_followup:
                     messages.append(img_followup)
+                # 提取图片引用（供前端缩略图渲染，不受 truncate 影响）
+                img_refs = _extract_image_refs(result)
                 tool_entry = {**tool_msg, "ts": datetime.utcnow().isoformat()}
                 if is_relay:
                     tool_entry["relay"] = True
+                if img_refs:
+                    tool_entry["images"] = img_refs
                 conv["messages"].append(tool_entry)
+                # ⚠️ JSON 行不做 _esc（见快通道同名行注释）
                 yield f"R:{tc['id']}|{result_str}\n"
-                for _ip in _extract_image_paths(result):
-                    yield f"IMAGE:{_ip}\n"
+                if img_refs:
+                    yield f"I:{tc['id']}|{json.dumps(img_refs, ensure_ascii=False)}\n"
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
 
             # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
