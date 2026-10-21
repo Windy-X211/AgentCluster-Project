@@ -259,6 +259,42 @@ def _safe_resolve(path_str: str) -> _P:
     raise HTTPException(403, f"path 超出允许范围：{path_str}")
 
 
+def _is_under(p: _P, root: _P) -> bool:
+    try:
+        p.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _collect_workdir_roots() -> list[_P]:
+    """收集所有画布 workdir + 全局 default_workdir，供 /api/fs/image 放行工作区图片。
+
+    智能体常把图片生成在画布工作区里（如 PPT 导出的 qa_png/overview.png），
+    这些路径不在 _safe_resolve 的固定允许根内，缩略图走 /api/fs/image 加载时需放行。
+    """
+    roots: list[_P] = []
+    try:
+        import core.store as _store
+        for c in (_store.load("canvases") or []):
+            wd = c.get("workdir")
+            if wd:
+                try:
+                    roots.append(_P(wd).resolve())
+                except Exception:
+                    pass
+        s = _store.load("settings") or {}
+        dwd = s.get("default_workdir")
+        if dwd:
+            try:
+                roots.append(_P(dwd).resolve())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return roots
+
+
 @app.get("/api/fs/list")
 def fs_list(path: str = ""):
     """列出指定目录内容，返回 [{name, path, is_dir, size, modified}]"""
@@ -383,7 +419,16 @@ def fs_image(path: str = ""):
     if not path:
         from fastapi import HTTPException
         raise HTTPException(400, "path required")
-    fp = _safe_resolve(path)
+    try:
+        fp = _safe_resolve(path)
+    except Exception:
+        # _safe_resolve 拒绝（403）→ 放宽到画布工作区 / default_workdir：
+        # 智能体常把图片生成在工作区里，缩略图走本接口加载需放行这些路径。
+        p = _P(path).resolve()
+        if not any(_is_under(p, r) for r in _collect_workdir_roots()):
+            from fastapi import HTTPException
+            raise HTTPException(403, f"path 超出允许范围：{path}")
+        fp = p
     if not fp.is_file():
         from fastapi import HTTPException
         raise HTTPException(404, f"文件不存在：{path}")

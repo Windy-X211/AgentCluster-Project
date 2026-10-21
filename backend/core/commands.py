@@ -477,6 +477,18 @@ def run_command(command_name: str, **kwargs) -> Any:
     return fn(**kwargs) if fn else {"error": f"unknown command: {command_name}"}
 
 
+_IMG_READ_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+_IMG_READ_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
+
+
+def _looks_like_image_bytes(data: bytes) -> bool:
+    if not data or len(data) < 4:
+        return False
+    if any(data.startswith(m) for m in _IMG_READ_MAGIC):
+        return True
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
 def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
                   line_numbers: bool = False, start_line: int | None = None,
                   end_line: int | None = None) -> dict:
@@ -485,9 +497,22 @@ def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
     区域读取：传 start_line / end_line（1 起的行号，闭区间）只读指定行范围，
     适合大文件分段查看；line_numbers=True 时行号始终为文件真实行号
     （区域读取时从 start_line 起），方便配合 file.patch 按锚点定点修改。
+
+    图片文件（png/jpg/jpeg/gif/webp/bmp）不返回文本内容（二进制 read_text 会出乱码），
+    而是返回 file 字段，由上层 _build_image_followup 把图片以 data URL 注入多模态
+    user 消息给模型，模型可直接"看到"图片；前端也通过 _extract_image_refs 拿到缩略图。
     """
     try:
         p = _resolve(path)
+        if str(p).lower().endswith(_IMG_READ_EXTS):
+            try:
+                with open(p, "rb") as _f:
+                    _raw = _f.read()
+            except Exception as _e:
+                return {"error": f"读取图片文件失败：{_e}", "path": str(p)}
+            if _looks_like_image_bytes(_raw):
+                return {"file": str(p), "path": str(p), "content": "[图片]"}
+            return {"error": "文件扩展名是图片类型，但内容魔数不匹配，可能不是有效图片文件", "path": str(p)}
         all_lines = p.read_text(encoding=encoding, errors="ignore").splitlines()
         total = len(all_lines)
         region = start_line is not None or end_line is not None
@@ -1010,7 +1035,7 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "file.read",
-            "description": "读取指定文件的内容。默认返回完整内容；也可以传 start_line / end_line 只读指定行区间（大文件分段查看）。用于查看代码、文档、配置等文本文件。",
+            "description": "读取指定文件的内容。默认返回完整内容；也可以传 start_line / end_line 只读指定行区间（大文件分段查看）。用于查看代码、文档、配置等文本文件。图片文件（png/jpg/jpeg/gif/webp/bmp）会以图片形式返回（不返回文本乱码），模型可直接看到图片内容做视觉分析。",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -12,7 +12,16 @@ const agents = useAgentStore()
 const settings = useSettingsStore()
 const models = useModelStore()
 const editing = ref<any>(null)
-const showHidden = ref(true)
+const SHOW_HIDDEN_KEY = 'agent-cluster.agent-list.show-hidden'
+const showHidden = ref((() => {
+  try {
+    const raw = localStorage.getItem(SHOW_HIDDEN_KEY)
+    return raw == null ? true : raw === '1'
+  } catch { return true }
+})())
+watch(showHidden, (v) => {
+  try { localStorage.setItem(SHOW_HIDDEN_KEY, v ? '1' : '0') } catch {}
+})
 
 // 分组视图状态：
 //   null  → 组列表（收纳）视图

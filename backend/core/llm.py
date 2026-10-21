@@ -645,6 +645,26 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                         tc_invalid = {}
                         tc_warnings = {}
                         tc_aborted = set()
+            # —— 流截断检测：已 announce tool_call_start 但流结束时未 emit tool_call ——
+            # 上游连接中断（RST）时 aiter_lines 可能正常结束（EOF）而非抛 ReadError，
+            # 此时 finish_reason 非 "tool_calls"，已 announce 的 tool_call 不会走到 emit，
+            # 若不处理则前端收到 TS:（正在调用）但永远等不到 C:（参数）和 R:（结果）→ 悬空
+            for _idx in sorted(tc_announced):
+                if _idx in tc_invalid:
+                    continue
+                _entry = tc_buf.get(_idx, {})
+                if _entry.get("name"):
+                    _logger.warning(
+                        "LLM 流式中断：tool_call name=%s id=%s 已开始但参数未完整接收"
+                        "（上游连接断开，已收 args %d 字符），上报 error 让上层终止而非悬空",
+                        _entry["name"], _entry.get("id"), len(_entry.get("args", "")),
+                    )
+                    yield ("error", {
+                        "status": 0,
+                        "detail": f"上游流式输出中断：工具调用 {_entry['name']} 的参数未接收完整"
+                                  f"（已收 {len(_entry.get('args', ''))} 字符），本轮已中止，请重试",
+                    })
+                    break
         else:
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()

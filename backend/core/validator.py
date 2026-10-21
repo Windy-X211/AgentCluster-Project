@@ -145,7 +145,19 @@ async def _llm_verify(interface: dict, model: str, user_input: str,
     for th in tool_history or []:
         result = th.get("result") or {}
         result_str = json.dumps(result, ensure_ascii=False)[:300]
-        tool_summary_lines.append(f"- {th.get('name')}({json.dumps(th.get('args') or {}, ensure_ascii=False)[:150]}) → {result_str}")
+        # 图片型结果：file 字段是图片路径，图片已通过多模态视觉通道（img_followup）
+        # 作为 user 消息发送给主模型，主模型可直接"看到"完整图片内容。此处文本摘要里的
+        # [图片] 仅为占位符（避免 base64 撑爆验证上下文），并非缺失数据。需告知验证 LLM
+        # 这一点，否则它会因"工具只返回 [图片] 占位符"误判主模型"没有图像依据/幻觉"。
+        _img_note = ""
+        if isinstance(result, dict):
+            _fp = result.get("file") or ""
+            if isinstance(_fp, str) and _fp.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+                _img_note = ("  [注：该工具返回的是图片文件，图片已通过多模态视觉通道发送给主模型，"
+                             "主模型可直接看到完整图片内容；此处文本摘要中的 [图片] 仅为占位符，并非缺失数据。"
+                             "请据此判断主模型是否基于真实图片作答，而非幻觉。]")
+        tool_summary_lines.append(f"- {th.get('name')}({json.dumps(th.get('args') or {}, ensure_ascii=False)[:150]}) → {result_str}{_img_note}")
 
     user_msg = (
         f"【用户原始请求】\n{user_input}\n\n"

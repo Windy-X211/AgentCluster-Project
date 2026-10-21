@@ -1609,7 +1609,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     # 上游 HTTP 错误（400 等）→ 记录诊断信息并终止本轮
                     _err_body = payload.get("detail", "")[:300]
                     _diag = payload.get("payload_diag", "")
-                    yield f"E:❌ 上游返回 HTTP {payload.get('status')}：{_err_body[:200]}\n"
+                    _err_msg = f"❌ 上游返回 HTTP {payload.get('status')}：{_err_body[:200]}"
+                    yield f"E:{_esc(_err_msg)}\n"
                     if _diag:
                         yield f"RN:【诊断】{_diag[:1500]}\n"
                     _upstream_error = True

@@ -2182,7 +2182,7 @@ onBeforeUnmount(() => {
           <span class="cur-title">{{ conv ? convDisplayName(conv) : '— 未选择 —' }}</span>
         </div>
         <div class="row2">
-          <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" ></textarea>
+          <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true"></textarea>
           <button v-if="!convs.streaming" class="btn send" @click="send" aria-label="发送消息">发送</button>
           <button v-else class="btn send stop-btn" @click="sendStop" aria-label="停止输出">
             <span class="stop-icon" aria-hidden="true"></span>
