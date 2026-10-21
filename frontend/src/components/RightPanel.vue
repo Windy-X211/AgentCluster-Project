@@ -2493,7 +2493,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 6px;
   max-height: min(420px, calc(100vh - 180px));
-  background: rgba(16, 22, 40, 0.98);
+  background: rgba(var(--node-bg-rgb), 0.98);
   border: 1px solid rgba(var(--surface-rgb), 0.14);
   border-radius: 10px;
   box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.55);
@@ -2614,7 +2614,7 @@ onBeforeUnmount(() => {
 .dd-thumb:active { cursor: grabbing; filter: brightness(1.2); }
 /* ============ 模型快速切换下拉 ============ */
 .model-dd { position: relative; flex-shrink: 0; display: inline-flex; align-items: center; }
-.model-dd-trigger { color: rgba(180, 200, 245, 0.92); background: rgba(var(--accent2-rgb), 0.10); border-color: rgba(var(--accent2-rgb), 0.28); max-width: 200px; }
+.model-dd-trigger { color: rgba(var(--text-rgb), 0.92); background: rgba(var(--accent2-rgb), 0.10); border-color: rgba(var(--accent2-rgb), 0.28); max-width: 200px; }
 .model-dd-trigger:hover { background: rgba(var(--accent2-rgb), 0.18); border-color: rgba(var(--accent2-rgb), 0.45); }
 .model-dd-trigger:disabled { opacity: .5; cursor: not-allowed; }
 .model-dd-trigger:disabled:hover { background: rgba(var(--accent2-rgb), 0.10); border-color: rgba(var(--accent2-rgb), 0.28); }
@@ -2965,7 +2965,7 @@ onBeforeUnmount(() => {
   z-index: 1500;
 }
 .modal {
-  background: rgba(16, 22, 40, 0.98);
+  background: rgba(var(--node-bg-rgb), 0.98);
   border: 1px solid rgba(var(--surface-rgb), 0.14);
   border-radius: 14px;
   box-shadow: 0 20px 60px rgba(var(--shadow-rgb), 0.6);
@@ -3082,7 +3082,7 @@ onBeforeUnmount(() => {
 /* Share 截图灯箱：全屏遮罩 + 居中图片 + 右上角关闭按钮 */
 .lightbox {
   position: fixed; inset: 0; z-index: 10000;
-  background: rgba(8, 10, 18, 0.92);
+  background: rgba(var(--shadow-rgb), 0.92);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   display: flex; align-items: center; justify-content: center;

@@ -17,6 +17,10 @@
   --success-light: #80e4b8;
   --panel-bg: #1a1f30;
   --node-bg-rgb: 20, 26, 44;
+  --accent-ink: var(--accent);
+  --purple-ink: var(--accent-2);
+  --green-ink: var(--success-light);
+  --red-ink: #ff9090;
   --font-scale: 1;
 }
 
@@ -52,6 +56,7 @@
   --success-light: #16a34a;
   --panel-bg: #f5f7fa;
   --node-bg-rgb: 228, 236, 245;
+  --red-ink: #dc2626;
 }
 
 /* 护眼白（米黄） */
@@ -69,6 +74,7 @@
   --success-light: #2f855a;
   --panel-bg: #ece1c5;
   --node-bg-rgb: 235, 225, 198;
+  --red-ink: #c53030;
 }
 
 $bg-deep: var(--bg-base);
@@ -117,6 +123,15 @@ body {
   backdrop-filter: blur(12px);
   border: 1px solid rgba(var(--surface-rgb), 0.08);
   border-radius: 12px;
+}
+
+/* 主题化弹出面板：新面板加 class="popup-surface" 即可跟随配色方案，无需重写配色 */
+.popup-surface {
+  background: rgba(var(--node-bg-rgb), 0.98);
+  border: 1px solid rgba(var(--surface-rgb), 0.14);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
+  color: var(--text);
 }
 
 .btn {
