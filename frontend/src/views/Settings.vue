@@ -12,7 +12,7 @@ const settings = useSettingsStore()
 const layout = useLayoutStore()
 
 const themeOptions = [
-  { id: 'standard', name: '标准配色', bg: '#0a0e1a', bgGrad: '#1a2340', text: '#e8ecf4', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
+  { id: 'standard', name: '标准配色-银河蓝', bg: '#0a0e1a', bgGrad: '#1a2340', text: '#e8ecf4', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
   { id: 'deep-black', name: '深邃黑', bg: '#000000', bgGrad: '#080808', text: '#d7d7d7', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
   { id: 'tech-white', name: '科技白', bg: '#ffffff', bgGrad: '#e6eef9', text: '#1e283c', accent: '#2563eb', surface: 'rgba(20,30,50,0.08)' },
   { id: 'eye-care', name: '护眼白', bg: '#f4ecd6', bgGrad: '#faf3df', text: '#46371e', accent: '#2b6cb0', surface: 'rgba(90,70,30,0.1)' },

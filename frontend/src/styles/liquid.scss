@@ -21,6 +21,7 @@
   --purple-ink: var(--accent-2);
   --green-ink: var(--success-light);
   --red-ink: #ff9090;
+  --code-ink: #ffb088;
   --font-scale: 1;
 }
 
@@ -57,6 +58,7 @@
   --panel-bg: #f5f7fa;
   --node-bg-rgb: 228, 236, 245;
   --red-ink: #dc2626;
+  --code-ink: #c2410c;
 }
 
 /* 护眼白（米黄） */
@@ -75,6 +77,7 @@
   --panel-bg: #ece1c5;
   --node-bg-rgb: 235, 225, 198;
   --red-ink: #c53030;
+  --code-ink: #92400e;
 }
 
 $bg-deep: var(--bg-base);

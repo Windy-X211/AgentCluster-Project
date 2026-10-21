@@ -2428,7 +2428,7 @@ onBeforeUnmount(() => {
 /* 用户消息泡泡额外样式 */
 .bubble.user-bubble { color: rgba(var(--text-rgb), 0.95); }
 .bubble.user-bubble.markdown a { color: #ffd088; }
-.bubble.user-bubble.markdown code { background: rgba(var(--shadow-rgb), 0.25); color: #ffe0b0; }
+.bubble.user-bubble.markdown code { background: rgba(var(--surface-rgb), 0.12); color: var(--code-ink); }
 .bubble.user-bubble.markdown blockquote { background: rgba(var(--surface-rgb), 0.08); border-left-color: rgba(255,208,136,0.5); }
 
 /* 流式占位泡泡（只有光标闪烁） */
@@ -2796,13 +2796,13 @@ onBeforeUnmount(() => {
 /* —— 行内代码 —— */
 .bubble.markdown code {
   font-family: Consolas, "Courier New", monospace; font-size: calc(11.5px * var(--font-scale));
-  background: rgba(var(--shadow-rgb), 0.35); padding: 1px 5px; border-radius: 4px; color: #ffb088;
+  background: rgba(var(--surface-rgb), 0.12); padding: 1px 5px; border-radius: 4px; color: var(--code-ink);
   word-break: break-word;
 }
 
 /* —— 代码块 —— */
 .bubble.markdown pre {
-  background: rgba(var(--shadow-rgb), 0.42); padding: 10px 12px; border-radius: 6px;
+  background: rgba(var(--surface-rgb), 0.06); padding: 10px 12px; border-radius: 6px;
   overflow-x: auto; margin: 6px 0; border: 1px solid rgba(var(--surface-rgb), 0.1);
   max-height: 400px;
 }
@@ -2852,7 +2852,7 @@ onBeforeUnmount(() => {
 /* —— 表格 —— */
 .bubble.markdown table {
   border-collapse: collapse; border: 1px solid rgba(var(--surface-rgb), 0.3);
-  background: rgba(var(--shadow-rgb), 0.45); margin: 8px 0; font-size: calc(11.5px * var(--font-scale));
+  background: rgba(var(--surface-rgb), 0.08); margin: 8px 0; font-size: calc(11.5px * var(--font-scale));
   width: max-content; max-width: 100%; border-radius: 6px; overflow: hidden;
 }
 .bubble.markdown th, .bubble.markdown td {
