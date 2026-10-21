@@ -26,20 +26,20 @@ const store = usePluginDebugStore()
 <style scoped>
 .run-log { display: flex; flex-direction: column; min-height: 0; }
 .log-head { display: flex; align-items: center; margin-bottom: 8px; }
-.log-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: .55; }
-.sm { padding: 2px 10px; font-size: 11px; margin-left: auto; }
+.log-title { font-size: calc(11px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px; opacity: .55; }
+.sm { padding: 2px 10px; font-size: calc(11px * var(--font-scale)); margin-left: auto; }
 .log-list { display: flex; flex-direction: column; gap: 4px; max-height: 200px; overflow-y: auto; }
 .log-item {
-  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; font-size: 11px;
-  background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; font-size: calc(11px * var(--font-scale));
+  background: rgba(var(--surface-rgb), 0.03); border: 1px solid rgba(var(--surface-rgb), 0.06);
   font-family: Consolas, monospace;
 }
-.log-item.ok .status { color: #80e4b8; }
+.log-item.ok .status { color: var(--success-light); }
 .log-item.err .status { color: #ffb0b0; }
 .status { font-weight: bold; }
 .time { opacity: .55; }
 .plugin { font-weight: 600; }
 .ms { opacity: .55; }
 .summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .6; }
-.empty { padding: 16px; text-align: center; opacity: .5; font-size: 12px; }
+.empty { padding: 16px; text-align: center; opacity: .5; font-size: calc(12px * var(--font-scale)); }
 </style>

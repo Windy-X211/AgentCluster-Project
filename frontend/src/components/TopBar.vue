@@ -20,9 +20,9 @@ import { RouterLink } from 'vue-router'
 <style scoped>
 .topbar-content { display: flex; align-items: center; height: 100%; padding: 0 20px; gap: 16px; }
 .brand { display: flex; align-items: center; gap: 12px; }
-.logo { width: 32px; height: 32px; border-radius: 10px; object-fit: cover; box-shadow: 0 4px 12px rgba(110,168,255,0.3); }
-.title { font-weight: 600; font-size: 15px; }
-.subtitle { font-size: 10px; opacity: .6; letter-spacing: 1px; }
+.logo { width: 32px; height: 32px; border-radius: 10px; object-fit: cover; box-shadow: 0 4px 12px rgba(var(--accent-rgb), 0.3); }
+.title { font-weight: 600; font-size: calc(15px * var(--font-scale)); }
+.subtitle { font-size: calc(10px * var(--font-scale)); opacity: .6; letter-spacing: 1px; }
 .spacer { flex: 1; }
-.nav-item { color: rgb(var(--text-rgb)); text-decoration: none; font-size: 13px; padding: 6px 12px; border-radius: 8px; transition: background .2s; &:hover { background: rgba(255,255,255,0.06); } }
+.nav-item { color: rgb(var(--text-rgb)); text-decoration: none; font-size: calc(13px * var(--font-scale)); padding: 6px 12px; border-radius: 8px; transition: background .2s; &:hover { background: rgba(var(--surface-rgb), 0.06); } }
 </style>

@@ -52,17 +52,17 @@ async function copy() {
 <style scoped>
 .result-panel { display: flex; flex-direction: column; min-height: 0; }
 .result-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.badge { font-size: 11px; padding: 2px 10px; border-radius: 999px; font-weight: 600; }
-.badge.ok { background: rgba(100, 220, 160, 0.18); color: #80e4b8; border: 1px solid rgba(100, 220, 160, 0.4); }
+.badge { font-size: calc(11px * var(--font-scale)); padding: 2px 10px; border-radius: 999px; font-weight: 600; }
+.badge.ok { background: rgba(100, 220, 160, 0.18); color: var(--success-light); border: 1px solid rgba(100, 220, 160, 0.4); }
 .badge.err { background: rgba(255, 96, 96, 0.18); color: #ffb0b0; border: 1px solid rgba(255, 96, 96, 0.4); }
-.ms { font-size: 11px; opacity: .55; }
-.sm { padding: 2px 10px; font-size: 11px; margin-left: auto; }
+.ms { font-size: calc(11px * var(--font-scale)); opacity: .55; }
+.sm { padding: 2px 10px; font-size: calc(11px * var(--font-scale)); margin-left: auto; }
 .result-body {
   margin: 0; padding: 12px; border-radius: 10px; font-family: Consolas, monospace;
-  font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  font-size: calc(12px * var(--font-scale)); line-height: 1.55; white-space: pre-wrap; word-break: break-word;
   max-height: 260px; overflow: auto;
 }
 .result-body.ok { background: rgba(100, 220, 160, 0.08); border: 1px solid rgba(100, 220, 160, 0.28); color: #c8f5e0; }
 .result-body.err { background: rgba(255, 96, 96, 0.08); border: 1px solid rgba(255, 96, 96, 0.3); color: #ffcfcf; }
-.empty { padding: 24px; text-align: center; opacity: .5; font-size: 13px; }
+.empty { padding: 24px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }
 </style>

@@ -195,7 +195,7 @@ onMounted(() => {
 <style scoped>
 .rules-overlay {
   position: fixed; inset: 0; z-index: 1000;
-  background: rgba(0,0,0,0.45); backdrop-filter: blur(4px);
+  background: rgba(var(--shadow-rgb), 0.45); backdrop-filter: blur(4px);
   display: flex; align-items: center; justify-content: center; padding: 24px;
 }
 .rules-dialog {
@@ -203,8 +203,8 @@ onMounted(() => {
   display: flex; flex-direction: column; padding: 16px 18px; gap: 12px;
 }
 .rules-head { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-.rules-title { font-size: 15px; font-weight: 600; }
-.rules-hint { font-size: 11px; opacity: .55; flex: 1; }
+.rules-title { font-size: calc(15px * var(--font-scale)); font-weight: 600; }
+.rules-hint { font-size: calc(11px * var(--font-scale)); opacity: .55; flex: 1; }
 .rules-form { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
 .rules-input { resize: vertical; min-height: 64px; font-family: inherit; line-height: 1.5; }
 .form-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -214,50 +214,50 @@ onMounted(() => {
   position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
   min-width: 260px; max-height: 280px; overflow-y: auto;
   padding: 6px; display: flex; flex-direction: column; gap: 2px;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  box-shadow: 0 8px 24px rgba(var(--shadow-rgb), 0.4);
   /* 下拉弹层需要实底，覆盖 glass-soft 的半透明，防止与底层 modal 文字重叠 */
-  background: rgba(18, 24, 38, 0.98) !important;
+  background: rgba(var(--node-bg-rgb), 0.98) !important;
   backdrop-filter: blur(16px) saturate(140%);
   -webkit-backdrop-filter: blur(16px) saturate(140%);
-  border: 1px solid rgba(110,168,255,0.25);
+  border: 1px solid rgba(var(--accent-rgb), 0.25);
 }
 .scope-opt {
   appearance: none; border: 0; background: transparent; color: rgb(var(--text-rgb));
-  font-size: 12px; text-align: left; padding: 7px 10px; border-radius: 6px; cursor: pointer;
+  font-size: calc(12px * var(--font-scale)); text-align: left; padding: 7px 10px; border-radius: 6px; cursor: pointer;
 }
-.scope-opt:hover { background: rgba(110,168,255,0.15); }
-.scope-opt.on { background: rgba(110,168,255,0.2); color: var(--accent-ink); }
-.scope-agents { border-top: 1px dashed rgba(255,255,255,0.1); margin-top: 4px; padding-top: 4px; max-height: 180px; overflow-y: auto; }
+.scope-opt:hover { background: rgba(var(--accent-rgb), 0.15); }
+.scope-opt.on { background: rgba(var(--accent-rgb), 0.2); color: var(--accent-ink); }
+.scope-agents { border-top: 1px dashed rgba(var(--surface-rgb), 0.1); margin-top: 4px; padding-top: 4px; max-height: 180px; overflow-y: auto; }
 .scope-agent {
-  display: flex; align-items: center; gap: 8px; font-size: 12px;
+  display: flex; align-items: center; gap: 8px; font-size: calc(12px * var(--font-scale));
   padding: 5px 8px; border-radius: 6px; cursor: pointer;
 }
-.scope-agent:hover { background: rgba(255,255,255,0.06); }
+.scope-agent:hover { background: rgba(var(--surface-rgb), 0.06); }
 .scope-agent input { accent-color: var(--accent); }
-.scope-empty { font-size: 11px; opacity: .5; padding: 8px; }
+.scope-empty { font-size: calc(11px * var(--font-scale)); opacity: .5; padding: 8px; }
 .rules-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
 .rule-item {
   display: flex; gap: 10px; align-items: flex-start;
   padding: 10px 12px; border-radius: 10px;
-  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(var(--surface-rgb), 0.04); border: 1px solid rgba(var(--surface-rgb), 0.08);
 }
-.rule-item.editing { border-color: rgba(110,168,255,0.45); background: rgba(110,168,255,0.1); }
+.rule-item.editing { border-color: rgba(var(--accent-rgb), 0.45); background: rgba(var(--accent-rgb), 0.1); }
 .rule-idx {
   flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
-  background: rgba(110,168,255,0.2); color: var(--accent-ink);
-  font-size: 11px; display: flex; align-items: center; justify-content: center;
+  background: rgba(var(--accent-rgb), 0.2); color: var(--accent-ink);
+  font-size: calc(11px * var(--font-scale)); display: flex; align-items: center; justify-content: center;
   font-family: Consolas, monospace; margin-top: 1px;
 }
 .rule-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-.rule-text { font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.rule-text { font-size: calc(13px * var(--font-scale)); line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 .rule-meta { display: flex; gap: 6px; flex-wrap: wrap; }
 .tag {
-  font-size: 10px; padding: 2px 7px; border-radius: 4px;
-  background: rgba(180,114,255,0.18); color: var(--purple-ink);
+  font-size: calc(10px * var(--font-scale)); padding: 2px 7px; border-radius: 4px;
+  background: rgba(var(--accent2-rgb), 0.18); color: var(--purple-ink);
 }
-.tag.all { background: rgba(110,168,255,0.18); color: var(--accent-ink); }
+.tag.all { background: rgba(var(--accent-rgb), 0.18); color: var(--accent-ink); }
 .tag.off { background: rgba(255,80,80,0.15); color: var(--red-ink); }
 .rule-actions { display: flex; gap: 4px; flex-shrink: 0; }
-.rules-empty { text-align: center; font-size: 12px; opacity: .5; padding: 28px 16px; line-height: 1.7; }
-.sm { padding: 3px 8px; font-size: 11px; }
+.rules-empty { text-align: center; font-size: calc(12px * var(--font-scale)); opacity: .5; padding: 28px 16px; line-height: 1.7; }
+.sm { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); }
 </style>

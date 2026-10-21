@@ -644,29 +644,29 @@ onBeforeUnmount(() => {
 .fv {
   display: flex; flex-direction: column;
   overflow: hidden; z-index: 9994;
-  box-shadow: 0 16px 52px rgba(0, 0, 0, 0.58);
+  box-shadow: 0 16px 52px rgba(var(--shadow-rgb), 0.58);
   border-radius: 10px;
 }
 .fv-head {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 44px 8px 10px; cursor: grab; user-select: none;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(var(--surface-rgb), 0.08);
   flex-shrink: 0;
 }
 .fv-head:active { cursor: grabbing; }
 .fv-ico { flex-shrink: 0; }
-.fv-title { font-size: 13.5px; font-weight: 600; flex-shrink: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.fv-meta { font-size: 11px; opacity: .55; font-family: Consolas, monospace; white-space: nowrap; flex-shrink: 0; }
+.fv-title { font-size: calc(13.5px * var(--font-scale)); font-weight: 600; flex-shrink: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fv-meta { font-size: calc(11px * var(--font-scale)); opacity: .55; font-family: Consolas, monospace; white-space: nowrap; flex-shrink: 0; }
 .fv-btn {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(var(--surface-rgb), 0.05);
+  border: 1px solid rgba(var(--surface-rgb), 0.12);
   color: rgb(var(--text-rgb)); border-radius: 7px; cursor: pointer;
-  font-size: 11px; padding: 3px 8px; line-height: 1.6;
+  font-size: calc(11px * var(--font-scale)); padding: 3px 8px; line-height: 1.6;
   transition: all .15s; flex-shrink: 0; white-space: nowrap;
 }
-.fv-btn:hover { background: rgba(110, 168, 255, 0.18); }
+.fv-btn:hover { background: rgba(var(--accent-rgb), 0.18); }
 .fv-btn:disabled { opacity: .4; cursor: not-allowed; }
-.fv-btn.big { font-size: 13px; padding: 8px 18px; }
+.fv-btn.big { font-size: calc(13px * var(--font-scale)); padding: 8px 18px; }
 .fv-btn.ok { background: rgba(100, 220, 160, 0.15); border-color: rgba(100, 220, 160, 0.4); color: #7dd88f; }
 .fv-btn.ok:hover { background: rgba(100, 220, 160, 0.28); }
 
@@ -674,20 +674,20 @@ onBeforeUnmount(() => {
 .fv-close {
   position: absolute; top: 6px; right: 8px; z-index: 8;
   width: 26px; height: 26px; padding: 0;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(var(--surface-rgb), 0.06);
+  border: 1px solid rgba(var(--surface-rgb), 0.14);
   color: rgb(var(--text-rgb)); border-radius: 7px; cursor: pointer;
-  font-size: 13px; line-height: 1; transition: all .15s;
+  font-size: calc(13px * var(--font-scale)); line-height: 1; transition: all .15s;
 }
 .fv-close:hover { background: rgba(255, 80, 80, 0.28); border-color: rgba(255, 80, 80, 0.5); }
 
 .fv-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px; position: relative; }
 .fv-body.editing { padding: 8px 10px; overflow: hidden; display: flex; }
-.fv-hint { padding: 30px 12px; text-align: center; font-size: 12.5px; opacity: .65; }
+.fv-hint { padding: 30px 12px; text-align: center; font-size: calc(12.5px * var(--font-scale)); opacity: .65; }
 .fv-hint.err { color: #ffb0b0; opacity: 1; display: flex; flex-direction: column; align-items: center; gap: 12px; }
 .fv-fail { display: flex; justify-content: center; padding-bottom: 20px; }
 .fv-notice {
-  font-size: 11.5px; color: #ffd18a; opacity: .9;
+  font-size: calc(11.5px * var(--font-scale)); color: #ffd18a; opacity: .9;
   border: 1px dashed rgba(255, 209, 138, 0.4);
   background: rgba(255, 209, 138, 0.08);
   border-radius: 7px; padding: 6px 10px; margin-bottom: 10px;
@@ -696,13 +696,13 @@ onBeforeUnmount(() => {
 /* 编辑器（与预览同一窗口内切换） */
 .fv-edit {
   flex: 1; width: 100%; min-height: 0;
-  background: rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
-  color: rgb(var(--text-rgb)); font-size: 12.5px;
+  background: rgba(var(--shadow-rgb), 0.35);
+  border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 8px;
+  color: rgb(var(--text-rgb)); font-size: calc(12.5px * var(--font-scale));
   font-family: Consolas, "Courier New", monospace;
   padding: 10px; outline: none; resize: none; line-height: 1.55;
 }
-.fv-edit:focus { border-color: rgba(110, 168, 255, 0.6); }
+.fv-edit:focus { border-color: rgba(var(--accent-rgb), 0.6); }
 
 /* 图片 */
 .fv-img-wrap { display: flex; align-items: center; justify-content: center; min-height: 100%; cursor: zoom-in; }
@@ -711,7 +711,7 @@ onBeforeUnmount(() => {
 .fv-img.full { max-width: none; max-height: none; }
 
 /* PDF / Office 转 PDF 的 iframe */
-.fv-frame { width: 100%; height: 100%; min-height: 420px; border: none; background: rgba(0, 0, 0, 0.35); border-radius: 8px; }
+.fv-frame { width: 100%; height: 100%; min-height: 420px; border: none; background: rgba(var(--shadow-rgb), 0.35); border-radius: 8px; }
 
 /* pptx 渲染容器 */
 .fv-pptx { width: 100%; min-height: 200px; }
@@ -720,40 +720,40 @@ onBeforeUnmount(() => {
 /* 文本 */
 .fv-text {
   margin: 0; white-space: pre-wrap; word-break: break-word;
-  font-size: 12.5px; font-family: Consolas, "Courier New", monospace;
+  font-size: calc(12.5px * var(--font-scale)); font-family: Consolas, "Courier New", monospace;
   line-height: 1.6; color: rgb(var(--text-rgb));
 }
 
 /* 表格 */
 .fv-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; position: sticky; top: -10px; }
 .fv-tab {
-  background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(var(--surface-rgb), 0.05); border: 1px solid rgba(var(--surface-rgb), 0.12);
   color: rgb(var(--text-rgb)); border-radius: 6px 6px 0 0; cursor: pointer;
-  font-size: 11.5px; padding: 4px 12px; transition: all .15s;
+  font-size: calc(11.5px * var(--font-scale)); padding: 4px 12px; transition: all .15s;
 }
-.fv-tab:hover { background: rgba(110, 168, 255, 0.15); }
-.fv-tab.on { background: rgba(110, 168, 255, 0.22); border-color: rgba(110, 168, 255, 0.5); }
+.fv-tab:hover { background: rgba(var(--accent-rgb), 0.15); }
+.fv-tab.on { background: rgba(var(--accent-rgb), 0.22); border-color: rgba(var(--accent-rgb), 0.5); }
 .fv-table-wrap { overflow: auto; }
-.fv-table { border-collapse: collapse; font-size: 12px; min-width: 100%; }
+.fv-table { border-collapse: collapse; font-size: calc(12px * var(--font-scale)); min-width: 100%; }
 .fv-table th, .fv-table td {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(var(--surface-rgb), 0.14);
   padding: 4px 9px; text-align: left; white-space: nowrap;
   max-width: 320px; overflow: hidden; text-overflow: ellipsis;
 }
-.fv-table th { background: rgba(110, 168, 255, 0.16); position: sticky; top: 0; font-weight: 600; }
-.fv-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.03); }
+.fv-table th { background: rgba(var(--accent-rgb), 0.16); position: sticky; top: 0; font-weight: 600; }
+.fv-table tbody tr:nth-child(even) { background: rgba(var(--surface-rgb), 0.03); }
 
 /* docx 回退 / pptx 回退 文本 */
-.fv-doc { font-size: 13px; line-height: 1.7; }
+.fv-doc { font-size: calc(13px * var(--font-scale)); line-height: 1.7; }
 .fv-line { min-height: 1.4em; white-space: pre-wrap; word-break: break-word; }
-.fv-slide { margin-bottom: 18px; padding-bottom: 10px; border-bottom: 1px dashed rgba(255, 255, 255, 0.14); }
+.fv-slide { margin-bottom: 18px; padding-bottom: 10px; border-bottom: 1px dashed rgba(var(--surface-rgb), 0.14); }
 .fv-slide:last-child { border-bottom: none; }
-.fv-slide-no { font-size: 11px; font-weight: 600; color: #ffd18a; opacity: .85; margin-bottom: 6px; letter-spacing: .5px; }
+.fv-slide-no { font-size: calc(11px * var(--font-scale)); font-weight: 600; color: #ffd18a; opacity: .85; margin-bottom: 6px; letter-spacing: .5px; }
 
 .fv-foot {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  padding: 6px 12px; border-top: 1px solid rgba(255, 255, 255, 0.08);
-  font-size: 10.5px; opacity: .7; flex-shrink: 0;
+  padding: 6px 12px; border-top: 1px solid rgba(var(--surface-rgb), 0.08);
+  font-size: calc(10.5px * var(--font-scale)); opacity: .7; flex-shrink: 0;
 }
 .fv-foot-hint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .75; }
 .fv-foot-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
@@ -772,41 +772,41 @@ onBeforeUnmount(() => {
 
 <!-- markdown v-html 内容样式：scoped 样式命中不了 v-html 节点，故单独全局块（统一 .fv-md 前缀） -->
 <style>
-.fv-md { font-size: 13.5px; line-height: 1.7; word-break: break-word; }
+.fv-md { font-size: calc(13.5px * var(--font-scale)); line-height: 1.7; word-break: break-word; }
 .fv-md h1, .fv-md h2, .fv-md h3, .fv-md h4, .fv-md h5, .fv-md h6 {
   margin: 16px 0 8px; line-height: 1.35; font-weight: 650;
 }
-.fv-md h1 { font-size: 20px; border-bottom: 1px solid rgba(255, 255, 255, 0.12); padding-bottom: 5px; }
-.fv-md h2 { font-size: 17px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 4px; }
-.fv-md h3 { font-size: 15.5px; }
-.fv-md h4 { font-size: 14px; }
-.fv-md h5, .fv-md h6 { font-size: 13px; opacity: .9; }
+.fv-md h1 { font-size: calc(20px * var(--font-scale)); border-bottom: 1px solid rgba(var(--surface-rgb), 0.12); padding-bottom: 5px; }
+.fv-md h2 { font-size: calc(17px * var(--font-scale)); border-bottom: 1px solid rgba(var(--surface-rgb), 0.1); padding-bottom: 4px; }
+.fv-md h3 { font-size: calc(15.5px * var(--font-scale)); }
+.fv-md h4 { font-size: calc(14px * var(--font-scale)); }
+.fv-md h5, .fv-md h6 { font-size: calc(13px * var(--font-scale)); opacity: .9; }
 .fv-md p { margin: 8px 0; }
 .fv-md ul, .fv-md ol { margin: 8px 0; padding-left: 24px; }
 .fv-md li { margin: 3px 0; }
 .fv-md a { color: #7db3ff; text-decoration: underline; text-underline-offset: 2px; }
 .fv-md img { max-width: 100%; border-radius: 6px; }
-.fv-md hr { border: none; border-top: 1px solid rgba(255, 255, 255, 0.15); margin: 16px 0; }
+.fv-md hr { border: none; border-top: 1px solid rgba(var(--surface-rgb), 0.15); margin: 16px 0; }
 .fv-md blockquote {
-  border-left: 3px solid rgba(110, 168, 255, 0.55);
+  border-left: 3px solid rgba(var(--accent-rgb), 0.55);
   margin: 10px 0; padding: 4px 12px; opacity: .85;
-  background: rgba(110, 168, 255, 0.07); border-radius: 0 6px 6px 0;
+  background: rgba(var(--accent-rgb), 0.07); border-radius: 0 6px 6px 0;
 }
 .fv-md code {
   font-family: Consolas, "Courier New", monospace;
-  background: rgba(255, 255, 255, 0.09);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(var(--surface-rgb), 0.09);
+  border: 1px solid rgba(var(--surface-rgb), 0.1);
   padding: 1px 5px; border-radius: 4px; font-size: .9em;
 }
 .fv-md pre {
-  background: rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(var(--shadow-rgb), 0.45);
+  border: 1px solid rgba(var(--surface-rgb), 0.12);
   border-radius: 8px; padding: 10px 12px; overflow: auto; margin: 10px 0;
 }
-.fv-md pre code { background: none; border: none; padding: 0; font-size: 12.5px; line-height: 1.55; }
+.fv-md pre code { background: none; border: none; padding: 0; font-size: calc(12.5px * var(--font-scale)); line-height: 1.55; }
 .fv-md table { border-collapse: collapse; margin: 10px 0; display: block; overflow-x: auto; }
-.fv-md th, .fv-md td { border: 1px solid rgba(255, 255, 255, 0.18); padding: 5px 10px; font-size: 12.5px; }
-.fv-md th { background: rgba(255, 255, 255, 0.07); font-weight: 600; }
-.fv-md tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.03); }
+.fv-md th, .fv-md td { border: 1px solid rgba(var(--surface-rgb), 0.18); padding: 5px 10px; font-size: calc(12.5px * var(--font-scale)); }
+.fv-md th { background: rgba(var(--surface-rgb), 0.07); font-weight: 600; }
+.fv-md tbody tr:nth-child(even) { background: rgba(var(--surface-rgb), 0.03); }
 .fv-md input[type="checkbox"] { margin-right: 6px; }
 </style>

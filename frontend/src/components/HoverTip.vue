@@ -80,14 +80,14 @@ onBeforeUnmount(() => {
 <style scoped>
 .ht-tip {
   z-index: 3100; padding: 10px 12px; border-radius: 8px;
-  font-size: 12px; line-height: 1.55; overflow-y: auto; overflow-x: hidden;
+  font-size: calc(12px * var(--font-scale)); line-height: 1.55; overflow-y: auto; overflow-x: hidden;
   background: rgba(30, 34, 50, 0.98);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(var(--surface-rgb), 0.14);
   color: rgb(var(--text-rgb));
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 12px 30px rgba(var(--shadow-rgb), 0.55);
   backdrop-filter: blur(8px);
   white-space: pre-wrap; word-break: break-word;
   cursor: default;
-  scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+  scrollbar-width: thin; scrollbar-color: rgba(var(--surface-rgb), 0.25) transparent;
 }
 </style>

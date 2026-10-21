@@ -249,7 +249,7 @@ watch(
 .modal-bg {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgba(var(--shadow-rgb), 0.5);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
   display: flex;
@@ -260,9 +260,9 @@ watch(
 /* 弹窗面板 */
 .modal {
   background: rgba(16, 22, 40, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(var(--surface-rgb), 0.12);
   border-radius: 16px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 20px 60px rgba(var(--shadow-rgb), 0.6);
   overflow: hidden;
 }
 .modal.file-explorer {
@@ -278,15 +278,15 @@ watch(
   align-items: center;
   gap: 12px;
   padding: 12px 16px;
-  border-bottom: 1px solid rgba(255,255,255,.08);
+  border-bottom: 1px solid rgba(var(--surface-rgb), .08);
 }
 .modal-title { font-weight: 600; }
 .path-bar {
   flex: 1;
   font-family: Consolas, monospace;
-  font-size: 12px;
-  color: rgba(255,255,255,.6);
-  background: rgba(255,255,255,.04);
+  font-size: calc(12px * var(--font-scale));
+  color: rgba(var(--surface-rgb), .6);
+  background: rgba(var(--surface-rgb), .04);
   padding: 4px 10px;
   border-radius: 4px;
   overflow: hidden;
@@ -304,26 +304,26 @@ watch(
 .tree-pane {
   width: 280px;
   min-width: 220px;
-  border-right: 1px solid rgba(255,255,255,.08);
+  border-right: 1px solid rgba(var(--surface-rgb), .08);
   display: flex;
   flex-direction: column;
-  background: rgba(255,255,255,.02);
+  background: rgba(var(--surface-rgb), .02);
 }
 .tree-toolbar {
   display: flex;
   gap: 6px;
   padding: 8px;
-  border-bottom: 1px solid rgba(255,255,255,.06);
+  border-bottom: 1px solid rgba(var(--surface-rgb), .06);
 }
 .tree-root {
   padding: 8px 12px;
-  font-size: 12px;
-  color: rgba(255,255,255,.5);
-  border-bottom: 1px solid rgba(255,255,255,.04);
+  font-size: calc(12px * var(--font-scale));
+  color: rgba(var(--surface-rgb), .5);
+  border-bottom: 1px solid rgba(var(--surface-rgb), .04);
   cursor: pointer;
   font-family: Consolas, monospace;
 }
-.tree-root:hover { background: rgba(110,168,255,.08); }
+.tree-root:hover { background: rgba(var(--accent-rgb), .08); }
 .tree-list {
   flex: 1;
   overflow-y: auto;
@@ -335,17 +335,17 @@ watch(
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   transition: background .15s;
   user-select: none;
 }
-.tree-item:hover { background: rgba(110,168,255,.1); }
-.tree-item.selected { background: rgba(110,168,255,.18); color: #e8f0ff; }
+.tree-item:hover { background: rgba(var(--accent-rgb), .1); }
+.tree-item.selected { background: rgba(var(--accent-rgb), .18); color: #e8f0ff; }
 .tree-item.dir .tree-name { font-weight: 500; }
-.tree-ico { font-size: 15px; }
+.tree-ico { font-size: calc(15px * var(--font-scale)); }
 .tree-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tree-size { font-size: 11px; opacity: .5; font-family: Consolas, monospace; }
-.tree-empty { padding: 20px; text-align: center; opacity: .4; font-size: 12px; }
+.tree-size { font-size: calc(11px * var(--font-scale)); opacity: .5; font-family: Consolas, monospace; }
+.tree-empty { padding: 20px; text-align: center; opacity: .4; font-size: calc(12px * var(--font-scale)); }
 
 /* 编辑区 */
 .editor-pane {
@@ -362,11 +362,11 @@ watch(
   align-items: center;
   justify-content: center;
   gap: 10px;
-  color: rgba(255,255,255,.4);
+  color: rgba(var(--surface-rgb), .4);
 }
-.empty-big { font-size: 48px; opacity: .5; }
-.empty-hint { font-size: 14px; }
-.empty-hint.sm { font-size: 12px; opacity: .7; }
+.empty-big { font-size: calc(48px * var(--font-scale)); opacity: .5; }
+.empty-hint { font-size: calc(14px * var(--font-scale)); }
+.empty-hint.sm { font-size: calc(12px * var(--font-scale)); opacity: .7; }
 
 .editor-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .editor-bar {
@@ -374,12 +374,12 @@ watch(
   align-items: center;
   gap: 10px;
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(255,255,255,.08);
-  background: rgba(0,0,0,.15);
+  border-bottom: 1px solid rgba(var(--surface-rgb), .08);
+  background: rgba(var(--shadow-rgb), .15);
 }
-.editor-file { font-weight: 500; font-size: 13px; }
-.editor-meta { font-size: 11px; opacity: .5; }
-.editor-dirty { color: #ffcc66; font-size: 12px; }
+.editor-file { font-weight: 500; font-size: calc(13px * var(--font-scale)); }
+.editor-meta { font-size: calc(11px * var(--font-scale)); opacity: .5; }
+.editor-dirty { color: #ffcc66; font-size: calc(12px * var(--font-scale)); }
 .editor-actions { margin-left: auto; display: flex; gap: 6px; }
 .editor-text {
   flex: 1;
@@ -389,7 +389,7 @@ watch(
   border: none;
   padding: 14px 16px;
   font-family: "Cascadia Code", Consolas, "Courier New", monospace;
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   line-height: 1.55;
   resize: none;
   outline: none;
@@ -401,10 +401,10 @@ watch(
 .editor-text.lang-py { color: #ffa657; }
 .editor-footer {
   padding: 4px 14px;
-  font-size: 11px;
-  color: rgba(255,255,255,.35);
-  border-top: 1px solid rgba(255,255,255,.06);
-  background: rgba(0,0,0,.12);
+  font-size: calc(11px * var(--font-scale));
+  color: rgba(var(--surface-rgb), .35);
+  border-top: 1px solid rgba(var(--surface-rgb), .06);
+  background: rgba(var(--shadow-rgb), .12);
 }
 
 .btn.sm.danger { background: rgba(255,80,80,.15); color: #ff9090; border-color: rgba(255,80,80,.25); }

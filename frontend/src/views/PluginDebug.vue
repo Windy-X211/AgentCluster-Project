@@ -18,8 +18,8 @@ import PluginDebugPanel from '@/components/plugin-debug/PluginDebugPanel.vue'
 .pd-root { padding: 16px; height: 100vh; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .top {
   padding: 12px 20px; margin-bottom: 12px; display: flex; align-items: center; gap: 16px; flex-shrink: 0;
-  h2 { font-size: 18px; }
+  h2 { font-size: calc(18px * var(--font-scale)); }
 }
-.sub { font-size: 12px; opacity: .5; }
+.sub { font-size: calc(12px * var(--font-scale)); opacity: .5; }
 .body { flex: 1; min-height: 0; overflow: hidden; }
 </style>
