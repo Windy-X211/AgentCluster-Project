@@ -60,6 +60,8 @@ export interface RichMsg {
   image_data_url?: string
   image_content_type?: string
   purpose?: string
+  // 工具生成的图片本地路径列表（通过 IMAGE: 流式行传输），前端用 /api/fs/image 加载
+  images?: string[]
 }
 
 // —— 简化 cron 匹配：5 字段（分 时 日 月 周），支持 * , - / ——
@@ -1061,6 +1063,20 @@ export const useConvStore = defineStore('conv', {
           const hasOpen = !!tailA && tailA.role === 'assistant' && tailA.streaming && !(tailA.content || '').trim()
           if (!hasOpen) {
             msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
+          }
+        }
+
+      } else if (line.startsWith('IMAGE:')) {
+        // 工具生成的图片本地路径：IMAGE:<file_path>
+        // 挂到最近一条 assistant 消息的 images 数组上，前端用 /api/fs/image 加载渲染
+        const imgPath = line.slice(6)
+        if (imgPath) {
+          let ai = msgs.length - 1
+          while (ai >= 0 && msgs[ai].role !== 'assistant') ai--
+          if (ai >= 0) {
+            const a = msgs[ai] as any
+            if (!a.images) a.images = []
+            a.images.push(imgPath)
           }
         }
 

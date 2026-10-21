@@ -313,6 +313,26 @@ def _strip_prev_image_followups(messages: list[dict], keep_from_idx: int = 0) ->
     return stripped
 
 
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+def _extract_image_paths(result: Any) -> list[str]:
+    """从工具结果中提取所有图片文件路径（用于 IMAGE: 流式行传输给前端）。"""
+    if not isinstance(result, dict):
+        return []
+    paths: list[str] = []
+    files = result.get("files")
+    if isinstance(files, list):
+        for f in files:
+            if isinstance(f, str) and f.lower().endswith(_IMG_EXTS):
+                paths.append(f)
+    if not paths:
+        f = result.get("file")
+        if isinstance(f, str) and f.lower().endswith(_IMG_EXTS):
+            paths.append(f)
+    return paths
+
+
 def _truncate_tool_result(result: Any, is_image: bool = False) -> str:
     """把工具执行结果序列化成 JSON，并对大字段做智能截断。
 
@@ -1389,7 +1409,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 conv["messages"].append({**tool_msg, "ts": datetime.utcnow().isoformat(),
                                          **({"relay": True} if is_relay else {})})
                 yield f"R:{tc['id']}|{result_str}\n"
-
+                for _ip in _extract_image_paths(result):
+                    yield f"IMAGE:{_ip}\n"
                 tool_history.append({"name": tc["name"], "args": args, "result": result})
             # 进入慢通道循环
         else:
@@ -1691,7 +1712,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     tool_entry["relay"] = True
                 conv["messages"].append(tool_entry)
                 yield f"R:{tc['id']}|{result_str}\n"
-
+                for _ip in _extract_image_paths(result):
+                    yield f"IMAGE:{_ip}\n"
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
 
             # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
