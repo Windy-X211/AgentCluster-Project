@@ -53,6 +53,7 @@ export interface RichMsg {
   result?: any         // tool_result 的执行结果
   envelope?: any       // a2a 消息信封（a2a-lite/0.1）
   ts?: string
+  startedAt?: number    // 流式开始毫秒时间戳（前端思考计时用，不依赖后端 ts）
   relay?: boolean      // 接力链消息（聊天区过滤，画布气泡保留）
   agent_id?: number
   from_agent_id?: number  // a2a 信封额外字段：发送方 agent_id
@@ -709,7 +710,7 @@ export const useConvStore = defineStore('conv', {
       // 构建当前轮消息数组（混合：用户 + 工具卡片 + 流式 assistant）
       const msgs: RichMsg[] = c.messages || []
       msgs.push({ role: 'user', content, ts: new Date().toISOString() })
-      msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), agent_id: agentId })
+      msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), agent_id: agentId })
       c.messages = msgs
       this.streamingConvIds.add(cid)
       this._speakingAgent[cid] = agentId
@@ -947,7 +948,7 @@ export const useConvStore = defineStore('conv', {
           console.log('[RN] 已累加到 lastAssistant，累计总长=' + (lastAssistant.reasoning || '').length)
         } else {
           // 思考先于正文到达（快通道常见）→ 先开一条流式 assistant 承接思考
-          msgs.push({ role: 'assistant', content: '', reasoning: text, streaming: true, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
+          msgs.push({ role: 'assistant', content: '', reasoning: text, streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
           console.log('[RN] 懒创建新的 assistant 来承接思考')
         }
       } else if (line.startsWith('T:')) {
@@ -961,7 +962,7 @@ export const useConvStore = defineStore('conv', {
         } else {
           // 懒创建：正文真正到达时才开新的 assistant（不在 R: 后预建空泡泡，
           // 一次性多工具调用会产生 N-1 条空 assistant → 空消息泡泡）
-          msgs.push({ role: 'assistant', content: text, streaming: true, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
+          msgs.push({ role: 'assistant', content: text, streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
         }
       } else if (line.startsWith('TS:')) {
         // 能力调用开始（名称已确定，参数仍在流式）→ 立即显示"正在调用: xxx"
@@ -1013,7 +1014,7 @@ export const useConvStore = defineStore('conv', {
         if (anchor && anchor.role === 'assistant' && (anchor.agent_id ?? null) === (curAgent ?? null)) {
           if (anchor.agent_id == null && curAgent != null) anchor.agent_id = curAgent
         } else {
-          msgs.push({ role: 'assistant', content: '', ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
+          msgs.push({ role: 'assistant', content: '', ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
         }
         msgs.push({ role: 'tool_call', content: '', name: tcName, tool_call_id: tcId, args, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
       } else if (line.startsWith('R:')) {
@@ -1062,7 +1063,7 @@ export const useConvStore = defineStore('conv', {
           const tailA = j >= 0 ? msgs[j] : null
           const hasOpen = !!tailA && tailA.role === 'assistant' && tailA.streaming && !(tailA.content || '').trim()
           if (!hasOpen) {
-            msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
+            msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
           }
         }
 

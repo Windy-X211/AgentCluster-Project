@@ -31,6 +31,47 @@ function isStreamingMsg(m: any): boolean {
   return !!(m?.streaming && convs.streaming)
 }
 
+// —— 思考用时计时器：流式期间每秒 tick 驱动实时用时；停止后用缓存 end 算最终用时 ——
+const nowTick = ref(Date.now())
+let _elapsedTimer: ReturnType<typeof setInterval> | null = null
+watch(() => convs.streaming, (v) => {
+  if (v) {
+    if (!_elapsedTimer) _elapsedTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
+  } else {
+    if (_elapsedTimer) { clearInterval(_elapsedTimer); _elapsedTimer = null }
+    nowTick.value = Date.now()
+  }
+}, { immediate: true })
+onBeforeUnmount(() => { if (_elapsedTimer) clearInterval(_elapsedTimer) })
+// 非活跃 turn 的结束时间缓存（key=该轮最早 startedAt，value=end ms）；普通 Map：end 记录后不变，无需响应式
+const _turnEndCache = new Map<number, number>()
+function formatElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return s + 's'
+  const m = Math.floor(s / 60)
+  return m + 'm' + (s % 60) + 's'
+}
+function turnElapsedLabel(turn: any): string {
+  let start = Infinity
+  for (const ch of turn?.children || []) {
+    if (ch.kind !== 'assistant') continue
+    const s = ch.msg?.startedAt
+    if (typeof s === 'number' && s < start) start = s
+  }
+  if (start === Infinity) return ''
+  const live = isTurnActive(turn.start)
+  let elapsed: number
+  if (live) {
+    elapsed = nowTick.value - start
+  } else {
+    let end = _turnEndCache.get(start)
+    if (!end) { end = Date.now(); _turnEndCache.set(start, end) }
+    elapsed = end - start
+  }
+  if (elapsed < 1000) return ''
+  return formatElapsed(elapsed)
+}
+
 const input = ref('')
 const currentAgentId = ref<number | null>(null)
 const msgBox = ref<HTMLElement | null>(null)
@@ -1880,6 +1921,7 @@ onBeforeUnmount(() => {
               <div class="head-row">
                 <div class="avatar" :style="{ background: turnAvatarGradient(it) }">{{ turnAvatar(it) }}</div>
                 <div v-if="turnName(it)" class="who-assistant">{{ turnName(it) }}</div>
+                <span v-if="turnElapsedLabel(it)" class="turn-elapsed" :class="{ active: isTurnActive(it.start) }">{{ turnElapsedLabel(it) }}</span>
                 <span v-if="showProcToggle(it.start, it)"
                       class="proc-toggle"
                       :class="{ open: isProcessOpen(it.start) }"
@@ -2366,6 +2408,8 @@ onBeforeUnmount(() => {
   object-fit: cover; display: block; border-radius: inherit;
 }
 .who-assistant { font-size: 11.5px; color: rgba(232,236,244,0.75); opacity: .9; line-height: 1; }
+.turn-elapsed { font-size: 10px; color: rgba(232,236,244,0.4); font-family: Consolas, 'Courier New', monospace; line-height: 1.2; margin-left: 4px; align-self: center; white-space: nowrap; }
+.turn-elapsed.active { color: #6ea8ff; }
 
 /* ============ 消息泡泡（基础） ============ */
 .bubble {
