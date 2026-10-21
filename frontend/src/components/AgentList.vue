@@ -360,7 +360,8 @@ function onGroupDrop(e: DragEvent, g: any) {
         <div class="section-title">
           <div class="title-left">
             <button class="collapse-btn" @click="emit('toggle')" title="折叠智能体列表">◂</button>
-            <span class="active-group-name" @click="backToGroups" title="返回分组列表">{{ currentGroupName }}</span>
+            <button class="back-btn" @click="backToGroups" title="返回分组列表">←</button>
+            <span class="active-group-name">{{ currentGroupName }}</span>
           </div>
           <button class="btn ghost" @click="openNew(activeGroupId)">+ 新建智能体</button>
         </div>
@@ -488,6 +489,8 @@ function onGroupDrop(e: DragEvent, g: any) {
 }
 .collapse-btn { flex-shrink: 0; width: 22px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 6px; color: rgba(var(--text-rgb), 0.7); font-size: calc(11px * var(--font-scale)); cursor: pointer; line-height: 1; transition: all .15s; }
 .collapse-btn:hover { background: rgba(var(--surface-rgb), 0.08); color: rgb(var(--text-rgb)); border-color: rgba(var(--accent-rgb), 0.4); }
+.back-btn { flex-shrink: 0; width: 22px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 6px; color: rgba(var(--text-rgb), 0.7); font-size: calc(13px * var(--font-scale)); cursor: pointer; line-height: 1; transition: all .15s; }
+.back-btn:hover { background: rgba(var(--accent-rgb), 0.12); color: var(--accent-ink); border-color: rgba(var(--accent-rgb), 0.4); }
 
 /* 折叠态窄条 */
 .expand-strip { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; background: transparent; border: 0; cursor: pointer; color: rgba(var(--text-rgb), 0.6); transition: all .15s; padding: 0; }
