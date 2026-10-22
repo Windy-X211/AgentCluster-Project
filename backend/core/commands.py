@@ -1433,6 +1433,11 @@ def _with_preset(tool: dict, pname: str) -> dict:
             if k in required:
                 required.remove(k)
         desc = fn.get("description") or ""
+        if fixed:
+            # 固定参数已从 schema 剔除（模型不可见、不可改），但在 description 中
+            # 告知智能体哪些参数已被预设，使其感知运行时状态（不暴露预设值）。
+            desc = (desc.rstrip() + "\n\n【能力参数预设 · 固定参数（已自动注入，无需填写）】\n"
+                    + "\n".join(f"- {k}（已预设，运行时自动生效）" for k in fixed))
         if optional:
             # 1) 把每个可选参数提示注入到该参数自己的 description 里
             new_props: dict = {}

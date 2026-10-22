@@ -20,6 +20,7 @@ import json, asyncio, os, time, re, logging
 from datetime import datetime
 from typing import Any
 from core.store import load, save, upsert, get_by, next_id
+import core.store as store  # 运行时访问 store.ROOT（可变，set_root() 会修改）
 from core.llm import chat_with_failover as chat, ModelDegenerateError, ModelRepetitionError, _encode_tool_name
 from core.commands import run_command, filter_tools, COMMAND_META, WORKDIR_CTX
 from core.a2a import (
@@ -799,6 +800,16 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
     if cluster_context:
         parts.append(f"\n【集群上下文】{cluster_context}")
     prompt = "\n".join(parts)
+    # —— 动态替换存储路径占位符 ——
+    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {storage_root}，
+    # 与 store.ROOT 保持同步（用户在设置里切换存储根后自动生效）。
+    try:
+        _root = str(store.ROOT)
+        prompt = prompt.replace("{skills_dir}", str(store.ROOT / "skills"))
+        prompt = prompt.replace("{plugins_dir}", str(store.ROOT / "plugins"))
+        prompt = prompt.replace("{storage_root}", _root)
+    except Exception:
+        pass
     # 面向模型的工具名统一替换为上游合法名（下划线），与注入的 tools schema 保持一致，
     # 避免模型从示例文本模仿点号名（file.read / cluster.send_message 等）导致上游网关 400。
     for _t in tools or []:
