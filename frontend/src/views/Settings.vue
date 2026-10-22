@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref, computed, watch } from 'vue'
-import { RouterLink } from 'vue-router'
-import { useModelStore, useSettingsStore, useLayoutStore, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP } from '@/stores'
+import { RouterLink, useRouter } from 'vue-router'
+import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP } from '@/stores'
 import { api } from '@/api'
 import FileExplorerDialog from '@/components/FileExplorerDialog.vue'
 import ParamSelect from '@/components/ParamSelect.vue'
@@ -10,6 +10,12 @@ import { getAvatarGradient } from '@/utils/avatar'
 const models = useModelStore()
 const settings = useSettingsStore()
 const layout = useLayoutStore()
+const guide = useGuideStore()
+const router = useRouter()
+function startGuide(type: 'flow' | 'region') {
+  guide.requestGuide(type)
+  router.push('/')
+}
 
 const themeOptions = [
   { id: 'standard', name: '标准配色-银河蓝', bg: '#0a0e1a', bgGrad: '#1a2340', text: '#e8ecf4', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
@@ -404,7 +410,7 @@ async function togglePreset(p: any) {
 </script>
 
 <template>
-  <div class="settings-root">
+  <div class="settings-root region-settings">
     <div class="top glass">
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
       <h2>设置中心</h2>
@@ -617,6 +623,26 @@ async function togglePreset(p: any) {
           </div>
           <div class="hint-empty" style="margin-top: 8px">
             切换全局配色方案，设置自动保存，刷新后仍然生效
+          </div>
+        </div>
+      </div>
+
+      <!-- 新手引导 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>📖 新手引导</span>
+          <span class="hint">再次查看引导说明</span>
+        </div>
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">引导方式</span>
+          </div>
+          <div class="guide-actions">
+            <button class="btn" @click="startGuide('flow')">🗺️ 使用流程引导</button>
+            <button class="btn" @click="startGuide('region')">🖱️ 区域功能引导</button>
+          </div>
+          <div class="hint-empty" style="margin-top: 8px">
+            流程引导：按步骤箭头指引各区域用法；区域引导：鼠标移至区域自动显示说明
           </div>
         </div>
       </div>
@@ -890,6 +916,8 @@ async function togglePreset(p: any) {
 
 .cap-block { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(var(--surface-rgb), 0.06); }
 .cap-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.guide-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.guide-actions .btn { padding: 8px 16px; }
 .cap-title { font-size: calc(12px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px; color: rgba(var(--text-rgb), 0.6); font-weight: 500; }
 .sm { padding: 3px 10px; font-size: calc(11px * var(--font-scale)); }
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; min-height: 26px; }

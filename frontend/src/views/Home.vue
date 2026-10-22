@@ -6,6 +6,7 @@ import AgentList from '@/components/AgentList.vue'
 import MainView from '@/components/MainView.vue'
 import RightPanel from '@/components/RightPanel.vue'
 
+
 const agents = useAgentStore()
 const canvases = useCanvasStore()
 const models = useModelStore()
@@ -63,4 +64,5 @@ onMounted(async () => {
     <div class="resize-handle" @mousedown="onHandleDown" title="拖动调整右侧面板宽度（双击复位）"></div>
     <RightPanel class="right" />
   </div>
+
 </template>

@@ -2,6 +2,7 @@
 import { watch } from 'vue'
 import { RouterView } from 'vue-router'
 import { useLayoutStore } from '@/stores'
+import GuideManager from '@/components/guide/GuideManager.vue'
 
 const layout = useLayoutStore()
 
@@ -19,4 +20,5 @@ watch(() => layout.theme, applyTheme, { immediate: true })
 
 <template>
   <RouterView />
+  <GuideManager />
 </template>

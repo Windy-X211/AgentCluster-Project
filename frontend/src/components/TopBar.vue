@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { RouterLink } from 'vue-router'
+
 </script>
 
 <template>
@@ -12,8 +13,9 @@ import { RouterLink } from 'vue-router'
       </div>
     </div>
     <div class="spacer" />
-    <RouterLink to="/plugins" class="nav-item">🔌 插件调试</RouterLink>
-    <RouterLink to="/settings" class="nav-item">⚙ 设置</RouterLink>
+    <RouterLink to="/plugins" class="nav-item region-plugins">🔌 插件调试</RouterLink>
+    <RouterLink to="/settings" class="nav-item region-settings">⚙ 设置</RouterLink>
+
   </div>
 </template>
 

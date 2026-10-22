@@ -4,7 +4,7 @@ import PluginDebugPanel from '@/components/plugin-debug/PluginDebugPanel.vue'
 </script>
 
 <template>
-  <div class="pd-root">
+  <div class="pd-root region-plugins">
     <div class="top glass">
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
       <h2>插件调试面板</h2>
