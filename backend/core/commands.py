@@ -543,6 +543,29 @@ def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
         return {"error": str(e), "resolved": str(_resolve(path))}
 
 
+def cmd_image_read(path: str) -> dict:
+    """读取本地图片文件并在对话框展示缩略图；返回的 file 路径可作为 SD WebUI 图生图 init_images 的参考图。"""
+    try:
+        p = _resolve(path)
+        if not p.is_file():
+            return {"error": f"图片不存在: {p}"}
+        ext = p.suffix.lower().lstrip(".")
+        if ext not in {"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"}:
+            return {"error": f"不是支持的图片格式: {p}（支持 png/jpg/jpeg/gif/bmp/webp/svg）"}
+        from urllib.parse import quote
+        size = p.stat().st_size
+        return {
+            "ok": True,
+            "file": str(p),
+            "files": [str(p)],
+            "image_data_url": f"/api/fs/image?path={quote(str(p), safe='')}",
+            "size": size,
+            "hint": "图片已发送到对话框。搭配 SD WebUI 图生图(img2img)时，把 file 路径传给 sd_webui 的 init_images 参数即可生成新图。",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def cmd_file_write(path: str, content: str, mode: str = "overwrite") -> dict:
     try:
         p = _resolve(path)
@@ -1053,6 +1076,20 @@ COMMAND_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "image.read",
+            "description": "读取用户电脑上存储的本地图片并在对话框中展示缩略图。返回图片本地绝对路径(file)、可访问 URL(image_data_url) 和文件大小。搭配 SD WebUI 生图插件做图生图(img2img)时，把返回的 file 路径传给 sd_webui 插件的 init_images 参数即可基于该图生成新图，生成图会自动回显到对话框。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "本地图片文件的绝对或相对路径，如 C:/Users/me/pic.png 或 ./photo.jpg"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "skill.invoke",
             "description": "显式调用指定的技能。技能内容不会自动添加到系统提示词中，仅在通过此命令显式调用时返回。一般大小正文（如 lx-music-control）会返回完整正文；较大正文（如 pptx）采用渐进式读取——只返回目录 toc 与开头 preview，不返回全文，需要用 skill.read_section 按需读取具体章节。返回结果还包含技能文件夹绝对路径（skill_dir），读取技能内部文件时必须使用该绝对路径，不能用工作区相对路径。",
             "parameters": {
@@ -1301,6 +1338,7 @@ COMMAND_TOOLS = [
 #  emoji 要贴合动作：读→打开、写→✍️、删→🗑、运行→🚀、创建→🤖/🎨/✨、连接→🔗…
 COMMAND_CN_LABELS = {
     "file.read": "📖 读文件",
+    "image.read": "🖼 读取图片",
     "file.write": "✍️ 写文件",
     "file.delete": "🗑 删除文件",
     "file.replace": "🔄 替换文本",
