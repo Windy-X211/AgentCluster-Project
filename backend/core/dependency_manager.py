@@ -103,37 +103,109 @@ def _pip_already_installed(pkg_spec: str) -> bool:
 # pip 安装全局锁 —— 避免多线程同时 pip install
 _PIP_LOCK = threading.Lock()
 _PIP_INSTALLED_CACHE: set[str] = set()
+_PIP_INSTALLING: set[str] = set()  # 正在后台安装中，避免重复启动
+_PIP_INDEX_ARGS_CACHE: list[str] | None = None  # 镜像源参数缓存
 
 
-def _pip_install(pkg_spec: str) -> bool:
-    """安装一个 pip 包。成功返回 True。"""
+def _pip_index_args() -> list[str]:
+    """检测 pip 是否已配置自定义镜像源；未配置时返回清华源参数加速国内安装。
+
+    用户已通过 pip config set global.index-url 配置过镜像源时不覆盖。
+    结果缓存，避免每次安装都 subprocess 检测。
+    """
+    global _PIP_INDEX_ARGS_CACHE
+    if _PIP_INDEX_ARGS_CACHE is not None:
+        return _PIP_INDEX_ARGS_CACHE
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "config", "get", "global.index-url"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            _PIP_INDEX_ARGS_CACHE = []  # 已有自定义源，不覆盖
+        else:
+            _PIP_INDEX_ARGS_CACHE = ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]
+    except Exception:
+        _PIP_INDEX_ARGS_CACHE = ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]
+    return _PIP_INDEX_ARGS_CACHE
+
+
+def _pip_install(pkg_spec: str, blocking: bool = False) -> bool:
+    """安装一个 pip 包。
+
+    - blocking=False（默认，启动/热重载用）：后台 daemon 线程异步安装，立即返回 False，不阻塞调用方。
+    - blocking=True（用户主动点击"重新扫描/安装依赖"用）：同步执行 pip install 并等待完成，
+      返回 True（成功）/ False（失败），让前端能立即看到安装结果。
+    """
+    cache_key = pkg_spec.strip()
+    if cache_key in _PIP_INSTALLED_CACHE:
+        return True
+
     with _PIP_LOCK:
-        cache_key = pkg_spec.strip()
-        if cache_key in _PIP_INSTALLED_CACHE:
-            return True
+        if cache_key in _PIP_INSTALLING:
+            if blocking:
+                # 已有后台任务在跑，同步等待其完成后再检查结果
+                import time
+                for _ in range(600):
+                    if cache_key not in _PIP_INSTALLING:
+                        break
+                    time.sleep(1)
+                return cache_key in _PIP_INSTALLED_CACHE
+            return False  # 已有安装任务在跑，不重复启动
+        _PIP_INSTALLING.add(cache_key)
 
-        print(f"[dependency] 正在安装 pip 包: {cache_key}")
+    # ---- 同步阻塞安装 ----
+    if blocking:
+        print(f"[dependency] ⏳ 同步安装 pip 包: {cache_key}")
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet", cache_key],
-                capture_output=True, text=True, timeout=180,
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--timeout", "60", "--retries", "3", cache_key, *_pip_index_args()],
+                capture_output=True, text=True, timeout=600,
             )
             if result.returncode == 0:
                 _PIP_INSTALLED_CACHE.add(cache_key)
-                print(f"[dependency] ✓ pip 包已安装: {cache_key}")
+                print(f"[dependency] ✓ 同步安装完成: {cache_key}")
                 return True
             else:
-                print(f"[dependency] ✗ pip install {cache_key} 失败: {result.stderr.strip()}")
+                print(f"[dependency] ✗ pip install {cache_key} 失败: {result.stderr.strip()[:300]}")
                 return False
         except subprocess.TimeoutExpired:
-            print(f"[dependency] ✗ pip install {cache_key} 超时（180s）")
+            print(f"[dependency] ✗ pip install {cache_key} 超时（600s）")
             return False
         except Exception as e:
             print(f"[dependency] ✗ pip install {cache_key} 异常: {e}")
             return False
+        finally:
+            _PIP_INSTALLING.discard(cache_key)
+
+    # ---- 后台异步安装（不阻塞启动）----
+    print(f"[dependency] ⏳ 后台安装 pip 包: {cache_key}（不阻塞启动）")
+
+    def _do_install():
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--timeout", "60", "--retries", "3", cache_key, *_pip_index_args()],
+                capture_output=True, text=True, timeout=600,  # 给足时间（playwright ~40MB）
+            )
+            if result.returncode == 0:
+                _PIP_INSTALLED_CACHE.add(cache_key)
+                print(f"[dependency] ✓ 后台安装完成: {cache_key}")
+            else:
+                print(f"[dependency] ✗ pip install {cache_key} 失败: {result.stderr.strip()[:300]}")
+        except subprocess.TimeoutExpired:
+            print(f"[dependency] ✗ pip install {cache_key} 超时（600s）")
+        except Exception as e:
+            print(f"[dependency] ✗ pip install {cache_key} 异常: {e}")
+        finally:
+            _PIP_INSTALLING.discard(cache_key)
+
+    threading.Thread(target=_do_install, daemon=True).start()
+    return False  # 立即返回 False —— 告诉调用方"当前还没装好，正在后台装"
 
 
-def _ensure_pip_deps(pip_deps: list[str]) -> dict:
+def _ensure_pip_deps(pip_deps: list[str], blocking: bool = False) -> dict:
     """检测并安装 pip 依赖。返回结构化结果：
 
       {
@@ -143,6 +215,8 @@ def _ensure_pip_deps(pip_deps: list[str]) -> dict:
         "install_failed": [尝试安装但失败的],
         "still_missing": [最终仍未满足的（含安装失败的）],
       }
+
+    blocking=True 时同步等待 pip install 完成（用户主动触发安装时用）。
     """
     checked: list[str] = []
     need_install: list[str] = []
@@ -158,7 +232,7 @@ def _ensure_pip_deps(pip_deps: list[str]) -> dict:
     installed_ok: list[str] = []
     install_failed: list[str] = []
     for spec in need_install:
-        if _pip_install(spec):
+        if _pip_install(spec, blocking=blocking):
             installed_ok.append(spec)
         else:
             install_failed.append(spec)
@@ -318,6 +392,7 @@ def ensure_dependencies(
     deps: dict,
     source_dir: Path,
     source_label: str = "",
+    blocking: bool = False,
 ) -> dict:
     """统一入口：检测并安装依赖。返回依赖安装结果摘要。
 
@@ -325,6 +400,8 @@ def ensure_dependencies(
         deps: parse_dependencies() 返回的结构化依赖 dict
         source_dir: 插件/技能所在目录（npm install 用）
         source_label: 来源标识（打印日志时更清晰）
+        blocking: True 时同步等待 pip install 完成（用户主动点击"重新扫描/安装依赖"时用），
+                  False 时后台异步安装不阻塞（启动/热重载时用）
 
     Returns:
         {"pip_installed": [...], "npm_installed": bool|None, "external_reminded": [...]}
@@ -344,7 +421,7 @@ def ensure_dependencies(
     pip_deps = deps.get("pip") or []
     if pip_deps:
         print(f"{label} 检测 {len(pip_deps)} 个 pip 依赖...")
-        pip_result = _ensure_pip_deps(pip_deps)
+        pip_result = _ensure_pip_deps(pip_deps, blocking=blocking)
         summary["pip_checked"] = pip_result["checked"]
         summary["pip_installed"] = pip_result["installed_ok"]
         summary["pip_install_failed"] = pip_result["install_failed"]

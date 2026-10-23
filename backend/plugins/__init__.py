@@ -310,8 +310,11 @@ def _file_hash(fp: Path) -> str:
         return ""
 
 
-def _register_one(plugin_dir: Path) -> dict | None:
-    """注册单个插件，返回注册表条目（失败返回 None；但 exec_module 失败时仍返回 placeholder 条目）。"""
+def _register_one(plugin_dir: Path, blocking: bool = False) -> dict | None:
+    """注册单个插件，返回注册表条目（失败返回 None；但 exec_module 失败时仍返回 placeholder 条目）。
+
+    blocking=True 时同步等待 pip install 完成（用户主动点击"重新扫描/安装依赖"时用）。
+    """
     manifest_fp = plugin_dir / "manifest.yaml"
     tool_fp = plugin_dir / "tool.yaml"
     tool_py = plugin_dir / "tool.py"
@@ -337,7 +340,7 @@ def _register_one(plugin_dir: Path) -> dict | None:
     if raw_deps is not None:
         parsed = parse_dependencies(raw_deps)
         try:
-            dep_summary = ensure_dependencies(parsed, plugin_dir, source_label=f"plugin:{name}")
+            dep_summary = ensure_dependencies(parsed, plugin_dir, source_label=f"plugin:{name}", blocking=blocking)
         except Exception as e:
             print(f"[plugins] WARN 插件 {name} 依赖检测异常: {e}")
 
@@ -467,19 +470,20 @@ def plugin_dependencies_snapshot() -> dict[str, dict]:
     return out
 
 
-def load_plugins() -> dict[str, dict]:
+def load_plugins(blocking: bool = False) -> dict[str, dict]:
     """扫描 AppData/plugins/*/，重建 PLUGIN_REGISTRY（热重载，无需重启）。
 
     - 已删除的插件目录会从注册表移除
     - tool.py 内容未变的插件复用旧模块（保留运行态，不重复执行）
     - tool.py 变化的插件重新执行模块，新代码立即生效
+    - blocking=True 时同步等待缺失的 pip 依赖安装完成（用户主动点击"重新扫描/安装依赖"时用）
     """
     new_registry: dict[str, dict] = {}
     if _plugins_root().exists():
         for sub in sorted(_plugins_root().iterdir()):
             if not sub.is_dir() or sub.name.startswith(("_", ".")):
                 continue
-            entry = _register_one(sub)
+            entry = _register_one(sub, blocking=blocking)
             if entry:
                 new_registry[entry["name"]] = entry
     # 原地更新：保持 PLUGIN_REGISTRY 对象引用不变，避免其他模块通过

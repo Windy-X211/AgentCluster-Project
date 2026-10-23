@@ -46,9 +46,13 @@ def list_plugins():
 
 @router.post("/reload")
 def reload_capabilities():
-    """重新扫描插件和技能目录，热加载（无需重启后端）。"""
-    plugins_reg = load_plugins()
-    skills_reg = load_skills()
+    """重新扫描插件和技能目录，热加载（无需重启后端）。
+
+    用户主动点击"重新扫描/安装依赖"时，以同步阻塞模式安装缺失的 pip 依赖，
+    确保返回时依赖已安装完成，前端能立即看到安装结果（而非后台异步导致快照仍显示缺失）。
+    """
+    plugins_reg = load_plugins(blocking=True)
+    skills_reg = load_skills(blocking=True)
     return {
         "ok": True,
         "plugins_count": len(plugins_reg),
