@@ -2523,7 +2523,7 @@ onBeforeUnmount(() => {
               @click.stop @mousedown.stop>
           <!-- 复制（所有消息通用） -->
           <div class="msg-ctx-item" @click.stop="copyMessageFromCtx">
-            <span class="msg-ctx-icon">📋</span>
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
             <span>复制</span>
           </div>
           <!-- 修改（仅用户最新一条消息） -->
@@ -2533,17 +2533,17 @@ onBeforeUnmount(() => {
           </div>
           <!-- 删除消息（所有消息通用） -->
           <div class="msg-ctx-item" @click.stop="deleteMessageFromCtx">
-            <span class="msg-ctx-icon">🗑</span>
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></span>
             <span>删除此消息</span>
           </div>
           <!-- 撤销（仅用户消息） -->
           <div v-if="msgCtxMenu.role === 'user'" class="msg-ctx-item" @click.stop="undoFromCtx">
-            <span class="msg-ctx-icon">↩️</span>
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v3"/></svg></span>
             <span>撤销此消息及之后对话（并还原文件）</span>
           </div>
           <!-- 查看文件操作历史（仅用户消息） -->
           <div v-if="msgCtxMenu.role === 'user'" class="msg-ctx-item" @click.stop="openFileOpsFromMsg">
-            <span class="msg-ctx-icon">📂</span>
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M3 7v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H10l-2-2H5a2 2 0 0 0-2 2z" fill="#fff" stroke="#2E7D8A" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 7a2 2 0 0 1 2-2h3l2 2H3z" fill="#8FC1C1"/></svg></span>
             <span>查看此消息后的文件操作历史</span>
           </div>
         </div>
@@ -2631,11 +2631,11 @@ onBeforeUnmount(() => {
              :style="{ left: avatarCtxMenu.x + 'px', top: avatarCtxMenu.y + 'px' }"
              @click.stop @mousedown.stop>
           <div class="msg-ctx-item" @click.stop="triggerAvatarPhotoUpload">
-            <span class="msg-ctx-icon">📷</span>
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="8" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/></svg></span>
             <span>{{ userAvatarPhoto ? '更换头像照片' : '设置头像照片' }}</span>
           </div>
           <div v-if="userAvatarPhoto" class="msg-ctx-item" @click.stop="resetAvatarPhoto">
-            <span class="msg-ctx-icon">↩️</span>
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v3"/></svg></span>
             <span>恢复默认头像</span>
           </div>
         </div>
@@ -2969,7 +2969,14 @@ onBeforeUnmount(() => {
         <div class="row2">
           <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true"></textarea>
           <button v-if="settings.asrAvailable && settings.asrEnabled" class="btn voice-btn" :class="{ recording: isRecording }" @click="toggleVoiceInput" :title="isRecording ? '停止同声传译' : '同声传译'" aria-label="语音输入">
-            <span class="voice-icon">🎤</span>
+            <span class="voice-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" aria-hidden="true">
+                <rect x="9" y="3" width="6" height="10" rx="3" />
+                <path d="M6 11 a6 6 0 0 0 12 0" />
+                <line x1="12" y1="17" x2="12" y2="20" />
+                <line x1="8" y1="20" x2="16" y2="20" />
+              </svg>
+            </span>
           </button>
           <button v-if="!convs.streaming" class="btn send" @click="send" aria-label="发送消息">发送</button>
           <button v-else class="btn send stop-btn" @click="sendStop" aria-label="停止输出">
