@@ -1427,6 +1427,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         fast_content_parts = []
         fast_reasoning_parts = []
         fast_tool_calls = []
+        fast_invalid_calls = []   # 快通道实时检测到的非法工具调用（降级到慢通道纠错）
         _fast_upstream_error = False
         fast_text_scan = _ContinueScanner()
         fast_reason_scan = _ContinueScanner()
@@ -1447,12 +1448,18 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 elif kind == "tool_call_start":
                     # 名称已确定，参数仍在流式 → 前端立刻显示"正在调用: xxx"
                     yield f"TS:{payload.get('name') or ''}\n"
+                elif kind == "tool_args_delta":
+                    # 参数增量实时广播 → 前端流式显示正在接收的参数内容（TD: 通道）
+                    _acc = payload.get("accumulated", "")
+                    if _acc:
+                        yield f"TD:{_esc(_acc)}\n"
                 elif kind == "tool_call":
                     # 快通道意外遇到 tool_call（模型忽略了 tool_choice=none）→ 降级到慢通道
                     fast_tool_calls.append(payload)
                     yield f"C:{payload['id']}|{payload['name']}|{json.dumps(payload['arguments'], ensure_ascii=False)}\n"
                 elif kind == "tool_call_invalid":
-                    # 实时检测：工具调用格式错误 → 广播纠错提示，但不执行（快通道降级时也不加入）
+                    # 实时检测：工具调用格式错误 → 收集并标记降级到慢通道纠错
+                    fast_invalid_calls.append(payload)
                     yield f"RN:⚠️ 实时检测：工具 {payload.get('name') or '?'} 参数非法 —— {payload.get('reason', '')[:200]}\n"
                 elif kind == "error":
                     # 快通道上游 400 → 降级到慢通道重试（慢通道 payload 不同：传了 tools）
@@ -1494,7 +1501,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     args = json.loads(tc.get("arguments", "{}")) if isinstance(tc.get("arguments"), str) else (tc.get("arguments") or {})
                 except Exception:
                     args = {}
-                result = _execute_tool(tc["name"], args,
+                result = await asyncio.to_thread(_execute_tool, tc["name"], args,
                                       conv_id=conversation_id,
                                       tool_call_id=tc["id"],
                                       agent_id=agent.get("id"))
@@ -1524,6 +1531,32 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 # 快通道上游 400 → 直接降级到慢通道循环（不存空 assistant 消息）
                 # 慢通道会重新调用 LLM，且带上 tools —— payload 不同，有可能成功
                 yield "RN:（快通道上游错误，降级到慢通道重试）\n"
+            elif fast_invalid_calls:
+                # 快通道检测到非法工具调用 → 降级到慢通道，注入纠错反馈让模型修正
+                _last_assistant_text = fast_text
+                _fast_assistant_msg: dict = {"role": "assistant", "content": fast_text,
+                                             "ts": datetime.utcnow().isoformat()}
+                if assistant_reasoning:
+                    _fast_assistant_msg["reasoning"] = assistant_reasoning
+                messages.append(_fast_assistant_msg)
+                _invalid_lines = [
+                    f"- 工具 {iv.get('name') or '?'}：{iv.get('reason', '参数非法')}"
+                    for iv in fast_invalid_calls
+                ]
+                _invalid_block = "\n".join(_invalid_lines)
+                _fast_correction = (
+                    "[实时检测 · 工具调用格式错误]\n"
+                    "你上一轮发起的工具调用被实时检测器判定为非法，**已中止执行**，未产生任何副作用。\n"
+                    f"问题清单：\n{_invalid_block}\n"
+                    "\n正确格式要求：\n"
+                    "1. 必须通过 function calling 机制调用工具，**严禁**在正文里手写工具调用；\n"
+                    "2. 工具名必须是可用工具列表中的真实名称；\n"
+                    "3. 参数必须是合法 JSON 对象，字符串值必须用双引号包裹；\n"
+                    "4. **必填参数不可遗漏**（如 action 参数必须明确指定为 enum 中的值）。\n"
+                    "\n请立即用正确格式重新发起调用，不要重复相同的错误。"
+                )
+                messages.append({"role": "user", "content": _fast_correction})
+                yield "RN:（快通道检测到非法工具调用，降级到慢通道修正）\n"
             elif fast_text_scan.found or fast_reason_scan.found:
                 # 模型输出了 <continue> → 任务未结束：清掉前端已流出的快通道内容，
                 # 不入库、不 return，直接落入下方慢通道循环继续处理
@@ -1607,6 +1640,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 elif kind == "tool_call_start":
                     # 名称首次确定即广播（参数还在流）→ 画布气泡/聊天区立刻显示"正在调用: xxx"
                     yield f"TS:{payload.get('name') or ''}\n"
+                elif kind == "tool_args_delta":
+                    # 参数增量实时广播 → 前端流式显示正在接收的参数内容（TD: 通道）
+                    _acc = payload.get("accumulated", "")
+                    if _acc:
+                        yield f"TD:{_esc(_acc)}\n"
                 elif kind == "tool_call":
                     tc = {"id": payload["id"], "type": "function", "function": {"name": payload["name"], "arguments": json.dumps(payload["arguments"], ensure_ascii=False)}}
                     assistant_tool_calls.append(tc)
@@ -1804,7 +1842,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     args = json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
                 except Exception:
                     args = {}
-                result = _execute_tool(fn["name"], args,
+                result = await asyncio.to_thread(_execute_tool, fn["name"], args,
                                       conv_id=conversation_id,
                                       tool_call_id=tc["id"],
                                       agent_id=agent.get("id"))

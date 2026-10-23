@@ -155,6 +155,32 @@ export const api = {
         } catch (e) { rej(e) }
       })
   },
+  // 根级文件访问（不依赖 canvasId：上传附件 / 外部路径等）
+  fs: {
+    list: (path: string) => req<any>('/fs/list?path=' + encodeURIComponent(path)),
+    read: (path: string) => req<any>('/fs/read?path=' + encodeURIComponent(path)),
+    write: (path: string, content: string) => req<any>('/fs/write', { method: 'PUT', body: JSON.stringify({ path, content }) }),
+    del: (path: string) => req<any>('/fs/delete', { method: 'DELETE', body: JSON.stringify({ path }) }),
+    // —— 根级文件原始字节 / 二进制预览（供 FileViewer 预览上传附件等不属于任何画布的文件）——
+    rawUrl: (path: string, v?: number) =>
+      BASE + `/api/fs/raw?path=` + encodeURIComponent(path) + (v ? `&v=${v}` : ''),
+    raw: async (path: string): Promise<ArrayBuffer> => {
+      const r = await fetch(BASE + `/api/fs/raw?path=` + encodeURIComponent(path))
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+      return r.arrayBuffer()
+    },
+    officePdf: async (path: string): Promise<string> => {
+      const r = await fetch(BASE + `/api/fs/office-pdf?path=` + encodeURIComponent(path))
+      if (!r.ok) {
+        let d: any = null
+        try { d = await r.json() } catch { /* 非 JSON 错误体 */ }
+        throw new Error(d?.detail || `${r.status} ${r.statusText}`)
+      }
+      return URL.createObjectURL(await r.blob())
+    },
+    run: async (path: string) =>
+      req<any>(`/api/fs/run?path=` + encodeURIComponent(path), { method: 'POST' }),
+  },
   convs: {
     list: () => req<any[]>('/conversations'),
     create: (d: any) => req('/conversations', { method: 'POST', body: JSON.stringify(d) }),
@@ -206,12 +232,6 @@ export const api = {
     pickFolder: (initial?: string, title?: string) =>
       req<{ path: string }>('/storage/pick_folder', { method: 'POST', body: JSON.stringify({ initial: initial || '', title: title || '' }) }),
     setLocation: (path: string) => req<any>('/storage/set_location', { method: 'POST', body: JSON.stringify({ path }) })
-  },
-  fs: {
-    list: (path: string) => req<any>('/fs/list?path=' + encodeURIComponent(path)),
-    read: (path: string) => req<any>('/fs/read?path=' + encodeURIComponent(path)),
-    write: (path: string, content: string) => req<any>('/fs/write', { method: 'PUT', body: JSON.stringify({ path, content }) }),
-    del: (path: string) => req<any>('/fs/delete', { method: 'DELETE', body: JSON.stringify({ path }) })
   },
   capabilities: {
     all: () => req<any>('/commands'),          // 返回 {commands, skills, plugins}

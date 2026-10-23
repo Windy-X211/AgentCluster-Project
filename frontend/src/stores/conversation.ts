@@ -54,6 +54,7 @@ export interface RichMsg {
   envelope?: any       // a2a 消息信封（a2a-lite/0.1）
   ts?: string
   startedAt?: number    // 流式开始毫秒时间戳（前端思考计时用，不依赖后端 ts）
+  endedAt?: number      // 流式结束毫秒时间戳（用于计算最终用时，避免重挂载后 Date.now() 漂移）
   relay?: boolean      // 接力链消息（聊天区过滤，画布气泡保留）
   agent_id?: number
   from_agent_id?: number  // a2a 信封额外字段：发送方 agent_id
@@ -701,11 +702,6 @@ export const useConvStore = defineStore('conv', {
       const cid = this.current!  // 捕获本次发送的会话 id：整个流程（含 finally）都按此 id 操作，
       // 用户中途切换会话不会影响本流的收尾与状态复位
 
-      // 文字触发：运行中且命中某智能体的 message 触发 → 替换目标
-      if (this.running) {
-        const hit = this._matchTextTrigger(content)
-        if (hit) agentId = hit
-      }
 
       // 链首不是接力段：复位本会话的接力/工具状态
       this._relayPhase.delete(cid)
@@ -785,8 +781,12 @@ export const useConvStore = defineStore('conv', {
         this._toolPending[cid] = {}
         // 兜底：清空本轮所有残留的 streaming 标记（正常结束 / 中断 / 异常统一收敛到这里），
         // 确保最终落库的 messages 不带"活的"流式标记，防止空泡泡+光标被持久化
+        // 同时为所有有 startedAt 但尚未记录 endedAt 的消息补上结束时间戳（用于最终用时计算）
+        const endedAt = Date.now()
         for (const m of msgs) {
-          if ((m as any).streaming) (m as any).streaming = false
+          const anyM = m as any
+          if (anyM.streaming) anyM.streaming = false
+          if (typeof anyM.startedAt === 'number' && typeof anyM.endedAt !== 'number') anyM.endedAt = endedAt
         }
         // 兜底：丢掉末尾仍然一个字都没有的 assistant 占位（模型整轮没输出正文时，
         // 不让空占位落库/渲染成空消息泡泡；带工具的锚点必在工具卡片之前，不会被误删）
@@ -809,7 +809,7 @@ export const useConvStore = defineStore('conv', {
       }
     },
 
-    // —— 运行/停止：按节点右键配置的触发方式（manual 等待 / cron 定时 / message 文字）——
+    // —— 运行/停止：按节点右键配置的触发方式（manual 等待 / cron 定时）——
     startRun(canvasId: number) {
       if (this.running) return
       this.running = true
@@ -864,22 +864,7 @@ export const useConvStore = defineStore('conv', {
         return // 一轮只触发一个，避免并发
       }
     },
-    _matchTextTrigger(content: string): number | null {
-      if (this.runCanvasId == null) return null
-      const canvas = useCanvasStore().list.find(x => x.id === this.runCanvasId)
-      if (!canvas) return null
-      const agents = useAgentStore().list
-      const text = (content || '').trim()
-      if (!text) return null
-      for (const n of canvas.nodes || []) {
-        const a = agents.find((x: any) => x.id === n.agent_id)
-        if (!a || a.enabled === false) continue
-        const t = a.trigger || {}
-        if (t.type !== 'message' || !t.message) continue
-        if (text.includes(t.message)) return a.id
-      }
-      return null
-    },
+
 
     /** 被消息目标开始输出（当前发言者是某条 call 连线的 to）→ 结束该条连线流动
      *  按 cid 操作对应会话的状态，避免并发流互相干扰。 */

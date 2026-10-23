@@ -523,13 +523,25 @@ def _resolve_under(workdir: str, path: str) -> Path | None:
 
 
 def read_file(workdir: str, path: str) -> dict:
-    """读取工作区内文本文件（UTF-8，失败回退 gbk；≤2MB）。"""
+    """读取工作区内文件。文本走 UTF-8（失败回退 gbk；≤2MB）；
+    Office/PDF（docx/doc/xls/xlsx/ppt/pptx/pdf）走专用库抽取纯文本。
+    """
     p = _resolve_under(workdir, path)
     if not p:
         return {"error": "路径不在工作区内"}
     if not p.is_file():
         return {"error": f"不是文件或不存在：{path}"}
     ext = p.suffix.lower().lstrip(".")
+    # —— Office 文档：走 commands 里的抽取函数（避免二进制解码乱码）——
+    OFFICE_EXTS = {"docx", "doc", "xlsx", "xls", "pptx", "ppt", "pdf"}
+    if ext in OFFICE_EXTS:
+        try:
+            from core.commands import _extract_office_text
+            content = _extract_office_text(p)
+        except Exception as e:
+            return {"error": f"Office 文档解析失败：{e}"}
+        return {"ok": True, "path": str(p), "name": p.name, "ext": ext,
+                "size": p.stat().st_size, "content": content, "office": True}
     if ext and ext not in TEXT_EXTS:
         return {"error": f"不支持读取的文件类型：.{ext}"}
     if p.stat().st_size > 2 * 1024 * 1024:

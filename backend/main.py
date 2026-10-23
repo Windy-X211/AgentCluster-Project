@@ -1,7 +1,7 @@
 """智能体集群 - FastAPI 入口"""
 import os
 import zlib
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
@@ -443,6 +443,127 @@ def fs_image(path: str = ""):
         raise HTTPException(500, f"读取失败：{e}")
     from fastapi.responses import Response
     return Response(content=raw, media_type=mime)
+
+
+# ---- 文件上传（前端拖拽文件到对话输入框 → 保存到 AppData/uploads/）----
+@app.post("/api/fs/upload")
+async def fs_upload(files: list[UploadFile] = File(...)):
+    """接收 multipart/form-data 文件上传，保存到 AppData/uploads/ 目录，返回文件的绝对路径。
+
+    前端从操作系统拖文件到对话输入框时调用，得到路径后插入到消息文本中，
+    智能体即可通过 file.read / file.structure 等工具访问该文件。
+    """
+    uploads_dir = ROOT / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    if not files:
+        raise HTTPException(400, "未收到任何文件")
+
+    MAX_SIZE = 20 * 1024 * 1024  # 单文件 20 MB 上限
+    import time
+
+    results = []
+    for up in files:
+        filename = up.filename or "upload"
+        # Windows 路径里可能带反斜杠，去掉目录前缀
+        filename = filename.replace("\\", "/").split("/")[-1]
+        ext = os.path.splitext(filename)[1]
+        safe_name = f"{int(time.time()*1000)}_{os.getpid()}_{filename}"
+        dest = uploads_dir / safe_name
+
+        content = await up.read()
+        if len(content) > MAX_SIZE:
+            raise HTTPException(413, f"文件过大（>20MB）：{filename}")
+
+        try:
+            dest.write_bytes(content)
+        except Exception as e:
+            raise HTTPException(500, f"保存失败：{e}")
+
+        results.append({
+            "name": filename,
+            "path": str(dest),
+            "size": len(content),
+            "content_type": up.content_type or "",
+            "ext": ext.lstrip("."),
+        })
+
+    return {"ok": True, "files": results}
+
+
+# ---- 根级文件原始字节（供 FileViewer 预览不属于任何画布的文件：上传附件/外部路径等）----
+@app.get("/api/fs/raw")
+def fs_raw(path: str = "", v: int = 0):
+    """返回文件原始字节（二进制）。允许 ROOT/uploads 等非画布路径；≤50MB；扩展名白名单。"""
+    if not path:
+        raise HTTPException(400, "path required")
+    try:
+        fp = _safe_resolve(path)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(403, f"path 不可访问：{path}")
+    if not fp.is_file():
+        raise HTTPException(404, f"文件不存在：{path}")
+    ext = fp.suffix.lower().lstrip(".")
+    from api.canvases import _RAW_EXT_MIME, _RAW_MAX_BYTES
+    mime = _RAW_EXT_MIME.get(ext)
+    if not mime:
+        raise HTTPException(415, f"不支持预览的文件类型：.{ext}")
+    if fp.stat().st_size > _RAW_MAX_BYTES:
+        raise HTTPException(413, "文件过大（>50MB），无法在线预览")
+    from fastapi.responses import FileResponse
+    return FileResponse(fp, media_type=mime)
+
+
+@app.get("/api/fs/office-pdf")
+def fs_office_pdf(path: str = ""):
+    """doc/docx/ppt 经 Office COM 转 PDF（带磁盘缓存），返回 PDF 文件流。
+    供聊天附件 FileViewer 使用——这些文件不属于任何画布 workdir。"""
+    if not path:
+        raise HTTPException(400, "path required")
+    try:
+        fp = _safe_resolve(path)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(403, f"path 不可访问：{path}")
+    if not fp.is_file():
+        raise HTTPException(404, f"文件不存在：{path}")
+    from core import office_preview
+    if fp.suffix.lower().lstrip(".") not in office_preview.SUPPORTED_EXTS:
+        raise HTTPException(415, "仅支持 doc / docx / ppt 转换")
+    r = office_preview.convert_to_pdf(str(fp))
+    if "error" in r:
+        raise HTTPException(400, r["error"])
+    from fastapi.responses import FileResponse
+    return FileResponse(r["pdf"], media_type="application/pdf")
+
+
+@app.post("/api/fs/run")
+def fs_run(path: str = ""):
+    """用系统默认程序打开指定文件（Windows 下 os.startfile；其他平台用命令）。"""
+    if not path:
+        raise HTTPException(400, "path required")
+    try:
+        fp = _safe_resolve(path)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(403, f"path 不可访问：{path}")
+    if not fp.exists():
+        raise HTTPException(404, f"文件不存在：{path}")
+    import platform, subprocess
+    try:
+        if os.name == "nt":
+            os.startfile(str(fp))  # type: ignore[attr-defined]
+        elif platform.system().lower() == "darwin":
+            subprocess.Popen(["open", str(fp)])
+        else:
+            subprocess.Popen(["xdg-open", str(fp)])
+    except Exception as e:
+        raise HTTPException(500, f"打开失败：{e}")
+    return {"ok": True, "path": str(fp)}
 
 
 if __name__ == "__main__":

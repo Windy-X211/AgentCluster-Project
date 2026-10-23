@@ -480,6 +480,217 @@ def run_command(command_name: str, **kwargs) -> Any:
 _IMG_READ_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 _IMG_READ_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
 
+# Office 文档扩展名：file.read 遇到这些类型时会抽取可读文本返回，而不是直接 UTF-8 解码二进制
+_OFFICE_EXTS = (
+    ".docx",  # Word 2007+
+    ".doc",   # 旧版 Word 二进制（仅 Windows + 本机 Word）
+    ".xlsx",  # Excel 2007+
+    ".xls",   # 旧版 Excel 二进制（仅 Windows + 本机 Excel）
+    ".pptx",  # PowerPoint 2007+
+    ".ppt",   # 旧版 PowerPoint 二进制（仅 Windows + 本机 PowerPoint）
+    ".pdf",   # PDF
+)
+
+
+def _extract_office_text(p: Path) -> str:
+    """把 Office/PDF 文档转成可读纯文本返回（失败则返回错误信息字符串）。
+
+    抽取原则：
+      - 不追求完美排版，只要 LLM 能看懂内容就行
+      - 现代格式（docx/xlsx/pptx/pdf）走 Python 第三方库（已预装）
+      - 旧版二进制（doc/xls/ppt）在 Windows 上走本机 Office COM；无 Office 时返回明确提示
+      - 任何异常都降级为 "（错误：...）" 插入返回文本，保证调用方始终能拿到字符串
+    """
+    ext = p.suffix.lower()
+    try:
+        if ext == ".docx":
+            return _extract_docx(p)
+        if ext == ".doc":
+            return _extract_doc_old(p)
+        if ext == ".xlsx":
+            return _extract_xlsx(p)
+        if ext == ".xls":
+            return _extract_xls_old(p)
+        if ext == ".pptx":
+            return _extract_pptx(p)
+        if ext == ".ppt":
+            return _extract_ppt_old(p)
+        if ext == ".pdf":
+            return _extract_pdf(p)
+    except Exception as e:  # noqa: BLE001
+        return f"（{ext} 解析失败：{e}）"
+    return f"（{ext} 不支持文本抽取）"
+
+
+def _extract_docx(p: Path) -> str:
+    from docx import Document
+    doc = Document(str(p))
+    out: list[str] = []
+    for para in doc.paragraphs:
+        t = para.text.strip()
+        if t:
+            out.append(t)
+    for ti, tbl in enumerate(doc.tables):
+        out.append(f"\n[表格 {ti + 1}]")
+        for row in tbl.rows:
+            cells = [c.text.replace("\n", " ").strip() for c in row.cells]
+            out.append(" | ".join(cells))
+    return "\n".join(out)
+
+
+def _extract_doc_old(p: Path) -> str:
+    """旧版 .doc —— 用本机 Word COM 读取 Content.Text。"""
+    import pythoncom
+    from win32com.client import Dispatch
+    pythoncom.CoInitialize()
+    app = None
+    try:
+        app = Dispatch("Word.Application")
+        app.Visible = False
+        app.DisplayAlerts = 0
+        doc = app.Documents.Open(str(p), ReadOnly=True, AddToRecentFiles=False)
+        try:
+            text = doc.Content.Text
+        finally:
+            doc.Close(SaveChanges=False)
+        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    except ImportError:
+        return "（.doc 旧格式需要 pywin32 + 本机安装 Word 才能读取）"
+    finally:
+        if app is not None:
+            try: app.Quit()
+            except Exception: pass
+        pythoncom.CoUninitialize()
+
+
+def _extract_xlsx(p: Path) -> str:
+    import openpyxl
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out: list[str] = []
+    for name in wb.sheetnames:
+        ws = wb[name]
+        out.append(f"\n=== Sheet: {name} ===")
+        rows_counted = 0
+        for row in ws.iter_rows(values_only=True):
+            if all(v is None or str(v).strip() == "" for v in row):
+                continue
+            cells = [str(v).strip() if v is not None else "" for v in row]
+            out.append(" | ".join(cells))
+            rows_counted += 1
+            if rows_counted >= 500:   # 单 sheet 封顶 500 行，避免巨型表格撑爆 LLM 上下文
+                out.append(f"... （该 sheet 超过 500 行，已截断）")
+                break
+        out.append("")
+    wb.close()
+    return "\n".join(out).strip()
+
+
+def _extract_xls_old(p: Path) -> str:
+    """旧版 .xls —— 用本机 Excel COM 读取 UsedRange。"""
+    import pythoncom
+    from win32com.client import Dispatch
+    pythoncom.CoInitialize()
+    app = None
+    try:
+        app = Dispatch("Excel.Application")
+        app.Visible = False
+        app.DisplayAlerts = False
+        wb = app.Workbooks.Open(str(p), ReadOnly=True)
+        try:
+            out: list[str] = []
+            for ws in wb.Worksheets:
+                name = ws.Name
+                out.append(f"\n=== Sheet: {name} ===")
+                used = ws.UsedRange
+                rows = used.Rows.Count
+                cols = used.Columns.Count
+                # 读值数组（比逐单元格快得多）
+                values = used.Value if rows > 0 and cols > 0 else [[]]
+                if rows == 1:
+                    values = [values]  # 单行时 Excel 返回扁平数组
+                rc = 0
+                for row in values:
+                    cells = []
+                    for v in row[:cols]:
+                        cells.append(str(v).strip() if v is not None else "")
+                    if any(cells):
+                        out.append(" | ".join(cells))
+                        rc += 1
+                        if rc >= 500:
+                            out.append("... （该 sheet 超过 500 行，已截断）")
+                            break
+        finally:
+            wb.Close(SaveChanges=False)
+        return "\n".join(out).strip()
+    except ImportError:
+        return "（.xls 旧格式需要 pywin32 + 本机安装 Excel 才能读取）"
+    finally:
+        if app is not None:
+            try: app.Quit()
+            except Exception: pass
+        pythoncom.CoUninitialize()
+
+
+def _extract_pptx(p: Path) -> str:
+    from pptx import Presentation
+    prs = Presentation(str(p))
+    out: list[str] = []
+    for si, slide in enumerate(prs.slides):
+        out.append(f"\n=== Slide {si + 1} ===")
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    t = para.text.strip()
+                    if t:
+                        out.append(t)
+            # 表格里的文本
+            if shape.has_table:
+                for row in shape.table.rows:
+                    cells = [c.text.replace("\n", " ").strip() for c in row.cells]
+                    out.append(" | ".join(cells))
+    return "\n".join(out).strip()
+
+
+def _extract_ppt_old(p: Path) -> str:
+    """旧版 .ppt —— 用本机 PowerPoint COM 读取。"""
+    import pythoncom
+    from win32com.client import Dispatch
+    pythoncom.CoInitialize()
+    app = None
+    try:
+        app = Dispatch("PowerPoint.Application")
+        pres = app.Presentations.Open(str(p), ReadOnly=True, Untitled=False, WithWindow=False)
+        try:
+            out: list[str] = []
+            for si, slide in enumerate(pres.Slides):
+                out.append(f"\n=== Slide {si + 1} ===")
+                for shape in slide.Shapes:
+                    if shape.HasTextFrame and shape.TextFrame.HasText:
+                        t = shape.TextFrame.TextRange.Text.strip()
+                        if t:
+                            out.append(t)
+        finally:
+            pres.Close()
+        return "\n".join(out).strip()
+    except ImportError:
+        return "（.ppt 旧格式需要 pywin32 + 本机安装 PowerPoint 才能读取）"
+    finally:
+        if app is not None:
+            try: app.Quit()
+            except Exception: pass
+        pythoncom.CoUninitialize()
+
+
+def _extract_pdf(p: Path) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(str(p))
+    out: list[str] = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        if text.strip():
+            out.append(f"\n--- Page {i + 1} ---\n{text.strip()}")
+    return "\n".join(out).strip()
+
 
 def _looks_like_image_bytes(data: bytes) -> bool:
     if not data or len(data) < 4:
@@ -501,6 +712,9 @@ def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
     图片文件（png/jpg/jpeg/gif/webp/bmp）不返回文本内容（二进制 read_text 会出乱码），
     而是返回 file 字段，由上层 _build_image_followup 把图片以 data URL 注入多模态
     user 消息给模型，模型可直接"看到"图片；前端也通过 _extract_image_refs 拿到缩略图。
+
+    Office 文档（doc/docx/xls/xlsx/ppt/pptx/pdf）不走 UTF-8 二进制解码，
+    而是用 python-docx/openpyxl/python-pptx/pypdf 或本机 Office COM 抽取可读纯文本。
     """
     try:
         p = _resolve(path)
@@ -513,6 +727,19 @@ def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
             if _looks_like_image_bytes(_raw):
                 return {"file": str(p), "path": str(p), "content": "[图片]"}
             return {"error": "文件扩展名是图片类型，但内容魔数不匹配，可能不是有效图片文件", "path": str(p)}
+
+        # —— Office / PDF：用专用库抽取可读文本，不再 UTF-8 解码二进制 ——
+        if p.suffix.lower() in _OFFICE_EXTS:
+            text = _extract_office_text(p)
+            if len(text) > max_chars:
+                # Office 文档标题/摘要通常在开头，结论在结尾；保留头尾各一段
+                head = int(max_chars * 0.75)
+                tail = max_chars - head
+                text = (text[:head].rstrip() +
+                        f"\n\n...[中间已截断，原文共 {len(text)} 字符]...\n\n" +
+                        text[-tail:].lstrip())
+            return {"content": text, "path": str(p), "office": True}
+
         all_lines = p.read_text(encoding=encoding, errors="ignore").splitlines()
         total = len(all_lines)
         region = start_line is not None or end_line is not None
@@ -541,29 +768,6 @@ def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
         return result
     except Exception as e:
         return {"error": str(e), "resolved": str(_resolve(path))}
-
-
-def cmd_image_read(path: str) -> dict:
-    """读取本地图片文件并在对话框展示缩略图；返回的 file 路径可作为 SD WebUI 图生图 init_images 的参考图。"""
-    try:
-        p = _resolve(path)
-        if not p.is_file():
-            return {"error": f"图片不存在: {p}"}
-        ext = p.suffix.lower().lstrip(".")
-        if ext not in {"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"}:
-            return {"error": f"不是支持的图片格式: {p}（支持 png/jpg/jpeg/gif/bmp/webp/svg）"}
-        from urllib.parse import quote
-        size = p.stat().st_size
-        return {
-            "ok": True,
-            "file": str(p),
-            "files": [str(p)],
-            "image_data_url": f"/api/fs/image?path={quote(str(p), safe='')}",
-            "size": size,
-            "hint": "图片已发送到对话框。搭配 SD WebUI 图生图(img2img)时，把 file 路径传给 sd_webui 的 init_images 参数即可生成新图。",
-        }
-    except Exception as e:
-        return {"error": str(e)}
 
 
 def cmd_file_write(path: str, content: str, mode: str = "overwrite") -> dict:
@@ -1058,7 +1262,7 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "file.read",
-            "description": "读取指定文件的内容。默认返回完整内容；也可以传 start_line / end_line 只读指定行区间（大文件分段查看）。用于查看代码、文档、配置等文本文件。图片文件（png/jpg/jpeg/gif/webp/bmp）会以图片形式返回（不返回文本乱码），模型可直接看到图片内容做视觉分析。",
+            "description": "读取指定文件的内容。默认返回完整内容；也可以传 start_line / end_line 只读指定行区间（大文件分段查看）。支持的文件类型：\n\n  1) **文本文件**：代码、配置、markdown、JSON、CSV、日志等（UTF-8/GBK）；\n  2) **图片**（png/jpg/jpeg/gif/webp/bmp）：不返回文本，返回 file 字段由上层做视觉注入；\n  3) **Office 文档**（.docx / .doc / .xlsx / .xls / .pptx / .ppt / .pdf）：自动抽取可读纯文本（段落+表格，不走二进制解码，不会有乱码），可直接用于总结、翻译、提取数据。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1068,20 +1272,6 @@ COMMAND_TOOLS = [
                     "line_numbers": {"type": "boolean", "description": "是否在每行前加文件真实行号（区域读取时从 start_line 起；配合 file.patch 按行定点编辑时建议开启）"},
                     "start_line": {"type": "integer", "description": "可选：起始行号（1 起），只读该行及之后的内容；与 end_line 配合构成闭区间 [start_line, end_line]，适合大文件分段查看"},
                     "end_line": {"type": "integer", "description": "可选：结束行号（1 起），与 start_line 配合构成闭区间；单独给 end_line 时表示从第 1 行读到此行"}
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "image.read",
-            "description": "读取用户电脑上存储的本地图片并在对话框中展示缩略图。返回图片本地绝对路径(file)、可访问 URL(image_data_url) 和文件大小。搭配 SD WebUI 生图插件做图生图(img2img)时，把返回的 file 路径传给 sd_webui 插件的 init_images 参数即可基于该图生成新图，生成图会自动回显到对话框。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "本地图片文件的绝对或相对路径，如 C:/Users/me/pic.png 或 ./photo.jpg"}
                 },
                 "required": ["path"]
             }
@@ -1338,7 +1528,6 @@ COMMAND_TOOLS = [
 #  emoji 要贴合动作：读→打开、写→✍️、删→🗑、运行→🚀、创建→🤖/🎨/✨、连接→🔗…
 COMMAND_CN_LABELS = {
     "file.read": "📖 读文件",
-    "image.read": "🖼 读取图片",
     "file.write": "✍️ 写文件",
     "file.delete": "🗑 删除文件",
     "file.replace": "🔄 替换文本",

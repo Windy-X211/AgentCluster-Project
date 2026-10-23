@@ -1,4 +1,4 @@
-﻿import { marked } from 'marked'
+import { marked } from 'marked'
 
 marked.setOptions({
   gfm: true,
@@ -220,6 +220,81 @@ export function renderMarkdown(text: string | undefined | null): string {
       return escHtml(src).replace(/\n/g, '<br>')
     }
   }
+}
+
+/** 在 renderMarkdown 基础上，额外处理"聊天附件"场景：
+ *   - `/file-viewer?path=...&name=...&size=...` 的 <a> → 可点击的文件卡片 HTML
+ *   - `/api/fs/image?path=...` 的 <img> → 加 data-chat-img 标记，供外层做缩略图+点击灯箱
+ * 产出的 HTML 仍通过 sanitizeHtml，保证安全。
+ */
+export function renderChatMarkdown(text: string | undefined | null): string {
+  const html = renderMarkdown(text)
+  if (!html) return html
+  return _postChatAttachments(html)
+}
+
+function _postChatAttachments(html: string): string {
+  let out = html
+
+  // 1. 文件卡片：把 <a href="/file-viewer?path=...&name=...&size=...">text</a> 替换为卡片
+  //    注意：href 里的 path/name 经过 URL 编码
+  out = out.replace(/<a\b([^>]*)href="(\/file-viewer\?[^"]+)"([^>]*)>([^<]*)<\/a>/gi,
+    (_m, preAttrs, href, postAttrs, inner) => {
+      const q = href.split('?')[1] || ''
+      const params = new URLSearchParams(q)
+      const path = params.get('path') || ''
+      const name = params.get('name') || ''
+      const sizeStr = params.get('size') || ''
+      // 文件名必须是 Office/PDF/文本类型才当作附件（防止误替换智能体写的普通 /file-viewer 链接）
+      const ext = name.split('.').pop()?.toLowerCase() || ''
+      if (!path || !ext) {
+        // 不是合法附件标记 → 原样返回（保留 sanitizeHtml 输出的安全 <a>）
+        return _m
+      }
+      const ICON_MAP: Record<string, string> = {
+        doc: '📝', docx: '📝', txt: '📄', md: '📝', pdf: '📕',
+        xls: '📊', xlsx: '📊', csv: '📊', json: '📋', yaml: '📋',
+        ppt: '🎞', pptx: '🎞',
+        py: '🐍', js: '📜', ts: '📜', vue: '📜', html: '🌐', css: '🎨',
+      }
+      const icon = ICON_MAP[ext] || '📎'
+      const sizeText = sizeStr ? _formatSize(parseInt(sizeStr, 10)) : ''
+      // 构造卡片：数据属性保留原始值（外层点击事件委托时再解码）
+      const card = `<span class="chat-attach" data-chat-file="1" ` +
+        `data-path="${escAttrValue(path)}" data-name="${escAttrValue(name)}" ` +
+        `data-size="${escAttrValue(sizeStr)}" data-ext="${escAttrValue(ext)}">` +
+        `<span class="chat-att-icon">${icon}</span>` +
+        `<span class="chat-att-info">` +
+        `<span class="chat-att-name">${escHtml(name)}</span>` +
+        (sizeText ? `<span class="chat-att-size">${escHtml(sizeText)}</span>` : '') +
+        `</span>` +
+        `</span>`
+      return card
+    })
+
+  // 2. 图片缩略图标记：给 /api/fs/image 开头的 <img> 加 data-chat-img 属性 + 样式类
+  //    同时加外层 <span class="chat-img-wrap"> 让点击事件委托有挂载点
+  out = out.replace(/<img\b([^>]*)src="(\/api\/fs\/image\?[^"]+)"([^>]*)>/gi,
+    (_m, preAttrs, src, postAttrs) => {
+      const altMatch = (preAttrs + postAttrs).match(/alt="([^"]*)"/i)
+      const alt = altMatch ? altMatch[1] : ''
+      return `<span class="chat-img-wrap" data-chat-img="1" data-src="${escAttrValue(src)}">` +
+        `<img${preAttrs}src="${src}"${postAttrs} class="chat-att-img" alt="${escAttrValue(alt)}">` +
+        `</span>`
+    })
+
+  return out
+}
+
+function escAttrValue(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function _formatSize(bytes: number): string {
+  if (!bytes || bytes <= 0) return ''
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
 }
 
 /** 给所有 http(s) 外链自动补 target="_blank"，避免把智能体集群 SPA 覆盖掉。

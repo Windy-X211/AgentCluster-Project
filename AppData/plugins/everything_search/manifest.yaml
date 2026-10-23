@@ -1,0 +1,13 @@
+version: "0.0.1"
+type: "plugin"
+name: "everything_search"
+label:
+  zh_Hans: "Everything 快速搜索"
+  en_US: "Everything Search"
+author: "AgentCluster"
+description:
+  zh_Hans: "调用本地 Everything SDK 搜索文件、打开应用、查询文件路径。要求本机已安装 Everything 并开启 SDK。"
+  en_US: "Query local Everything SDK to search files, open apps, and resolve paths. Requires Everything installed and SDK enabled."
+version_code: 1
+icon: "🔍"
+tags: ["search", "filesystem", "everything", "windows"]

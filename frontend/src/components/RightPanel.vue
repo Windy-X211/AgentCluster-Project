@@ -3,18 +3,19 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
 import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
-import { renderMarkdown } from '@/utils/markdown'
+import { renderChatMarkdown } from '@/utils/markdown'
 import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
 import { api } from '@/api'
+import FileViewer, { type ViewerFile } from './FileViewer.vue'
 
 /** 去掉消息首尾纯空行（保留中间换行）—— 用于修复气泡顶部空白；顺带剥离 <continue> 续跑标记 */
 function trimMsgContent(s: string | undefined): string {
   if (!s) return ''
   return stripContinueTag(s).replace(/^\s*\n+/, '').replace(/\n+\s*$/, '')
 }
-/** 消息泡泡 Markdown 渲染（用户/助手统一走这里，含流式光标） */
+/** 消息泡泡 Markdown 渲染（用户/助手统一走这里，含流式光标 + 聊天附件后处理） */
 function msgBubbleHtml(m: any): string {
-  const html = renderMarkdown(trimMsgContent(m.content))
+  const html = renderChatMarkdown(trimMsgContent(m.content))
   return isStreamingMsg(m) ? html + '<span class="stream-cursor">▌</span>' : html
 }
 
@@ -43,30 +44,36 @@ watch(() => convs.streaming, (v) => {
   }
 }, { immediate: true })
 onBeforeUnmount(() => { if (_elapsedTimer) clearInterval(_elapsedTimer) })
-// 非活跃 turn 的结束时间缓存（key=该轮最早 startedAt，value=end ms）；普通 Map：end 记录后不变，无需响应式
-const _turnEndCache = new Map<number, number>()
 function formatElapsed(ms: number): string {
   const s = Math.floor(ms / 1000)
   if (s < 60) return s + 's'
   const m = Math.floor(s / 60)
   return m + 'm' + (s % 60) + 's'
 }
+/** 计算本轮智能体运行用时：
+ *  - 流式中：nowTick - 最早 startedAt（实时计时）
+ *  - 已结束：最大 endedAt - 最早 startedAt（从消息本身取结束时间，组件重挂载也不会漂移）
+ *  - 两者都没有足够数据时返回空串 */
 function turnElapsedLabel(turn: any): string {
   let start = Infinity
+  let end = -Infinity
   for (const ch of turn?.children || []) {
     if (ch.kind !== 'assistant') continue
-    const s = ch.msg?.startedAt
+    const msg: any = ch.msg
+    const s = msg?.startedAt
+    const e = msg?.endedAt
     if (typeof s === 'number' && s < start) start = s
+    if (typeof e === 'number' && e > end) end = e
   }
   if (start === Infinity) return ''
   const live = isTurnActive(turn.start)
   let elapsed: number
   if (live) {
     elapsed = nowTick.value - start
-  } else {
-    let end = _turnEndCache.get(start)
-    if (!end) { end = Date.now(); _turnEndCache.set(start, end) }
+  } else if (end > 0) {
     elapsed = end - start
+  } else {
+    return ''  // 结束了但没有 endedAt（极老的历史消息或 edge case），不显示错误的 Date.now() 推算
   }
   if (elapsed < 1000) return ''
   return formatElapsed(elapsed)
@@ -79,6 +86,115 @@ const taRef = ref<HTMLTextAreaElement | null>(null)
 // 工作区拖拽到输入框：填入文件/文件夹绝对路径
 const chatDropHover = ref(false)
 let chatDragDepth = 0
+
+// —— 附件（从电脑拖入的文件）——
+interface ChatAttachment {
+  id: string
+  name: string
+  path: string
+  size: number
+  content_type: string
+  ext: string
+  /** 图片缩略图的 objectURL（仅图片类型有） */
+  previewUrl?: string
+  /** 上传中/失败状态 */
+  status: 'uploading' | 'ready' | 'error'
+  errorMsg?: string
+}
+const attachments = ref<ChatAttachment[]>([])
+
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico'])
+function isImageFile(name: string): boolean {
+  const ext = name.split('.').pop()?.toLowerCase() || ''
+  return IMAGE_EXTS.has(ext)
+}
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+}
+function fileIconOf(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() || ''
+  const map: Record<string, string> = {
+    pdf: '📄', doc: '📝', docx: '📝', txt: '📃', md: '📝',
+    xls: '📊', xlsx: '📊', csv: '📊', json: '📋', yaml: '📋', yml: '📋',
+    py: '🐍', js: '📜', ts: '📜', vue: '📜', html: '🌐', css: '🎨',
+    zip: '🗜', rar: '🗜', '7z': '🗜',
+    mp3: '🎵', wav: '🎵', mp4: '🎬', mov: '🎬',
+  }
+  return map[ext] || '📎'
+}
+
+/** 上传一组 File 对象到后端，返回附件信息数组 */
+async function uploadFiles(files: FileList | File[]): Promise<ChatAttachment[]> {
+  const list = Array.from(files)
+  // 为每个文件先生成临时占位（带本地预览），再并行上传
+  const atts: ChatAttachment[] = list.map(f => ({
+    id: crypto.randomUUID(),
+    name: f.name,
+    path: '',
+    size: f.size,
+    content_type: f.type || '',
+    ext: f.name.split('.').pop()?.toLowerCase() || '',
+    previewUrl: isImageFile(f.name) ? URL.createObjectURL(f) : undefined,
+    status: 'uploading',
+  }))
+  attachments.value.push(...atts)
+
+  // 执行上传（并行）
+  const form = new FormData()
+  list.forEach(f => form.append('files', f))
+  try {
+    const r = await fetch('/api/fs/upload', { method: 'POST', body: form })
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: '上传失败' }))
+      throw new Error(err.detail || `HTTP ${r.status}`)
+    }
+    const data = await r.json()
+    const uploaded: Array<{ name: string; path: string; size: number; content_type: string; ext: string }> = data.files || []
+    // 按文件名+大小匹配回填 path
+    uploaded.forEach(u => {
+      const match = atts.find(a => a.name === u.name && a.size === u.size)
+      if (match) { match.path = u.path; match.status = 'ready' }
+    })
+    // 没匹配到的标 error
+    atts.forEach(a => {
+      if (a.status === 'uploading') { a.status = 'error'; a.errorMsg = '上传失败' }
+    })
+  } catch (e: any) {
+    atts.forEach(a => { a.status = 'error'; a.errorMsg = e?.message || String(e) })
+  }
+  return atts
+}
+
+function removeAttachment(id: string) {
+  const idx = attachments.value.findIndex(a => a.id === id)
+  if (idx < 0) return
+  const att = attachments.value[idx]
+  if (att.previewUrl) URL.revokeObjectURL(att.previewUrl)
+  attachments.value.splice(idx, 1)
+}
+
+/** 把附件列表格式化为文本，合并到发送内容里（markdown + 自定义链接格式供后处理） */
+function attachmentsToText(): string {
+  if (!attachments.value.length) return ''
+  const lines: string[] = []
+  for (const a of attachments.value) {
+    if (a.status !== 'ready' || !a.path) continue
+    // 所有 path/name 参数做 URL 编码（Windows 路径里的 \ / : 中文等安全）
+    const enc = encodeURIComponent
+    if (isImageFile(a.name)) {
+      // 图片：markdown 图片语法 → 后处理成带点击事件的缩略图
+      lines.push(`![${a.name}](/api/fs/image?path=${enc(a.path)})`)
+    } else {
+      // 其他文件：markdown 链接 → 后处理替换为可点击的文件卡片
+      // href 用 /file-viewer?... 前缀，data 层解码
+      lines.push(`[📎 ${a.name} · ${formatFileSize(a.size)}](/file-viewer?path=${enc(a.path)}&name=${enc(a.name)}&size=${a.size})`)
+    }
+  }
+  return lines.join('\n\n')
+}
+
 /** 从 dataTransfer 取路径：优先工作区自定义类型，其次 file:// 列表（资源管理器拖入），最后纯文本 */
 function dropPathFromEvent(e: DragEvent): string {
   const dt = e.dataTransfer
@@ -128,13 +244,21 @@ function onChatDragLeave() {
   chatDragDepth = Math.max(0, chatDragDepth - 1)
   if (!chatDragDepth) chatDropHover.value = false
 }
-function onChatDrop(e: DragEvent) {
+async function onChatDrop(e: DragEvent) {
   chatDragDepth = 0
   chatDropHover.value = false
-  const path = dropPathFromEvent(e)
-  if (!path) return
   e.preventDefault()
-  insertAtCursor(path)
+  e.stopPropagation()
+
+  // 1) 优先尝试 dataTransfer.files（从电脑/资源管理器拖入的真实文件）
+  const dt = e.dataTransfer
+  if (dt && dt.files && dt.files.length > 0) {
+    await uploadFiles(dt.files)
+    return
+  }
+  // 2) 回退：工作区拖拽路径（已有的 insertAtCursor 逻辑）
+  const path = dropPathFromEvent(e)
+  if (path) insertAtCursor(path)
 }
 const renameId = ref<number | null>(null)
 const renameVal = ref('')
@@ -142,23 +266,282 @@ const convsCollapsed = ref(true) // 对话记录列表默认折叠（展开时�
 const canvasesCollapsed = ref(true) // 画布列表默认折叠
 const convDesc = ref(true) // 对话记录排序：true = 新在上，false = 新在下
 
-// 图片灯箱：purpose=share 的截图缩略图点击后放大查看
+// 图片浮窗：滚轮缩放（以鼠标为锚） + 鼠标拖拽平移 + 8 方向 resize
+// —— 解耦架构：窗口尺寸 ≠ 图片缩放 ≠ 图片平移 ——
+//   · lightboxW/H = 浮窗尺寸（resize 改这个）
+//   · lbScale     = 图片额外缩放（滚轮/键盘改）
+//   · lbPanX/Y    = 图片平移（鼠标拖拽）
+//   · img { object-fit: contain; transform: translate(x,y) scale(s) }
 const lightboxSrc = ref<string | null>(null)
 const lightboxOpen = ref(false)
-function openLightbox(src: string) {
+const lightboxX = ref(0)
+const lightboxY = ref(0)
+const lightboxW = ref(320)
+const lightboxH = ref(240)
+const lbOrigW = ref(600)
+const lbOrigH = ref(400)
+const lbScale = ref(1)
+const lbPanX = ref(0)
+const lbPanY = ref(0)
+const lbBodyRef = ref<HTMLElement | null>(null)
+
+const LB_TITLEBAR_H = 32
+const LB_MIN_W = 160
+const LB_MIN_H = 120
+const LB_MAX_SCALE = 8
+const LB_MIN_SCALE = 0.1
+
+// 聊天附件预览器（文件卡片点击后打开内置 FileViewer）
+const chatViewerFile = ref<ViewerFile | null>(null)
+
+/** 图片 load：保存原始尺寸，自动给一个合适的初始窗口（不超过屏幕 60%） */
+function onLightboxImgLoad(e: Event) {
+  const img = e.target as HTMLImageElement
+  if (!img) return
+  lbOrigW.value = img.naturalWidth || img.width || 600
+  lbOrigH.value = img.naturalHeight || img.height || 400
+  // 初始窗口：按图片比例缩到屏幕 60%
+  const availW = Math.round(window.innerWidth * 0.6)
+  const availH = Math.round((window.innerHeight - LB_TITLEBAR_H - 40) * 0.6)
+  const pad = 16
+  const fitByW = (availW - pad) / lbOrigW.value
+  const fitByH = (availH - pad) / lbOrigH.value
+  const baseFit = Math.min(1, fitByW, fitByH)
+  const newW = Math.max(LB_MIN_W, Math.min(window.innerWidth - 16, Math.round(lbOrigW.value * baseFit) + pad))
+  const newH = Math.max(LB_MIN_H, Math.min(window.innerHeight - LB_TITLEBAR_H - 24, Math.round(lbOrigH.value * baseFit) + pad))
+  lightboxW.value = newW
+  lightboxH.value = newH
+  lbScale.value = 1
+  lbPanX.value = 0
+  lbPanY.value = 0
+  clampLightboxPos()
+}
+function clampLightboxPos() {
+  const pad = 8
+  const maxX = Math.max(pad, window.innerWidth - lightboxW.value - pad)
+  const maxY = Math.max(pad, window.innerHeight - lightboxH.value - pad)
+  lightboxX.value = Math.min(Math.max(pad, lightboxX.value), maxX)
+  lightboxY.value = Math.min(Math.max(pad, lightboxY.value), maxY)
+}
+/** 八方向 resize 专用 clamp：保持"没被拖动的那条边"固定 */
+function clampResizeEdges(d: string, newX: number, newY: number, newW: number, newH: number) {
+  const pad = 8
+  let nx = newX, ny = newY, nw = newW, nh = newH
+  if (d.includes('e')) nw = Math.min(nw, window.innerWidth - pad - nx)
+  if (d.includes('s')) nh = Math.min(nh, window.innerHeight - pad - ny)
+  if (d.includes('w')) {
+    const rightEdge = nx + nw // 固定右边界
+    nw = Math.min(nw, rightEdge - pad)
+    nx = rightEdge - nw
+  }
+  if (d.includes('n')) {
+    const bottomEdge = ny + nh // 固定下边界
+    nh = Math.min(nh, bottomEdge - pad)
+    ny = bottomEdge - nh
+  }
+  // 整体再保底（极端尺寸）
+  nw = Math.max(LB_MIN_W, nw); nh = Math.max(LB_MIN_H, nh)
+  nx = Math.max(pad, nx); ny = Math.max(pad, ny)
+  return { x: nx, y: ny, w: nw, h: nh }
+}
+/** 从缩略图点击事件推断浮窗初始位置；不传入事件则居中 */
+function openLightbox(src: string, clickEvt?: MouseEvent) {
   if (!src) return
   lightboxSrc.value = src
   lightboxOpen.value = true
+  lightboxW.value = 320; lightboxH.value = 240
+  lbScale.value = 1; lbPanX.value = 0; lbPanY.value = 0
+  if (clickEvt) {
+    let x = clickEvt.clientX + 24
+    let y = clickEvt.clientY - 40
+    if (x + lightboxW.value + 8 > window.innerWidth) x = clickEvt.clientX - lightboxW.value - 24
+    if (y < 8) y = 8
+    lightboxX.value = Math.max(8, x)
+    lightboxY.value = Math.max(8, y)
+  } else {
+    lightboxX.value = Math.max(8, Math.round((window.innerWidth - lightboxW.value) / 2))
+    lightboxY.value = Math.max(8, Math.round((window.innerHeight - lightboxH.value) / 2))
+  }
+  requestAnimationFrame(() => clampLightboxPos())
 }
 function closeLightbox() {
   lightboxOpen.value = false
-  // 延迟清空：让关闭动画先播放
   setTimeout(() => { lightboxSrc.value = null }, 200)
 }
 function onLightboxKey(e: KeyboardEvent) {
-  if (lightboxOpen.value && e.key === 'Escape') closeLightbox()
+  if (!lightboxOpen.value) return
+  if (e.key === 'Escape') { e.stopImmediatePropagation(); closeLightbox() }
+  else if (e.key === '+' || e.key === '=') lbZoomAtWithAnchor(lbScale.value * 1.2, null)
+  else if (e.key === '-') lbZoomAtWithAnchor(lbScale.value / 1.2, null)
+  else if (e.key === '0') { lbScale.value = 1; lbPanX.value = 0; lbPanY.value = 0 }
 }
-if (typeof window !== 'undefined') window.addEventListener('keydown', onLightboxKey)
+/** 设置缩放，锚点 = body 内 (ax, ay)；null 表示 body 中心。
+ *  保证鼠标指向的那个像素在屏幕上位置不变。
+ *  transform: translate(pan) scale(s) 按 CSS 右→左顺序 = scale 后 translate；
+ *  视觉位置 = center + (p-center)*s + pan。
+ *  推导得：pan_new = (delta)(1 - s'/s) + pan_old*(s'/s)，其中 delta = anchor - center */
+function lbZoomAtWithAnchor(s: number, anchor: { x: number; y: number } | null) {
+  const newScale = Math.max(LB_MIN_SCALE, Math.min(LB_MAX_SCALE, s))
+  if (newScale === lbScale.value) return
+  const body = lbBodyRef.value
+  const bw = body?.clientWidth ?? 320
+  const bh = body?.clientHeight ?? 240
+  const cx = bw / 2; const cy = bh / 2
+  const ax = anchor?.x ?? cx; const ay = anchor?.y ?? cy
+  const dx = ax - cx; const dy = ay - cy
+  const ratio = newScale / lbScale.value
+  lbPanX.value = dx * (1 - ratio) + lbPanX.value * ratio
+  lbPanY.value = dy * (1 - ratio) + lbPanY.value * ratio
+  lbScale.value = newScale
+}
+/** 双击 body：让图片按窗口尺寸自动填充（scale=1，pan=0） */
+function onLbBodyDblClick() {
+  lbScale.value = 1
+  lbPanX.value = 0
+  lbPanY.value = 0
+}
+
+// —— 滚轮缩放（以鼠标位置为锚，鼠标不动） ——
+function onLbWheel(e: WheelEvent) {
+  e.preventDefault()
+  const body = lbBodyRef.value
+  if (!body) { lbZoomAtWithAnchor(lbScale.value * (e.deltaY > 0 ? 0.85 : 1.18), null); return }
+  const r = body.getBoundingClientRect()
+  const ax = e.clientX - r.left
+  const ay = e.clientY - r.top
+  lbZoomAtWithAnchor(lbScale.value * (e.deltaY > 0 ? 0.85 : 1.18), { x: ax, y: ay })
+}
+
+// —— body 内鼠标拖拽平移图片 ——
+let lbPanning = false
+let lbPanStartX = 0
+let lbPanStartY = 0
+let lbPanStartPanX = 0
+let lbPanStartPanY = 0
+function onLbPanStart(e: MouseEvent) {
+  // 只在左键、且事件 target 不是 body 里的滚动条时触发
+  if (e.button !== 0) return
+  lbPanning = true
+  lbPanStartX = e.clientX; lbPanStartY = e.clientY
+  lbPanStartPanX = lbPanX.value; lbPanStartPanY = lbPanY.value
+  e.preventDefault()
+  window.addEventListener('mousemove', onLbPanMove)
+  window.addEventListener('mouseup', onLbPanEnd)
+}
+function onLbPanMove(e: MouseEvent) {
+  if (!lbPanning) return
+  let px = lbPanStartPanX + (e.clientX - lbPanStartX)
+  let py = lbPanStartPanY + (e.clientY - lbPanStartY)
+  // 限制 pan：图片至少要留 30% 在 body 里，防止拖到完全看不见
+  const body = lbBodyRef.value
+  if (body) {
+    const bw = body.clientWidth
+    const bh = body.clientHeight
+    const halfImgW = (lbOrigW.value * lbScale.value) / 2 * 0.7
+    const halfImgH = (lbOrigH.value * lbScale.value) / 2 * 0.7
+    px = Math.max(-bw * 0.7, Math.min(bw * 0.7, px))
+    py = Math.max(-bh * 0.7, Math.min(bh * 0.7, py))
+    // 额外：按图片实际尺寸算更精确的 clamp
+    const maxPanX = Math.max(0, lbOrigW.value * lbScale.value / 2 - bw * 0.3)
+    const maxPanY = Math.max(0, lbOrigH.value * lbScale.value / 2 - bh * 0.3)
+    px = Math.max(-maxPanX, Math.min(maxPanX, px))
+    py = Math.max(-maxPanY, Math.min(maxPanY, py))
+  }
+  lbPanX.value = px
+  lbPanY.value = py
+}
+function onLbPanEnd() {
+  lbPanning = false
+  window.removeEventListener('mousemove', onLbPanMove)
+  window.removeEventListener('mouseup', onLbPanEnd)
+}
+
+// —— 标题栏拖拽移动 ——
+let lbDragging = false
+let lbDragStartX = 0
+let lbDragStartY = 0
+let lbWinStartX = 0
+let lbWinStartY = 0
+function onLbDragStart(e: MouseEvent) {
+  lbDragging = true
+  lbDragStartX = e.clientX; lbDragStartY = e.clientY
+  lbWinStartX = lightboxX.value; lbWinStartY = lightboxY.value
+  e.preventDefault(); e.stopPropagation()
+  window.addEventListener('mousemove', onLbDragMove)
+  window.addEventListener('mouseup', onLbDragEnd)
+}
+function onLbDragMove(e: MouseEvent) {
+  if (!lbDragging) return
+  lightboxX.value = lbWinStartX + (e.clientX - lbDragStartX)
+  lightboxY.value = lbWinStartY + (e.clientY - lbDragStartY)
+  clampLightboxPos()
+}
+function onLbDragEnd() {
+  lbDragging = false
+  window.removeEventListener('mousemove', onLbDragMove)
+  window.removeEventListener('mouseup', onLbDragEnd)
+}
+
+// —— 八方向 resize ——
+type LbResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
+let lbResizing = false
+let lbResizeDir: LbResizeDir = 'se'
+let lbResizeStartX = 0
+let lbResizeStartY = 0
+let lbResizeStartW = 0
+let lbResizeStartH = 0
+let lbResizeStartWinX = 0
+let lbResizeStartWinY = 0
+function onLbResizeStart(e: MouseEvent, dir: LbResizeDir) {
+  lbResizing = true
+  lbResizeDir = dir
+  lbResizeStartX = e.clientX; lbResizeStartY = e.clientY
+  lbResizeStartW = lightboxW.value; lbResizeStartH = lightboxH.value
+  lbResizeStartWinX = lightboxX.value; lbResizeStartWinY = lightboxY.value
+  e.preventDefault(); e.stopPropagation()
+  window.addEventListener('mousemove', onLbResizeMove)
+  window.addEventListener('mouseup', onLbResizeEnd)
+}
+function onLbResizeMove(e: MouseEvent) {
+  if (!lbResizing) return
+  const dx = e.clientX - lbResizeStartX
+  const dy = e.clientY - lbResizeStartY
+  const d = lbResizeDir
+  let nx = lbResizeStartWinX
+  let ny = lbResizeStartWinY
+  let nw = lbResizeStartW
+  let nh = lbResizeStartH
+  // 东西方向：w 边向左拖 → x 减 + w 加；e 边只有 w 加
+  if (d.includes('w')) {
+    const newW = Math.max(LB_MIN_W, lbResizeStartW - dx)
+    nx = lbResizeStartWinX + (lbResizeStartW - newW)
+    nw = newW
+  } else if (d.includes('e')) {
+    nw = Math.max(LB_MIN_W, lbResizeStartW + dx)
+  }
+  // 南北方向：n 边向上拖 → y 减 + h 加；s 边只有 h 加
+  if (d.includes('n')) {
+    const newH = Math.max(LB_MIN_H, lbResizeStartH - dy)
+    ny = lbResizeStartWinY + (lbResizeStartH - newH)
+    nh = newH
+  } else if (d.includes('s')) {
+    nh = Math.max(LB_MIN_H, lbResizeStartH + dy)
+  }
+  // 专用 clamp：保持 opposite edge 固定
+  const c = clampResizeEdges(d, nx, ny, nw, nh)
+  lightboxX.value = c.x; lightboxY.value = c.y
+  lightboxW.value = c.w; lightboxH.value = c.h
+}
+function onLbResizeEnd() {
+  lbResizing = false
+  window.removeEventListener('mousemove', onLbResizeMove)
+  window.removeEventListener('mouseup', onLbResizeEnd)
+}
+
+/** img transform 计算属性 */
+const lbImgTransform = computed(() =>
+  `translate(${lbPanX.value}px, ${lbPanY.value}px) scale(${lbScale.value})`
+)
 
 // 对话列表浮层的 right 偏移量跟随右侧面板宽度变化
 const convFloatStyle = computed(() => ({ right: `${layout.rightWidth + 10}px` }))
@@ -330,7 +713,11 @@ watch([() => agents.list, () => agents.groups, agentGroupsByColumn], async () =>
     syncDdMetrics()
   }
 })
-function onWinResizeDd() { if (agentDdOpen.value) { updateDdPos(); syncDdMetrics() }; modelDdOpen.value = false }
+function onWinResizeDd() {
+  if (agentDdOpen.value) { updateDdPos(); syncDdMetrics() }
+  modelDdOpen.value = false
+  if (lightboxOpen.value) clampLightboxPos()
+}
 onMounted(() => {
   document.addEventListener('mousedown', onAgentDdOutside)
   document.addEventListener('mousedown', onModelDdOutside)
@@ -1446,11 +1833,19 @@ watch(() => convs.focusChatAt, async (t) => {
 })
 
 async function send() {
-  const text = input.value.trim(); if (!text) return
+  // 合并消息文本 + 附件
+  const msgText = input.value.trim()
+  const attText = attachmentsToText()
+  if (!msgText && !attText) return
+  const fullText = [msgText, attText].filter(Boolean).join('\n\n')
   input.value = ''  // ← 立刻清空，不等流式结束
+  // 清理附件（已合并到文本里）
+  for (const a of attachments.value) { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl) }
+  attachments.value = []
+
   const agentId = currentAgentId.value ?? agents.list[0]?.id; if (!agentId) return alert('请先新建智能体')
   stickBottom.value = true   // 自己发的消息必须可见
-  await convs.send(agentId, text)
+  await convs.send(agentId, fullText)
   setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
 }
 function sendStop() {
@@ -1645,9 +2040,37 @@ function onDocKey(e: KeyboardEvent) {
     if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false }
 }
 
+/** 聊天消息内附件点击事件委托（冒泡到 document 处理，支持 v-html 渲染的附件卡片） */
+function onChatAttachClick(e: MouseEvent) {
+  const t = e.target as HTMLElement
+  if (!t) return
+  // 从目标向上找 chat-attach 或 chat-img-wrap 祖先
+  const card = t.closest('.chat-attach, .chat-img-wrap') as HTMLElement | null
+  if (!card) return
+  e.stopPropagation()
+  // 文件卡片 → 打开 FileViewer
+  const path = (card.getAttribute('data-path') || '').trim()
+  const name = (card.getAttribute('data-name') || '').trim()
+  if (card.classList.contains('chat-attach') && path && name) {
+    const sizeStr = card.getAttribute('data-size') || ''
+    chatViewerFile.value = {
+      path, name,
+      size: sizeStr ? parseInt(sizeStr, 10) || 0 : 0,
+    }
+    return
+  }
+  // 图片缩略图 → 打开已有 lightbox
+  if (card.classList.contains('chat-img-wrap')) {
+    const src = (card.getAttribute('data-src') || '').trim()
+    if (src) openLightbox(src, e)
+  }
+}
+
 onMounted(async () => {
   document.addEventListener('click', onDocClick)
+  document.addEventListener('click', onChatAttachClick, true)   // capture 阶段先触发，避免冒泡被吞
   document.addEventListener('keydown', onDocKey)
+  window.addEventListener('keydown', onLightboxKey)
   // 父级 Home 的 fetch 可能还没返回，这里先确保拉到列表，避免误判为空而重复新建
   if (!convs.list.length) await convs.fetch()
   if (!convs.current && convs.list.length) convs.current = convs.list[0].id
@@ -1656,8 +2079,18 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   document.removeEventListener('click', onDocClick)
+  document.removeEventListener('click', onChatAttachClick, true)
   document.removeEventListener('keydown', onDocKey)
-  if (typeof window !== 'undefined') window.removeEventListener('keydown', onLightboxKey)
+  window.removeEventListener('keydown', onLightboxKey)
+  // 浮窗拖拽 / resize / pan 期间被卸载也要清干净
+  window.removeEventListener('mousemove', onLbDragMove)
+  window.removeEventListener('mouseup', onLbDragEnd)
+  window.removeEventListener('mousemove', onLbResizeMove)
+  window.removeEventListener('mouseup', onLbResizeEnd)
+  window.removeEventListener('mousemove', onLbPanMove)
+  window.removeEventListener('mouseup', onLbPanEnd)
+  // 清理附件预览 URL
+  for (const a of attachments.value) { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl) }
 })
 </script>
 
@@ -2035,7 +2468,7 @@ onBeforeUnmount(() => {
                         <div v-for="(ref, si) in imageRefsOfAssistant(ch.idx)" :key="si" class="share-shot">
                           <img :src="resolveImgSrc(ref)" :alt="'tool result image ' + (si + 1)" loading="lazy"
                                class="share-shot-img"
-                               @click.stop="openLightbox(resolveImgSrc(ref))" />
+                               @click.stop="(e: MouseEvent) => openLightbox(resolveImgSrc(ref), e)" />
                         </div>
                       </div>
 
@@ -2095,15 +2528,37 @@ onBeforeUnmount(() => {
         </template>
       </div>
 
-      <!-- Share 截图灯箱：缩略图点击后放大查看，点空白或按 Esc 关闭 -->
+      <!-- 图片浮窗：8 方向边界改大小，滚轮只缩放图片不动窗口 -->
       <Teleport to="body">
-        <div v-if="lightboxOpen && lightboxSrc" class="lightbox" @click.self="closeLightbox">
-          <div class="lightbox-inner">
-            <img :src="lightboxSrc" alt="screenshot full view" class="lightbox-img" />
-            <button class="lightbox-close" type="button" @click.stop="closeLightbox" title="关闭 (Esc)">✕</button>
+        <div v-if="lightboxOpen && lightboxSrc"
+             class="lb-float"
+             :style="{ left: lightboxX + 'px', top: lightboxY + 'px', width: lightboxW + 'px', height: lightboxH + 'px' }">
+          <div class="lb-titlebar" @mousedown="onLbDragStart">
+            <span class="lb-titlebar-icon">🖼</span>
+            <span class="lb-titlebar-text">图片预览 <span class="lb-zoom-pct">{{ Math.round(lbScale * 100) }}%</span></span>
+            <button class="lb-close" type="button" @mousedown.stop @click.stop="closeLightbox" title="关闭 (Esc)">✕</button>
           </div>
+          <div class="lb-body" ref="lbBodyRef"
+               @wheel="onLbWheel" @mousedown="onLbPanStart" @dblclick="onLbBodyDblClick"
+               title="滚轮缩放（鼠标为锚）；按住左键拖拽平移图片；双击自适应窗口">
+            <img :src="lightboxSrc" alt="image preview" class="lb-img"
+                 :style="{ transform: lbImgTransform }"
+                 @load="onLightboxImgLoad" draggable="false" />
+          </div>
+          <!-- 八方向 resize handles -->
+          <div class="lb-edge lb-n"  @mousedown.stop="onLbResizeStart($event, 'n')"  title="上"></div>
+          <div class="lb-edge lb-s"  @mousedown.stop="onLbResizeStart($event, 's')"  title="下"></div>
+          <div class="lb-edge lb-e"  @mousedown.stop="onLbResizeStart($event, 'e')"  title="右"></div>
+          <div class="lb-edge lb-w"  @mousedown.stop="onLbResizeStart($event, 'w')"  title="左"></div>
+          <div class="lb-corner lb-nw" @mousedown.stop="onLbResizeStart($event, 'nw')" title="左上"></div>
+          <div class="lb-corner lb-ne" @mousedown.stop="onLbResizeStart($event, 'ne')" title="右上"></div>
+          <div class="lb-corner lb-sw" @mousedown.stop="onLbResizeStart($event, 'sw')" title="左下"></div>
+          <div class="lb-corner lb-se" @mousedown.stop="onLbResizeStart($event, 'se')" title="右下"></div>
         </div>
       </Teleport>
+
+      <!-- 聊天附件文件预览器（复用已有 FileViewer 组件） -->
+      <FileViewer :canvas-id="null" :file="chatViewerFile" @close="chatViewerFile = null" />
 
       <div class="chat-input" :class="{ 'drop-hover': chatDropHover }"
            @dragenter.prevent="onChatDragEnter" @dragover.prevent
@@ -2180,6 +2635,41 @@ onBeforeUnmount(() => {
             </Teleport>
           </div>
           <span class="cur-title">{{ conv ? convDisplayName(conv) : '— 未选择 —' }}</span>
+        </div>
+        <!-- 附件预览区：从电脑拖入的文件（上传中/已就绪/失败） -->
+        <div v-if="attachments.length" class="attachments-bar">
+          <div v-for="a in attachments" :key="a.id"
+               class="att-card" :class="{ error: a.status === 'error', uploading: a.status === 'uploading' }">
+            <button type="button" class="att-remove" @click="removeAttachment(a.id)" :title="'移除 ' + a.name">✕</button>
+            <!-- 图片：缩略图预览 -->
+            <template v-if="isImageFile(a.name)">
+              <div class="att-thumb">
+                <img v-if="a.previewUrl" :src="a.previewUrl" :alt="a.name" />
+                <span v-if="a.status === 'uploading'" class="att-spinner"></span>
+                <span v-if="a.status === 'error'" class="att-err-ico">⚠️</span>
+              </div>
+              <div class="att-info">
+                <div class="att-name" :title="a.name">{{ a.name }}</div>
+                <div class="att-meta">
+                  <span>{{ formatFileSize(a.size) }}</span>
+                  <span v-if="a.status === 'uploading'" class="att-loading">上传中…</span>
+                  <span v-if="a.status === 'error'" class="att-err-msg">{{ a.errorMsg || '上传失败' }}</span>
+                </div>
+              </div>
+            </template>
+            <!-- 非图片：文件卡片（带图标） -->
+            <template v-else>
+              <div class="att-file-icon">{{ fileIconOf(a.name) }}</div>
+              <div class="att-info">
+                <div class="att-name" :title="a.name">{{ a.name }}</div>
+                <div class="att-meta">
+                  <span>{{ formatFileSize(a.size) }}</span>
+                  <span v-if="a.status === 'uploading'" class="att-loading">上传中…</span>
+                  <span v-if="a.status === 'error'" class="att-err-msg">{{ a.errorMsg || '上传失败' }}</span>
+                </div>
+              </div>
+            </template>
+          </div>
         </div>
         <div class="row2">
           <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true"></textarea>
@@ -2484,6 +2974,134 @@ onBeforeUnmount(() => {
 .chat-input { padding: 8px 12px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); display: flex; flex-direction: column; gap: 6px; transition: background .15s, box-shadow .15s; }
 /* 拖拽文件悬停时的高亮提示 */
 .chat-input.drop-hover { background: rgba(var(--accent-rgb), 0.1); box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.45); }
+
+/* ============ 附件预览区 ============ */
+.attachments-bar {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  max-height: 120px; overflow-y: auto; padding: 2px 0;
+}
+.att-card {
+  position: relative;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 28px 6px 6px;
+  background: rgba(var(--surface-rgb), 0.08);
+  border: 1px solid rgba(var(--accent-rgb), 0.25);
+  border-radius: 8px;
+  min-width: 180px; max-width: 260px;
+}
+.att-card.uploading { border-color: rgba(251, 191, 36, 0.5); background: rgba(251, 191, 36, 0.06); }
+.att-card.error { border-color: rgba(239, 68, 68, 0.6); background: rgba(239, 68, 68, 0.08); }
+.att-remove {
+  position: absolute; top: 2px; right: 2px;
+  width: 18px; height: 18px;
+  border: none; border-radius: 50%;
+  background: rgba(var(--shadow-rgb), 0.4);
+  color: rgba(var(--text-rgb), 0.7);
+  font-size: 11px; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.att-remove:hover { background: rgba(239, 68, 68, 0.7); color: #fff; }
+.att-thumb {
+  flex-shrink: 0; width: 44px; height: 44px;
+  border-radius: 6px; overflow: hidden;
+  background: rgba(var(--shadow-rgb), 0.25);
+  display: flex; align-items: center; justify-content: center;
+  position: relative;
+}
+.att-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.att-file-icon {
+  flex-shrink: 0; width: 44px; height: 44px;
+  border-radius: 6px;
+  background: rgba(var(--accent-rgb), 0.15);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px;
+}
+.att-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.att-name {
+  font-size: calc(11px * var(--font-scale));
+  color: rgb(var(--text-rgb));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.att-meta {
+  font-size: calc(10px * var(--font-scale));
+  opacity: .6;
+  display: flex; gap: 6px; align-items: center;
+}
+.att-meta .att-loading { color: #fbbf24; }
+.att-meta .att-err-msg { color: #ef4444; }
+.att-spinner {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.45);
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 10px;
+  animation: attPulse 1.2s ease-in-out infinite;
+}
+.att-err-ico {
+  position: absolute; inset: 0;
+  background: rgba(239, 68, 68, 0.4);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px;
+}
+@keyframes attPulse { 0%, 100% { opacity: .4; } 50% { opacity: 1; } }
+
+/* ============ 消息气泡里的附件（文件卡片 + 图片缩略图） ============ */
+.chat-attach {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 10px; margin: 4px 2px;
+  background: rgba(var(--accent-rgb), 0.08);
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+  transition: background .12s, border-color .12s, transform .08s;
+  vertical-align: middle;
+}
+.chat-attach:hover {
+  background: rgba(var(--accent-rgb), 0.15);
+  border-color: rgba(var(--accent-rgb), 0.55);
+  transform: translateY(-1px);
+}
+.chat-attach:active { transform: translateY(0); }
+.chat-attach .chat-att-icon {
+  flex-shrink: 0; font-size: 20px; line-height: 1;
+  width: 32px; height: 32px; border-radius: 6px;
+  background: rgba(var(--accent-rgb), 0.12);
+  display: flex; align-items: center; justify-content: center;
+}
+.chat-attach .chat-att-info {
+  display: flex; flex-direction: column; gap: 1px; min-width: 0;
+}
+.chat-attach .chat-att-name {
+  font-size: calc(12px * var(--font-scale));
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: rgb(var(--text-rgb));
+}
+.chat-attach .chat-att-size {
+  font-size: calc(10px * var(--font-scale)); opacity: .6;
+}
+
+.chat-img-wrap {
+  display: inline-block; cursor: zoom-in; margin: 4px 2px;
+  border-radius: 8px; overflow: hidden;
+  background: rgba(var(--shadow-rgb), 0.1);
+  vertical-align: middle;
+  user-select: none;
+  transition: transform .1s, box-shadow .1s;
+  line-height: 0;
+}
+.chat-img-wrap:hover {
+  transform: scale(1.02);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+.chat-img-wrap .chat-att-img {
+  max-width: 120px; max-height: 90px; object-fit: cover;
+  display: block;
+  border-radius: 8px;
+}
+@media (max-width: 700px) {
+  .chat-img-wrap .chat-att-img { max-width: 80px; max-height: 64px; }
+}
+
 .row1 { display: flex; gap: 6px; align-items: center; }
 .cur-title { font-size: calc(11px * var(--font-scale)); opacity: .6; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -3107,39 +3725,107 @@ onBeforeUnmount(() => {
 .btn.sm.ghost { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); background: transparent; }
 .btn.sm.ghost:hover { background: rgba(var(--surface-rgb), 0.08); }
 
-/* Share 截图灯箱：全屏遮罩 + 居中图片 + 右上角关闭按钮 */
-.lightbox {
-  position: fixed; inset: 0; z-index: 10000;
-  background: rgba(var(--shadow-rgb), 0.92);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  display: flex; align-items: center; justify-content: center;
-  animation: lightboxFade .18s ease-out;
-  padding: 24px;
+/* 图片浮窗：窗口尺寸 ≠ 图片缩放；8 方向边界改大小 */
+.lb-float {
+  position: fixed; z-index: 10000;
+  background: rgba(var(--node-bg-rgb), 0.98);   /* 主题化弹层底 */
+  border: 1px solid rgba(var(--surface-rgb), 0.28);
+  border-radius: 10px;
+  box-shadow: 0 12px 36px rgba(var(--shadow-rgb), 0.55), 0 2px 8px rgba(var(--shadow-rgb), 0.3);
+  user-select: none;
+  animation: lbFloatIn .16s ease-out;
+  cursor: default;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; /* 让 body 的 overflow:hidden 能生效，同时圆角能裁剪内容 */
+  color: var(--text);  /* 主题化前景色：保证与背景对比度 */
 }
-.lightbox-inner {
-  position: relative;
-  max-width: 100%; max-height: 100%;
-  display: flex; align-items: center; justify-content: center;
+.lb-titlebar {
+  height: 32px; flex-shrink: 0;
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 8px 0 10px;
+  background: linear-gradient(180deg, rgba(var(--node-bg-rgb), 0.95), rgba(var(--node-bg-rgb), 0.8));
+  border-bottom: 1px solid rgba(var(--surface-rgb), 0.18);
+  cursor: grab;
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1;
+  border-radius: 10px 10px 0 0;
 }
-.lightbox-img {
-  max-width: calc(100vw - 48px);
-  max-height: calc(100vh - 48px);
-  object-fit: contain;
-  border-radius: 8px;
-  box-shadow: 0 24px 60px rgba(var(--shadow-rgb), 0.6);
-  border: 1px solid rgba(var(--surface-rgb), 0.12);
+.lb-titlebar:active { cursor: grabbing; }
+.lb-titlebar-icon { font-size: 13px; opacity: 0.85; }
+.lb-titlebar-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.9; display: inline-flex; align-items: center; gap: 6px; }
+.lb-zoom-pct {
+  font-variant-numeric: tabular-nums;
+  font-size: calc(11px * var(--font-scale));
+  padding: 1px 6px;
+  background: rgba(var(--accent-rgb), 0.18);
+  color: rgb(var(--accent));
+  border-radius: 999px;
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
 }
-.lightbox-close {
-  position: absolute; top: -14px; right: -14px;
-  width: 34px; height: 34px; border-radius: 50%;
-  background: rgba(28, 32, 44, 0.96); color: rgb(var(--text-rgb));
-  border: 1px solid rgba(var(--surface-rgb), 0.18);
-  cursor: pointer; font-size: calc(15px * var(--font-scale)); line-height: 1;
+.lb-close {
+  width: 24px; height: 24px; border-radius: 6px;
+  background: transparent; border: 1px solid transparent;
+  color: rgb(var(--text-rgb));
+  cursor: pointer; font-size: calc(12px * var(--font-scale)); line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
-  transition: background .15s ease;
-  box-shadow: 0 4px 12px rgba(var(--shadow-rgb), 0.4);
+  transition: background .12s, border-color .12s, color .12s;
 }
-.lightbox-close:hover { background: rgba(255,80,80,0.28); border-color: rgba(255,80,80,0.55); color: #ff9090; }
-@keyframes lightboxFade { from { opacity: 0; } to { opacity: 1; } }
+.lb-close:hover { background: rgba(255,80,80,0.22); border-color: rgba(255,80,80,0.48); color: #ff9090; }
+.lb-body {
+  flex: 1;
+  padding: 8px;
+  background: rgba(var(--node-bg-rgb), 0.95); /* 与浮窗背景一致的主题色 */
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden; /* 阻止原生滚动 —— 放大图用鼠标拖拽平移看（自定义 pan） */
+  border-radius: 0 0 10px 10px;
+  min-height: 0; /* 让 flex 子元素能正确收缩 */
+  cursor: grab;
+}
+.lb-body:active { cursor: grabbing; }
+.lb-img {
+  width: 100%; height: 100%;
+  object-fit: contain;  /* 窗口多大，图片按比例填满多大 */
+  border-radius: 6px;
+  display: block;
+  pointer-events: none;   /* wheel / mousedown 事件冒泡到 .lb-body */
+  transform-origin: center center;  /* 缩放以 body 中心为原点（pan 叠加在 translate 上） */
+  transition: none;      /* 滚轮缩放要即时响应 */
+}
+/* —— 8 方向 resize handles —— */
+/* 边条：粗 6px，hover 时变色 + 加粗到 8px 以便抓取 */
+.lb-edge {
+  position: absolute;
+  z-index: 3;
+  background: transparent;
+  transition: background .12s;
+}
+.lb-edge:hover { background: rgba(var(--accent-rgb), 0.35); }
+.lb-n { top: 0; left: 6px; right: 6px; height: 6px; cursor: ns-resize; }
+.lb-s { bottom: 0; left: 6px; right: 6px; height: 6px; cursor: ns-resize; }
+.lb-e { right: 0; top: 6px; bottom: 6px; width: 6px; cursor: ew-resize; }
+.lb-w { left: 0; top: 6px; bottom: 6px; width: 6px; cursor: ew-resize; }
+/* 角：12×12 点击热区，比视觉 6px 大，更易抓取 */
+.lb-corner {
+  position: absolute;
+  z-index: 4;
+  width: 12px; height: 12px;
+  background: transparent;
+}
+.lb-corner::before {
+  content: '';
+  position: absolute; inset: 2px;
+  background: rgba(var(--accent-rgb), 0);
+  border-radius: 2px;
+  transition: background .12s;
+}
+.lb-corner:hover::before { background: rgba(var(--accent-rgb), 0.55); }
+.lb-nw { top: 0; left: 0; cursor: nwse-resize; }
+.lb-ne { top: 0; right: 0; cursor: nesw-resize; }
+.lb-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.lb-se { bottom: 0; right: 0; cursor: nwse-resize; }
+@keyframes lbFloatIn {
+  from { opacity: 0; transform: scale(0.94); }
+  to { opacity: 1; transform: scale(1); }
+}
 </style>

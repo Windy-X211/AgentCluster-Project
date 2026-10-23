@@ -81,7 +81,7 @@ const avatarGradient = computed(() => {
 // 触发设置
 const triggerDlg = ref(false)
 const triggerAgentId = ref<number | null>(null)
-const triggerType = ref<'manual' | 'cron' | 'message'>('manual')
+const triggerType = ref<'manual' | 'cron'>('manual')
 const triggerCron = ref('')
 const triggerMsg = ref('')
 
@@ -1108,7 +1108,7 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div class="toolbar-right">
           <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
                   @click.stop="toggleRun"
-                  :title="runningOnThisCanvas ? '停止：中止定时/文字触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时/文字）运行集群'">
+                  :title="runningOnThisCanvas ? '停止：中止定时触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时）运行集群'">
             {{ runningOnThisCanvas ? '⏹ 停止' : '▶ 运行' }}
           </button>
           <div class="exec-mode-toggle" @click.stop
@@ -1289,16 +1289,14 @@ defineExpose({ viewportRef, computeNodeBbox })
           <div class="trigger-types">
             <label class="tr-opt"><input type="radio" value="manual" v-model="triggerType" /> 手动（运行后等待触发）</label>
             <label class="tr-opt"><input type="radio" value="cron" v-model="triggerType" /> 定时（cron）</label>
-            <label class="tr-opt"><input type="radio" value="message" v-model="triggerType" /> 文字触发</label>
           </div>
           <label v-if="triggerType === 'cron'" class="lbl">
             cron 表达式（分 时 日 月 周）
             <input class="input" v-model="triggerCron" placeholder="如：*/5 * * * *（每 5 分钟）" />
           </label>
-          <label v-if="triggerType === 'cron' || triggerType === 'message'" class="lbl">
-            触发消息{{ triggerType === 'message' ? '（包含此文字时发送）' : '（留空则默认）' }}
-            <input class="input" v-model="triggerMsg"
-                   :placeholder="triggerType === 'message' ? '如：开始' : '【定时触发】请执行任务'" />
+          <label v-if="triggerType === 'cron'" class="lbl">
+            触发消息（留空则默认）
+            <input class="input" v-model="triggerMsg" placeholder="【定时触发】请执行任务" />
           </label>
           <div class="actions">
             <button class="btn ghost" @click="triggerDlg = false">取消</button>

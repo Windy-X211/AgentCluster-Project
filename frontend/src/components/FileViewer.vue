@@ -313,9 +313,11 @@ function extError(r: any, statusText: string): string {
   return r?.detail || r?.error || statusText
 }
 
-/** 读文本：保留后端 detail 错误信息（原生 fetch，不走统一 req 的状态码抛错） */
-async function readText(cid: number, path: string): Promise<string> {
-  const r = await fetch(`/api/canvases/${cid}/file?path=` + encodeURIComponent(path))
+/** 读文本：保留后端 detail 错误信息；canvasId=null 时走根级 /api/fs/read 等价路径 */
+async function readText(cid: number | null, path: string): Promise<string> {
+  const r = cid != null
+    ? await fetch(`/api/canvases/${cid}/file?path=` + encodeURIComponent(path))
+    : await fetch(`/api/fs/read?path=` + encodeURIComponent(path))
   const d = await r.json().catch(() => null)
   if (!r.ok || !d?.ok) throw new Error(extError(d, `${r.status} ${r.statusText}`))
   return d.content || ''
@@ -339,12 +341,14 @@ async function renderPptx(buf: ArrayBuffer) {
 async function load() {
   const f = props.file
   const cid = props.canvasId
-  if (!f || cid == null) return
+  if (!f) return
   const g = ++loadGen
   reset()
   const k = kind.value
   if (k === 'image' || k === 'pdf') {
-    src.value = api.canvases.fileRawUrl(cid, f.path, f.mtime)
+    src.value = cid != null
+      ? api.canvases.fileRawUrl(cid, f.path, f.mtime)
+      : api.fs.rawUrl(f.path, f.mtime)
     return
   }
   if (k === 'unsupported') return
@@ -357,7 +361,7 @@ async function load() {
       if (g !== loadGen) return
       if (mode.value === 'edit') await nextTick(() => editEl.value?.focus())
     } else if (k === 'sheet') {
-      const buf = await api.canvases.fileRaw(cid, f.path)
+      const buf = cid != null ? await api.canvases.fileRaw(cid, f.path) : await api.fs.raw(f.path)
       if (g !== loadGen) return
       const XLSX = await import('xlsx')
       const wb = XLSX.read(new Uint8Array(buf), { type: 'array' })
@@ -372,13 +376,15 @@ async function load() {
       sheetIdx.value = 0
     } else if (k === 'office') {
       try {
-        pdfUrl.value = await api.canvases.fileOfficePdf(cid, f.path)
+        pdfUrl.value = cid != null
+          ? await api.canvases.fileOfficePdf(cid, f.path)
+          : await api.fs.officePdf(f.path)
         if (g !== loadGen) revokePdf()
       } catch (e: any) {
         if (g !== loadGen) return
         if (ext.value === 'docx') {
           // Word COM 不可用 → 回退纯文本提取
-          const buf = await api.canvases.fileRaw(cid, f.path)
+          const buf = cid != null ? await api.canvases.fileRaw(cid, f.path) : await api.fs.raw(f.path)
           if (g !== loadGen) return
           docLines.value = extractDocx(buf)
           officeFallback.value = true
@@ -387,7 +393,7 @@ async function load() {
         }
       }
     } else if (k === 'pptx') {
-      const buf = await api.canvases.fileRaw(cid, f.path)
+      const buf = cid != null ? await api.canvases.fileRaw(cid, f.path) : await api.fs.raw(f.path)
       if (g !== loadGen) return
       loading.value = false
       pptxRendering.value = true
@@ -475,9 +481,13 @@ function requestClose() {
 async function openSystem() {
   const f = props.file
   const cid = props.canvasId
-  if (!f || cid == null) return
+  if (!f) return
   try {
-    await api.canvases.fileRun(cid, f.path)
+    if (cid != null) {
+      await api.canvases.fileRun(cid, f.path)
+    } else {
+      await api.fs.run(f.path)
+    }
   } catch (e: any) {
     alert('打开失败：' + (e?.message || e))
   }

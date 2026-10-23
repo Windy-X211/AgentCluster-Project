@@ -363,6 +363,7 @@ def _git_run(args: list, cwd: str | None = None, timeout: int = 60) -> dict:
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout, startupinfo=si,
         )
         return {
@@ -755,10 +756,14 @@ def _handle_clone_repo(kwargs: dict) -> dict:
     clone_args += [clone_url, str(dest_path)]
     clone_resp = _git_run(clone_args, timeout=GITHUB_CLONE_TIMEOUT)
     if not clone_resp.get("ok"):
-        # 清理半成品
+        # 清理半成品：仅当 dest 不含完整 .git 时才删（clone 可能已成功，仅输出解码失败）
         if created_by_us and dest_path.exists():
-            shutil.rmtree(dest_path, ignore_errors=True)
-        stderr = clone_resp.get("stderr", "")
+            has_git = (dest_path / ".git").exists()
+            has_content = any(dest_path.iterdir())
+            if not (has_git and has_content):
+                shutil.rmtree(dest_path, ignore_errors=True)
+        # 错误信息：优先 stderr，为空则回退 _git_run 的 error 字段（如 UnicodeDecodeError 等）
+        stderr = clone_resp.get("stderr", "") or clone_resp.get("error", "")
         code = clone_resp.get("code")
         if code == CLONE_TIMEOUT:
             return _build_result(False, error="克隆超时", code=CLONE_TIMEOUT)
