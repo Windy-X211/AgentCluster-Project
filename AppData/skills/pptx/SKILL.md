@@ -5,6 +5,14 @@ description: "创建、编辑、分析 PowerPoint (.pptx) 演示文稿。当用�
 version: "1.0.0"
 author: AgentCluster
 tags: [office, pptx, presentation, slides, document]
+
+dependencies:
+  pip:
+    - "markitdown>=0.1.0"
+  external:
+    - name: "Node.js"
+      url: "https://nodejs.org/"
+      description: "可选。若选用 pptxgenjs 从零生成方案，需要 Node.js + npm（npm install pptxgenjs）；OOXML 解包/编辑方案纯 Python 即可"
 ---
 
 ## Step-by-step execution and dependencies

@@ -5,6 +5,7 @@ export default createRouter({
   routes: [
     { path: '/', component: () => import('@/views/Home.vue') },
     { path: '/settings', component: () => import('@/views/Settings.vue') },
-    { path: '/plugins', component: () => import('@/views/PluginDebug.vue') }
+    { path: '/capabilities', component: () => import('@/views/CapabilityManagement.vue') },
+    { path: '/plugins', redirect: '/capabilities' }  // 向后兼容旧链接
   ]
 })

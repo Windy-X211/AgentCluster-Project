@@ -2,7 +2,7 @@
 
 AppData/plugins/
   http_request/
-    manifest.yaml        ← 插件级元数据（name/label/version/description/author）
+    manifest.yaml        ← 插件级元数据（name/label/version/description/author/dependencies）
     tool.yaml            ← function calling schema（LLM 自动调的参数定义）
     tool.py              ← 真正执行，里面要有 run(**kwargs) 函数
   send_email/
@@ -21,6 +21,16 @@ manifest.yaml 最小结构：
     en_US: "..."
   icon: "🌐"
   tags: [...]
+
+  # 【可选】依赖声明 — 系统加载时自动检测安装
+  dependencies:
+    pip:
+      - "requests>=2.28.0"
+      - "Pillow>=9.0.0"
+    external:
+      - name: "Everything Search"
+        url: "https://www.voidtools.com/"
+        description: "快速文件搜索工具（everything_search 插件必需）"
 
 tool.yaml 最小结构（每个插件至少一个 tool）：
   identity:
@@ -49,6 +59,7 @@ from pathlib import Path
 from typing import Any
 
 import core.store as _store
+from core.dependency_manager import parse_dependencies, ensure_dependencies
 
 
 def _plugins_root() -> Path:
@@ -300,7 +311,7 @@ def _file_hash(fp: Path) -> str:
 
 
 def _register_one(plugin_dir: Path) -> dict | None:
-    """注册单个插件，返回注册表条目（失败返回 None）。"""
+    """注册单个插件，返回注册表条目（失败返回 None；但 exec_module 失败时仍返回 placeholder 条目）。"""
     manifest_fp = plugin_dir / "manifest.yaml"
     tool_fp = plugin_dir / "tool.yaml"
     tool_py = plugin_dir / "tool.py"
@@ -315,30 +326,79 @@ def _register_one(plugin_dir: Path) -> dict | None:
     if not name:
         return None
 
-    # tool.py 内容未变且已注册 → 复用旧 run（保留运行态）；
-    # 只有 tool.py 实际变化时才重新执行模块，让新代码生效。
+    # ----------------------------------------------------------
+    # 依赖检测与安装（在 import tool.py 之前完成，避免 import 失败）
+    # ----------------------------------------------------------
+    dep_summary: dict = {}
+    raw_deps = manifest.get("dependencies")
+    # 若 manifest 没有，也尝试从 tool.yaml 顶层取
+    if raw_deps is None:
+        raw_deps = tool_yaml.get("dependencies")
+    if raw_deps is not None:
+        parsed = parse_dependencies(raw_deps)
+        try:
+            dep_summary = ensure_dependencies(parsed, plugin_dir, source_label=f"plugin:{name}")
+        except Exception as e:
+            print(f"[plugins] WARN 插件 {name} 依赖检测异常: {e}")
+
+    # ----------------------------------------------------------
+    # tool.py 加载 —— 即使缺失依赖导致 import 失败，也返回 placeholder 条目
+    # 让前端能力管理面板能看到缺失依赖的插件
+    # ----------------------------------------------------------
+    status = "ok"
+    load_error: str | None = None
+    run_fn = None
+
     h = _file_hash(tool_py)
     prev = PLUGIN_REGISTRY.get(name)
     if (prev is not None and prev.get("_source_tool_py") == str(tool_py)
-            and _PLUGIN_SOURCE_HASH.get(str(tool_py)) == h):
+            and _PLUGIN_SOURCE_HASH.get(str(tool_py)) == h
+            and prev.get("status") == "ok"):
+        # 上次加载成功且文件未变 → 复用旧 run
         run_fn = prev["run"]
     else:
         # 动态导入 tool.py（新模块对象替换 sys.modules 里的旧模块）
         spec = importlib.util.spec_from_file_location(f"_plugin_{plugin_dir.name}", tool_py)
         if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = mod
-        try:
-            spec.loader.exec_module(mod)  # type: ignore[union-attr]
-        except Exception as e:
-            print(f"[plugins] WARN 执行 {tool_py} 失败：{e}")
-            return None
-        if not hasattr(mod, "run"):
-            print(f"[plugins] WARN {tool_py} 没有 run() 函数")
-            return None
-        run_fn = mod.run
-        _PLUGIN_SOURCE_HASH[str(tool_py)] = h
+            load_error = "无法创建模块 spec"
+        else:
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            try:
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            except Exception as e:
+                load_error = f"{type(e).__name__}: {e}"
+                print(f"[plugins] WARN 执行 {tool_py} 失败：{load_error}")
+                # 清理失败的模块
+                sys.modules.pop(spec.name, None)
+                mod = None
+
+            if mod is not None and not hasattr(mod, "run"):
+                load_error = f"{tool_py} 没有 run() 函数"
+                print(f"[plugins] WARN {load_error}")
+                mod = None
+
+            if mod is not None:
+                run_fn = mod.run
+                _PLUGIN_SOURCE_HASH[str(tool_py)] = h
+
+    if run_fn is None:
+        # 构造 stub run 函数
+        _err_msg = load_error or "插件无法加载（未知原因）"
+        def _stub_run(**kwargs: Any) -> dict[str, Any]:
+            missing = dep_summary.get("pip_still_missing", []) or dep_summary.get("pip_install_failed", [])
+            parts = [f"插件 {name} 无法加载：{_err_msg}"]
+            if missing:
+                parts.append(f"缺失依赖: {', '.join(missing)}")
+            if dep_summary.get("npm_missing"):
+                parts.append("npm 依赖未满足（npm 不可用或 install 失败）")
+            if dep_summary.get("external"):
+                ext_names = [d.get("name", "") for d in dep_summary["external"] if d.get("name")]
+                if ext_names:
+                    parts.append(f"需要外部应用: {', '.join(ext_names)}")
+            return {"error": " | ".join(parts)}
+        run_fn = _stub_run
+        status = "dependency_error" if dep_summary.get("pip_still_missing") or dep_summary.get("pip_install_failed") or dep_summary.get("npm_missing") else "load_error"
 
     # 从 tool.yaml 拿参数列表（兼容旧 PLUGIN_PARAMS 字段）
     params_list: list[dict] = tool_yaml.get("parameters", []) or []
@@ -367,6 +427,9 @@ def _register_one(plugin_dir: Path) -> dict | None:
         "run": run_fn,
         "_source_dir": str(plugin_dir),
         "_source_tool_py": str(tool_py),
+        "dependencies": dep_summary,  # 依赖安装结果（公开视图保留此字段）
+        "status": status,              # "ok" / "dependency_error" / "load_error"
+        "load_error": load_error,      # exec_module 失败时的错误信息
     }
 
 
@@ -376,6 +439,32 @@ def _public_view(registry: dict[str, dict] | None = None) -> dict[str, dict]:
     return {k: {kk: vv for kk, vv in v.items()
                 if not kk.startswith("_") and kk not in ("run", "name")}
             for k, v in registry.items()}
+
+
+def plugin_dependencies_snapshot() -> dict[str, dict]:
+    """返回所有插件的依赖汇总快照（前端依赖管理面板用）。
+
+    每个条目：
+      {type, label, status, load_error,
+       pip: [...所有 pip 规格], pip_still_missing: [...最终缺失的],
+       npm_installed: bool|None, npm_missing: bool, external: [{name, url, description}]}
+    """
+    out: dict[str, dict] = {}
+    for name, p in PLUGIN_REGISTRY.items():
+        deps = p.get("dependencies") or {}
+        out[name] = {
+            "type": "plugin",
+            "label": p.get("label", name),
+            "status": p.get("status", "ok"),
+            "load_error": p.get("load_error"),
+            "pip": deps.get("pip_checked", []),
+            "pip_installed": deps.get("pip_installed", []),
+            "pip_still_missing": deps.get("pip_still_missing", []),
+            "npm_installed": deps.get("npm_installed"),
+            "npm_missing": deps.get("npm_missing", False),
+            "external": deps.get("external", []),
+        }
+    return out
 
 
 def load_plugins() -> dict[str, dict]:

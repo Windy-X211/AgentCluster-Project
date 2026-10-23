@@ -10,3 +10,8 @@ description:
   en_US: "Control Live2D pet: show/hide, position/resize, facial params w/ smooth tween, low-latency stream animation"
 icon: "🐱"
 tags: ["desktop", "live2d", "pet", "animation", "stream"]
+
+dependencies:
+  pip:
+    - "PyQt5>=5.15.9"
+    - "PyQtWebEngine>=5.15.7"

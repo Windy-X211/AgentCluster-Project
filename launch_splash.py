@@ -58,7 +58,7 @@ class Splash(tk.Tk):
         super().__init__()
         self.title("AgentCluster 启动中")
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
+        self.attributes("-topmost", False)
         try:
             self.attributes("-toolwindow", True)   # 不进任务栏
         except Exception:

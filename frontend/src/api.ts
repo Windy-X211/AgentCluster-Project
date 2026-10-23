@@ -238,7 +238,8 @@ export const api = {
     commands: () => req<any>('/commands/commands'),
     plugins: () => req<any>('/commands/plugins'),
     reload: () => req<any>('/commands/reload', { method: 'POST' }),
-    run: (d: any) => req('/commands/run', { method: 'POST', body: JSON.stringify(d) })
+    run: (d: any) => req('/commands/run', { method: 'POST', body: JSON.stringify(d) }),
+    dependencies: () => req<any>('/commands/dependencies'),
   },
   presets: {
     list: () => req<any[]>('/param_presets'),

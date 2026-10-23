@@ -43,3 +43,15 @@ description:
 version_code: 2
 icon: "🌐"
 tags: ["browser", "automation", "playwright", "web", "cdp", "unified"]
+
+dependencies:
+  pip:
+    - "playwright>=1.40.0"
+  external:
+    - name: "Playwright Chromium 浏览器内核"
+      url: "https://playwright.dev/docs/browsers"
+      description: "pip install playwright 后还需执行 playwright install chromium（可选）；CDP/system 模式可连接已安装的 Edge/Chrome"
+    - name: "Microsoft Edge / Google Chrome（可选）"
+      url: "https://www.microsoft.com/edge"
+      description: "CDP 模式或 system 模式需要系统已安装 Edge 或 Chrome"
+

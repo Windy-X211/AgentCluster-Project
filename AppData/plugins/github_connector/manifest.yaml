@@ -43,3 +43,12 @@ description:
 version_code: 1
 icon: "🐙"
 tags: ["github", "git", "vcs", "code"]
+
+dependencies:
+  pip:
+    - "httpx>=0.24.0"
+  external:
+    - name: "Git 命令行工具"
+      url: "https://git-scm.com/downloads"
+      description: "clone_repo / push_project action 需要 git 命令可用"
+

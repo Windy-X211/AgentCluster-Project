@@ -2,8 +2,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Any
 from core.commands import run_command, COMMAND_META, COMMAND_GROUPS
-from plugins import list_plugins as list_plugins_meta, run_plugin, load_plugins
-from skills import list_skills as list_skills_meta, get_skill_prompt, load_skills
+from plugins import list_plugins as list_plugins_meta, run_plugin, load_plugins, plugin_dependencies_snapshot
+from skills import list_skills as list_skills_meta, get_skill_prompt, load_skills, skill_dependencies_snapshot
 
 router = APIRouter()
 
@@ -70,3 +70,39 @@ def run(c: CmdIn):
     if fixed:
         params = {**params, **fixed}
     return run_plugin(c.name, **params)
+
+
+@router.get("/dependencies")
+def get_dependencies():
+    """返回所有插件 + 技能的依赖汇总快照（前端能力管理-依赖安装面板用）。
+
+    返回结构：
+      {
+        plugins: { name: {type, label, status, load_error,
+                          pip, pip_installed, pip_still_missing,
+                          npm_installed, npm_missing, external} },
+        skills:  { name: {...} },
+        summary: { total, with_external, with_pip, with_npm, with_errors }
+      }
+
+    status 取值："ok" / "dependency_error" / "load_error"，
+    异常项（status != "ok"）不会被跳过，仍会出现在快照中供前端提示。
+    每个 external 条目: {name, url, description}  （供前端展示可点击的下载链接）
+    """
+    plugins_deps = plugin_dependencies_snapshot()
+    skills_deps = skill_dependencies_snapshot()
+
+    all_items = list(plugins_deps.values()) + list(skills_deps.values())
+    summary = {
+        "total": len(all_items),
+        "with_external": sum(1 for d in all_items if d.get("external")),
+        "with_pip": sum(1 for d in all_items if d.get("pip")),
+        "with_npm": sum(1 for d in all_items if d.get("npm_installed") is not None),
+        "with_errors": sum(1 for d in all_items if d.get("status") not in (None, "ok")),
+    }
+
+    return {
+        "plugins": plugins_deps,
+        "skills": skills_deps,
+        "summary": summary,
+    }

@@ -19,6 +19,15 @@ SKILL.md 要求：
   version: "1.0.0"                 ← 可选
   author: 作者                     ← 可选
   tags: [creative, writing]        ← 可选
+
+  # 【可选】依赖声明 — 系统加载时自动检测安装
+  dependencies:
+    pip:
+      - "python-pptx>=0.6.21"
+    external:
+      - name: "Node.js"
+        url: "https://nodejs.org/"
+        description: "前端构建工具"
   ---                              ← frontmatter 结束
   # Markdown 指令 ...              ← 正文：步骤、规则、模板、边界
 
@@ -34,6 +43,7 @@ import json, re, os
 from pathlib import Path
 
 import core.store as _store
+from core.dependency_manager import parse_dependencies, ensure_dependencies
 
 
 def _skills_root() -> Path:
@@ -54,43 +64,211 @@ PROGRESSIVE_PREVIEW_CHARS = 2500
 # ==============================================================
 # YAML frontmatter 简易解析（标准库没 yaml，用正则足够）
 # ==============================================================
+def _unquote_scalar(v: str) -> object:
+    """YAML 标量解析：字符串/整数/浮点/布尔/null/内联数组。"""
+    v = v.strip()
+    if not v:
+        return ""
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        return v[1:-1]
+    if v.lower() == "true":
+        return True
+    if v.lower() == "false":
+        return False
+    if v.lower() in ("null", "~"):
+        return None
+    try:
+        if "." in v:
+            return float(v)
+        return int(v)
+    except ValueError:
+        pass
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
+    return v
+
+
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """从 SKILL.md 里拆出 YAML frontmatter 和 Markdown body。"""
+    """从 SKILL.md 里拆出 YAML frontmatter 和 Markdown body。
+
+    支持：
+      - 标量值：name: foo, version: "1.0"
+      - 内联数组：tags: [a, b, c]
+      - 多行数组：tags:\n  - a\n  - b
+      - 嵌套对象：dependencies:\n  pip: [requests]\n  external:\n    - name: xxx
+    """
     m = re.match(r"^\s*---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.DOTALL)
     if not m:
         return {}, text
     fm = m.group(1)
     body = m.group(2)
 
+    # 先简单情况逐行收集 → {key: (first_value, [sub_lines], base_indent)}
+    lines = fm.splitlines()
     meta: dict = {}
-    for line in fm.splitlines():
-        line = line.rstrip()
-        if not line or line.startswith("#"):
+
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i].rstrip()
+        stripped = raw_line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
             continue
-        if ":" not in line:
+        indent = len(raw_line) - len(stripped)
+        if ":" not in stripped:
+            i += 1
             continue
-        key, _, val = line.partition(":")
+        key, _, val = stripped.partition(":")
         key = key.strip()
         val = val.strip()
-        # 数组：tags: [a, b, c] 或 plugins:\n  - item1\n  - item2
-        if val.startswith("[") and val.endswith("]"):
-            items = [x.strip().strip("'\"") for x in val[1:-1].split(",")]
-            meta[key] = [x for x in items if x]
-        elif val.startswith(("'", '"')) and val.endswith(("'", '"')):
-            meta[key] = val[1:-1]
-        elif val.lower() in ("true", "false"):
-            meta[key] = val.lower() == "true"
-        elif val.replace(".", "", 1).isdigit():
-            meta[key] = float(val) if "." in val else int(val)
+
+        if val:
+            # key: 标量 或 key: [内联数组]
+            meta[key] = _unquote_scalar(val)
+            i += 1
         else:
-            # 可能是多行列表
-            if not val:
-                items = re.findall(r"^\s*-\s+(.+)$", fm, re.MULTILINE)
-                if items:
-                    meta[key] = items
+            # key: (空值 → 后续缩进更大的行属于它)
+            sub_lines: list[tuple[int, str]] = []
+            j = i + 1
+            while j < len(lines):
+                sl = lines[j].rstrip()
+                ss = sl.lstrip()
+                if not ss or ss.startswith("#"):
+                    j += 1
                     continue
-            meta[key] = val
+                sub_indent = len(sl) - len(ss)
+                if sub_indent <= indent:
+                    break
+                sub_lines.append((sub_indent, ss))
+                j += 1
+
+            if not sub_lines:
+                meta[key] = None
+                i = j
+                continue
+
+            # 判断子内容是 list 还是 dict
+            first_stripped = sub_lines[0][1]
+            if first_stripped.startswith("- "):
+                # 数组
+                items = _parse_inline_list(sub_lines)
+                meta[key] = items
+            else:
+                # 嵌套对象（递归简化解析）
+                nested = _parse_nested_object(sub_lines)
+                meta[key] = nested
+            i = j
+
     return meta, body
+
+
+def _parse_inline_list(sub_lines: list[tuple[int, str]]) -> list:
+    """解析多行 YAML 数组（以 '- ' 开头的条目列表）。支持简单条目和对象条目。"""
+    result: list = []
+    idx = 0
+    while idx < len(sub_lines):
+        _ind, stripped = sub_lines[idx]
+        if not stripped.startswith("- "):
+            idx += 1
+            continue
+        item_text = stripped[2:].strip()
+        # 判断 item 是纯标量还是含 key:value
+        if ":" not in item_text:
+            result.append(_unquote_scalar(item_text))
+            idx += 1
+            continue
+
+        # 对象条目：收集缩进更大的后续行为子属性
+        item_obj: dict = {}
+        k, _, v = item_text.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if v:
+            item_obj[k] = _unquote_scalar(v)
+            idx += 1
+        else:
+            idx += 1
+
+        # 继续收集缩进大于当前 item 的子行
+        item_indent = sub_lines[idx - 1][0]
+        while idx < len(sub_lines):
+            ci, cl = sub_lines[idx]
+            if ci <= item_indent:
+                break
+            if cl.startswith("- "):
+                # 嵌套 list item 结束
+                break
+            ck, _, cv = cl.partition(":")
+            ck = ck.strip()
+            cv = cv.strip()
+            if cv:
+                item_obj[ck] = _unquote_scalar(cv)
+            else:
+                # 子嵌套对象/数组 — 收集更缩进的行
+                idx += 1
+                child_lines = []
+                child_indent = ci + 2  # 期望子行缩进更大
+                while idx < len(sub_lines):
+                    cci, ccl = sub_lines[idx]
+                    if cci <= ci:
+                        break
+                    child_lines.append((cci, ccl))
+                    idx += 1
+                if child_lines:
+                    first_c = child_lines[0][1]
+                    if first_c.startswith("- "):
+                        item_obj[ck] = _parse_inline_list(child_lines)
+                    else:
+                        item_obj[ck] = _parse_nested_object(child_lines)
+                else:
+                    item_obj[ck] = None
+                continue
+            idx += 1
+
+        result.append(item_obj)
+    return result
+
+
+def _parse_nested_object(sub_lines: list[tuple[int, str]]) -> dict:
+    """解析嵌套 YAML 对象（子 key: value 对）。"""
+    result: dict = {}
+    idx = 0
+    while idx < len(sub_lines):
+        ind, stripped = sub_lines[idx]
+        if not stripped or not stripped.startswith(("-", "#")) and ":" not in stripped:
+            idx += 1
+            continue
+        if stripped.startswith("- ") or ":" not in stripped:
+            idx += 1
+            continue
+        k, _, v = stripped.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if v:
+            result[k] = _unquote_scalar(v)
+            idx += 1
+        else:
+            idx += 1
+            # 收集缩进更大的子行
+            child_lines = []
+            while idx < len(sub_lines):
+                ci, cl = sub_lines[idx]
+                if ci <= ind:
+                    break
+                child_lines.append((ci, cl))
+                idx += 1
+            if child_lines:
+                first_c = child_lines[0][1]
+                if first_c.startswith("- "):
+                    result[k] = _parse_inline_list(child_lines)
+                else:
+                    result[k] = _parse_nested_object(child_lines)
+            else:
+                result[k] = None
+    return result
 
 
 def _frontmatter_field(text: str, field: str) -> str:
@@ -126,6 +304,26 @@ def _load_one(p: Path) -> dict | None:
     if not name:
         return None
 
+    # ----------------------------------------------------------
+    # 依赖检测与安装（技能 frontmatter 的 dependencies 字段）
+    # ----------------------------------------------------------
+    dep_summary: dict = {}
+    raw_deps = meta.get("dependencies")
+    if raw_deps is not None:
+        parsed = parse_dependencies(raw_deps)
+        try:
+            dep_summary = ensure_dependencies(parsed, p, source_label=f"skill:{name}")
+        except Exception as e:
+            print(f"[skills] WARN 技能 {name} 依赖检测异常: {e}")
+
+    # 依赖状态（供前端能力管理面板展示）
+    has_missing = bool(
+        dep_summary.get("pip_still_missing")
+        or dep_summary.get("pip_install_failed")
+        or dep_summary.get("npm_missing")
+    )
+    status = "dependency_error" if has_missing else "ok"
+
     # 技能目录下的相对资源（scripts/references/assets 文件夹）
     subdirs = {
         "scripts": (p / "scripts").exists(),
@@ -145,6 +343,9 @@ def _load_one(p: Path) -> dict | None:
         "_source_dir": str(p),
         "_subdirs": subdirs,
         "_source_file": str(md),
+        "dependencies": dep_summary,
+        "status": status,              # "ok" / "dependency_error"
+        "load_error": None,            # 技能是文本加载，不会有 exec 错误，保留字段供一致性
     }
 
 
@@ -174,6 +375,26 @@ def load_skills() -> dict:
 
 def list_skills() -> dict:
     return {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in SKILL_REGISTRY.items()}
+
+
+def skill_dependencies_snapshot() -> dict[str, dict]:
+    """返回所有技能的依赖汇总快照（前端依赖管理面板用）。"""
+    out: dict[str, dict] = {}
+    for name, s in SKILL_REGISTRY.items():
+        deps = s.get("dependencies") or {}
+        out[name] = {
+            "type": "skill",
+            "label": s.get("label", name),
+            "status": s.get("status", "ok"),
+            "load_error": s.get("load_error"),
+            "pip": deps.get("pip_checked", []),
+            "pip_installed": deps.get("pip_installed", []),
+            "pip_still_missing": deps.get("pip_still_missing", []),
+            "npm_installed": deps.get("npm_installed"),
+            "npm_missing": deps.get("npm_missing", False),
+            "external": deps.get("external", []),
+        }
+    return out
 
 
 def skill_toc(body: str) -> list[dict]:

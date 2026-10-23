@@ -37,3 +37,9 @@ description:
 version_code: 1
 icon: "🎨"
 tags: ["image", "stablediffusion", "txt2img", "img2img", "sd-webui"]
+
+dependencies:
+  external:
+    - name: "Stable Diffusion WebUI（A1111 / 秋叶整合包）"
+      url: "https://github.com/AUTOMATIC1111/stable-diffusion-webui"
+      description: "必装。需以 --api 参数启动（默认监听 http://127.0.0.1:7860），插件通过 HTTP 调用其 /sdapi/v1 API"

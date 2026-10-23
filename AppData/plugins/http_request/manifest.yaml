@@ -13,3 +13,7 @@ description:
 version_code: 1
 icon: "🌐"
 tags: ["network", "http"]
+
+dependencies:
+  pip:
+    - "httpx>=0.24.0"

@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref, computed, watch } from 'vue'
+import { onMounted, ref, computed } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP } from '@/stores'
 import { api } from '@/api'
 import FileExplorerDialog from '@/components/FileExplorerDialog.vue'
-import ParamSelect from '@/components/ParamSelect.vue'
 import { getAvatarGradient } from '@/utils/avatar'
 
 const models = useModelStore()
@@ -91,14 +90,9 @@ async function uninstallASR() {
 
 onMounted(async () => {
   await Promise.all([models.fetch(), settings.fetch()])
-  defaults.value.commands = [...(settings.data.default_commands || [])]
-  defaults.value.skills   = [...(settings.data.default_skills   || [])]
-  defaults.value.plugins  = [...(settings.data.default_plugins  || [])]
-  maxRounds.value = Number(settings.data.max_tool_rounds) || 50
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
-  loadPresets()
 })
 
 function openPath(p: string) { api.storage.open(p).catch(() => {}) }
@@ -131,9 +125,8 @@ async function persistStorageLocation() {
     storageLocation.value = storagePaths.value?.root || val
     // 前端同步刷新 settings / capabilities，让其它页也能立即感知
     await Promise.all([settings.fetch(), models.fetch()])
-    showToast('已切换到新存储位置')
   } catch (e: any) {
-    showToast(`切换失败：${e?.message || e}`, 'err')
+    alert('切换存储位置失败：' + (e?.message || e))
   } finally {
     storageSaving.value = false
   }
@@ -147,111 +140,8 @@ async function browseStorage() {
       await persistStorageLocation()
     }
   } catch (e: any) {
-    showToast(`打开选择器失败：${e?.message || e}`, 'err')
+    alert('打开选择器失败：' + (e?.message || e))
   }
-}
-
-// —— 能力选择器逻辑 ——
-const availableByType = (type: string) => {
-  const source = type === 'commands' ? settings.commandsMeta
-               : type === 'skills'   ? settings.skillsMeta
-                                     : settings.pluginsMeta
-  const added = new Set((defaults.value[type as keyof typeof defaults.value] || []) as string[])
-  return Object.entries(source as Record<string, any>)
-    .filter(([k, v]) => !added.has(k) && !(type === 'commands' && (v as any).hidden))
-    .map(([k, v]) => ({
-      key: k,
-      label: v.label || k,
-      desc: v.description || v.desc || '',
-      extra: type === 'skills' ? (v.version ? `v${v.version}` : '') + (v.triggers?.length ? ` · ${v.triggers.join('/')}` : '') : '',
-    }))
-}
-const currentPickerItems = computed(() => pickerOpen.value ? availableByType(pickerOpen.value) : [])
-
-// 命令选择器分组（仅 commands；skills/plugins 返回 null 走扁平列表）
-const currentPickerGroups = computed(() => {
-  if (!pickerOpen.value || pickerOpen.value !== 'commands') return null
-  const items = availableByType('commands')
-  const byGroup = new Map<string, any[]>()
-  for (const it of items) {
-    const g = (settings.commandsMeta[it.key] || {}).group || '其他'
-    if (!byGroup.has(g)) byGroup.set(g, [])
-    byGroup.get(g)!.push(it)
-  }
-  const order = [...(settings.commandGroups || [])]
-  for (const g of byGroup.keys()) if (!order.includes(g)) order.push(g)
-  return order.filter(g => byGroup.has(g)).map(g => ({ name: g, items: byGroup.get(g)! }))
-})
-function toggleGroupExpand(name: string) {
-  const s = new Set(collapsedGroups.value)
-  if (s.has(name)) s.delete(name)
-  else s.add(name)
-  collapsedGroups.value = s
-}
-function isGroupSelected(group: { name: string; items: any[] }) {
-  return group.items.length > 0 && group.items.every(it => selectedKeys.value.has(it.key))
-}
-function isGroupIndeterminate(group: { name: string; items: any[] }) {
-  const cnt = group.items.filter(it => selectedKeys.value.has(it.key)).length
-  return cnt > 0 && cnt < group.items.length
-}
-function toggleGroup(group: { name: string; items: any[] }) {
-  if (isGroupSelected(group)) {
-    group.items.forEach(it => selectedKeys.value.delete(it.key))
-  } else {
-    group.items.forEach(it => selectedKeys.value.add(it.key))
-  }
-}
-
-function pickerTitle(type: string) {
-  return type === 'commands' ? '选择默认命令' : type === 'skills' ? '选择默认技能' : '选择默认插件'
-}
-
-function openPicker(type: string) {
-  selectedKeys.value = new Set()
-  pickerOpen.value = type
-  // 命令组默认折叠，点击展开后单独勾选
-  collapsedGroups.value = type === 'commands' ? new Set(settings.commandGroups || []) : new Set()
-}
-function closePicker() { pickerOpen.value = null; selectedKeys.value = new Set() }
-function togglePick(key: string) {
-  if (selectedKeys.value.has(key)) selectedKeys.value.delete(key)
-  else selectedKeys.value.add(key)
-}
-function confirmAdd() {
-  if (!pickerOpen.value) return
-  const list: string[] = (defaults.value[pickerOpen.value as keyof typeof defaults.value] as string[]) || []
-  selectedKeys.value.forEach(k => list.push(k))
-  defaults.value[pickerOpen.value as keyof typeof defaults.value] = list
-  // 立即持久化
-  persistDefaults()
-  closePicker()
-}
-function removeDefault(type: 'commands' | 'skills' | 'plugins', key: string) {
-  defaults.value[type] = defaults.value[type].filter(k => k !== key)
-  persistDefaults()
-}
-function persistDefaults() {
-  settings.update({
-    default_commands: [...defaults.value.commands],
-    default_skills:   [...defaults.value.skills],
-    default_plugins:  [...defaults.value.plugins],
-  })
-}
-function persistMaxRounds() {
-  const v = Math.max(1, Math.floor(Number(maxRounds.value) || 50))
-  maxRounds.value = v
-  settings.update({ max_tool_rounds: v })
-}
-
-function displayLabel(type: string, key: string): string {
-  const src = type === 'commands' ? settings.commandsMeta
-            : type === 'skills' ? settings.skillsMeta
-                                : settings.pluginsMeta
-  let m = src[key]
-  if (!m && key.includes('_')) m = src[key.replace(/_/g, '-')]
-  if (!m && key.includes('-')) m = src[key.replace(/-/g, '_')]
-  return m?.label || key
 }
 
 // —— 模型接口 ——
@@ -273,38 +163,6 @@ async function saveIface() {
 }
 async function setDefaultIface(id: number) { await settings.update({ default_model_interface: id }) }
 
-// —— 能力参数预设 ——
-const presets = ref<any[]>([])
-const presetDialog = ref(false)
-const presetSaving = ref(false)
-const isEditingPreset = ref(false)
-const presetForm = ref<any>({ target_type: 'plugin', target_name: '', label: '', note: '', enabled: true, fixed: [], optional: [] })
-
-const currentTargetParams = computed(() => {
-  const base = presetForm.value?.target_type === 'skill' ? settings.skillsMeta : settings.pluginsMeta
-  const meta = (base || {})[presetForm.value?.target_name] || {}
-  const norm = (arr: any[]) => (arr || [])
-    .map((p: any) => typeof p === 'string'
-      ? { name: p, desc: '', type: '', enum: null as any, default: undefined }
-      : {
-          name: p?.name || '',
-          desc: p?.description || p?.desc || p?.label || '',
-          type: p?.type || '',
-          enum: Array.isArray(p?.enum) ? p.enum : null,
-          default: p?.default,
-        })
-    .filter((p: any) => p.name)
-  const fromParams = norm(meta.parameters)
-  return fromParams.length ? fromParams : norm(meta.params)
-})
-function paramOptions(currentKey: string) {
-  const opts = currentTargetParams.value.slice()
-  if (currentKey && !opts.some(p => p.name === currentKey)) {
-    opts.unshift({ name: currentKey, desc: '自定义', type: '', enum: null as any, default: undefined })
-  }
-  return opts
-}
-
 // —— 外观设置 ——
 const avatarMode = computed({
   get() { return settings.data.avatar_mode || 'differentiated' },
@@ -316,111 +174,6 @@ function avatarPreviewGradient(name: string): string {
     return 'linear-gradient(135deg, #6376b8, #8d73c4)'
   }
   return getAvatarGradient(name)
-}
-
-// —— 固定参数值选项：当目标参数带 enum 或为 boolean 时，返回可选值列表（用于下拉框）；否则返回 null（用文本/密码输入） ——
-function valueOptionsFor(targetType: string, targetName: string, key: string): any[] | null {
-  if (!key) return null
-  const base = targetType === 'skill' ? settings.skillsMeta : settings.pluginsMeta
-  const meta = (base || {})[targetName] || {}
-  const params: any[] = meta.parameters || meta.params || []
-  const p = params.find((x: any) => (typeof x === 'string' ? x : x?.name) === key)
-  if (!p || typeof p === 'string') return null
-  if (Array.isArray(p.enum) && p.enum.length) {
-    return p.enum.map((v: any) => ({ value: String(v), label: String(v) }))
-  }
-  if ((p.type || '').toLowerCase() === 'boolean') {
-    return [{ value: 'false', label: 'false' }, { value: 'true', label: 'true' }]
-  }
-  return null
-}
-function paramValueOptions(row: any): any[] | null {
-  const f = presetForm.value
-  return valueOptionsFor(f?.target_type, f?.target_name, row?.key)
-}
-// 把当前值对齐到选项（用于加载旧数据 / 切换 key 时规范化）
-function coerceToOption(row: any): void {
-  const opts = paramValueOptions(row)
-  if (!opts) return
-  const cur = String(row.value ?? '').toLowerCase()
-  const m = opts.find((o: any) => String(o.value).toLowerCase() === cur)
-  if (m) {
-    row.value = m.value
-  } else {
-    // 不在选项内 → 取参数 default（若 default 也在选项内）或首项
-    const p = currentTargetParams.value.find((x: any) => x.name === row.key)
-    const def = p?.default
-    const defOpt = (def !== undefined && def !== null && def !== '')
-      ? opts.find((o: any) => String(o.value).toLowerCase() === String(def).toLowerCase())
-      : null
-    row.value = defOpt ? defOpt.value : opts[0].value
-  }
-}
-function onFixedKeyChange(row: any) {
-  coerceToOption(row)
-}
-const presetTypeIcon = (t: string) => t === 'skill' ? '⚡' : '🧩'
-
-async function loadPresets() {
-  try { presets.value = await api.presets.list() } catch { presets.value = [] }
-}
-function openNewPreset() {
-  presetForm.value = { target_type: 'plugin', target_name: '', label: '', note: '', enabled: true, fixed: [], optional: [] }
-  isEditingPreset.value = false; presetDialog.value = true
-}
-function editPreset(p: any) {
-  presetForm.value = {
-    ...p,
-    fixed: (p.fixed || []).map((x: any) => {
-      const row = { ...x, _visible: false }
-      // 加载时把 enum/布尔固定参数的值对齐到选项（旧加密条目解密后可能是 "False" 等大小写不一致的值）
-      const opts = valueOptionsFor(p.target_type, p.target_name, row.key)
-      if (opts && opts.length) {
-        const cur = String(row.value ?? '').toLowerCase()
-        const m = opts.find((o: any) => String(o.value).toLowerCase() === cur)
-        row.value = m ? m.value : (opts[0]?.value ?? row.value)
-      }
-      return row
-    }),
-    optional: (p.optional || []).map((x: any) => ({ ...x })),
-  }
-  isEditingPreset.value = true; presetDialog.value = true
-}
-function closePresetDialog() { presetDialog.value = false; presetForm.value = {} }
-async function savePreset() {
-  presetSaving.value = true
-  try {
-    const f = presetForm.value
-    const payload = {
-      target_type: f.target_type,
-      target_name: f.target_name,
-      label: f.label || '', note: f.note || '', enabled: !!f.enabled,
-      fixed: (f.fixed || []).map((x: any) => {
-        const opts = paramValueOptions(x)
-        const isPlain = !!(opts && opts.length)
-        // 值对齐到选项；不在选项内时落到首项
-        let val = x.value ?? ''
-        if (isPlain && opts) {
-          const cur = String(val).toLowerCase()
-          const m = opts.find((o: any) => String(o.value).toLowerCase() === cur)
-          val = m ? m.value : opts[0].value
-        }
-        return { key: (x.key || '').trim(), value: val, plain: isPlain }
-      }).filter((x: any) => x.key),
-      optional: (f.optional || []).map((x: any) => ({ key: (x.key || '').trim(), desc: x.desc ?? '' })).filter((x: any) => x.key),
-    }
-    if (isEditingPreset.value) await api.presets.update(f.id, payload)
-    else await api.presets.create(payload)
-    closePresetDialog(); await loadPresets()
-  } catch (e: any) { alert('保存失败：' + (e?.message || e)) }
-  finally { presetSaving.value = false }
-}
-async function removePreset(p: any) {
-  if (!confirm(`删除预设「${p.label || p.target_name}」？`)) return
-  await api.presets.remove(p.id); await loadPresets()
-}
-async function togglePreset(p: any) {
-  await api.presets.update(p.id, { ...p, enabled: !p.enabled }); await loadPresets()
 }
 </script>
 
@@ -458,102 +211,6 @@ async function togglePreset(p: any) {
           </tbody>
         </table>
         <div v-if="!models.list.length" class="empty">还没有接口，点击右上角"新建接口"</div>
-      </div>
-
-      <!-- 默认能力（改用 + 添加 选择器，与 AgentEditDialog 一致） -->
-      <div class="panel glass">
-        <div class="panel-title">
-          <span>智能体默认能力</span>
-          <span class="hint">新建智能体时自动勾选这些能力</span>
-          <button class="btn sm ghost" style="margin-left:auto" @click="reloadCapabilities" :disabled="refreshLoading" :title="'重新扫描插件/技能目录'">
-            <span v-if="refreshLoading">⟳ 刷新中…</span>
-            <span v-else>⟳ 刷新能力</span>
-          </button>
-        </div>
-
-        <!-- 默认命令 -->
-        <div class="cap-block">
-          <div class="cap-header">
-            <span class="cap-title">默认命令</span>
-            <button class="btn sm ghost" @click="openPicker('commands')" :disabled="availableByType('commands').length === 0">+ 添加</button>
-          </div>
-          <div class="chip-row">
-            <div v-for="k in defaults.commands" :key="k" class="chip blue">
-              {{ displayLabel('commands', k) }} <span class="x" @click="removeDefault('commands', k)">×</span>
-            </div>
-            <div v-if="!defaults.commands.length" class="hint-empty">未设置，点击 "+ 添加"</div>
-          </div>
-        </div>
-
-        <!-- 默认技能 -->
-        <div class="cap-block">
-          <div class="cap-header">
-            <span class="cap-title">默认技能</span>
-            <button class="btn sm ghost" @click="openPicker('skills')" :disabled="availableByType('skills').length === 0">+ 添加</button>
-          </div>
-          <div class="chip-row">
-            <div v-for="s in defaults.skills" :key="s" class="chip purple">
-              {{ displayLabel('skills', s) }} <span class="x" @click="removeDefault('skills', s)">×</span>
-            </div>
-            <div v-if="!defaults.skills.length" class="hint-empty">未设置，点击 "+ 添加"</div>
-          </div>
-        </div>
-
-        <!-- 默认插件 -->
-        <div class="cap-block">
-          <div class="cap-header">
-            <span class="cap-title">默认插件</span>
-            <button class="btn sm ghost" @click="openPicker('plugins')" :disabled="availableByType('plugins').length === 0">+ 添加</button>
-          </div>
-          <div class="chip-row">
-            <div v-for="p in defaults.plugins" :key="p" class="chip green">
-              {{ displayLabel('plugins', p) }} <span class="x" @click="removeDefault('plugins', p)">×</span>
-            </div>
-            <div v-if="!defaults.plugins.length" class="hint-empty">未设置，点击 "+ 添加"</div>
-          </div>
-        </div>
-
-        <!-- 工具调用最大轮数 -->
-        <div class="cap-block">
-          <div class="cap-header">
-            <span class="cap-title">工具调用最大轮数</span>
-            <span class="hint-empty">单次回复最多迭代轮数，默认 50，失焦即保存</span>
-          </div>
-          <input class="input rounds-input" type="number" min="1" step="1"
-                 v-model.number="maxRounds" @change="persistMaxRounds" />
-        </div>
-      </div>
-
-      <!-- 能力参数预设 -->
-      <div class="panel glass">
-        <div class="panel-title">
-          <span>🔐 能力参数预设</span>
-          <button class="btn" @click="openNewPreset">+ 新建预设</button>
-        </div>
-        <div class="hint-empty" style="margin-bottom: 4px">
-          为插件/技能预填参数：固定参数加密保存，模型不可见、不可更改；可选参数仅以文字描述供模型参考选择。
-        </div>
-
-        <div v-if="presets.length" class="preset-grid">
-          <div v-for="p in presets" :key="p.id" class="preset-card" :class="{ off: !p.enabled }">
-            <div class="pc-head">
-              <span class="pc-type">{{ presetTypeIcon(p.target_type) }} {{ p.target_type === 'skill' ? '技能' : '插件' }}</span>
-              <span class="pc-label">{{ p.label || p.target_name }}</span>
-              <span class="pc-tag mono">{{ p.target_name }}</span>
-            </div>
-            <div v-if="p.note" class="pc-note">{{ p.note }}</div>
-            <div class="pc-counts">
-              <span class="cnt red">🔒 固定 {{ (p.fixed || []).length }}</span>
-              <span class="cnt blue">📝 可选 {{ (p.optional || []).length }}</span>
-            </div>
-            <div class="pc-actions">
-              <button class="btn sm ghost" @click="togglePreset(p)">{{ p.enabled ? '停用' : '启用' }}</button>
-              <button class="btn sm ghost" @click="editPreset(p)">编辑</button>
-              <button class="btn sm ghost" @click="removePreset(p)">删除</button>
-            </div>
-          </div>
-        </div>
-        <div v-else class="empty">还没有预设，点击右上角"新建预设"</div>
       </div>
 
       <!-- 外观设置 -->
@@ -773,69 +430,6 @@ async function togglePreset(p: any) {
       </div>
     </div>
 
-    <!-- 统一能力选择器（与 AgentEditDialog 同款，居中弹窗） -->
-    <Teleport to="body">
-      <div v-if="pickerOpen" class="picker-mask">
-        <div class="picker-popup glass">
-          <div class="picker-title">
-            <span>{{ pickerTitle(pickerOpen) }}</span>
-            <span class="picker-sub">共 {{ currentPickerItems.length }} 项</span>
-          </div>
-          <div class="picker-list">
-            <!-- 命令：按分组展示，可整组勾选或展开后单独勾选 -->
-            <template v-if="currentPickerGroups">
-              <div v-for="g in currentPickerGroups" :key="g.name" class="picker-group">
-                <div class="pg-head" @click="toggleGroupExpand(g.name)">
-                  <input type="checkbox"
-                         :checked="isGroupSelected(g)"
-                         :indeterminate="isGroupIndeterminate(g)"
-                         @click.stop="toggleGroup(g)" />
-                  <span class="pg-name">{{ g.name }}</span>
-                  <span class="pg-count">{{ g.items.length }}</span>
-                  <span class="pg-arrow">{{ collapsedGroups.has(g.name) ? '▸' : '▾' }}</span>
-                </div>
-                <div v-if="!collapsedGroups.has(g.name)" class="pg-items">
-                  <label v-for="item in g.items" :key="item.key"
-                         :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
-                    <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
-                    <div class="pi-body">
-                      <div class="pi-label">{{ item.label }}</div>
-                      <div class="pi-key">{{ item.key }}</div>
-                      <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
-                    </div>
-                  </label>
-                </div>
-              </div>
-              <div v-if="currentPickerGroups.length === 0" class="hint-empty">全部已添加</div>
-            </template>
-
-            <!-- 技能 / 插件：扁平列表 -->
-            <template v-else>
-              <label v-for="item in currentPickerItems" :key="item.key"
-                     :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
-                <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
-                <div class="pi-body">
-                  <div class="pi-label">
-                    {{ item.label }}
-                    <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
-                  </div>
-                  <div class="pi-key">{{ item.key }}</div>
-                  <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
-                </div>
-              </label>
-              <div v-if="currentPickerItems.length === 0" class="hint-empty">全部已添加</div>
-            </template>
-          </div>
-          <div class="picker-actions">
-            <button class="btn ghost" @click="closePicker">取消</button>
-            <button class="btn" @click="confirmAdd" :disabled="selectedKeys.size === 0">
-              添加 ({{ selectedKeys.size }})
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
-
     <!-- 接口编辑弹窗 -->
     <div class="modal-bg" v-if="showDialog">
       <div class="modal glass">
@@ -855,98 +449,12 @@ async function togglePreset(p: any) {
       </div>
     </div>
 
-    <!-- 能力参数预设编辑弹窗 -->
-    <div class="modal-bg" v-if="presetDialog">
-      <div class="modal preset-modal">
-        <div class="modal-title">{{ isEditingPreset ? '编辑预设' : '新建预设' }}</div>
-        <div class="grid">
-          <label>类型
-            <select class="input" v-model="presetForm.target_type" @change="presetForm.target_name = ''">
-              <option value="plugin">🧩 插件</option>
-              <option value="skill">⚡ 技能</option>
-            </select>
-          </label>
-          <label>目标能力
-            <select class="input" v-model="presetForm.target_name">
-              <option value="" disabled>选择…</option>
-              <option v-for="(v, k) in (presetForm.target_type === 'skill' ? settings.skillsMeta : settings.pluginsMeta)"
-                      :key="k" :value="k">{{ v.label || k }}</option>
-            </select>
-          </label>
-          <label>预设名称（选填）<input class="input" v-model="presetForm.label" placeholder="如：QQ邮箱发送配置" /></label>
-          <label>备注（选填）<input class="input" v-model="presetForm.note" placeholder="如：用于发送通知邮件" /></label>
-          <label class="chk-full"><input type="checkbox" v-model="presetForm.enabled" /> 启用预设</label>
-        </div>
-
-        <!-- 固定参数 -->
-        <div class="preset-block">
-          <div class="preset-block-title">
-            <span>🔒 固定参数</span>
-            <span class="hint-empty">敏感值加密保存 · 明确选项（下拉选择）明文保存 · 模型不可见、不可更改</span>
-          </div>
-          <div v-for="(row, i) in presetForm.fixed" :key="'f' + i" class="kv-row">
-            <ParamSelect v-if="currentTargetParams.length && !row._manual" :modelValue="row.key"
-                         @update:modelValue="(v: any) => { row.key = v; onFixedKeyChange(row) }"
-                         :options="paramOptions(row.key)" />
-            <input v-else class="input mono" v-model="row.key" @change="onFixedKeyChange(row)" placeholder="参数名（如 smtp_user）" list="preset-param-list" />
-            <button v-if="currentTargetParams.length" type="button" class="btn sm ghost icon-btn" @click="row._manual = !row._manual" :title="row._manual ? '从列表选择' : '手动输入'">{{ row._manual ? '▾' : '✎' }}</button>
-            <select v-if="paramValueOptions(row)" class="input" v-model="row.value">
-              <option v-for="o in paramValueOptions(row)" :key="o.value" :value="o.value">{{ o.label }}</option>
-            </select>
-            <template v-else>
-              <input class="input" v-model="row.value" :type="row._visible ? 'text' : 'password'" placeholder="固定值（如发件邮箱、授权码）" />
-              <button type="button" class="btn sm ghost icon-btn" @click="row._visible = !row._visible" :title="row._visible ? '隐藏' : '显示'">{{ row._visible ? '🙈' : '👁' }}</button>
-            </template>
-            <button class="btn sm ghost" @click="presetForm.fixed.splice(i, 1)">×</button>
-          </div>
-          <button class="btn sm ghost" @click="presetForm.fixed.push({ key: '', value: '', _visible: false })">+ 添加固定参数</button>
-        </div>
-
-        <!-- 可选参数 -->
-        <div class="preset-block">
-          <div class="preset-block-title">
-            <span>📝 可选参数</span>
-            <span class="hint-empty">文字描述仅供模型参考选择</span>
-          </div>
-          <div v-for="(row, i) in presetForm.optional" :key="'o' + i" class="kv-row">
-            <ParamSelect v-if="currentTargetParams.length && !row._manual" v-model="row.key" :options="paramOptions(row.key)" />
-            <input v-else class="input mono" v-model="row.key" placeholder="参数名（如 to_email）" list="preset-param-list" />
-            <button v-if="currentTargetParams.length" type="button" class="btn sm ghost icon-btn" @click="row._manual = !row._manual" :title="row._manual ? '从列表选择' : '手动输入'">{{ row._manual ? '▾' : '✎' }}</button>
-            <textarea class="input" v-model="row.desc" rows="2" placeholder="描述，如：小明 &lt;xiaoming@x.com&gt;、小红 &lt;xiaohong@x.com&gt;"></textarea>
-            <button class="btn sm ghost" @click="presetForm.optional.splice(i, 1)">×</button>
-          </div>
-          <button class="btn sm ghost" @click="presetForm.optional.push({ key: '', desc: '' })">+ 添加可选参数</button>
-        </div>
-
-        <datalist id="preset-param-list">
-          <option v-for="p in currentTargetParams" :key="p.name" :value="p.name" />
-        </datalist>
-        <div v-if="!currentTargetParams.length" class="hint-empty" style="margin-top: 6px">
-          该能力未声明参数，可手动输入参数名。
-        </div>
-
-        <div class="actions">
-          <button class="btn ghost" @click="closePresetDialog">取消</button>
-          <button class="btn" @click="savePreset" :disabled="presetSaving">
-            {{ presetSaving ? '保存中…' : '保存' }}
-          </button>
-        </div>
-      </div>
-    </div>
-
     <!-- 文件浏览器 -->
     <FileExplorerDialog
       v-model:visible="explorerOpen"
       :initial-path="explorerInitial"
       @saved="() => { storagePaths.value = null; api.storage.paths().then(r => storagePaths.value = r).catch(() => {}) }"
     />
-
-    <!-- 刷新能力 toast -->
-    <Transition name="fade">
-      <div v-if="toast" class="toast" :class="toast.kind">
-        {{ toast.msg }}
-      </div>
-    </Transition>
   </div>
 </template>
 

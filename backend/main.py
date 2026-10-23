@@ -1,7 +1,7 @@
 """智能体集群 - FastAPI 入口"""
 import os
 import zlib
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
@@ -446,35 +446,122 @@ def fs_image(path: str = ""):
     return Response(content=raw, media_type=mime)
 
 
-# ---- 文件上传（前端拖拽文件到对话输入框 → 保存到 AppData/uploads/）----
+# ---- 文件上传/路径直通（前端拖拽文件/文件夹到对话输入框）----
 @app.post("/api/fs/upload")
-async def fs_upload(files: list[UploadFile] = File(...)):
-    """接收 multipart/form-data 文件上传，保存到 AppData/uploads/ 目录，返回文件的绝对路径。
+async def fs_upload(
+    files: list[UploadFile] = File(default_factory=list),
+    absolute_paths: str | None = Form(None),       # ← 毫秒级路径直通（本地拖文件首选）
+    relative_paths: str | None = Form(None),
+):
+    """接收 multipart/form-data，两种模式：
 
-    前端从操作系统拖文件到对话输入框时调用，得到路径后插入到消息文本中，
-    智能体即可通过 file.read / file.structure 等工具访问该文件。
+    【模式 A · 路径直通（毫秒级 · 推荐）】
+      前端只传 absolute_paths（JSON 数组），files 为空：
+        POST /api/fs/upload  absolute_paths=["F:/project/doc.docx", "F:/project/data.xlsx"]
+      后端验证每个路径在 ROOT 内且是文件 → 直接返回原路径，不读任何文件内容、不复制磁盘。
+
+    【模式 B · 二进制上传（兜底）】
+      前端传 files[] + 可选 relative_paths：读取文件内容 → 写入 ROOT/uploads/ → 返回新路径。
+      仅用于 ROOT 外文件或浏览器内部拖入（无文件系统路径）的场景。
+
+    前端典型策略：先尝试模式 A（从 text/uri-list 拿路径），后端拒绝才走模式 B。
     """
+    import json as _json
+    results = []
+    idx = 0
+
+    # —— 模式 A：路径直通 ——
+    abs_list: list[str] = []
+    if absolute_paths:
+        try:
+            parsed = _json.loads(absolute_paths)
+            if isinstance(parsed, list):
+                abs_list = [str(p) for p in parsed if p]
+        except Exception:
+            abs_list = []
+    if abs_list and not files:
+        # 纯路径直通：不读二进制、不复制文件
+        for p_str in abs_list:
+            p_str = p_str.replace("\\", "/").strip()
+            try:
+                fp = _safe_resolve(p_str)
+                if not fp.is_file():
+                    # 路径不是文件（可能是目录）→ 跳过，让前端知道
+                    results.append({
+                        "name": os.path.basename(p_str.rstrip("/")),
+                        "path": p_str,
+                        "size": 0,
+                        "content_type": "",
+                        "ext": "",
+                        "upload_index": idx,
+                        "skipped": True,
+                        "skip_reason": "not_a_file",
+                    })
+                else:
+                    st = fp.stat()
+                    results.append({
+                        "name": fp.name,
+                        "path": str(fp),
+                        "size": st.st_size,
+                        "content_type": "",
+                        "ext": fp.suffix.lstrip("."),
+                        "upload_index": idx,
+                        "via": "path",   # ← 告诉前端这是直通路径
+                    })
+            except HTTPException as e:
+                results.append({
+                    "name": os.path.basename(p_str.rstrip("/")),
+                    "path": p_str,
+                    "size": 0,
+                    "content_type": "",
+                    "ext": "",
+                    "upload_index": idx,
+                    "skipped": True,
+                    "skip_reason": str(e.detail) if e.detail else "outside_root",
+                })
+            idx += 1
+        return {"ok": True, "files": results}
+
+    # —— 模式 B：二进制上传 ——
+    if not files:
+        raise HTTPException(400, "未收到任何文件或路径")
+
     uploads_dir = ROOT / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
-
-    if not files:
-        raise HTTPException(400, "未收到任何文件")
-
-    MAX_SIZE = 20 * 1024 * 1024  # 单文件 20 MB 上限
+    MAX_SIZE = 50 * 1024 * 1024  # 单文件 50 MB
     import time
 
-    results = []
-    for up in files:
-        filename = up.filename or "upload"
-        # Windows 路径里可能带反斜杠，去掉目录前缀
-        filename = filename.replace("\\", "/").split("/")[-1]
+    # 解析 relative_paths（前端可能传也可能不传）
+    rel_paths: list[str] = []
+    if relative_paths:
+        try:
+            parsed = _json.loads(relative_paths)
+            if isinstance(parsed, list) and len(parsed) == len(files):
+                rel_paths = [str(p) for p in parsed]
+        except Exception:
+            rel_paths = []
+    if not rel_paths:
+        rel_paths = [(up.filename or f"file_{i}") for i, up in enumerate(files)]
+
+    def _sanitize_rel(p: str) -> str:
+        import re
+        p = p.replace("\\", "/").lstrip("./").lstrip("/")
+        p = re.sub(r'[\\/:*?"<>|\s]+', '_', p)
+        return (p.rstrip('_').rstrip('.') or "file")
+
+    now_ms = int(time.time() * 1000)
+    pid = os.getpid()
+
+    for i, up in enumerate(files):
+        filename = (up.filename or "upload").replace("\\", "/").split("/")[-1]
         ext = os.path.splitext(filename)[1]
-        safe_name = f"{int(time.time()*1000)}_{os.getpid()}_{filename}"
+        rel = _sanitize_rel(rel_paths[i]) if i < len(rel_paths) else filename
+        safe_name = f"{now_ms}_{pid}_{rel}"
         dest = uploads_dir / safe_name
 
         content = await up.read()
         if len(content) > MAX_SIZE:
-            raise HTTPException(413, f"文件过大（>20MB）：{filename}")
+            raise HTTPException(413, f"文件过大（>50MB）：{rel}")
 
         try:
             dest.write_bytes(content)
@@ -483,10 +570,13 @@ async def fs_upload(files: list[UploadFile] = File(...)):
 
         results.append({
             "name": filename,
+            "relative_path": rel,
             "path": str(dest),
             "size": len(content),
             "content_type": up.content_type or "",
             "ext": ext.lstrip("."),
+            "upload_index": i,
+            "via": "upload",
         })
 
     return {"ok": True, "files": results}

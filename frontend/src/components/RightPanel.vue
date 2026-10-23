@@ -131,25 +131,110 @@ function fileIconOf(name: string): string {
   return map[ext] || '📎'
 }
 
+/**
+ * 从 DragEvent 的 dataTransfer.items 里用 webkitGetAsEntry 递归收集所有 File 对象。
+ * Chrome / Edge / Safari 支持；Firefox 回退用 dataTransfer.files。
+ *
+ * 关键点：
+ *  - 拖**文件夹**时 dt.files 可能返回占位符（0 size / 目录名本身），必须用 webkitGetAsEntry 才能拿到里面的文件
+ *  - 拖**多个文件**时 dt.files 已经是完整的 FileList，但 webkitGetAsEntry 也能逐个取
+ *  - 过滤系统垃圾文件：.DS_Store / Thumbs.db / desktop.ini / 隐藏文件
+ *  - 返回 { files, relativePaths }：relativePaths[i] 是 files[i] 相对于最顶层根的路径（用 / 分隔）
+ */
+async function _extractFilesFromDataTransfer(e: DragEvent): Promise<{ files: File[]; relativePaths: string[] }> {
+  const dt = e.dataTransfer
+  if (!dt) return { files: [], relativePaths: [] }
+
+  const SKIP_NAMES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini', '$RECYCLE.BIN', 'System Volume Information'])
+
+  // 递归采集函数
+  async function collect(entry: any, basePath: string, acc: { files: File[]; paths: string[] }) {
+    // 跳过以 . 开头的隐藏文件/目录 + 系统垃圾名
+    const name = entry.name || ''
+    if (!name || SKIP_NAMES.has(name) || name.startsWith('.')) return
+
+    if (entry.isFile) {
+      const file: File = await new Promise((resolve, reject) => {
+        try { entry.file(resolve, reject) } catch (err) { reject(err) }
+      })
+      // 过滤零字节占位符（Chrome 对某些拖入的非文件对象会返回空 file）
+      if (!file || file.size === 0) return
+      acc.files.push(file)
+      acc.paths.push(basePath ? `${basePath}/${name}` : name)
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader()
+      // readEntries 需要循环直到返回空数组（Chrome 单次最多返回 100 条）
+      const readBatch = (): Promise<any[]> =>
+        new Promise((resolve, reject) => {
+          try { reader.readEntries(resolve, reject) } catch (err) { reject(err) }
+        })
+      let batch: any[]
+      while ((batch = await readBatch()).length > 0) {
+        for (const child of batch) {
+          await collect(child, basePath ? `${basePath}/${name}` : name, acc)
+        }
+      }
+    }
+  }
+
+  const acc: { files: File[]; paths: string[] } = { files: [], paths: [] }
+
+  // 优先：dataTransfer.items（含目录信息）
+  if (dt.items && dt.items.length > 0) {
+    // 判断是否有 webkitGetAsEntry（Chrome/Edge/Safari）
+    const hasEntryApi = Array.from(dt.items).some(it => (it as any).webkitGetAsEntry)
+    if (hasEntryApi) {
+      for (const item of Array.from(dt.items)) {
+        const entry = (item as any).webkitGetAsEntry?.()
+        if (!entry) continue
+        await collect(entry, '', acc)
+      }
+      if (acc.files.length > 0) return { files: acc.files, relativePaths: acc.paths }
+    }
+  }
+
+  // 回退：dataTransfer.files（Firefox / 单文件拖入时 items 可能为空但 files 有值）
+  if (dt.files && dt.files.length > 0) {
+    for (const f of Array.from(dt.files)) {
+      if (!f || f.size === 0) continue
+      const name = f.name || ''
+      if (!SKIP_NAMES.has(name) && !name.startsWith('.')) {
+        acc.files.push(f)
+        acc.paths.push(name)
+      }
+    }
+  }
+  return { files: acc.files, relativePaths: acc.paths }
+}
+
 /** 上传一组 File 对象到后端，返回附件信息数组 */
-async function uploadFiles(files: FileList | File[]): Promise<ChatAttachment[]> {
+async function uploadFiles(files: FileList | File[], relativePaths?: string[]): Promise<ChatAttachment[]> {
   const list = Array.from(files)
+  const relPaths = (relativePaths && relativePaths.length === list.length) ? relativePaths : list.map(f => f.name)
+
   // 为每个文件先生成临时占位（带本地预览），再并行上传
-  const atts: ChatAttachment[] = list.map(f => ({
+  // 用 name+size+lastModified 三元组作为上传后匹配键（比 name+size 更稳）
+  const atts: ChatAttachment[] = list.map((f, i) => ({
     id: crypto.randomUUID(),
-    name: f.name,
+    name: relPaths[i] || f.name,  // 有相对路径就完整显示（例如 myfolder/report.docx）
     path: '',
     size: f.size,
     content_type: f.type || '',
     ext: f.name.split('.').pop()?.toLowerCase() || '',
     previewUrl: isImageFile(f.name) ? URL.createObjectURL(f) : undefined,
     status: 'uploading',
-  }))
+    // 内部匹配用的原始签名（不进 template，只在运行时用来匹配后端返回）
+    _sign: `${f.name}::${f.size}::${f.lastModified}::${i}`,
+  } as ChatAttachment & { _sign: string }))
   attachments.value.push(...atts)
 
-  // 执行上传（并行）
+  // 执行上传（一次 POST 全量）
   const form = new FormData()
-  list.forEach(f => form.append('files', f))
+  list.forEach((f, i) => {
+    // 把原始文件名保留（后端返回的 name 字段），相对路径通过单独 JSON 字段传
+    form.append('files', f, f.name)
+  })
+  form.append('relative_paths', JSON.stringify(relPaths))
   try {
     const r = await fetch('/api/fs/upload', { method: 'POST', body: form })
     if (!r.ok) {
@@ -157,13 +242,22 @@ async function uploadFiles(files: FileList | File[]): Promise<ChatAttachment[]> 
       throw new Error(err.detail || `HTTP ${r.status}`)
     }
     const data = await r.json()
-    const uploaded: Array<{ name: string; path: string; size: number; content_type: string; ext: string }> = data.files || []
-    // 按文件名+大小匹配回填 path
+    const uploaded: Array<{ name: string; path: string; size: number; content_type: string; ext: string; relative_path?: string; upload_index?: number }> = data.files || []
+    // 匹配：优先按 upload_index；否则按 name+size+lastModified
     uploaded.forEach(u => {
-      const match = atts.find(a => a.name === u.name && a.size === u.size)
-      if (match) { match.path = u.path; match.status = 'ready' }
+      const idx = u.upload_index
+      let match = idx != null ? atts[idx] : undefined
+      if (!match) {
+        // 退化匹配：name + size（如果有多个同签名的，只 match 第一个）
+        match = atts.find(a => a.name === u.name && a.size === u.size)
+      }
+      if (match) {
+        match.path = u.path
+        match.status = 'ready'
+        // 如果后端返回了 relative_path，把附件卡片的 name 显示成带路径的
+        if (u.relative_path) match.name = u.relative_path
+      }
     })
-    // 没匹配到的标 error
     atts.forEach(a => {
       if (a.status === 'uploading') { a.status = 'error'; a.errorMsg = '上传失败' }
     })
@@ -250,19 +344,129 @@ function onChatDragLeave() {
   chatDragDepth = Math.max(0, chatDragDepth - 1)
   if (!chatDragDepth) chatDropHover.value = false
 }
+/** 从 DragEvent 里快速提取本地路径：优先 text/uri-list，其次 text/plain（单行路径） */
+function _extractDropPaths(e: DragEvent): string[] {
+  const dt = e.dataTransfer
+  if (!dt) return []
+  const out: string[] = []
+
+  // 1) text/uri-list：Chrome/Edge 一定会给（file:///C:/xxx/yyy.docx 格式）
+  const uriList = dt.getData('text/uri-list')
+  if (uriList) {
+    for (const line of uriList.split('\n')) {
+      const s = line.trim()
+      if (!s || s.startsWith('#')) continue
+      if (!s.toLowerCase().startsWith('file://')) continue
+      try {
+        // file:///F:/path/to/file → /F:/path/to/file → F:/path/to/file
+        let decoded = decodeURIComponent(new URL(s).pathname)
+        decoded = decoded.replace(/^\//, '')
+        if (decoded) out.push(decoded)
+      } catch { /* ignore */ }
+    }
+  }
+
+  // 2) text/plain：单行 + 含路径分隔符（避免把聊天文本塞进输入框）
+  if (out.length === 0) {
+    const plain = (dt.getData('text/plain') || '').trim()
+    if (plain && !plain.includes('\n') && plain.length < 512 && /[\\/]/.test(plain)) {
+      out.push(plain)
+    }
+  }
+  return out
+}
+
+/** 判断路径指向文件还是目录（后缀启发式：有扩展名大概率文件） */
+function _looksLikeFile(p: string): boolean {
+  const base = p.replace(/\\/g, '/').split('/').pop() || ''
+  return /\.[a-zA-Z0-9]{1,5}$/.test(base)
+}
+
+/**
+ * 把一组候选路径发给后端做"路径直通验证"（毫秒级，不读任何文件内容）
+ * 返回 [{ path, ok, name, size, ext, skipped?, skip_reason? }]
+ * 其中 ok=true 表示可以直接用（via="path"），ok=false 表示后端拒绝（通常是不在 ROOT 内）
+ */
+async function _verifyPaths(paths: string[]): Promise<any[]> {
+  if (!paths.length) return []
+  const form = new FormData()
+  form.append('absolute_paths', JSON.stringify(paths))
+  try {
+    const r = await fetch('/api/fs/upload', { method: 'POST', body: form })
+    if (!r.ok) return []
+    const data = await r.json()
+    return data.files || []
+  } catch {
+    return []
+  }
+}
+
 async function onChatDrop(e: DragEvent) {
   chatDragDepth = 0
   chatDropHover.value = false
   e.preventDefault()
   e.stopPropagation()
 
-  // 1) 优先尝试 dataTransfer.files（从电脑/资源管理器拖入的真实文件）
-  const dt = e.dataTransfer
-  if (dt && dt.files && dt.files.length > 0) {
-    await uploadFiles(dt.files)
+  // —— 优先级 1：本地路径直通（毫秒级，零上传）——
+  //    从 text/uri-list 拿路径是最快的，Chrome/Edge 100% 有；
+  //    后端 _safe_resolve 只放 ROOT 内的路径通过，ROOT 外的会返回 skipped=true
+  const dropPaths = _extractDropPaths(e)
+  if (dropPaths.length > 0) {
+    // 分类：文件 → 走附件；文件夹 → 直接塞路径，让智能体自己遍历
+    const filePaths = dropPaths.filter(_looksLikeFile)
+    const dirPaths  = dropPaths.filter(p => !_looksLikeFile(p))
+
+    // 文件夹路径 → 直接 insertAtCursor（零上传）
+    for (const d of dirPaths) insertAtCursor(d)
+
+    if (filePaths.length > 0) {
+      // 发给后端验证：ROOT 内的秒过，ROOT 外的返回 skipped
+      const verified = await _verifyPaths(filePaths)
+      const useable  = verified.filter(v => !v.skipped)
+      const rejected = verified.filter(v => v.skipped)
+
+      // ROOT 内 → 直接当附件用（零上传！只是把路径塞进卡片）
+      for (const v of useable) {
+        attachments.value.push({
+          id: crypto.randomUUID(),
+          name: v.name,
+          path: v.path,
+          size: v.size,
+          content_type: v.content_type || '',
+          ext: v.ext || '',
+          previewUrl: isImageFile(v.name) ? api.fs.rawUrl(v.path, v.size) : undefined,
+          status: 'ready',
+        })
+      }
+
+      // ROOT 外 → 才走 webkitGetAsEntry + 上传（兜底）
+      if (rejected.length > 0) {
+        const names = new Set(rejected.map(v => v.name))
+        const { files, relativePaths } = await _extractFilesFromDataTransfer(e)
+        // 只上传被拒绝的那些（按名字+大小近似匹配）
+        const toUpload = files.filter((f, i) => {
+          if (names.has(f.name)) return true
+          // 再用路径前缀匹配一次（避免同名字漏掉）
+          return rejected.some(r => r.path.endsWith('/' + f.name) || r.path.endsWith('\\' + f.name))
+        })
+        if (toUpload.length > 0) {
+          const toPaths = relativePaths.filter((_, i) => toUpload.includes(files[i]))
+          await uploadFiles(toUpload, toPaths)
+        }
+      }
+      return
+    }
+    if (dirPaths.length > 0) return   // 只有目录，已经塞完
+  }
+
+  // —— 优先级 2：webkitGetAsEntry 递归（拖文件夹进 ROOT 外，或浏览器内部拖入）——
+  const { files, relativePaths } = await _extractFilesFromDataTransfer(e)
+  if (files.length > 0) {
+    await uploadFiles(files, relativePaths)
     return
   }
-  // 2) 回退：工作区拖拽路径（已有的 insertAtCursor 逻辑）
+
+  // —— 优先级 3：工作区拖拽路径 ——
   const path = dropPathFromEvent(e)
   if (path) insertAtCursor(path)
 }
@@ -300,27 +504,15 @@ const LB_MIN_SCALE = 0.1
 // 聊天附件预览器（文件卡片点击后打开内置 FileViewer）
 const chatViewerFile = ref<ViewerFile | null>(null)
 
-/** 图片 load：保存原始尺寸，自动给一个合适的初始窗口（不超过屏幕 60%） */
+/** 图片 load：只保存原始尺寸，**不再改窗口大小**（图片 object-fit: contain 自动适配）。
+ *  窗口尺寸由 openLightbox 一次到位按画布区最大值算好，避免闪变。 */
 function onLightboxImgLoad(e: Event) {
   const img = e.target as HTMLImageElement
   if (!img) return
   lbOrigW.value = img.naturalWidth || img.width || 600
   lbOrigH.value = img.naturalHeight || img.height || 400
-  // 初始窗口：按图片比例缩到屏幕 60%
-  const availW = Math.round(window.innerWidth * 0.6)
-  const availH = Math.round((window.innerHeight - LB_TITLEBAR_H - 40) * 0.6)
-  const pad = 16
-  const fitByW = (availW - pad) / lbOrigW.value
-  const fitByH = (availH - pad) / lbOrigH.value
-  const baseFit = Math.min(1, fitByW, fitByH)
-  const newW = Math.max(LB_MIN_W, Math.min(window.innerWidth - 16, Math.round(lbOrigW.value * baseFit) + pad))
-  const newH = Math.max(LB_MIN_H, Math.min(window.innerHeight - LB_TITLEBAR_H - 24, Math.round(lbOrigH.value * baseFit) + pad))
-  lightboxW.value = newW
-  lightboxH.value = newH
-  lbScale.value = 1
-  lbPanX.value = 0
-  lbPanY.value = 0
-  clampLightboxPos()
+  // 图片已经 object-fit: contain 填满窗口了，这里只重置缩放/平移
+  lbScale.value = 1; lbPanX.value = 0; lbPanY.value = 0
 }
 function clampLightboxPos() {
   const pad = 8
@@ -350,24 +542,31 @@ function clampResizeEdges(d: string, newX: number, newY: number, newW: number, n
   nx = Math.max(pad, nx); ny = Math.max(pad, ny)
   return { x: nx, y: ny, w: nw, h: nh }
 }
-/** 从缩略图点击事件推断浮窗初始位置；不传入事件则居中 */
-function openLightbox(src: string, clickEvt?: MouseEvent) {
+/** 获取画布区（center 列）的 boundingRect；找不到时降级为整个视口内缩 16px */
+function getCanvasRect(): { x: number; y: number; w: number; h: number } {
+  const center = document.querySelector('.app-root > .center') as HTMLElement | null
+  if (center) {
+    const r = center.getBoundingClientRect()
+    const topOffset = 52
+    return { x: r.left + 8, y: r.top + topOffset, w: Math.max(200, r.width - 16), h: Math.max(120, r.height - topOffset - 8) }
+  }
+  return { x: 16, y: 60, w: window.innerWidth - 32, h: window.innerHeight - 80 }
+}
+/** 打开浮窗：一次就位——按画布区最大可用尺寸开窗口并居中，避免二次 resize 闪变 */
+function openLightbox(src: string, _clickEvt?: MouseEvent) {
   if (!src) return
+  const c = getCanvasRect()
+  // 窗口一次到位：画布区 80% 宽、80% 高，保留画布区完整的可视 margin
+  const pad = 16
+  const maxBodyW = Math.max(200, c.w - pad * 2)
+  const maxBodyH = Math.max(120, c.h - pad * 2 - LB_TITLEBAR_H)
+  lightboxW.value = Math.max(LB_MIN_W, Math.round(maxBodyW) + pad)   // +pad 给 body 的 padding 8×2
+  lightboxH.value = Math.max(LB_MIN_H, Math.round(maxBodyH) + pad + LB_TITLEBAR_H)
+  lbScale.value = 1; lbPanX.value = 0; lbPanY.value = 0
   lightboxSrc.value = src
   lightboxOpen.value = true
-  lightboxW.value = 320; lightboxH.value = 240
-  lbScale.value = 1; lbPanX.value = 0; lbPanY.value = 0
-  if (clickEvt) {
-    let x = clickEvt.clientX + 24
-    let y = clickEvt.clientY - 40
-    if (x + lightboxW.value + 8 > window.innerWidth) x = clickEvt.clientX - lightboxW.value - 24
-    if (y < 8) y = 8
-    lightboxX.value = Math.max(8, x)
-    lightboxY.value = Math.max(8, y)
-  } else {
-    lightboxX.value = Math.max(8, Math.round((window.innerWidth - lightboxW.value) / 2))
-    lightboxY.value = Math.max(8, Math.round((window.innerHeight - lightboxH.value) / 2))
-  }
+  lightboxX.value = Math.round(c.x + Math.max(0, (c.w - lightboxW.value) / 2))
+  lightboxY.value = Math.round(c.y + Math.max(0, (c.h - lightboxH.value) / 2))
   requestAnimationFrame(() => clampLightboxPos())
 }
 function closeLightbox() {

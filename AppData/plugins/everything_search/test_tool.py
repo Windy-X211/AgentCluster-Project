@@ -1,75 +1,114 @@
 # -*- coding: utf-8 -*-
-"""everything_search 插件单元测试：mock everything.client，验证 run() 各分支逻辑。"""
+"""everything_search 插件单元测试：mock subprocess 模拟 es.exe，验证 run() 各分支逻辑。"""
 import sys
-import types
 import os
+import json
 import importlib.util
+import subprocess
+from datetime import datetime, timezone, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.join(HERE, "tool.py")
 
-# 用一个真实存在的文件冒充「应用」，方便 open 分支通过 isfile 校验
 REAL_EXE = sys.executable
-
-
-class FakeResult:
-    def __init__(self, name, parent, size, is_folder=False, ext=""):
-        self.name = name
-        self.parent_path = parent + "\\"
-        self.full_path = os.path.join(parent, name)
-        self.size = size
-        self.is_folder = is_folder
-        self.extension = ext
-        self.date_modified = 0
-        self.date_created = 0
-        self.date_accessed = 0
-        self.attributes = 0x20
-
-    @property
-    def modified_time(self):
-        from datetime import datetime
-        return datetime(2024, 1, 1, 12, 0, 0)
-
-
-class FakeClient:
-    def __init__(self, results):
-        self._r = results
-        self.searches = []
-
-    def connect(self, version):
-        self.version = version
-
-    def search(self, text, **kw):
-        self.searches.append((text, kw))
-        # 极简匹配：取 name: 后的第一段关键词做子串匹配
-        key = text.split("name:")[-1].split(" ")[0].lower()
-        matched = [r for r in self._r if key in r.name.lower()]
-        return matched, len(matched)
-
-
-def install_mock(results):
-    mod = types.ModuleType("everything")
-    client_mod = types.ModuleType("everything.client")
-    client_mod.EverythingClient = lambda *a, **k: FakeClient(results)
-    sys.modules["everything"] = mod
-    sys.modules["everything.client"] = client_mod
-
-
 exe_dir, exe_name = os.path.split(REAL_EXE)
-results = [
-    FakeResult(exe_name, exe_dir, 300_000_000, ext="exe"),      # 冒充 vscode
-    FakeResult("settings.yaml", r"C:\Users\me\Projects", 2048, ext="yaml"),
-    FakeResult("notes.md", r"D:\Docs", 5120, ext="md"),
+
+_ft = int((datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+           - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds() * 10_000_000
+          ) + 116444736000000000
+
+_MOCK_DB = [
+    {"filename": REAL_EXE, "size": 300_000_000, "date_modified": _ft, "extension": "exe", "attributes": 0x20},
+    {"filename": r"C:\Users\me\Projects\settings.yaml", "size": 2048, "date_modified": _ft, "extension": "yaml", "attributes": 0x20},
+    {"filename": r"D:\Docs\notes.md", "size": 5120, "date_modified": _ft, "extension": "md", "attributes": 0x20},
+    {"filename": r"D:\Docs\notes2.md", "size": 8192, "date_modified": _ft, "extension": "md", "attributes": 0x20},
+    {"filename": r"D:\Docs\subdir", "size": 0, "date_modified": _ft, "extension": "", "attributes": 0x10},
 ]
-install_mock(results)
+
+
+class _MockResult:
+    def __init__(self, stdout="", returncode=0, stderr=""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+_VALUE_OPTS = {"-n", "-viewport-offset", "-viewport-count", "-get-result-count",
+               "-path", "-sort", "-instance", "-timeout", "-highlight-color",
+               "-size-format", "-date-format"}
+
+
+def _extract_query_parts(cmd):
+    """从 cmd 中提取查询位置参数（跳过 es 路径和选项及其值）。"""
+    parts = []
+    i = 1
+    while i < len(cmd):
+        arg = cmd[i]
+        if arg.startswith("-") or arg.startswith("/"):
+            if arg in _VALUE_OPTS and i + 1 < len(cmd):
+                i += 2
+            else:
+                i += 1
+        else:
+            parts.append(arg)
+            i += 1
+    return parts
+
+
+def _mock_search(parts):
+    """极简模拟 Everything 搜索：根据查询 parts 过滤。"""
+    results = list(_MOCK_DB)
+
+    for part in parts:
+        if part.startswith("ext:"):
+            ext = part[4:].lower()
+            results = [r for r in results if r["extension"].lower() == ext]
+        elif part == "hidden":
+            results = [r for r in results if r["attributes"] & 0x02]
+        elif part == "!hidden":
+            results = [r for r in results if not (r["attributes"] & 0x02)]
+        elif part.startswith(("size:", "dm:", "path:")):
+            pass
+        else:
+            key = part.lower()
+            results = [r for r in results if key in os.path.basename(r["filename"]).lower()]
+
+    return results
+
+
+def _mock_subprocess_run(cmd, **kw):
+    """模拟 es.exe 的 subprocess.run 调用。"""
+    parts = _extract_query_parts(cmd)
+
+    if "-get-result-count" in cmd:
+        matched = _mock_search(parts)
+        return _MockResult(stdout=str(len(matched)), returncode=0, stderr="")
+
+    if "-json" in cmd:
+        limit, offset = 30, 0
+        for i, arg in enumerate(cmd):
+            if arg == "-viewport-count" and i + 1 < len(cmd):
+                limit = int(cmd[i + 1])
+            elif arg == "-viewport-offset" and i + 1 < len(cmd):
+                offset = int(cmd[i + 1])
+
+        matched = _mock_search(parts)
+        paged = matched[offset:offset + limit]
+        return _MockResult(stdout=json.dumps(paged), returncode=0, stderr="")
+
+    return _MockResult(stdout="", returncode=1, stderr="unknown command")
+
+
+_real_run = subprocess.run
+subprocess.run = _mock_subprocess_run
 
 spec = importlib.util.spec_from_file_location("everything_search_tool", PLUGIN)
 tool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tool)
 
-# 绕过真实 DLL 探测 + 重置客户端缓存 + 屏蔽真实启动
-tool._find_dll = lambda: r"C:\__fake__\Everything3_x64.dll"
-tool._CLIENT = None
+tool._ES_PATH_CACHE = r"C:\__fake__\es.exe"
+tool._find_es = lambda: r"C:\__fake__\es.exe"
+tool._get_everything_proc_dir = lambda: None
 tool.os.startfile = lambda p: None
 
 ok = 0
@@ -92,8 +131,8 @@ check("search ok", r.get("ok") is True, r)
 check("search count==1", r.get("count") == 1, r)
 check("search path correct",
       r.get("results") and r["results"][0]["path"].lower() == REAL_EXE.lower(), r)
-check("search query_used has name/ext",
-      "name:" in r.get("query_used", "") and "ext:exe" in r.get("query_used", ""), r.get("query_used"))
+check("search query_used has ext:exe",
+      "ext:exe" in r.get("query_used", ""), r.get("query_used"))
 
 # 2) open 分支（指向真实存在的 exe，isfile 通过）
 r2 = tool.run(action="open", query=exe_name)
@@ -107,16 +146,16 @@ r3 = tool.run(action="search", query="", ext="md", path="D:\\*",
               mdate_min="2024-01-01", mdate_max="2024-12-31", hidden=1)
 q = r3.get("query_used", "")
 check("query ext", "ext:md" in q, q)
-check("query path", 'path:"D:\\"' in q, q)
+check("query path", 'path:"D:\\*"' in q, q)
 check("query size", "size:>=4096" in q and "size:<=65536" in q, q)
 check("query date", "dm:>=2024-01-01" in q and "dm:<=2024-12-31" in q, q)
-check("query hidden=1", "attrib:H" in q, q)
+check("query hidden=1 => hidden", "hidden" in q and "!hidden" not in q, q)
 
-# 4) hidden 默认排除隐藏
+# 4) hidden 默认排除隐藏 → !hidden
 r4 = tool.run(action="search", query="x", ext="txt")
-check("query hidden default excludes", "!attrib:H" in r4.get("query_used", ""), r4.get("query_used"))
+check("query hidden default excludes", "!hidden" in r4.get("query_used", ""), r4.get("query_used"))
 
-# 5) size 传 0 视为不限（不应出现 size: 条件）
+# 5) size 传 0 视为不限
 r5 = tool.run(action="search", query="x", ext="txt", size_min=0, size_max=0)
 check("size 0 => no size filter", "size:" not in r5.get("query_used", ""), r5.get("query_used"))
 
@@ -128,8 +167,32 @@ r_notfound = tool.run(action="open", query="definitely_not_exist_xyz")
 check("open not-found error", r_notfound.get("ok") is False, r_notfound)
 
 # 7) 分页
-r7 = tool.run(action="search", query="x", ext="txt", limit=1, offset=1)
-check("pagination returns dict", r7.get("ok") is True, r7)
+r7 = tool.run(action="search", query="", ext="md", limit=1, offset=1)
+check("pagination ok", r7.get("ok") is True, r7)
+check("pagination count==1", r7.get("count") == 1, r7)
+
+# 8) serialize 字段完整性
+r8 = tool.run(action="search", query="", ext="md", limit=1)
+if r8.get("results"):
+    item = r8["results"][0]
+    check("serialize has name", "name" in item, item)
+    check("serialize has path", "path" in item, item)
+    check("serialize has size", "size" in item, item)
+    check("serialize has modified", "modified" in item, item)
+    check("serialize modified format", bool(item["modified"]) and "-" in item["modified"], item)
+    check("serialize has is_folder", "is_folder" in item, item)
+else:
+    check("serialize fields", False, "no results")
+
+# 9) 文件夹识别
+r9 = tool.run(action="search", query="subdir", name_only=True, limit=5)
+folder_found = any(r.get("is_folder") for r in r9.get("results", []))
+check("folder is_folder=True", folder_found, r9.get("results"))
+
+# 10) total 字段
+check("total is int", isinstance(r.get("total", None), int), r.get("total"))
+
+subprocess.run = _real_run
 
 print("\nRESULT: {} passed, {} failed".format(ok, fail))
 sys.exit(1 if fail else 0)

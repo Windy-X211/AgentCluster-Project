@@ -5,6 +5,12 @@ description: 控制洛雪音乐桌面版（lx-music-desktop）播放/暂停/切�
 version: "2.0.0"
 author: AgentCluster
 tags: [music, player, http, api, automation, lxmusic]
+
+dependencies:
+  external:
+    - name: "洛雪音乐 lx-music-desktop"
+      url: "https://github.com/lyswhut/lx-music-desktop/releases"
+      description: "必装。需要 v2.7.0+ 并在「设置 → 开放 API 服务」开启 HTTP API（默认 http://127.0.0.1:23330）"
 ---
 
 # 洛雪音乐操控
