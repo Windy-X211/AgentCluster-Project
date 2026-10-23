@@ -291,7 +291,7 @@ def _is_valid_skill_dir(p: Path) -> bool:
     return p.is_dir() and not p.name.startswith(("_", ".")) and (p / "SKILL.md").exists()
 
 
-def _load_one(p: Path) -> dict | None:
+def _load_one(p: Path, blocking: bool = False) -> dict | None:
     md = p / "SKILL.md"
     try:
         text = md.read_text(encoding="utf-8")
@@ -312,7 +312,7 @@ def _load_one(p: Path) -> dict | None:
     if raw_deps is not None:
         parsed = parse_dependencies(raw_deps)
         try:
-            dep_summary = ensure_dependencies(parsed, p, source_label=f"skill:{name}")
+            dep_summary = ensure_dependencies(parsed, p, source_label=f"skill:{name}", blocking=blocking)
         except Exception as e:
             print(f"[skills] WARN 技能 {name} 依赖检测异常: {e}")
 
@@ -349,10 +349,12 @@ def _load_one(p: Path) -> dict | None:
     }
 
 
-def load_skills() -> dict:
+def load_skills(blocking: bool = False) -> dict:
     """扫描 AppData/skills/*/SKILL.md，重建 SKILL_REGISTRY。任何模块可调用实现热重载。
 
     registry key 优先使用 frontmatter 的 name（即 kebab-case），找不到则用文件夹名。
+
+    blocking=True 时同步等待缺失的 pip 依赖安装完成（用户主动点击"重新扫描/安装依赖"时用）。
     """
     registry: dict[str, dict] = {}
     if not _skills_root().exists():
@@ -360,7 +362,7 @@ def load_skills() -> dict:
     for sub in sorted(_skills_root().iterdir()):
         if not _is_valid_skill_dir(sub):
             continue
-        data = _load_one(sub)
+        data = _load_one(sub, blocking=blocking)
         if data:
             key = data.get("label") or data.get("description") or sub.name
             # 优先用 frontmatter 的 name 作为 key（kebab-case）

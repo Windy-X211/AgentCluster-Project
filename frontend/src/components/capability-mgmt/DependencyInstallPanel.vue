@@ -45,11 +45,38 @@ async function load() {
 onMounted(load)
 
 const refreshLoading = ref(false)
+const reloadMsg = ref<{ type: 'ok' | 'warn' | 'err'; text: string } | null>(null)
+
 async function reload() {
   refreshLoading.value = true
+  reloadMsg.value = null
   try {
     await api.capabilities.reload()
     await load()
+    // 根据最新快照给出安装结果提示
+    const all = data.value
+      ? [...Object.values(data.value.plugins), ...Object.values(data.value.skills)]
+      : []
+    const installed = all.flatMap(e => e.pip_installed || [])
+    const stillMissing = all.flatMap(e => e.pip_still_missing || [])
+    const npmMissing = all.filter(e => e.npm_missing).length
+    if (installed.length && !stillMissing.length && !npmMissing) {
+      reloadMsg.value = { type: 'ok', text: `✓ 已成功安装 ${installed.length} 个依赖，全部就绪` }
+    } else if (installed.length && (stillMissing.length || npmMissing)) {
+      const parts = [`已安装 ${installed.length} 个`]
+      if (stillMissing.length) parts.push(`${stillMissing.length} 个仍缺失`)
+      if (npmMissing) parts.push(`${npmMissing} 个 npm 依赖未满足`)
+      reloadMsg.value = { type: 'warn', text: `⚠ ${parts.join('，')}` }
+    } else if (stillMissing.length || npmMissing) {
+      const parts: string[] = []
+      if (stillMissing.length) parts.push(`${stillMissing.length} 个 pip 依赖仍缺失`)
+      if (npmMissing) parts.push(`${npmMissing} 个 npm 依赖未满足`)
+      reloadMsg.value = { type: 'err', text: `✗ 安装失败：${parts.join('，')}（请查看后端日志）` }
+    } else {
+      reloadMsg.value = { type: 'ok', text: '✓ 依赖均已就绪，无需安装' }
+    }
+  } catch (e: any) {
+    reloadMsg.value = { type: 'err', text: `扫描失败：${e?.message || String(e)}` }
   } finally {
     refreshLoading.value = false
   }
@@ -110,11 +137,14 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
         <span class="ds-chip ext">🔗 外部应用 {{ data.summary.with_external }} 项需下载</span>
         <span v-if="errorCount" class="ds-chip err">⚠ {{ errorCount }} 项异常</span>
       </div>
-      <button class="btn sm ghost" @click="reload" :disabled="refreshLoading" :title="'重新扫描 + 自动安装缺失依赖'">
-        <span v-if="refreshLoading">⟳ 扫描中…</span>
+      <button class="btn sm ghost" @click="reload" :disabled="refreshLoading" :title="'重新扫描 + 同步安装缺失依赖'">
+        <span v-if="refreshLoading">⟳ 扫描并安装中…</span>
         <span v-else>⟳ 重新扫描 / 安装依赖</span>
       </button>
     </div>
+
+    <!-- 安装结果提示 -->
+    <div v-if="reloadMsg" class="reload-msg" :class="reloadMsg.type">{{ reloadMsg.text }}</div>
 
     <!-- 加载 / 错误 -->
     <div v-if="loading && !data" class="dep-empty">加载中…</div>
@@ -219,6 +249,14 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
 .ds-chip.err { background: rgba(220, 100, 100, 0.15); color: #e09090; border-color: rgba(220, 100, 100, 0.3); }
 .dep-empty { padding: 40px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }
 .dep-empty.err { color: #e08080; opacity: 1; }
+
+.reload-msg {
+  padding: 8px 14px; border-radius: 8px; font-size: calc(12px * var(--font-scale));
+  border: 1px solid; flex-shrink: 0;
+}
+.reload-msg.ok { color: #80d8b0; background: rgba(100, 220, 160, 0.08); border-color: rgba(100, 220, 160, 0.3); }
+.reload-msg.warn { color: #f0c060; background: rgba(220, 180, 60, 0.08); border-color: rgba(220, 180, 60, 0.3); }
+.reload-msg.err { color: #e09090; background: rgba(220, 100, 100, 0.08); border-color: rgba(220, 100, 100, 0.3); }
 
 /* —— 两列布局 —— */
 .dep-cols {
