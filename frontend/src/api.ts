@@ -254,5 +254,9 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ root_dir: rootDir, plugin_name: pluginName, params })
       })
+  },
+  asr: {
+    status: () => req<{ available: boolean }>('/asr/status'),
+    uninstall: () => req<{ ok: boolean; msg: string }>('/asr/uninstall', { method: 'DELETE' }),
   }
 }

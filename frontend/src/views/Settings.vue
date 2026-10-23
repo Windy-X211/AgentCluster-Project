@@ -74,6 +74,21 @@ async function reloadCapabilities() {
   }
 }
 
+const asrUninstalling = ref(false)
+async function uninstallASR() {
+  if (!confirm('确定卸载语音识别模型？\n\n这将删除 SenseVoiceSmall 模型文件（约 2GB）。\n依赖包保留，重新启用时将自动重新下载模型。')) return
+  asrUninstalling.value = true
+  try {
+    await api.asr.uninstall()
+    settings.setAsrEnabled(false)
+    showToast('模型已卸载，已自动停用。重新启用时将自动下载模型')
+  } catch (e: any) {
+    showToast('卸载失败：' + (e?.message || e), 'err')
+  } finally {
+    asrUninstalling.value = false
+  }
+}
+
 onMounted(async () => {
   await Promise.all([models.fetch(), settings.fetch()])
   defaults.value.commands = [...(settings.data.default_commands || [])]
@@ -647,6 +662,45 @@ async function togglePreset(p: any) {
         </div>
       </div>
 
+      <!-- 语音识别 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>🎙️ 语音识别</span>
+          <span class="hint">SenseVoice 同声传译</span>
+        </div>
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">安装状态</span>
+          </div>
+          <div v-if="settings.asrAvailable" class="asr-status asr-ok">
+            <span class="asr-badge asr-badge-ok">✓ 已安装</span>
+            <span class="asr-desc">语音识别已就绪。</span>
+          </div>
+          <div v-else class="asr-status asr-missing">
+            <span class="asr-badge asr-badge-no">✗ 未安装</span>
+            <span class="asr-desc">安装后可在对话框中使用 🎤 按钮进行同声传译输入。</span>
+          </div>
+          <div v-if="!settings.asrAvailable" class="asr-install">
+            <div class="asr-install-label">安装命令（在后端目录执行）：</div>
+            <div class="asr-cmd">pip install funasr-onnx funasr modelscope onnxscript</div>
+            <div class="asr-note">安装后重启后端即可使用。首次识别会自动下载 SenseVoiceSmall 模型（约 936MB）。</div>
+          </div>
+          <div v-if="settings.asrAvailable" class="asr-toggle">
+            <button class="asr-switch" :class="{ on: settings.asrEnabled }" @click="settings.setAsrEnabled(!settings.asrEnabled)">
+              <span class="asr-switch-knob"></span>
+            </button>
+            <span class="asr-toggle-text">{{ settings.asrEnabled ? '已启用' : '已停用' }}</span>
+            <span class="asr-toggle-hint">{{ settings.asrEnabled ? '对话框显示 🎤 按钮，可同声传译' : '对话框隐藏 🎤 按钮（模型保留，随时可重新启用）' }}</span>
+          </div>
+          <div v-if="settings.asrAvailable" class="asr-uninstall-row">
+            <button class="btn sm ghost asr-uninstall-btn" @click="uninstallASR" :disabled="asrUninstalling">
+              {{ asrUninstalling ? '卸载中…' : '🗑 卸载模型' }}
+            </button>
+            <span class="asr-uninstall-hint">删除 SenseVoiceSmall 模型文件（约 936MB），释放磁盘空间。依赖包保留，重新使用时自动重新下载</span>
+          </div>
+        </div>
+      </div>
+
       <!-- 数据存储 -->
       <div class="panel glass">
         <div class="panel-title">
@@ -932,6 +986,28 @@ async function togglePreset(p: any) {
 }
 .hint-empty { font-size: calc(12px * var(--font-scale)); opacity: .45; padding: 4px 0; }
 .rounds-input { width: 140px; }
+
+/* —— 语音识别 —— */
+.asr-status { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.asr-badge { padding: 2px 10px; border-radius: 6px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.asr-badge-ok { background: rgba(34,197,94,0.18); color: #4ade80; }
+.asr-badge-no { background: rgba(239,68,68,0.18); color: #f87171; }
+.asr-desc { font-size: 13px; color: var(--text); opacity: 0.7; }
+.asr-install { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: rgba(var(--surface-rgb), 0.06); border: 1px solid rgba(var(--surface-rgb), 0.12); }
+.asr-install-label { font-size: 13px; margin-bottom: 6px; color: var(--text); opacity: 0.8; }
+.asr-cmd { font-family: monospace; font-size: 13px; padding: 6px 10px; border-radius: 6px; background: rgba(var(--shadow-rgb), 0.3); color: var(--code-ink, #ffb088); word-break: break-all; }
+.asr-note { font-size: 12px; margin-top: 6px; color: var(--text); opacity: 0.5; }
+.asr-toggle { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.asr-switch { position: relative; width: 42px; height: 24px; border-radius: 12px; border: none; cursor: pointer; background: rgba(var(--surface-rgb), 0.2); transition: background .2s; padding: 0; flex-shrink: 0; }
+.asr-switch.on { background: rgba(34,197,94,0.5); }
+.asr-switch-knob { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+.asr-switch.on .asr-switch-knob { transform: translateX(18px); }
+.asr-toggle-text { font-size: 14px; font-weight: 600; color: var(--text); white-space: nowrap; }
+.asr-toggle-hint { font-size: 12px; color: var(--text); opacity: 0.5; }
+.asr-uninstall-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.asr-uninstall-btn { color: #f87171 !important; border-color: rgba(239,68,68,0.3) !important; }
+.asr-uninstall-btn:hover:not(:disabled) { background: rgba(239,68,68,0.12) !important; }
+.asr-uninstall-hint { font-size: 12px; color: var(--text); opacity: 0.5; }
 
 /* —— 外观设置 —— */
 .appearance-row { display: flex; gap: 12px; margin-bottom: 12px; }

@@ -83,6 +83,12 @@ const input = ref('')
 const currentAgentId = ref<number | null>(null)
 const msgBox = ref<HTMLElement | null>(null)
 const taRef = ref<HTMLTextAreaElement | null>(null)
+// 语音输入（同声传译）
+const isRecording = ref(false)
+let mediaStream: MediaStream | null = null
+let mediaRecorder: MediaRecorder | null = null
+let audioChunks: Blob[] = []
+let recordTimer: number | null = null
 // 工作区拖拽到输入框：填入文件/文件夹绝对路径
 const chatDropHover = ref(false)
 let chatDragDepth = 0
@@ -1851,6 +1857,96 @@ async function send() {
 function sendStop() {
   convs.stopSend()
 }
+
+async function toggleVoiceInput() {
+  if (isRecording.value) { stopVoiceInput() } else { await startVoiceInput() }
+}
+
+async function startVoiceInput() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    isRecording.value = true
+    startRecordingChunk()
+  } catch {
+    alert('无法访问麦克风，请检查浏览器权限设置')
+  }
+}
+
+function startRecordingChunk() {
+  if (!mediaStream) return
+  audioChunks = []
+  mediaRecorder = new MediaRecorder(mediaStream)
+  mediaRecorder.ondataavailable = (e: BlobEvent) => { if (e.data.size > 0) audioChunks.push(e.data) }
+  mediaRecorder.onstop = () => {
+    if (audioChunks.length > 0) {
+      const blob = new Blob(audioChunks, { type: mediaRecorder?.mimeType || 'audio/webm' })
+      transcribeChunk(blob)
+    }
+    if (isRecording.value) startRecordingChunk()
+  }
+  mediaRecorder.start()
+  recordTimer = window.setTimeout(() => {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop()
+  }, 2000)
+}
+
+function stopVoiceInput() {
+  isRecording.value = false
+  if (recordTimer) { clearTimeout(recordTimer); recordTimer = null }
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop()
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null }
+}
+
+async function transcribeChunk(webmBlob: Blob) {
+  if (webmBlob.size < 2000) return
+  try {
+    const arrayBuffer = await webmBlob.arrayBuffer()
+    const audioContext = new AudioContext()
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer)
+    const wavBlob = audioBufferToWav(audioBuffer)
+    audioContext.close()
+    const wavBuf = await wavBlob.arrayBuffer()
+    const bytes = new Uint8Array(wavBuf)
+    let binary = ''
+    for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192))
+    const base64 = btoa(binary)
+    const r = await fetch('/api/asr/transcribe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio: base64, language: 'auto' })
+    })
+    const data = await r.json()
+    if (data.text) {
+      input.value = input.value ? input.value + data.text : data.text
+    }
+  } catch {
+    // 静默失败，不打断录音
+  }
+}
+
+function audioBufferToWav(buffer: AudioBuffer): Blob {
+  const numChannels = buffer.numberOfChannels
+  const sampleRate = buffer.sampleRate
+  const numSamples = buffer.length
+  const blockAlign = numChannels * 2
+  const dataSize = numSamples * blockAlign
+  const ab = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(ab)
+  const ws = (off: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)) }
+  ws(0, 'RIFF'); view.setUint32(4, 36 + dataSize, true); ws(8, 'WAVE'); ws(12, 'fmt ')
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, numChannels, true)
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * blockAlign, true)
+  view.setUint16(32, blockAlign, true); view.setUint16(34, 16, true); ws(36, 'data'); view.setUint32(40, dataSize, true)
+  const channels: Float32Array[] = []
+  for (let i = 0; i < numChannels; i++) channels.push(buffer.getChannelData(i))
+  let off = 44
+  for (let i = 0; i < numSamples; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      let s = Math.max(-1, Math.min(1, channels[ch][i]))
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true); off += 2
+    }
+  }
+  return new Blob([ab], { type: 'audio/wav' })
+}
 function formatResult(r: any): string {
   if (!r) return '(空)'
   try { return JSON.stringify(r, null, 2).slice(0, 2000) } catch { return String(r).slice(0, 2000) }
@@ -2673,6 +2769,9 @@ onBeforeUnmount(() => {
         </div>
         <div class="row2">
           <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true"></textarea>
+          <button v-if="settings.asrAvailable && settings.asrEnabled" class="btn voice-btn" :class="{ recording: isRecording }" @click="toggleVoiceInput" :title="isRecording ? '停止同声传译' : '同声传译'" aria-label="语音输入">
+            <span class="voice-icon">🎤</span>
+          </button>
           <button v-if="!convs.streaming" class="btn send" @click="send" aria-label="发送消息">发送</button>
           <button v-else class="btn send stop-btn" @click="sendStop" aria-label="停止输出">
             <span class="stop-icon" aria-hidden="true"></span>
@@ -3285,6 +3384,15 @@ onBeforeUnmount(() => {
 }
 
 .row2 { display: flex; gap: 6px; align-items: flex-end; }
+.voice-btn { flex-shrink: 0; width: 40px; height: 40px; padding: 0; min-width: 40px; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; border-radius: 8px; background: rgba(var(--surface-rgb), 0.08); border: 1px solid rgba(var(--surface-rgb), 0.12); color: var(--text); transition: all .2s; }
+.voice-btn:hover:not(:disabled) { background: rgba(var(--accent-rgb), 0.15); border-color: rgba(var(--accent-rgb), 0.3); }
+.voice-btn:disabled { opacity: .5; cursor: wait; }
+.voice-btn.recording { background: rgba(255,80,80,0.2); border-color: rgba(255,80,80,0.5); animation: voicePulse 1.2s ease-in-out infinite; }
+.voice-btn.recording .voice-icon { animation: voiceIconBounce .6s ease-in-out infinite; }
+.voice-loading { width: 16px; height: 16px; border: 2px solid rgba(var(--accent-rgb), 0.3); border-top-color: var(--accent-ink); border-radius: 50%; animation: voiceSpin .8s linear infinite; }
+@keyframes voicePulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,80,80,0.4); } 50% { box-shadow: 0 0 0 6px rgba(255,80,80,0); } }
+@keyframes voiceIconBounce { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-2px); } }
+@keyframes voiceSpin { to { transform: rotate(360deg); } }
 .sm { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); }
 .input-ta { min-height: 44px; max-height: 100px; resize: vertical; font-family: inherit; }
 .msg.assistant.empty { display: none; }
