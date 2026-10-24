@@ -23,6 +23,13 @@
   --red-ink: #ff9090;
   --code-ink: #ffb088;
   --font-scale: 1;
+  --code-tint-bg: rgba(var(--surface-rgb), 0.08);
+  --code-tint-strong: rgba(var(--surface-rgb), 0.12);
+  --code-tint-pre: rgba(var(--surface-rgb), 0.06);
+  --tint-soft-bg: rgba(var(--surface-rgb), 0.06);
+  --tint-input-bg: rgba(var(--surface-rgb), 0.04);
+  --glass-shadow: 0 8px 32px rgba(var(--shadow-rgb), 0.25), inset 0 1px 0 rgba(var(--surface-rgb), 0.08);
+  --popup-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
 }
 
 /* 深邃黑 */
@@ -45,20 +52,27 @@
 /* 科技白 */
 [data-theme="tech-white"] {
   --bg-base: #ffffff;
-  --bg-grad-1: #e6eef9;
-  --bg-grad-2: #ece8f5;
+  --bg-grad-1: #ffffff;
+  --bg-grad-2: #ffffff;
   --surface-rgb: 20, 30, 50;
   --shadow-rgb: 20, 30, 50;
-  --text-rgb: 30, 40, 60;
+  --text-rgb: 12, 18, 28;
   --accent-rgb: 37, 99, 235;
   --accent2-rgb: 124, 58, 237;
   --accent-light: #2563eb;
   --accent2-light: #7c3aed;
   --success-light: #16a34a;
-  --panel-bg: #f5f7fa;
+  --panel-bg: #ffffff;
   --node-bg-rgb: 228, 236, 245;
   --red-ink: #dc2626;
   --code-ink: #c2410c;
+  --code-tint-bg: #dce6f4;
+  --code-tint-strong: #c8d6ee;
+  --code-tint-pre: #dce6f4;
+  --tint-soft-bg: #f1f5fb;
+  --tint-input-bg: #f3f7fc;
+  --glass-shadow: 0 1px 8px rgba(20, 30, 50, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  --popup-shadow: 0 4px 20px rgba(20, 30, 50, 0.08);
 }
 
 /* 护眼白（米黄） */
@@ -118,7 +132,7 @@ body {
   -webkit-backdrop-filter: blur(20px) saturate(160%);
   border: 1px solid $glass-border;
   border-radius: 16px;
-  box-shadow: 0 8px 32px rgba(var(--shadow-rgb), 0.25), inset 0 1px 0 $glass-highlight;
+  box-shadow: var(--glass-shadow);
 }
 
 .glass-soft {
@@ -133,7 +147,7 @@ body {
   background: rgba(var(--node-bg-rgb), 0.98);
   border: 1px solid rgba(var(--surface-rgb), 0.14);
   border-radius: 10px;
-  box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
+  box-shadow: var(--popup-shadow);
   color: var(--text);
 }
 
