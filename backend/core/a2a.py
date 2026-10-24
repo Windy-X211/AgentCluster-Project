@@ -358,6 +358,17 @@ def cmd_cluster_send_message(to_agent: Any = None, message: str = "") -> dict:
                                  f"但你可以在对方先找你之后再回复"}
             return {"error": f"与「{target.get('name')}」尚未连线，无法消息；请先在画布上从你的节点拖一条连线指向对方"}
 
+    # 串行模式约束：每轮发言只能给一个智能体发送消息（保证同一时刻只有一条消息流）。
+    # 同一轮里对第二个目标的调用直接拒绝，避免一次发言被扇出成多路并发。
+    exec_mode = (canvas or {}).get("execution_mode", "serial")
+    if exec_mode != "parallel":
+        pending = [c for c in turn.get("calls", []) if c.get("from_id") == from_id]
+        if pending:
+            first_to = pending[0].get("to_agent_id")
+            first_name = (turn.get("all_agents", {}).get(first_to) or {}).get("name") or str(first_to)
+            return {"error": f"串行模式下每轮只能给一个智能体发送消息：本轮已排发给「{first_name}」，"
+                             f"不能再发给「{target.get('name')}」；请等对方回复或下一轮再联系其他成员。"}
+
     # 消息 ≠ 成果移交：本轮自动沿出边的成果接力默认关闭，避免消息被当成果扩散
     turn.setdefault("skip_auto_ids", set()).add(from_id)
 

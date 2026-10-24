@@ -1187,6 +1187,12 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
             "对方也可用 cluster.send_message 回复你，支持往返多轮。"
             "打招呼/寒暄/用户直接问你简单问题 → 直接输出文字回复，不要调用 cluster.send_message。"
         )
+        if (canvas or {}).get("execution_mode", "serial") != "parallel":
+            parts.append(
+                "【执行模式：串行】你本轮只能调用一次 cluster.send_message 联系一个成员；"
+                "发送消息后你会停止运行，由对方接着运行。如需联系多个成员，"
+                "请先与其中一个完成沟通，下一轮再联系其他成员。"
+            )
 
     # 不可 call 的（global 模式可见但不能 call / link 模式不可见）
     if perception == "global" and not_linked_visible:
