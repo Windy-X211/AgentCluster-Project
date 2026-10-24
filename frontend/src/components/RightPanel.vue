@@ -1944,7 +1944,6 @@ function onMessagesScroll() {
   if (!el) return
   stickBottom.value = isNearBottom(el)
   layout.chatMsgScrollTop = el.scrollTop
-  console.log('[DBG scroll] saved chatMsgScrollTop=', el.scrollTop)
 }
 function onConvListScroll() {
   const el = convListEl.value
@@ -2379,26 +2378,28 @@ onMounted(async () => {
 // scrollTop 归零；这里保存 / 还原消息区与会话列表的滚动位置。
 // 滚动位置存在 layout store（仅内存），既能覆盖 KeepAlive 命中的情况，
 // 也能覆盖 KeepAlive 未命中（组件被重建）的情况。
-// 注意：onDeactivated 触发时 DOM 已被移出文档流，scrollTop 可能读不到，
-// 所以主保存点在滚动事件里（onMessagesScroll / onConvListScroll），这里只做兜底。
+// 保存时机（三重保障）：
+//   1. Home.vue 的 onBeforeRouteLeave —— 路由离开前 DOM 仍完整时直接读取 scrollTop，最可靠；
+//   2. 滚动事件 onMessagesScroll / onConvListScroll —— 实时跟随用户滚动；
+//   3. onDeactivated —— 兜底，且仅当元素仍在文档流（isConnected）时才保存，
+//      因为 KeepAlive 切走时 DOM 已被移出，scrollTop 会被浏览器重置为 0。
 function restoreScrollPositions() {
   const mEl = msgBox.value
-  const before = mEl?.scrollTop
   if (mEl) mEl.scrollTop = layout.chatMsgScrollTop
-  console.log('[DBG restore] saved=', layout.chatMsgScrollTop, 'before=', before, 'after=', mEl?.scrollTop, 'sh=', mEl?.scrollHeight)
   const cEl = convListEl.value
   if (cEl) cEl.scrollTop = layout.convListScrollTop
 }
 onMounted(() => {
-  console.log('[DBG] onMounted')
+  // 组件首次挂载（或 KeepAlive 未命中被重建）时恢复滚动位置
   nextTick(() => { restoreScrollPositions(); requestAnimationFrame(restoreScrollPositions) })
 })
 onActivated(() => {
-  console.log('[DBG] onActivated, store.chatMsgScrollTop=', layout.chatMsgScrollTop)
   document.addEventListener('click', onDocClick)
   document.addEventListener('click', onChatAttachClick, true)   // capture 阶段先触发，避免冒泡被吞
   document.addEventListener('keydown', onDocKey)
   window.addEventListener('keydown', onLightboxKey)
+  // 等 DOM 重新接入并完成布局后再还原滚动位置：nextTick → rAF → setTimeout 多重兜底，
+  // 因为浏览器在元素重新接入文档后可能异步重置 scrollTop。
   nextTick(() => {
     restoreScrollPositions()
     requestAnimationFrame(restoreScrollPositions)
@@ -2406,8 +2407,10 @@ onActivated(() => {
   })
 })
 onDeactivated(() => {
+  // 兜底保存：仅当元素仍在文档流中时才读取 scrollTop。
+  // KeepAlive 切走时 DOM 已被移出文档（isConnected=false），此时 scrollTop 会被浏览器
+  // 重置为 0，若在这里写入会覆盖掉 onBeforeRouteLeave / 滚动事件中保存的正确值。
   const mEl = msgBox.value
-  console.log('[DBG] onDeactivated, isConnected=', mEl?.isConnected, 'el.scrollTop=', mEl?.scrollTop, 'store=', layout.chatMsgScrollTop)
   if (mEl && mEl.isConnected) layout.chatMsgScrollTop = mEl.scrollTop
   const cEl = convListEl.value
   if (cEl && cEl.isConnected) layout.convListScrollTop = cEl.scrollTop

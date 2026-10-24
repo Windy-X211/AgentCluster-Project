@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import { useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useConvStore, useLayoutStore } from '@/stores'
 import TopBar from '@/components/TopBar.vue'
 import AgentList from '@/components/AgentList.vue'
@@ -55,6 +56,16 @@ function onRootDblClick(e: MouseEvent) {
 onMounted(async () => {
   await Promise.all([agents.fetch(), canvases.fetch(), models.fetch(), settings.fetch(), convs.fetch()])
   if (!convs.current && convs.list.length) convs.current = convs.list[0].id
+})
+
+// 离开首页前往设置/能力管理等页面前，保存右侧对话区与会话列表的滚动位置。
+// 此守卫在 DOM 仍完整时触发，scrollTop 准确可靠（优于 onDeactivated，后者触发时 DOM
+// 已被 KeepAlive 移出文档，scrollTop 会被浏览器重置为 0）。
+onBeforeRouteLeave(() => {
+  const chatBox = document.querySelector('.chat-box') as HTMLElement | null
+  if (chatBox) layout.chatMsgScrollTop = chatBox.scrollTop
+  const convList = document.querySelector('.conv-list-wrap') as HTMLElement | null
+  if (convList) layout.convListScrollTop = convList.scrollTop
 })
 </script>
 
