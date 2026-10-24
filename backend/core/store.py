@@ -144,8 +144,8 @@ def _drain_sync_queue() -> None:
 RECORD_DOMAINS = ["agents", "agent_groups", "canvases", "conversations", "model_interfaces", "rules", "param_presets"]
 # 单文件域 → 整个域一个 json
 SINGLE_DOMAINS = ["settings"]
-# 预留的文件夹（用户可在这里放自定义 skills / plugins）
-EXTRA_DIRS = ["skills", "plugins"]
+# 预留的文件夹（用户可在这里放自定义 skills / plugins / backgrounds）
+EXTRA_DIRS = ["skills", "plugins", "backgrounds"]
 
 DEFAULT_SETTINGS = {
     "storage_version": 2,

@@ -220,6 +220,20 @@ export const api = {
     get: () => req<any>('/settings'),
     update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) })
   },
+  backgrounds: {
+    list: () => req<any[]>('/backgrounds'),
+    rawUrl: (id: string, file: string, v?: number) =>
+      BASE + `/backgrounds/${encodeURIComponent(id)}/raw/${encodeURI(file)}` + (v ? `?v=${v}` : ''),
+    upload: async (form: FormData) => {
+      const r = await fetch(BASE + '/backgrounds/upload', { method: 'POST', body: form })
+      if (!r.ok) {
+        let d: any = null; try { d = await r.json() } catch { /* 非 JSON 错误体 */ }
+        throw new Error(d?.detail || `${r.status} ${r.statusText}`)
+      }
+      return r.json()
+    },
+    remove: (id: string) => req<any>(`/backgrounds/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  },
   rules: {
     list: (canvasId?: number | null) => req<any[]>('/rules' + (canvasId != null ? `?canvas_id=${canvasId}` : '')),
     create: (d: any) => req('/rules', { method: 'POST', body: JSON.stringify(d) }),

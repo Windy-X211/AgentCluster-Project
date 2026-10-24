@@ -12,6 +12,14 @@ export const THEMES = ['standard', 'deep-black', 'tech-white', 'eye-care'] as co
 export type ThemeId = typeof THEMES[number]
 export const THEME_DEFAULT: ThemeId = 'standard'
 
+// 背景相关
+export const BG_OPACITY_MIN = 0.1
+export const BG_OPACITY_MAX = 1.0
+export const BG_OPACITY_DEFAULT = 1.0
+export const BG_BLUR_MIN = 0
+export const BG_BLUR_MAX = 30
+export const BG_BLUR_DEFAULT = 0
+
 function readStore(): Record<string, any> {
   try {
     const raw = localStorage.getItem(KEY)
@@ -48,11 +56,31 @@ function readTheme(): ThemeId {
   return (THEMES as readonly string[]).includes(t) ? t : THEME_DEFAULT
 }
 
+function readBackgroundId(): string | null {
+  const v = readStore()?.backgroundId
+  return v == null ? null : String(v)
+}
+
+function readBackgroundOpacity(): number {
+  const n = Number(readStore()?.backgroundOpacity)
+  if (!isFinite(n) || n <= 0) return BG_OPACITY_DEFAULT
+  return Math.min(BG_OPACITY_MAX, Math.max(BG_OPACITY_MIN, Math.round(n * 100) / 100))
+}
+
+function readBackgroundBlur(): number {
+  const n = Number(readStore()?.backgroundBlur)
+  if (!isFinite(n) || n < 0) return BG_BLUR_DEFAULT
+  return Math.min(BG_BLUR_MAX, Math.max(BG_BLUR_MIN, Math.round(n)))
+}
+
 export const useLayoutStore = defineStore('layout', {
   state: () => ({
     rightWidth: readWidth(),
     fontScale: readFontScale(),
     theme: readTheme(),
+    backgroundId: readBackgroundId(),
+    backgroundOpacity: readBackgroundOpacity(),
+    backgroundBlur: readBackgroundBlur(),
   }),
   actions: {
     setRightWidth(v: number) {
@@ -78,6 +106,20 @@ export const useLayoutStore = defineStore('layout', {
     },
     resetTheme() {
       this.setTheme(THEME_DEFAULT)
+    },
+    setBackground(id: string | null) {
+      this.backgroundId = id
+      writeStore({ backgroundId: id })
+    },
+    setBackgroundOpacity(v: number) {
+      const n = Math.min(BG_OPACITY_MAX, Math.max(BG_OPACITY_MIN, Math.round(v * 100) / 100))
+      this.backgroundOpacity = n
+      writeStore({ backgroundOpacity: n })
+    },
+    setBackgroundBlur(v: number) {
+      const n = Math.min(BG_BLUR_MAX, Math.max(BG_BLUR_MIN, Math.round(v)))
+      this.backgroundBlur = n
+      writeStore({ backgroundBlur: n })
     },
   },
 })

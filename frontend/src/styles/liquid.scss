@@ -257,6 +257,8 @@ option {
 
 // 布局
 .app-root {
+  position: relative;
+  z-index: 1;
   display: grid;
   // 4 列：left | center | resize-handle | right（宽度由 Home.vue 内联 gridTemplateColumns 覆盖）
   grid-template-columns: 240px minmax(0, 1fr) 6px 300px;

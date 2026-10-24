@@ -3,6 +3,7 @@ import { watch } from 'vue'
 import { RouterView } from 'vue-router'
 import { useLayoutStore } from '@/stores'
 import GuideManager from '@/components/guide/GuideManager.vue'
+import BackgroundLayer from '@/components/BackgroundLayer.vue'
 
 const layout = useLayoutStore()
 
@@ -19,6 +20,7 @@ watch(() => layout.theme, applyTheme, { immediate: true })
 </script>
 
 <template>
+  <BackgroundLayer />
   <RouterView />
   <GuideManager />
 </template>

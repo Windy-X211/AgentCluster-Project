@@ -73,6 +73,69 @@ async function reloadCapabilities() {
   }
 }
 
+// 背景管理
+const bgList = ref<any[]>([])
+const bgLoading = ref(false)
+const bgUploading = ref(false)
+const bgFileInput = ref<HTMLInputElement | null>(null)
+const bgUploadType = ref<'animation' | 'video' | 'image'>('image')
+
+async function loadBackgrounds() {
+  bgLoading.value = true
+  try { bgList.value = await api.backgrounds.list() } catch { /* 静默 */ }
+  bgLoading.value = false
+}
+
+function pickBackgroundFiles(type: 'animation' | 'video' | 'image') {
+  bgUploadType.value = type
+  bgFileInput.value?.click()
+}
+
+async function onBgFiles(e: Event) {
+  const input = e.target as HTMLInputElement
+  const files = input.files
+  if (!files || !files.length) return
+  const typeLabel = bgUploadType.value === 'animation' ? '动画' : bgUploadType.value === 'video' ? '视频' : '图片'
+  if (!confirm(`将所选文件作为${typeLabel}背景上传？`)) { input.value = ''; return }
+  bgUploading.value = true
+  try {
+    const form = new FormData()
+    form.append('name', files[0].name.replace(/\.[^.]+$/, '') || '自定义背景')
+    form.append('type', bgUploadType.value)
+    for (const f of Array.from(files)) form.append('files', f)
+    const created = await api.backgrounds.upload(form)
+    await loadBackgrounds()
+    layout.setBackground(created.id)
+    showToast(`背景「${created.name}」上传成功`)
+  } catch (err: any) {
+    showToast('上传失败：' + (err?.message || err), 'err')
+  } finally {
+    bgUploading.value = false
+    input.value = ''
+  }
+}
+
+async function deleteBackground(bg: any) {
+  if (bg.builtin) return
+  if (!confirm(`确定删除背景「${bg.name}」？`)) return
+  try {
+    await api.backgrounds.remove(bg.id)
+    if (layout.backgroundId === bg.id) layout.setBackground(null)
+    await loadBackgrounds()
+    showToast('已删除')
+  } catch (err: any) {
+    showToast('删除失败：' + (err?.message || err), 'err')
+  }
+}
+
+function bgThumbStyle(bg: any): any {
+  if (bg.thumbnail) {
+    return { backgroundImage: `url(${api.backgrounds.rawUrl(bg.id, bg.thumbnail)})`, backgroundSize: 'cover', backgroundPosition: 'center' }
+  }
+  if (bg.preview) return { background: bg.preview }
+  return { background: 'linear-gradient(135deg, #1a2340, #0a0e1a)' }
+}
+
 const asrUninstalling = ref(false)
 async function uninstallASR() {
   if (!confirm('确定卸载语音识别模型？\n\n这将删除 SenseVoiceSmall 模型文件（约 2GB）。\n依赖包保留，重新启用时将自动重新下载模型。')) return
@@ -93,6 +156,7 @@ onMounted(async () => {
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
+  loadBackgrounds()
 })
 
 function openPath(p: string) { api.storage.open(p).catch(() => {}) }
@@ -295,6 +359,50 @@ function avatarPreviewGradient(name: string): string {
           </div>
           <div class="hint-empty" style="margin-top: 8px">
             切换全局配色方案，设置自动保存，刷新后仍然生效
+          </div>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">背景</span>
+            <div class="bg-upload-btns">
+              <button class="btn sm ghost" @click="pickBackgroundFiles('image')" :disabled="bgUploading">🖼️ 图片</button>
+              <button class="btn sm ghost" @click="pickBackgroundFiles('video')" :disabled="bgUploading">🎬 视频</button>
+              <button class="btn sm ghost" @click="pickBackgroundFiles('animation')" :disabled="bgUploading">✨ 动画</button>
+            </div>
+          </div>
+          <div class="bg-grid">
+            <div class="bg-card" :class="{ active: layout.backgroundId === null }" @click="layout.setBackground(null)">
+              <div class="bg-preview" style="background: radial-gradient(ellipse at 30% 20%, #1a2340 0%, #050816 70%)"></div>
+              <div class="bg-name">默认渐变</div>
+            </div>
+            <div v-for="bg in bgList" :key="bg.id" class="bg-card" :class="{ active: layout.backgroundId === bg.id }" @click="layout.setBackground(bg.id)">
+              <div class="bg-preview" :style="bgThumbStyle(bg)">
+                <span class="bg-type-tag">{{ bg.type === 'animation' ? '动画' : bg.type === 'video' ? '视频' : '图片' }}</span>
+                <button v-if="!bg.builtin" class="bg-del" @click.stop="deleteBackground(bg)" title="删除">✕</button>
+              </div>
+              <div class="bg-name">{{ bg.name }}</div>
+            </div>
+          </div>
+          <div v-if="layout.backgroundId" class="bg-sliders">
+            <div class="bg-slider-row">
+              <span class="bg-slider-label">不透明度</span>
+              <input class="font-scale-slider" type="range" min="0.1" max="1" step="0.05"
+                     :value="layout.backgroundOpacity"
+                     @input="layout.setBackgroundOpacity(Number(($event.target as HTMLInputElement).value))" />
+              <span class="bg-slider-value">{{ Math.round(layout.backgroundOpacity * 100) }}%</span>
+            </div>
+            <div class="bg-slider-row">
+              <span class="bg-slider-label">模糊</span>
+              <input class="font-scale-slider" type="range" min="0" max="30" step="1"
+                     :value="layout.backgroundBlur"
+                     @input="layout.setBackgroundBlur(Number(($event.target as HTMLInputElement).value))" />
+              <span class="bg-slider-value">{{ layout.backgroundBlur }}px</span>
+            </div>
+          </div>
+          <input ref="bgFileInput" type="file" multiple style="display:none" @change="onBgFiles" />
+          <div class="hint-empty" style="margin-top: 8px">
+            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见 AppData/backgrounds/spec.md
           </div>
         </div>
       </div>
@@ -622,6 +730,35 @@ function avatarPreviewGradient(name: string): string {
 .tp-text { font-size: calc(11px * var(--font-scale)); }
 .tp-chip { width: 24px; height: 4px; border-radius: 2px; margin-left: 8px; }
 .theme-name { padding: 6px 8px; text-align: center; font-size: calc(12px * var(--font-scale)); }
+
+/* —— 背景选择 —— */
+.bg-upload-btns { display: flex; gap: 6px; }
+.bg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; }
+.bg-card {
+  cursor: pointer; border-radius: 10px; overflow: hidden;
+  border: 2px solid rgba(var(--surface-rgb), 0.1);
+  transition: border-color .15s, transform .12s;
+}
+.bg-card:hover { transform: translateY(-2px); border-color: rgba(var(--accent-rgb), 0.4); }
+.bg-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.bg-preview { height: 64px; position: relative; background-size: cover; background-position: center; }
+.bg-type-tag {
+  position: absolute; top: 4px; left: 4px;
+  font-size: calc(10px * var(--font-scale)); padding: 1px 6px; border-radius: 4px;
+  background: rgba(0,0,0,0.5); color: #fff; backdrop-filter: blur(4px);
+}
+.bg-del {
+  position: absolute; top: 4px; right: 4px;
+  width: 18px; height: 18px; border-radius: 50%; border: none; cursor: pointer;
+  background: rgba(0,0,0,0.5); color: #fff; font-size: 11px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  &:hover { background: rgba(220,60,60,0.85); }
+}
+.bg-name { padding: 6px 8px; text-align: center; font-size: calc(12px * var(--font-scale)); }
+.bg-sliders { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.bg-slider-row { display: flex; align-items: center; gap: 10px; }
+.bg-slider-label { font-size: calc(12px * var(--font-scale)); min-width: 56px; opacity: .8; }
+.bg-slider-value { font-size: calc(12px * var(--font-scale)); font-weight: 600; min-width: 44px; text-align: right; color: var(--accent); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 
 .picker-mask {
   position: fixed; inset: 0;

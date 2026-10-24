@@ -1,14 +1,14 @@
-# send_email 插件 — Dify 兼容 manifest.yaml
-version: "0.0.1"
+# send_email 插件 — 邮箱全功能管理（发送/读取/清理/整理/监听）
+version: "0.2.0"
 type: "plugin"
 name: "send_email"
 label:
-  zh_Hans: "发送邮箱"
-  en_US: "Send Email"
+  zh_Hans: "邮箱管理"
+  en_US: "Mail Manager"
 author: "AgentCluster"
 description:
-  zh_Hans: "通过 SMTP 发送文本邮件。内置 QQ/163/Gmail/Outlook/企业邮箱预设。"
-  en_US: "Send plain-text email via SMTP. Presets for QQ, 163, Gmail, Outlook."
-version_code: 1
+  zh_Hans: "邮箱全功能管理插件，支持发送、读取、清理、整理邮件，并可开启后台监听及时获取新邮件。核心能力：1.发送(send)支持纯文本/HTML/附件/抄送/密送；2.读取(list/read/search/folders)IMAP收件支持分页搜索附件下载；3.清理(delete/clean)删除批量清空垃圾箱；4.整理(move/mark/organize)移动标记已读重要按规则分类归档；5.监听(listen_start/stop/status/fetch_new)后台实时接收新邮件。内置QQ/163/Gmail/Outlook/企业邮箱预设。"
+  en_US: "Full-featured mail manager: send, read, clean, organize, and live-listen for new mails."
+version_code: 2
 icon: "📧"
-tags: ["email", "smtp", "notification"]
+tags: ["email", "smtp", "imap", "notification", "mail"]
