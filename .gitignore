@@ -1,6 +1,7 @@
 /AppData/*
 !/AppData/plugins/
 !/AppData/skills/
+!/AppData/backgrounds/
 /AppData/plugins/changzheng_machine/
 /outputs/
 /.trae
