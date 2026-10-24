@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, nextTick } from 'vue'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
 import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
 import { renderChatMarkdown } from '@/utils/markdown'
@@ -82,6 +82,7 @@ function turnElapsedLabel(turn: any): string {
 const input = ref('')
 const currentAgentId = ref<number | null>(null)
 const msgBox = ref<HTMLElement | null>(null)
+const convListEl = ref<HTMLElement | null>(null)
 const taRef = ref<HTMLTextAreaElement | null>(null)
 // 语音输入（同声传译）
 const isRecording = ref(false)
@@ -1942,6 +1943,13 @@ function onMessagesScroll() {
   const el = msgBox.value
   if (!el) return
   stickBottom.value = isNearBottom(el)
+  // 持续记录滚动位置：KeepAlive 切走时 onDeactivated 可能已拿不到正确的 scrollTop
+  // （DOM 被移出文档流），这里在滚动事件中实时保存，保证返回时能还原。
+  layout.chatMsgScrollTop = el.scrollTop
+}
+function onConvListScroll() {
+  const el = convListEl.value
+  if (el) layout.convListScrollTop = el.scrollTop
 }
 function scrollToBottom() {
   const el = msgBox.value
@@ -2362,28 +2370,65 @@ function onChatAttachClick(e: MouseEvent) {
 }
 
 onMounted(async () => {
-  document.addEventListener('click', onDocClick)
-  document.addEventListener('click', onChatAttachClick, true)   // capture 阶段先触发，避免冒泡被吞
-  document.addEventListener('keydown', onDocKey)
-  window.addEventListener('keydown', onLightboxKey)
   // 父级 Home 的 fetch 可能还没返回，这里先确保拉到列表，避免误判为空而重复新建
   if (!convs.list.length) await convs.fetch()
   if (!convs.current && convs.list.length) convs.current = convs.list[0].id
   if (!currentAgentId.value && agents.list.length) currentAgentId.value = agents.list[0].id
   if (!convs.list.length) await newConv('independent')
 })
-onBeforeUnmount(() => {
+// 从设置/能力管理等页面返回首页时，浏览器/KeepAlive 会把脱离文档流的可滚动元素
+// scrollTop 归零；这里保存 / 还原消息区与会话列表的滚动位置。
+// 滚动位置存在 layout store（仅内存），既能覆盖 KeepAlive 命中的情况，
+// 也能覆盖 KeepAlive 未命中（组件被重建）的情况。
+// 注意：onDeactivated 触发时 DOM 已被移出文档流，scrollTop 可能读不到，
+// 所以主保存点在滚动事件里（onMessagesScroll / onConvListScroll），这里只做兜底。
+function restoreScrollPositions() {
+  const mEl = msgBox.value
+  if (mEl) mEl.scrollTop = layout.chatMsgScrollTop
+  const cEl = convListEl.value
+  if (cEl) cEl.scrollTop = layout.convListScrollTop
+}
+onMounted(() => {
+  // 组件首次挂载（或 KeepAlive 未命中被重建）时恢复滚动位置
+  nextTick(() => {
+    restoreScrollPositions()
+    requestAnimationFrame(restoreScrollPositions)
+  })
+})
+onActivated(() => {
+  document.addEventListener('click', onDocClick)
+  document.addEventListener('click', onChatAttachClick, true)   // capture 阶段先触发，避免冒泡被吞
+  document.addEventListener('keydown', onDocKey)
+  window.addEventListener('keydown', onLightboxKey)
+  // 等 DOM 重新接入并完成布局后再还原滚动位置：nextTick → rAF → setTimeout 多重兜底，
+  // 因为浏览器在元素重新接入文档后可能异步重置 scrollTop。
+  nextTick(() => {
+    restoreScrollPositions()
+    requestAnimationFrame(restoreScrollPositions)
+    setTimeout(restoreScrollPositions, 0)
+  })
+})
+onDeactivated(() => {
+  // 兜底保存：仅当元素仍在文档流中时才读取 scrollTop。
+  // KeepAlive 切走时 DOM 已被移出文档（isConnected=false），此时 scrollTop 会被浏览器
+  // 重置为 0，若在这里写入会覆盖掉滚动事件中保存的正确值——所以必须跳过。
+  const mEl = msgBox.value
+  if (mEl && mEl.isConnected) layout.chatMsgScrollTop = mEl.scrollTop
+  const cEl = convListEl.value
+  if (cEl && cEl.isConnected) layout.convListScrollTop = cEl.scrollTop
   document.removeEventListener('click', onDocClick)
   document.removeEventListener('click', onChatAttachClick, true)
   document.removeEventListener('keydown', onDocKey)
   window.removeEventListener('keydown', onLightboxKey)
-  // 浮窗拖拽 / resize / pan 期间被卸载也要清干净
+  // 浮窗拖拽 / resize / pan 期间被切走也要清干净
   window.removeEventListener('mousemove', onLbDragMove)
   window.removeEventListener('mouseup', onLbDragEnd)
   window.removeEventListener('mousemove', onLbResizeMove)
   window.removeEventListener('mouseup', onLbResizeEnd)
   window.removeEventListener('mousemove', onLbPanMove)
   window.removeEventListener('mouseup', onLbPanEnd)
+})
+onBeforeUnmount(() => {
   // 清理附件预览 URL
   for (const a of attachments.value) { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl) }
 })
@@ -2483,7 +2528,7 @@ onBeforeUnmount(() => {
             <button class="btn sm danger" type="button" :disabled="!selectedIds.length" @click="deleteSelected">删除</button>
             <button class="btn sm ghost" type="button" @click="exitSel">取消</button>
           </div>
-          <div class="conv-list-wrap">
+          <div class="conv-list-wrap" ref="convListEl" @scroll.passive="onConvListScroll">
             <div class="conv-list">
               <div v-for="c in sortedConvs" :key="c.id"
                    :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id) }]"

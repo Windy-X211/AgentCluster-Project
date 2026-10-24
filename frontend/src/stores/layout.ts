@@ -81,6 +81,11 @@ export const useLayoutStore = defineStore('layout', {
     backgroundId: readBackgroundId(),
     backgroundOpacity: readBackgroundOpacity(),
     backgroundBlur: readBackgroundBlur(),
+    // —— 滚动位置缓存（仅内存，不持久化）——
+    // 从设置/能力管理等页面返回首页时，恢复对话框与会话列表的滚动位置。
+    // 放在 store 里是为了应对 KeepAlive 未命中（组件被重建）的情况。
+    chatMsgScrollTop: 0,
+    convListScrollTop: 0,
   }),
   actions: {
     setRightWidth(v: number) {

@@ -6,6 +6,8 @@ import AgentList from '@/components/AgentList.vue'
 import MainView from '@/components/MainView.vue'
 import RightPanel from '@/components/RightPanel.vue'
 
+defineOptions({ name: 'Home' })
+
 
 const agents = useAgentStore()
 const canvases = useCanvasStore()
