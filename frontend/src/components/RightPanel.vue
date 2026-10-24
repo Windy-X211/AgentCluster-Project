@@ -2387,8 +2387,11 @@ onMounted(async () => {
 // scrollTop 归零；这里保存 / 还原消息区与会话列表的滚动位置。
 // 滚动位置存在 layout store（仅内存），既能覆盖 KeepAlive 命中的情况，
 // 也能覆盖 KeepAlive 未命中（组件被重建）的情况。
-// 注意：onDeactivated 触发时 DOM 已被移出文档流，scrollTop 可能读不到，
-// 所以主保存点在滚动事件里（onMessagesScroll / onConvListScroll），这里只做兜底。
+// 保存时机（三重保障）：
+//   1. Home.vue 的 onBeforeRouteLeave —— 路由离开前 DOM 仍完整时直接读取 scrollTop，最可靠；
+//   2. 滚动事件 onMessagesScroll / onConvListScroll —— 实时跟随用户滚动；
+//   3. onDeactivated —— 兜底，且仅当元素仍在文档流（isConnected）时才保存，
+//      因为 KeepAlive 切走时 DOM 已被移出，scrollTop 会被浏览器重置为 0。
 function restoreScrollPositions() {
   const mEl = msgBox.value
   const before = mEl?.scrollTop
@@ -2398,6 +2401,7 @@ function restoreScrollPositions() {
   if (cEl) cEl.scrollTop = layout.convListScrollTop
 }
 onMounted(() => {
+  // 组件首次挂载（或 KeepAlive 未命中被重建）时恢复滚动位置
   console.log('[DBG] onMounted')
   nextTick(() => { restoreScrollPositions(); requestAnimationFrame(restoreScrollPositions) })
 })
@@ -2414,6 +2418,9 @@ onActivated(() => {
   })
 })
 onDeactivated(() => {
+  // 兜底保存：仅当元素仍在文档流中时才读取 scrollTop。
+  // KeepAlive 切走时 DOM 已被移出文档（isConnected=false），此时 scrollTop 会被浏览器
+  // 重置为 0，若在这里写入会覆盖掉 onBeforeRouteLeave / 滚动事件中保存的正确值。
   const mEl = msgBox.value
   console.log('[DBG] onDeactivated, isConnected=', mEl?.isConnected, 'el.scrollTop=', mEl?.scrollTop, 'store=', layout.chatMsgScrollTop)
   if (mEl && mEl.isConnected) layout.chatMsgScrollTop = mEl.scrollTop
@@ -3143,7 +3150,7 @@ onBeforeUnmount(() => {
 /* 助手消息靠左，纵向堆叠（头像行 + 泡泡 + 工具行） */
 .msg.assistant { align-self: flex-start; flex-direction: column; }
 .msg.assistant .bubble {
-  background: rgba(var(--surface-rgb), 0.06);
+  background: var(--tint-soft-bg);
   border-top-left-radius: 4px;
 }
 .msg.assistant.streaming .bubble { border-color: rgba(var(--accent-rgb), 0.4); box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.1); }
@@ -3299,7 +3306,7 @@ onBeforeUnmount(() => {
 /* 用户消息泡泡额外样式 */
 .bubble.user-bubble { color: rgba(var(--text-rgb), 0.95); }
 .bubble.user-bubble.markdown a { color: #ffd088; }
-.bubble.user-bubble.markdown code { background: rgba(var(--surface-rgb), 0.12); color: var(--code-ink); }
+.bubble.user-bubble.markdown code { background: var(--code-tint-strong); color: var(--code-ink); }
 .bubble.user-bubble.markdown blockquote { background: rgba(var(--surface-rgb), 0.08); border-left-color: rgba(255,208,136,0.5); }
 
 /* 流式占位泡泡（只有光标闪烁） */
@@ -3648,7 +3655,7 @@ onBeforeUnmount(() => {
 @keyframes voiceIconBounce { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-2px); } }
 @keyframes voiceSpin { to { transform: rotate(360deg); } }
 .sm { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); }
-.input-ta { min-height: 44px; max-height: 100px; resize: vertical; font-family: inherit; }
+.input-ta { min-height: 44px; max-height: 100px; resize: vertical; font-family: inherit; background: var(--tint-input-bg); }
 .msg.assistant.empty { display: none; }
 .tool-card { max-width: 95%; margin: 4px 0; align-self: flex-start; border-radius: 10px; padding: 8px 12px; border: 1px solid rgba(var(--surface-rgb), 0.1); font-size: calc(12px * var(--font-scale)); }
 /* 连续 a2a 信封组：一级展开后逐条列出（嵌套缩进 + 左侧竖线提示层级） */
@@ -3804,13 +3811,13 @@ onBeforeUnmount(() => {
 /* —— 行内代码 —— */
 .bubble.markdown code {
   font-family: Consolas, "Courier New", monospace; font-size: calc(11.5px * var(--font-scale));
-  background: rgba(var(--surface-rgb), 0.12); padding: 1px 5px; border-radius: 4px; color: var(--code-ink);
+  background: var(--code-tint-strong); padding: 1px 5px; border-radius: 4px; color: var(--code-ink);
   word-break: break-word;
 }
 
 /* —— 代码块 —— */
 .bubble.markdown pre {
-  background: rgba(var(--surface-rgb), 0.06); padding: 10px 12px; border-radius: 6px;
+  background: var(--code-tint-pre); padding: 10px 12px; border-radius: 6px;
   overflow-x: auto; margin: 6px 0; border: 1px solid rgba(var(--surface-rgb), 0.1);
   max-height: 400px;
 }
@@ -3860,7 +3867,7 @@ onBeforeUnmount(() => {
 /* —— 表格 —— */
 .bubble.markdown table {
   border-collapse: collapse; border: 1px solid rgba(var(--surface-rgb), 0.3);
-  background: rgba(var(--surface-rgb), 0.08); margin: 8px 0; font-size: calc(11.5px * var(--font-scale));
+  background: var(--code-tint-bg); margin: 8px 0; font-size: calc(11.5px * var(--font-scale));
   width: max-content; max-width: 100%; border-radius: 6px; overflow: hidden;
 }
 .bubble.markdown th, .bubble.markdown td {
@@ -3868,10 +3875,10 @@ onBeforeUnmount(() => {
   text-align: left; vertical-align: top; max-width: 350px;
 }
 .bubble.markdown th {
-  background: rgba(var(--surface-rgb), 0.12); font-weight: 600;
+  background: var(--code-tint-strong); font-weight: 600;
   border-bottom: 2px solid rgba(var(--surface-rgb), 0.4); white-space: nowrap;
 }
-.bubble.markdown tbody tr:nth-child(even) td { background: rgba(var(--surface-rgb), 0.04); }
+.bubble.markdown tbody tr:nth-child(even) td { background: var(--code-tint-pre); }
 
 /* —— 图片 —— */
 .bubble.markdown img { max-width: 100%; border-radius: 6px; margin: 4px 0; border: 1px solid rgba(var(--surface-rgb), 0.1); display: inline-block; }
