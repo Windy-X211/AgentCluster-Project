@@ -1943,9 +1943,8 @@ function onMessagesScroll() {
   const el = msgBox.value
   if (!el) return
   stickBottom.value = isNearBottom(el)
-  // 持续记录滚动位置：KeepAlive 切走时 onDeactivated 可能已拿不到正确的 scrollTop
-  // （DOM 被移出文档流），这里在滚动事件中实时保存，保证返回时能还原。
   layout.chatMsgScrollTop = el.scrollTop
+  console.log('[DBG scroll] saved chatMsgScrollTop=', el.scrollTop)
 }
 function onConvListScroll() {
   const el = convListEl.value
@@ -2384,24 +2383,22 @@ onMounted(async () => {
 // 所以主保存点在滚动事件里（onMessagesScroll / onConvListScroll），这里只做兜底。
 function restoreScrollPositions() {
   const mEl = msgBox.value
+  const before = mEl?.scrollTop
   if (mEl) mEl.scrollTop = layout.chatMsgScrollTop
+  console.log('[DBG restore] saved=', layout.chatMsgScrollTop, 'before=', before, 'after=', mEl?.scrollTop, 'sh=', mEl?.scrollHeight)
   const cEl = convListEl.value
   if (cEl) cEl.scrollTop = layout.convListScrollTop
 }
 onMounted(() => {
-  // 组件首次挂载（或 KeepAlive 未命中被重建）时恢复滚动位置
-  nextTick(() => {
-    restoreScrollPositions()
-    requestAnimationFrame(restoreScrollPositions)
-  })
+  console.log('[DBG] onMounted')
+  nextTick(() => { restoreScrollPositions(); requestAnimationFrame(restoreScrollPositions) })
 })
 onActivated(() => {
+  console.log('[DBG] onActivated, store.chatMsgScrollTop=', layout.chatMsgScrollTop)
   document.addEventListener('click', onDocClick)
   document.addEventListener('click', onChatAttachClick, true)   // capture 阶段先触发，避免冒泡被吞
   document.addEventListener('keydown', onDocKey)
   window.addEventListener('keydown', onLightboxKey)
-  // 等 DOM 重新接入并完成布局后再还原滚动位置：nextTick → rAF → setTimeout 多重兜底，
-  // 因为浏览器在元素重新接入文档后可能异步重置 scrollTop。
   nextTick(() => {
     restoreScrollPositions()
     requestAnimationFrame(restoreScrollPositions)
@@ -2409,10 +2406,8 @@ onActivated(() => {
   })
 })
 onDeactivated(() => {
-  // 兜底保存：仅当元素仍在文档流中时才读取 scrollTop。
-  // KeepAlive 切走时 DOM 已被移出文档（isConnected=false），此时 scrollTop 会被浏览器
-  // 重置为 0，若在这里写入会覆盖掉滚动事件中保存的正确值——所以必须跳过。
   const mEl = msgBox.value
+  console.log('[DBG] onDeactivated, isConnected=', mEl?.isConnected, 'el.scrollTop=', mEl?.scrollTop, 'store=', layout.chatMsgScrollTop)
   if (mEl && mEl.isConnected) layout.chatMsgScrollTop = mEl.scrollTop
   const cEl = convListEl.value
   if (cEl && cEl.isConnected) layout.convListScrollTop = cEl.scrollTop
