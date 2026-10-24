@@ -1811,8 +1811,16 @@ async function confirmEditMessage() {
     setTimeout(() => { msgOpStatus.value = '' }, 3000)
     return
   }
+  // 撤销成功后立刻清除状态提示——send() 内部会立即把新用户消息和 assistant 占位
+  // 推入消息列表，界面上马上能看到智能体开始回复，不再需要这条等待提示
+  msgOpStatus.value = ''
   stickBottom.value = true
-  await convs.send(dlg.agentId, text)
+  try {
+    await convs.send(dlg.agentId, text)
+  } catch (e: any) {
+    msgOpStatus.value = '❌ 发送失败: ' + (e?.message || String(e))
+    setTimeout(() => { msgOpStatus.value = '' }, 3000)
+  }
   setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
 }
 
@@ -1944,6 +1952,7 @@ function onMessagesScroll() {
   if (!el) return
   stickBottom.value = isNearBottom(el)
   layout.chatMsgScrollTop = el.scrollTop
+  console.log('[DBG scroll] saved chatMsgScrollTop=', el.scrollTop)
 }
 function onConvListScroll() {
   const el = convListEl.value
@@ -2385,21 +2394,23 @@ onMounted(async () => {
 //      因为 KeepAlive 切走时 DOM 已被移出，scrollTop 会被浏览器重置为 0。
 function restoreScrollPositions() {
   const mEl = msgBox.value
+  const before = mEl?.scrollTop
   if (mEl) mEl.scrollTop = layout.chatMsgScrollTop
+  console.log('[DBG restore] saved=', layout.chatMsgScrollTop, 'before=', before, 'after=', mEl?.scrollTop, 'sh=', mEl?.scrollHeight)
   const cEl = convListEl.value
   if (cEl) cEl.scrollTop = layout.convListScrollTop
 }
 onMounted(() => {
   // 组件首次挂载（或 KeepAlive 未命中被重建）时恢复滚动位置
+  console.log('[DBG] onMounted')
   nextTick(() => { restoreScrollPositions(); requestAnimationFrame(restoreScrollPositions) })
 })
 onActivated(() => {
+  console.log('[DBG] onActivated, store.chatMsgScrollTop=', layout.chatMsgScrollTop)
   document.addEventListener('click', onDocClick)
   document.addEventListener('click', onChatAttachClick, true)   // capture 阶段先触发，避免冒泡被吞
   document.addEventListener('keydown', onDocKey)
   window.addEventListener('keydown', onLightboxKey)
-  // 等 DOM 重新接入并完成布局后再还原滚动位置：nextTick → rAF → setTimeout 多重兜底，
-  // 因为浏览器在元素重新接入文档后可能异步重置 scrollTop。
   nextTick(() => {
     restoreScrollPositions()
     requestAnimationFrame(restoreScrollPositions)
@@ -2411,6 +2422,7 @@ onDeactivated(() => {
   // KeepAlive 切走时 DOM 已被移出文档（isConnected=false），此时 scrollTop 会被浏览器
   // 重置为 0，若在这里写入会覆盖掉 onBeforeRouteLeave / 滚动事件中保存的正确值。
   const mEl = msgBox.value
+  console.log('[DBG] onDeactivated, isConnected=', mEl?.isConnected, 'el.scrollTop=', mEl?.scrollTop, 'store=', layout.chatMsgScrollTop)
   if (mEl && mEl.isConnected) layout.chatMsgScrollTop = mEl.scrollTop
   const cEl = convListEl.value
   if (cEl && cEl.isConnected) layout.convListScrollTop = cEl.scrollTop

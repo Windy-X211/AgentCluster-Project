@@ -57,6 +57,26 @@ tool.py：标准 run(**kwargs) 返回 dict。
 import importlib.util, sys, re, json, hashlib
 from pathlib import Path
 from typing import Any
+import contextvars
+import threading
+
+_STOP_EVENT_CTX: contextvars.ContextVar = contextvars.ContextVar("plugin_stop_event", default=None)
+
+
+def set_stop_event(event):
+    """设置当前上下文的停止事件，agent_reply 开始时调用。返回 reset token。"""
+    return _STOP_EVENT_CTX.set(event)
+
+
+def get_stop_event():
+    """获取当前上下文的停止事件，插件在长轮询中检查 is_set()。"""
+    return _STOP_EVENT_CTX.get()
+
+
+def reset_stop_event(token):
+    """恢复停止事件 ContextVar，agent_reply finally 中调用。"""
+    _STOP_EVENT_CTX.reset(token)
+
 
 import core.store as _store
 from core.dependency_manager import parse_dependencies, ensure_dependencies

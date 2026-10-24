@@ -1543,6 +1543,7 @@ COMMAND_CN_LABELS = {
     "cmd.bg_stop": "🛑 停止进程",
     "cmd.bg_log": "📜 进程日志",
     "cluster.list_agents": "👥 列出智能体",
+    "cluster.list_capabilities": "🧩 查询可用能力",
     "cluster.create_agent": "🤖 创建智能体",
     "cluster.update_agent": "✏️ 更新智能体",
     "cluster.delete_agent": "🗑 删除智能体",
@@ -2058,6 +2059,51 @@ def cmd_cluster_assign_agent_group(agent_id: int | str,
     return {"ok": True, "agent": {"id": a["id"], "name": a["name"], "group_id": group_id}}
 
 
+def cmd_cluster_list_capabilities() -> dict:
+    """返回系统中所有可用的命令、技能、插件清单（含描述信息），供编排师在创建智能体时主动配置能力。"""
+    from plugins import list_plugins as _list_plugins
+    from skills import list_skills as _list_skills
+    # 命令：从 COMMAND_GROUPS 构建按组分类的清单（排除 runtime 注入的 skill.invoke 等）
+    commands_by_group: dict[str, list[dict]] = {}
+    hidden = RUNTIME_INJECTED_COMMANDS
+    for t in COMMAND_TOOLS:
+        name = t["function"]["name"]
+        if name in hidden or not name.startswith(("file.", "workspace.", "cmd.", "cluster.")):
+            continue
+        meta = COMMAND_META.get(name, {})
+        group = meta.get("group", "其他")
+        commands_by_group.setdefault(group, []).append({
+            "name": name,
+            "label": meta.get("label", name),
+            "description": t["function"].get("description", ""),
+            "params": meta.get("params", []),
+        })
+    # 技能：只返回 name / label / description
+    skills = _list_skills()
+    skill_list = [{
+        "name": k,
+        "label": v.get("label", k),
+        "description": v.get("description", ""),
+    } for k, v in skills.items()]
+    # 插件：只返回 name / label / description
+    plugins = _list_plugins()
+    plugin_list = [{
+        "name": k,
+        "label": v.get("label", k),
+        "description": v.get("description", ""),
+    } for k, v in plugins.items()]
+    return {
+        "commands": commands_by_group,
+        "skills": skill_list,
+        "plugins": plugin_list,
+        "_tips": [
+            "创建智能体时请根据其职责从上述列表中选择合适的 commands / skills / plugins 配置进去，不要留空",
+            "命令 (commands) 是内建工具，技能 (skills) 是专业工作流，插件 (plugins) 是外部功能扩展",
+            "cluster.* 系列命令已默认给编排师自己使用，不需要分配给普通智能体",
+        ],
+    }
+
+
 # ---- cluster.* 的 OpenAI function calling schema ----
 CLUSTER_TOOLS = [
     {
@@ -2071,8 +2117,16 @@ CLUSTER_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "cluster.list_capabilities",
+            "description": "返回系统中所有可用的命令、技能、插件清单（含名称和描述）。在创建或修改智能体之前先调用此工具，了解有哪些能力可以分配给智能体，然后根据智能体的职责主动配置 commands / skills / plugins。",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "cluster.create_agent",
-            "description": "创建一个新的智能体，包含名称、系统提示词、可选的命令/技能/插件列表。返回新智能体的完整信息。",
+            "description": "创建一个新的智能体。强烈建议在调用前先执行 cluster.list_capabilities 了解有哪些命令/技能/插件可用，然后根据这个智能体的职责主动配置 commands、skills、plugins（不要留空）。返回新智能体的完整信息。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2080,9 +2134,9 @@ CLUSTER_TOOLS = [
                     "description": {"type": "string", "description": "一句话描述这个智能体的职责"},
                     "system_prompt": {"type": "string", "description": "系统提示词，详细定义这个智能体的角色、工作方式和边界"},
                     "model": {"type": "string", "description": "可选：指定使用的模型，留空则用默认"},
-                    "commands": {"type": "array", "items": {"type": "string"}, "description": "可选：这个智能体加载的命令工具列表"},
-                    "skills": {"type": "array", "items": {"type": "string"}, "description": "可选：加载的技能列表"},
-                    "plugins": {"type": "array", "items": {"type": "string"}, "description": "可选：加载的插件列表"},
+                    "commands": {"type": "array", "items": {"type": "string"}, "description": "建议填写：这个智能体加载的命令工具列表（如 file.read、file.write、cmd.run 等）。可用 cluster.list_capabilities 查询所有可用命令名称"},
+                    "skills": {"type": "array", "items": {"type": "string"}, "description": "建议填写：加载的技能列表（如 pptx、novel_writing 等）。可用 cluster.list_capabilities 查询所有可用技能名称"},
+                    "plugins": {"type": "array", "items": {"type": "string"}, "description": "建议填写：加载的插件列表（如 browser_control、send_email 等）。可用 cluster.list_capabilities 查询所有可用插件名称"},
                     "max_tool_rounds": {"type": "integer", "description": "可选：单次回复最大工具调用轮数（默认取全局设置 50）"},
                     "group_id": {"type": "integer", "description": "可选：智能体所属分组 id（用 cluster.list_groups 查询）；省略=未分组"}
                 },
@@ -2094,7 +2148,7 @@ CLUSTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "cluster.update_agent",
-            "description": "更新一个已存在智能体的属性（名称、提示词、工具列表等）。agent_id 必填，其余仅传要改的字段。",
+            "description": "更新一个已存在智能体的属性（名称、提示词、工具列表等）。agent_id 必填，其余仅传要改的字段。如需修改 commands / skills / plugins，建议先执行 cluster.list_capabilities 查询当前可用的能力清单。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2390,7 +2444,8 @@ COMMAND_GROUPS = [
     ("工作区检索", ["workspace.search"]),
     ("命令运行", ["cmd.run", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
     ("集群编排", [
-        "cluster.list_agents", "cluster.create_agent", "cluster.update_agent", "cluster.delete_agent",
+        "cluster.list_agents", "cluster.list_capabilities",
+        "cluster.create_agent", "cluster.update_agent", "cluster.delete_agent",
         "cluster.list_groups", "cluster.create_group", "cluster.update_group",
         "cluster.delete_group", "cluster.assign_agent_group",
         "cluster.list_canvases", "cluster.create_canvas", "cluster.delete_canvas",

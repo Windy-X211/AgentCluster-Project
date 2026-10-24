@@ -38,14 +38,6 @@ FLAG_MAP = {
     "deleted":   ("+FLAGS", "\\Deleted"),
 }
 
-# ===== 监听状态（模块级，跨调用保持）=====
-_listen_thread: threading.Thread | None = None
-_listen_stop_event: threading.Event | None = None
-_listen_state: dict[str, Any] = {"running": False}
-_new_mail_queue: list[dict] = []
-_queue_lock = threading.Lock()
-_notified_uids: set[str] = set()
-
 
 # ===== modified UTF-7 编解码（RFC 3501 5.1.3，用于中文文件夹名）=====
 def _utf7_encode(s: str) -> str:
@@ -634,107 +626,92 @@ def _handle_organize(kw: dict) -> dict:
 
 
 # ===== 监听 =====
-def _handle_listen_start(kw: dict) -> dict:
-    global _listen_thread, _listen_stop_event, _listen_state
-    if _listen_state.get("running") and _listen_thread and _listen_thread.is_alive():
-        return {"ok": False, "error": "监听已在运行", "code": "ALREADY_RUNNING"}
+def _handle_listen_wait(kw: dict) -> dict:
+    """同步阻塞等待新邮件：记录监听开始时已有邮件 UID，只返回之后新到的邮件。"""
     err = _check_imap_params(kw)
     if err:
         return err
     imap_server, imap_port = _resolve_imap(kw)
     username, password = kw["username"], kw["password"]
     folder = kw.get("folder", "") or "INBOX"
-    interval = int(kw.get("check_interval", 60) or 60)
+    timeout = int(kw.get("timeout", 120) or 120)
+    interval = max(int(kw.get("check_interval", 30) or 30), 5)
     mark_as_read = kw.get("mark_as_read", True)
+    from_filter = (kw.get("from_filter", "") or "").lower()
+    subject_filter = (kw.get("subject_filter", "") or "").lower()
+    limit = int(kw.get("limit", 1) or 1)
 
-    _listen_stop_event = threading.Event()
-    _listen_state = {
-        "running": True,
-        "folder": folder,
-        "interval": interval,
-        "last_check": "",
-        "total_new": 0,
-        "error": None,
-        "mark_as_read": mark_as_read,
-    }
-    _notified_uids.clear()
-    with _queue_lock:
-        _new_mail_queue.clear()
+    deadline = time.time() + timeout
 
-    _listen_thread = threading.Thread(
-        target=_listen_loop,
-        args=(imap_server, imap_port, username, password, folder, interval, mark_as_read, _listen_stop_event),
-        daemon=True,
-    )
-    _listen_thread.start()
-    return {"ok": True, "data": {"message": "监听已启动", "folder": folder, "interval": interval}}
+    # 获取停止事件（智能体停止时 set，listen_wait 据此自动退出）
+    stop_event = None
+    try:
+        import plugins as _plugins
+        stop_event = _plugins.get_stop_event()
+    except Exception:
+        pass
 
+    # 记录监听开始时已有邮件 UID 作为基准集，只返回之后新到的邮件
+    baseline_uids: set[str] = set()
+    try:
+        conn = _imap_connect(imap_server, imap_port, username, password)
+        _select_folder(conn, folder)
+        typ, data = conn.uid("search", None, "ALL")
+        if typ == "OK":
+            if data and data[0]:
+                baseline_uids = {uid.decode() for uid in data[0].split()}
+        else:
+            conn.logout()
+            return {"ok": False, "error": "获取基准邮件列表失败", "code": "IMAP_ERROR"}
+        conn.logout()
+    except Exception as e:
+        return {"ok": False, "error": f"连接邮箱失败: {e}", "code": "IMAP_ERROR"}
 
-def _handle_listen_stop(kw: dict) -> dict:
-    global _listen_thread, _listen_stop_event, _listen_state
-    if not _listen_state.get("running"):
-        return {"ok": False, "error": "监听未运行", "code": "NOT_RUNNING"}
-    if _listen_stop_event:
-        _listen_stop_event.set()
-    if _listen_thread:
-        _listen_thread.join(timeout=5)
-    _listen_state["running"] = False
-    return {"ok": True, "data": {"message": "监听已停止", "total_new": _listen_state.get("total_new", 0)}}
-
-
-def _handle_listen_status(kw: dict) -> dict:
-    with _queue_lock:
-        queue_size = len(_new_mail_queue)
-    return {"ok": True, "data": {**_listen_state, "queue_size": queue_size}}
-
-
-def _handle_fetch_new(kw: dict) -> dict:
-    with _queue_lock:
-        mails = list(_new_mail_queue)
-        _new_mail_queue.clear()
-    return {"ok": True, "data": {"count": len(mails), "mails": mails}}
-
-
-def _listen_loop(imap_server: str, imap_port: int, username: str, password: str,
-                 folder: str, interval: int, mark_as_read: bool, stop_event: threading.Event) -> None:
-    global _listen_state, _notified_uids
-    while not stop_event.is_set():
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            remaining = round(max(0, deadline - time.time()), 1)
+            return {"ok": True, "data": {"mails": [], "count": 0, "timeout": False, "stopped": True, "remaining_time": remaining}}
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return {"ok": True, "data": {"mails": [], "count": 0, "timeout": True, "remaining_time": 0}}
         try:
             conn = _imap_connect(imap_server, imap_port, username, password)
             _select_folder(conn, folder)
-            typ, data = conn.uid("search", None, "UNSEEN")
-            new_mails = []
+            typ, data = conn.uid("search", None, "ALL")
+            matched: list[dict] = []
             if typ == "OK" and data and data[0]:
-                uids = data[0].split()
-                for uid in uids:
+                new_uids = [uid for uid in data[0].split() if uid.decode() not in baseline_uids]
+                for uid in new_uids:
                     uid_s = uid.decode()
-                    if not mark_as_read and uid_s in _notified_uids:
-                        continue
                     typ2, d = conn.uid("fetch", uid, "(RFC822)")
-                    if typ2 == "OK" and d and d[0]:
-                        raw = d[0][1] if isinstance(d[0], tuple) else b""
-                        mail = _parse_mail(raw, include_body=True)
-                        mail["uid"] = uid_s
-                        mail["folder"] = folder
-                        new_mails.append(mail)
+                    if typ2 != "OK" or not d or not d[0]:
+                        continue
+                    raw = d[0][1] if isinstance(d[0], tuple) else b""
+                    mail = _parse_mail(raw, include_body=True)
+                    mail["uid"] = uid_s
+                    mail["folder"] = folder
+                    if from_filter:
+                        senders = mail.get("from", [])
+                        sender_str = " ".join(s.get("addr", "") + " " + s.get("name", "") for s in senders).lower()
+                        if from_filter not in sender_str:
+                            continue
+                    if subject_filter and subject_filter not in mail.get("subject", "").lower():
+                        continue
+                    matched.append(mail)
                     if mark_as_read:
                         conn.uid("STORE", uid, "+FLAGS", "\\Seen")
-                    else:
-                        _notified_uids.add(uid_s)
-                        if len(_notified_uids) > 2000:
-                            _notified_uids.clear()
-                            _notified_uids.add(uid_s)
+                    if len(matched) >= limit:
+                        break
             conn.logout()
-            if new_mails:
-                with _queue_lock:
-                    _new_mail_queue.extend(new_mails)
-                _listen_state["total_new"] = _listen_state.get("total_new", 0) + len(new_mails)
-            _listen_state["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            _listen_state["error"] = None
-        except Exception as e:
-            _listen_state["error"] = str(e)
-        stop_event.wait(interval)
-    _listen_state["running"] = False
+            if matched:
+                remaining = round(max(0, deadline - time.time()), 1)
+                return {"ok": True, "data": {"mails": matched, "count": len(matched), "timeout": False, "remaining_time": remaining}}
+        except Exception:
+            pass
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return {"ok": True, "data": {"mails": [], "count": 0, "timeout": True, "remaining_time": 0}}
+        time.sleep(min(interval, remaining))
 
 
 # ===== 辅助 =====
@@ -766,10 +743,8 @@ def run(**kwargs) -> dict[str, Any]:
         "move": _handle_move,
         "mark": _handle_mark,
         "organize": _handle_organize,
-        "listen_start": _handle_listen_start,
-        "listen_stop": _handle_listen_stop,
-        "listen_status": _handle_listen_status,
-        "fetch_new": _handle_fetch_new,
+
+        "listen_wait": _handle_listen_wait,
     }
 
     handler = handlers.get(action)
@@ -791,4 +766,4 @@ PLUGIN_PARAMS = ["action", "provider", "username", "password", "smtp_server", "s
                  "imap_server", "imap_port", "folder", "target_folder", "mail_id", "mail_ids",
                  "flag", "limit", "offset", "download_dir", "mark_as_read",
                  "from_filter", "subject_filter", "since_date", "before_date", "unseen_only",
-                 "delete_mode", "clean_folders", "organize_rule", "keyword_map", "check_interval"]
+                 "delete_mode", "clean_folders", "organize_rule", "keyword_map", "check_interval", "timeout"]
