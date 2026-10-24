@@ -9,24 +9,29 @@ const loaded = ref(false)
 const err = ref('')
 
 async function reload() {
-  try {
-    list.value = await api.backgrounds.list()
-  } catch (e: any) {
-    err.value = e?.message || String(e)
+  // 后端启动可能晚于前端，首次请求可能失败，重试几次
+  for (let i = 0; i < 5; i++) {
+    try {
+      list.value = await api.backgrounds.list()
+      err.value = ''
+      return
+    } catch (e: any) {
+      err.value = e?.message || String(e)
+      await new Promise(r => setTimeout(r, 300 * (i + 1)))
+    }
   }
 }
 
-onMounted(async () => {
-  await reload()
+onMounted(() => {
   loaded.value = true
 })
 
-// 当前选中的背景不在列表中时（如刚上传的新背景），重新加载列表
+// 启动恢复与手动切换走同一逻辑：选中背景不在列表中则重新加载
 watch(() => layout.backgroundId, async (id) => {
   if (id && !list.value.some(b => b.id === id)) {
     await reload()
   }
-})
+}, { immediate: true })
 
 const current = computed(() =>
   layout.backgroundId ? list.value.find(b => b.id === layout.backgroundId) || null : null
