@@ -21,6 +21,10 @@ watch(() => layout.theme, applyTheme, { immediate: true })
 
 <template>
   <BackgroundLayer />
-  <RouterView />
+  <RouterView v-slot="{ Component }">
+    <KeepAlive :include="['Home']">
+      <component :is="Component" />
+    </KeepAlive>
+  </RouterView>
   <GuideManager />
 </template>
