@@ -2,6 +2,12 @@
 !/AppData/plugins/
 !/AppData/skills/
 !/AppData/backgrounds/
+!/AppData/agents/
+/AppData/agents/*
+!/AppData/agents/8.json
+!/AppData/agents/24.json
+!/AppData/agents/27.json
+!/AppData/agents/38.json
 /AppData/plugins/changzheng_machine/
 /outputs/
 /.trae
