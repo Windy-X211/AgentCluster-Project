@@ -24,10 +24,8 @@ parameters:
       - "move"
       - "mark"
       - "organize"
-      - "listen_start"
-      - "listen_stop"
-      - "listen_status"
-      - "fetch_new"
+
+      - "listen_wait"
 
   - name: "provider"
     type: string
@@ -217,8 +215,14 @@ parameters:
   - name: "check_interval"
     type: integer
     required: false
-    default: 60
-    description: "监听检查间隔秒数（listen_start用，默认60）"
+    default: 30
+    description: "监听轮询间隔秒数（listen_wait用，默认30）"
+
+  - name: "timeout"
+    type: integer
+    required: false
+    default: 120
+    description: "同步等待超时秒数（listen_wait用，默认120，无上限）。收到邮件立即返回，超时返回空。返回含remaining_time剩余监听秒数"
 
 outputs:
   - name: "ok"

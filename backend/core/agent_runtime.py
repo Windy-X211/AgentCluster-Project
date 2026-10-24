@@ -16,7 +16,7 @@
   ⚠️ 行协议用 \n 做分隔符，因此 T:/RN: 等载荷文本中的 \n 必须在 yield 前用
      _esc 转义为 \\n，前端收到后用 _unesc 还原。
 """
-import json, asyncio, os, time, re, logging
+import json, asyncio, os, time, re, logging, threading
 from datetime import datetime
 from typing import Any
 from core.store import load, save, upsert, get_by, next_id
@@ -29,7 +29,7 @@ from core.a2a import (
     render_envelope, mark_envelope_done, CALL_TOOL, A2A_HANDOFF_ENABLED,
     _resolve_target,
 )
-from plugins import PLUGIN_REGISTRY, run_plugin
+from plugins import PLUGIN_REGISTRY, run_plugin, set_stop_event, reset_stop_event
 from core.validator import verify_completion
 
 logger = logging.getLogger("agent_runtime")
@@ -801,12 +801,13 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         parts.append(f"\n【集群上下文】{cluster_context}")
     prompt = "\n".join(parts)
     # —— 动态替换存储路径占位符 ——
-    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {storage_root}，
+    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root}，
     # 与 store.ROOT 保持同步（用户在设置里切换存储根后自动生效）。
     try:
         _root = str(store.ROOT)
         prompt = prompt.replace("{skills_dir}", str(store.ROOT / "skills"))
         prompt = prompt.replace("{plugins_dir}", str(store.ROOT / "plugins"))
+        prompt = prompt.replace("{bg_dir}", str(store.ROOT / "backgrounds"))
         prompt = prompt.replace("{storage_root}", _root)
     except Exception:
         pass
@@ -1256,6 +1257,8 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
             return
     turn["current_agent_id"] = agent.get("id")
     token = TURN_CTX.set(turn)
+    _stop_event = threading.Event()
+    _stop_token = set_stop_event(_stop_event)
 
     # —— 注入 WORKDIR_CTX：画布有 workdir 则优先使用，否则让 commands.py 回落到 settings.default_workdir ——
     _workdir = (canvas or {}).get("workdir") if canvas else None
@@ -1308,6 +1311,8 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
             yield f"E:❌ 运行时异常：{e}\n"
             yield "DONE\n"
     finally:
+        _stop_event.set()
+        reset_stop_event(_stop_token)
         TURN_CTX.reset(token)
         if _wd_token is not None:
             WORKDIR_CTX.reset(_wd_token)

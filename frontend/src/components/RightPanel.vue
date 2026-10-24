@@ -1810,8 +1810,16 @@ async function confirmEditMessage() {
     setTimeout(() => { msgOpStatus.value = '' }, 3000)
     return
   }
+  // 撤销成功后立刻清除状态提示——send() 内部会立即把新用户消息和 assistant 占位
+  // 推入消息列表，界面上马上能看到智能体开始回复，不再需要这条等待提示
+  msgOpStatus.value = ''
   stickBottom.value = true
-  await convs.send(dlg.agentId, text)
+  try {
+    await convs.send(dlg.agentId, text)
+  } catch (e: any) {
+    msgOpStatus.value = '❌ 发送失败: ' + (e?.message || String(e))
+    setTimeout(() => { msgOpStatus.value = '' }, 3000)
+  }
   setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
 }
 
