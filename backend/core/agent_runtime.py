@@ -497,6 +497,13 @@ def _sanitize_tool_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, 
     # 需要重点清洗的字段名（URL/selector 类）
     _URL_FIELDS = {"url", "link", "href", "target_url", "download_url"}
     _SELECTOR_FIELDS = {"selector", "selectors", "css", "xpath"}
+    # 内容型字段：值是文件正文 / 代码 / 邮件正文的原始文本，首尾空白、缩进、
+    # 代码围栏都是内容本身，绝不能 trim 或去反引号（否则会静默改写内容，
+    # 例如 file.patch 的 new 缩进被裁掉后变成无改动，却仍返回成功）。
+    _RAW_FIELDS = {
+        "content", "old", "new", "code", "js", "text", "body", "html",
+        "prompt", "script", "source", "markdown", "template",
+    }
 
     def _clean_str(val: str, field: str) -> str:
         s = val.strip()
@@ -516,8 +523,12 @@ def _sanitize_tool_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, 
 
     cleaned: dict[str, Any] = {}
     for k, v in args.items():
-        if isinstance(v, str) and v and k.lower() in (_URL_FIELDS | _SELECTOR_FIELDS | {"text", "js", "code", "query"}):
-            cleaned[k] = _clean_str(v, k.lower())
+        key = k.lower()
+        if isinstance(v, str) and v and key in _RAW_FIELDS:
+            # 内容型字段原样透传，保留缩进/换行/首尾空白
+            cleaned[k] = v
+        elif isinstance(v, str) and v and key in (_URL_FIELDS | _SELECTOR_FIELDS | {"query"}):
+            cleaned[k] = _clean_str(v, key)
         elif isinstance(v, str) and v:
             # 其他字符串也轻量清洗（去首尾反引号 + trim）
             cleaned[k] = _re.sub(r'^`{1,3}|`{1,3}$', '', v).strip()

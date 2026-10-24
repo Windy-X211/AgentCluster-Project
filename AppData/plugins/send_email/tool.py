@@ -1,7 +1,7 @@
 """send_email 插件 — 邮箱全功能管理（发送/读取/清理/整理/监听）
 
 action 分发：send / list / read / search / folders / delete / clean / move / mark / organize
-             / listen_start / listen_stop / listen_status / fetch_new
+             / listen_wait
 """
 import base64
 import imaplib
@@ -727,10 +727,40 @@ def _collect_ids(kw: dict) -> list[str]:
 
 
 # ===== 入口 =====
+def _provider_from_addr(addr: str) -> str:
+    """按邮箱域名推断 provider，避免只配了 from_addr 时还要手填服务商。"""
+    a = (addr or "").strip().lower()
+    if "@" not in a:
+        return ""
+    domain = a.rsplit("@", 1)[1]
+    if domain.endswith("exmail.qq.com"):
+        return "exmail"
+    if domain == "qq.com":
+        return "qq"
+    if domain == "163.com":
+        return "163"
+    if domain in ("gmail.com", "googlemail.com"):
+        return "gmail"
+    if domain in ("outlook.com", "hotmail.com", "live.com", "office365.com"):
+        return "outlook"
+    return ""
+
+
+def _normalize_kwargs(kw: dict) -> None:
+    """兼容能力参数预设：预设通常只固定 from_addr + password，
+    而各 action 内部统一读 username；这里把 from_addr 兜底为 username，
+    并按邮箱域名自动补 provider，避免每次调用都因缺参被 AUTH_REQUIRED/PARAM_MISSING 拦下。"""
+    if not kw.get("username"):
+        kw["username"] = kw.get("from_addr") or ""
+    if not kw.get("provider"):
+        kw["provider"] = _provider_from_addr(kw.get("username") or kw.get("from_addr") or "")
+
+
 def run(**kwargs) -> dict[str, Any]:
     action = kwargs.get("action", "")
     if not action and kwargs.get("to_addrs"):
         action = "send"
+    _normalize_kwargs(kwargs)
 
     handlers = {
         "send": _handle_send,

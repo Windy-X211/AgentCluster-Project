@@ -30,7 +30,8 @@
     "cluster.create_group",
     "cluster.update_group",
     "cluster.delete_group",
-    "cluster.assign_agent_group"
+    "cluster.assign_agent_group",
+    "cluster.list_capabilities"
   ],
   "skills": [],
   "plugins": [],

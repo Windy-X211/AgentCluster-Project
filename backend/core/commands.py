@@ -7,6 +7,8 @@
   - 绝对路径原样使用（无论哪种模式）。
 """
 import os, subprocess, shutil, re, signal, socket, time, threading
+import base64
+import locale
 from pathlib import Path
 from typing import Any, Callable
 from contextvars import ContextVar
@@ -116,6 +118,73 @@ def _probe_port(port: int, host: str = "127.0.0.1", timeout: float = 2.0) -> dic
         return {"ok": False, "note": f"端口 {port} 尚未就绪（{type(e).__name__}）"}
 
 
+def _decode_console(data: bytes) -> str:
+    """解码子进程输出：Windows 上 cmd 内置命令多按本地代码页（中文为 GBK）输出，
+    直接按 UTF-8 解码会得到乱码。这里优先 UTF-8，失败再回退本地编码。"""
+    if not data:
+        return ""
+    encs = ["utf-8", locale.getpreferredencoding(False) or "gbk", "gbk"]
+    for enc in encs:
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_log_text(log_path: str, limit: int = 4000) -> str:
+    """读取后台日志（按本地编码容错解码），返回末尾 limit 字符。"""
+    try:
+        with open(log_path, "rb") as lf:
+            raw = lf.read()
+    except Exception:
+        return ""
+    return _decode_console(raw)[-limit:]
+
+
+# PowerShell 专属的命令入口 / 关键字：cmd.run 默认走 cmd.exe，
+# 这些写法在 cmd.exe 下必然报「不是内部或外部命令」，需要自动转 PowerShell 执行。
+_PS_CMDLETS = {
+    "start-sleep", "write-output", "write-host", "get-date", "test-path",
+    "new-item", "remove-item", "copy-item", "move-item", "rename-item",
+    "get-childitem", "get-content", "set-content", "add-content", "out-file",
+    "get-process", "stop-process", "start-process", "wait-process",
+    "get-service", "start-service", "stop-service", "get-item", "join-path",
+    "split-path", "resolve-path", "get-location", "set-location",
+    "select-object", "where-object", "foreach-object", "sort-object",
+    "measure-object", "invoke-webrequest", "invoke-restmethod", "get-help",
+    "get-command", "get-module", "import-module", "clear-host",
+}
+
+
+def _is_powershell_command(command: str) -> bool:
+    """粗略判断命令是否使用了 PowerShell 语法（cmdlet / $env: / 变量赋值等）。"""
+    if not command:
+        return False
+    lower = command.strip().lower()
+    if lower.startswith("powershell") or lower.startswith("pwsh"):
+        return False  # 已经显式指定解释器，交给 shell 原样执行
+    if "$env:" in lower or re.search(r'\bset-\w+', lower):
+        return True
+    segments = re.split(r'\s*(?:&&|\|\||[&|;])\s*', lower)
+    for seg in segments:
+        first = seg.strip().split()[0] if seg.strip() else ""
+        if first in _PS_CMDLETS:
+            return True
+    return False
+
+
+def _wrap_powershell(command: str) -> str:
+    """把 PowerShell 命令包装成可在 cmd.exe 下安全执行的单行调用。
+
+    用 -EncodedCommand（UTF-16LE + Base64）避免引号/换行转义问题；
+    同时把输出编码设为 UTF-8，保证中文输出可读。
+    """
+    script = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;" + command
+    b64 = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {b64}"
+
+
 def _cleanup_dead_bg() -> None:
     """清理已退出的后台进程（从字典中移除）。"""
     with _BG_LOCK:
@@ -177,7 +246,8 @@ def _is_gui_launch(command: str) -> bool:
     return False
 
 
-def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
+def _start_bg_process(command: str, cwd: str, shell: bool = True,
+                      classify_command: str | None = None) -> dict:
     """在后台启动一条长运行 / GUI 命令，立即返回状态。
 
     两类场景都走这里：
@@ -185,9 +255,13 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
       (b) GUI 启动（start / 浏览器...）→ Popen 只是 shell 包装（cmd.exe），
           它会很快退出；真正的 GUI 子进程脱离出来独立运行。
           这种情况下 Popen 的退出是正常的，不算"秒挂"。
+
+    classify_command：用于长运行/GUI/端口识别的原始命令。command 可能已被包装
+    （如 PowerShell -EncodedCommand），此时用原始命令做分类更准确。
     """
     import tempfile
     _cleanup_dead_bg()
+    classify = classify_command if classify_command is not None else command
 
     # 把 stdout/stderr 重定向到独立日志文件（Windows 上用 subprocess.DEVNULL 可能丢日志）
     log_dir = os.path.join(tempfile.gettempdir(), "agent_cluster_bg")
@@ -195,7 +269,7 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
     log_path = os.path.join(log_dir, f"bg_{os.getpid()}_{int(time.time())}.log")
 
     try:
-        log_fh = open(log_path, "w", encoding="utf-8", errors="ignore")
+        log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
     except Exception:
         log_fh = None
 
@@ -217,23 +291,30 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
     except Exception as e:
         if log_fh: log_fh.close()
         return {"error": f"后台启动失败: {e}", "command": command}
+    finally:
+        # 父进程不再需要写端：子进程已继承句柄，关闭避免句柄泄漏 / 日志尾巴不落盘
+        if log_fh:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
 
     pid = proc.pid
     # GUI 启动命令不把 shell wrapper 的 pid 记入后台表（它会秒退），
     # 直接跳过，让后续逻辑按"已启动"处理
-    gui_cmd = _is_gui_launch(command)
+    gui_cmd = _is_gui_launch(classify)
     if not gui_cmd:
         with _BG_LOCK:
             _BG_PROCESSES[pid] = {
                 "proc": proc,
-                "command": command,
+                "command": classify,
                 "cwd": cwd,
                 "started_at": time.time(),
                 "log_path": log_path,
             }
 
     # 快速探活：等一小会儿看端口
-    port = _extract_port(command)
+    port = _extract_port(classify)
     probe = None
     if port:
         # 最多试 3 次，每次间隔 0.6s（总共等 ~2s）
@@ -278,19 +359,31 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
     else:
         # 常驻服务：Popen 进程必须还活着
         if not still_alive:
-            # 秒挂 → 记录日志，返回 error
             with _BG_LOCK:
                 _BG_PROCESSES.pop(pid, None)
-            tail = ""
-            if os.path.isfile(log_path):
-                try:
-                    with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
-                        tail = lf.read()[-2000:]
-                except Exception:
-                    pass
+            tail = _read_log_text(log_path, 4000)
+            exit_code = proc.returncode
+            if exit_code == 0:
+                # 被关键词误判成长运行的短命令（如 node -e / python -c），
+                # 实际已经正常执行完毕 —— 这是成功，不是"秒挂"，返回完整输出
+                return {
+                    "ok": True,
+                    "completed": True,
+                    "returncode": 0,
+                    "stdout": tail,
+                    "stderr": "",
+                    "command": command,
+                    "classify_command": classify,
+                    "cwd": cwd,
+                    "background": False,
+                    "note": "命令已执行完成（快速退出，exit_code=0）",
+                }
+            # 非零退出 → 真正的启动/执行失败
             return {
-                "error": f"进程启动后立即退出（exit_code={proc.returncode}）",
+                "error": f"进程启动后立即退出（exit_code={exit_code}）",
+                "returncode": exit_code,
                 "stdout_tail": tail,
+                "stderr": tail,
                 "log_path": log_path,
                 "command": command,
             }
@@ -311,7 +404,7 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True) -> dict:
     result = {
         "ok": True,
         "pid": pid if still_alive else None,
-        "command": command,
+        "command": classify,
         "cwd": cwd,
         "running": still_alive if not gui_cmd else True,
         "background": True,
@@ -802,57 +895,99 @@ def cmd_file_delete(path: str, recursive: bool = False) -> dict:
 def cmd_file_replace(path: str, old: str, new: str, max_replacements: int = -1) -> dict:
     try:
         p = _resolve(path)
-        # 快照
-        _snapshot(str(p), "file.replace")
         text = p.read_text(encoding="utf-8")
         count = text.count(old)
-        if max_replacements > 0: text = text.replace(old, new, max_replacements)
-        else: text = text.replace(old, new)
+        if count == 0:
+            return {"error": "old 文本在文件中未找到，未做任何修改；请先 file.read 确认原文",
+                    "path": str(p)}
+        _snapshot(str(p), "file.replace")
+        replaced = count if max_replacements <= 0 else min(count, max_replacements)
+        text = text.replace(old, new, -1 if max_replacements <= 0 else max_replacements)
         p.write_text(text, encoding="utf-8")
-        return {"ok": True, "path": str(p), "replaced": count}
+        return {"ok": True, "path": str(p), "replaced": replaced,
+                "occurrences": count, "new_size": p.stat().st_size}
     except Exception as e:
         return {"error": str(e), "resolved": str(_resolve(path))}
 
 
 def cmd_file_patch(path: str, old: str, new: str, mode: str = "replace") -> dict:
-    """按行定位的定点编辑：只改文件中包含锚点 old 的那一行及其插入位置，
-    不动其他任何内容，避免为了改一处而重写整个文件。
+    """按锚点定位的定点编辑：只改锚点所在位置，不动其他任何内容。
 
     mode：
-      replace     —— 把该行内 old 片段换成 new
-      delete      —— 删掉该行内的 old 片段
-      insert_after —— 在锚点整行之后插入 new（按完整行追加）
-      insert_before—— 在锚点整行之前插入 new（按完整行追加）
-    锚点 old 必须完整落在同一行内（跨行锚点会报错），保证定位精确。
+      replace      —— 把 old 片段换成 new（old/new 都可以跨行）
+      delete       —— 删掉 old 片段
+      insert_after —— 在锚点最后一行之后插入 new（按完整行追加）
+      insert_before—— 在锚点第一行之前插入 new（按完整行追加）
+
+    锚点匹配规则：
+      - old 可以是单行片段，也可以跨行（含 \\n）；比对前统一换行符，CRLF 文件也能匹配；
+      - 只替换第一处命中，occurrences 会告知总命中数，便于判断锚点是否足够唯一；
+      - 写入时保留文件原有换行风格（CRLF/LF），不会把 LF 文件悄悄改成 CRLF。
     """
     try:
         p = _resolve(path)
-        # 快照
-        _snapshot(str(p), "file.patch")
-        text = p.read_text(encoding="utf-8")
-        lines = text.splitlines()
-        hits = [i for i, ln in enumerate(lines) if old and old in ln]
-        if not hits:
-            return {"error": "anchor not found: 锚点文本在文件中找不到，先 file.read 确认原文",
-                    "path": str(p)}
-        li = hits[0]
-        block = [b for b in new.splitlines()] if new else []
-        if mode == "replace":
-            lines = lines[:li] + [lines[li].replace(old, new, 1)] + lines[li + 1:]
-        elif mode == "delete":
-            lines = lines[:li] + [lines[li].replace(old, "", 1)] + lines[li + 1:]
-        elif mode == "insert_after":
-            lines = lines[:li + 1] + block + lines[li + 1:]
-        elif mode == "insert_before":
-            lines = lines[:li] + block + lines[li:]
-        else:
+        if not old:
+            return {"error": "old（锚点）不能为空", "path": str(p)}
+        if mode not in ("replace", "delete", "insert_after", "insert_before"):
             return {"error": f"unknown mode: {mode}, 可选 replace/delete/insert_after/insert_before",
                     "path": str(p)}
-        trailing = "\n" if text.endswith("\n") else ""
-        p.write_text("\n".join(lines) + trailing, encoding="utf-8")
-        return {"ok": True, "path": str(p), "mode": mode,
-                "line": li + 1, "occurrences": len(hits),
-                "new_size": p.stat().st_size}
+
+        # 统一换行符后做匹配（LLM 传 \n，磁盘上可能是 \r\n）
+        norm_old = old.replace("\r\n", "\n").replace("\r", "\n")
+        norm_new = new.replace("\r\n", "\n").replace("\r", "\n")
+        if mode == "replace" and norm_old == norm_new:
+            return {"error": "old 与 new 完全相同，不会产生任何改动；"
+                             "如需调整缩进/空白，请先 file.read 确认原文并让 new 真正不同",
+                    "path": str(p)}
+
+        _snapshot(str(p), "file.patch")
+        raw_bytes = p.read_bytes()
+        had_crlf = b"\r\n" in raw_bytes
+        text = raw_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+        idx = text.find(norm_old)
+        if idx < 0:
+            hint = ("（跨行锚点未匹配：请核对每一行的缩进、空行和首尾空白是否与文件完全一致）"
+                    if "\n" in norm_old else "")
+            return {"error": f"anchor not found: 锚点文本在文件中找不到{hint}，先 file.read 确认原文",
+                    "path": str(p)}
+
+        occurrences = text.count(norm_old)
+        line_no = text.count("\n", 0, idx) + 1
+
+        if mode == "replace":
+            result_text = text[:idx] + norm_new + text[idx + len(norm_old):]
+        elif mode == "delete":
+            result_text = text[:idx] + text[idx + len(norm_old):]
+        elif mode == "insert_after":
+            end = idx + len(norm_old)
+            if end < len(text) and text[end] == "\n":
+                insert_at = end + 1
+            else:
+                nl = text.find("\n", end)
+                insert_at = len(text) if nl < 0 else nl + 1
+            if insert_at >= len(text) and text and not text.endswith("\n"):
+                result_text = text + "\n" + norm_new + "\n"
+            else:
+                result_text = text[:insert_at] + norm_new + "\n" + text[insert_at:]
+        else:  # insert_before
+            line_start = text.rfind("\n", 0, idx) + 1
+            result_text = text[:line_start] + norm_new + "\n" + text[line_start:]
+
+        changed = result_text != text
+        final = result_text.replace("\n", "\r\n") if had_crlf else result_text
+        p.write_bytes(final.encode("utf-8"))
+
+        after_lines = result_text.split("\n")
+        line_text = after_lines[line_no - 1][:300] if 0 <= line_no - 1 < len(after_lines) else ""
+        result = {"ok": True, "path": str(p), "mode": mode, "changed": changed,
+                  "line": line_no, "line_text": line_text,
+                  "occurrences": occurrences,
+                  "newline": "CRLF" if had_crlf else "LF",
+                  "new_size": p.stat().st_size}
+        if occurrences > 1:
+            result["note"] = f"锚点在文件中命中 {occurrences} 处，本次只改了第 {line_no} 行；如改错位置请用更长的锚点重试"
+        return result
     except Exception as e:
         return {"error": str(e), "resolved": str(_resolve(path))}
 
@@ -927,8 +1062,11 @@ def cmd_file_search(pattern: str,
         files_skipped = 0
         truncated = False
         ctx = max(0, int(context))
+        # path 直接指向单个文件时，只搜这一个文件（rglob 在文件上会返回空结果）
+        single_file = root.is_file()
+        candidates = [root] if single_file else root.rglob(glob)
 
-        for p in root.rglob(glob):
+        for p in candidates:
             if not p.is_file():
                 continue
             try:
@@ -965,7 +1103,7 @@ def cmd_file_search(pattern: str,
                         break
             if hits:
                 matches.append({
-                    "path": str(p if abs else p.relative_to(root)),
+                    "path": str(p) if (abs or single_file) else str(p.relative_to(root)),
                     "hits": hits,
                 })
                 if len(matches) >= max_files:
@@ -999,8 +1137,11 @@ def cmd_file_find(pattern: str,
         root = _resolve(path)
         glob_pat = pattern if any(ch in pattern for ch in "*?[") else f"*{pattern}*"
         results: list[str] = []
-        for p in root.rglob("*"):
-            if p == root:
+        # path 直接指向文件/目录本身时也要参与匹配（rglob 不会返回 root 自身）
+        single = root.is_file()
+        iterable = [root] if single else root.rglob("*")
+        for p in iterable:
+            if p == root and not single:
                 continue
             name = p.name
             ok = fnmatch.fnmatch(name.lower(), glob_pat.lower()) if i else fnmatch.fnmatch(name, glob_pat)
@@ -1010,7 +1151,7 @@ def cmd_file_find(pattern: str,
                 continue
             if type == "dir" and not p.is_dir():
                 continue
-            results.append(str(p.relative_to(root)))
+            results.append(str(p) if single else str(p.relative_to(root)))
             if len(results) >= max_results:
                 break
         return {
@@ -1235,17 +1376,26 @@ def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = T
         #   (a) 常驻服务（uvicorn/node/redis...）—— 会一直运行不退出
         #   (b) GUI 启动（start/浏览器/explorer...）—— 若走 subprocess.run + capture_output，
         #       GUI 子进程会继承 pipe 句柄，Python 永远等不到输出关闭 → 卡住
+        # 两种判断都用原始命令，避免 PowerShell 包装后关键词不可见
         should_bg = background
         if should_bg is None:
             should_bg = _is_long_running(command) or _is_gui_launch(command)
 
-        if should_bg:
-            return _start_bg_process(command, cwd_eff, shell=shell)
+        # Windows 下 shell=True 走 cmd.exe：智能体常用的 PowerShell 写法会直接报
+        # 「不是内部或外部命令」，这里自动转成 PowerShell 执行
+        exec_command = command
+        if os.name == "nt" and shell and _is_powershell_command(command):
+            exec_command = _wrap_powershell(command)
 
-        # 前台阻塞执行（短命令）
-        r = subprocess.run(command, shell=shell, capture_output=True, text=True, cwd=cwd_eff,
-                           timeout=timeout, encoding="utf-8", errors="ignore")
-        return {"stdout": r.stdout[-4000:], "stderr": r.stderr[-2000:],
+        if should_bg:
+            return _start_bg_process(exec_command, cwd_eff, shell=shell,
+                                     classify_command=command)
+
+        # 前台阻塞执行（短命令）：捕获字节后按本地编码解码，避免中文乱码
+        r = subprocess.run(exec_command, shell=shell, capture_output=True, cwd=cwd_eff,
+                           timeout=timeout)
+        return {"stdout": _decode_console(r.stdout)[-4000:],
+                "stderr": _decode_console(r.stderr)[-2000:],
                 "returncode": r.returncode, "command": command, "cwd": cwd_eff}
     except subprocess.TimeoutExpired:
         return {"error": f"timeout（{timeout}s）—— 这条命令似乎在等待某些输出，"
@@ -1346,7 +1496,7 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "file.replace",
-            "description": "在文件中查找并替换指定文本片段。",
+            "description": "在文件中查找并替换指定文本片段（全局替换，可用 max_replacements 限制次数）。old 未命中时返回错误、不会静默成功。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1363,12 +1513,12 @@ COMMAND_TOOLS = [
         "type": "function",
         "function": {
             "name": "file.patch",
-            "description": "定点修改已有文件：以锚点 old 定位到那一行，只改或插入那一处，绝不重写整个文件。先 file.read 拿到锚点原文，再按 mode 选择替换该处 / 删除该处 / 在该行前后插入新内容。",
+            "description": "定点修改已有文件：以锚点 old 定位，只改或插入那一处，绝不重写整个文件。先 file.read 拿到锚点原文，再按 mode 选择替换该处 / 删除该处 / 在其前后插入新内容。锚点可单行也可跨行（会统一 CRLF/LF 后匹配），写入保留原换行风格；返回 changed/line_text 可用于确认改动是否真正落盘。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径"},
-                    "old": {"type": "string", "description": "锚点：文件中必须存在且完整落在同一行内的原文片段，用于定位修改位置"},
+                    "old": {"type": "string", "description": "锚点：文件中必须存在的原文片段，可单行也可跨行；请尽量复制 file.read 返回的原文（含缩进）以保证唯一命中"},
                     "new": {"type": "string", "description": "新内容：replace/delete 时为替换后文本（delete 可为空字符串）；insert_* 时要插入的完整新行（多行可自带换行）"},
                     "mode": {"type": "string", "enum": ["replace", "delete", "insert_after", "insert_before"],
                              "description": "replace=用 new 替换锚点行内 old 片段；delete=删除锚点行内 old 片段；insert_after=在锚点整行之后插入 new；insert_before=在锚点整行之前插入 new"}

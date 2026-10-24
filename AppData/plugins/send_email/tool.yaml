@@ -5,8 +5,8 @@ identity:
 version: "0.2.0"
 
 description:
-  zh_Hans: "邮箱全功能管理。通过 action 选择操作：发送send(支持html/attachments/cc/bcc)；读取list/read/search/folders；清理delete/clean；整理move/mark/organize；监听listen_start/stop/status/fetch_new。用provider预设可省略服务器配置。password为邮箱授权码。"
-  en_US: "Full mail manager. Pick action: send / list / read / search / folders / delete / clean / move / mark / organize / listen_start / listen_stop / listen_status / fetch_new."
+  zh_Hans: "邮箱全功能管理。通过 action 选择操作：发送send(支持html/attachments/cc/bcc)；读取list/read/search/folders；清理delete/clean；整理move/mark/organize；等待新邮件listen_wait（阻塞直到有新邮件或超时）。用provider预设可省略服务器配置，username/from_addr 与 password（授权码）可用能力参数预设固定。"
+  en_US: "Full mail manager. Pick action: send / list / read / search / folders / delete / clean / move / mark / organize / listen_wait."
 
 parameters:
   - name: "action"
