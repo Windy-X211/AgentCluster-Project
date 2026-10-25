@@ -133,6 +133,7 @@ import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { api } from '@/api'
 import { renderMarkdown } from '@/utils/markdown'
 import { unzipSync, strFromU8 } from 'fflate'
+import { API_BASE } from '@/utils/env'
 
 export interface ViewerFile {
   path: string
@@ -316,8 +317,8 @@ function extError(r: any, statusText: string): string {
 /** 读文本：保留后端 detail 错误信息；canvasId=null 时走根级 /api/fs/read 等价路径 */
 async function readText(cid: number | null, path: string): Promise<string> {
   const r = cid != null
-    ? await fetch(`/api/canvases/${cid}/file?path=` + encodeURIComponent(path))
-    : await fetch(`/api/fs/read?path=` + encodeURIComponent(path))
+    ? await fetch(`${API_BASE}/api/canvases/${cid}/file?path=` + encodeURIComponent(path))
+    : await fetch(`${API_BASE}/api/fs/read?path=` + encodeURIComponent(path))
   const d = await r.json().catch(() => null)
   if (!r.ok || !d?.ok) throw new Error(extError(d, `${r.status} ${r.statusText}`))
   return d.content || ''

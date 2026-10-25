@@ -41,3 +41,8 @@
 Thumbs.db
 # pywebview WebView2 用户数据（localStorage 等，勿提交）
 .webview_data/
+# Electron 迁移：dist 是 Vite 构建产物，勿提交
+/frontend/dist/
+/frontend/electron-main.log
+# Windows 伪设备
+/nul

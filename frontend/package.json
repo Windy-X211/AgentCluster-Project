@@ -1,29 +1,88 @@
 {
-  "name": "agent-cluster",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "@aiden0z/pptx-renderer": "^1.3.0",
-    "@vueuse/core": "^10.11",
-    "fflate": "^0.8.3",
-    "marked": "^18.0.14",
-    "pinia": "^2.1",
-    "vue": "^3.4",
-    "vue-router": "^4.3",
-    "xlsx": "^0.18.5"
-  },
-  "devDependencies": {
-    "@types/node": "^26.6.2",
-    "@vitejs/plugin-vue": "^5.0",
-    "sass": "^1.77",
-    "typescript": "^5.5",
-    "vite": "^5.4",
-    "vue-tsc": "^2.0"
-  }
+    "name":  "agent-cluster",
+    "version":  "0.1.0",
+    "private":  true,
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "vite",
+                    "build":  "vue-tsc -b \u0026\u0026 cross-env ELECTRON=1 vite build",
+                    "preview":  "vite preview",
+                    "electron":  "electron . --prod",
+                    "electron:dev":  "concurrently -k \"npm:dev\" \"cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 electron .\"",
+                    "electron:start":  "electron . --prod",
+                    "electron:build":  "cross-env ELECTRON=1 vite build \u0026\u0026 electron-builder --win --x64"
+                },
+    "dependencies":  {
+                         "@aiden0z/pptx-renderer":  "^1.3.0",
+                         "@vueuse/core":  "^10.11",
+                         "fflate":  "^0.8.3",
+                         "marked":  "^18.0.14",
+                         "pinia":  "^2.1",
+                         "vue":  "^3.4",
+                         "vue-router":  "^4.3",
+                         "xlsx":  "^0.18.5"
+                     },
+    "devDependencies":  {
+                            "@types/node":  "^26.6.2",
+                            "@vitejs/plugin-vue":  "^5.0",
+                            "concurrently":  "^9.0",
+                            "cross-env":  "^7.0",
+                            "electron":  "^33.0",
+                            "electron-builder":  "^25.0",
+                            "sass":  "^1.77",
+                            "typescript":  "^5.5",
+                            "vite":  "^5.4",
+                            "vue-tsc":  "^2.0",
+                            "wait-on":  "^8.0"
+                        },
+    "build":  {
+                  "appId":  "com.agentcluster.app",
+                  "productName":  "AgentCluster",
+                  "asar":  true,
+                  "directories":  {
+                                      "output":  "release",
+                                      "buildResources":  "electron/build"
+                                  },
+                  "files":  [
+                                "electron/**/*",
+                                "dist/**/*",
+                                "package.json"
+                            ],
+                  "extraResources":  [
+                                         {
+                                             "from":  "../backend",
+                                             "to":  "backend",
+                                             "filter":  [
+                                                            "main.py",
+                                                            "**/*.py",
+                                                            "requirements.txt"
+                                                        ]
+                                         }
+                                     ],
+                  "win":  {
+                              "target":  [
+                                             {
+                                                 "target":  "nsis",
+                                                 "arch":  [
+                                                              "x64"
+                                                          ]
+                                             },
+                                             {
+                                                 "target":  "portable",
+                                                 "arch":  [
+                                                              "x64"
+                                                          ]
+                                             }
+                                         ],
+                              "icon":  "public/icon.png"
+                          },
+                  "nsis":  {
+                               "oneClick":  false,
+                               "allowToChangeInstallationDirectory":  true,
+                               "createDesktopShortcut":  true,
+                               "createStartMenuShortcut":  true,
+                               "shortcutName":  "AgentCluster"
+                           }
+              },
+    "main":  "electron/main.cjs"
 }

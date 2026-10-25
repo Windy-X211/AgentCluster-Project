@@ -1,41 +1,44 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { RouterLink } from 'vue-router'
-import { isDesktop } from '@/utils/env'
+import { isDesktop, windowAPI } from '@/utils/env'
 
 const isMax = ref(false)
-let api: any = null
-let ready = false
 
-function bindApi() {
-  const w = window as any
-  if (w.pywebview?.api) { api = w.pywebview.api; ready = true }
-}
+// 监听 Electron 的最大化状态变化（主进程事件）
 onMounted(() => {
-  bindApi()
-  if (!ready) window.addEventListener('pywebviewready', bindApi)
-  if (isDesktop) document.documentElement.classList.add('desktop-frameless')
+  document.documentElement.classList.add('desktop-frameless')
+  // 尝试获取当前最大化状态
+  windowAPI.isMaximized?.().then((v: any) => { if (typeof v === 'boolean') isMax.value = v }).catch(() => {})
+  // Electron 事件监听
+  if (window.electronAPI?.on) {
+    window.electronAPI.on('win:maximized', (v: boolean) => { isMax.value = v })
+  }
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('pywebviewready', bindApi)
   document.documentElement.classList.remove('desktop-frameless')
 })
-async function minimize() { try { await api?.minimize() } catch {} }
+
+async function minimize() { try { await windowAPI.minimize() } catch {} }
 async function toggleMax() {
   try {
-    if (isMax.value) { await api?.restore(); isMax.value = false }
-    else { await api?.maximize(); isMax.value = true }
+    const result = await windowAPI.toggleMax()
+    if (typeof result === 'boolean') isMax.value = result
+    else {
+      // pywebview 路径：前端自行判断
+      isMax.value = !isMax.value
+      if (isMax.value) await windowAPI.maximize()
+      else await windowAPI.restore()
+    }
   } catch {}
 }
-async function close() { try { await api?.close() } catch {} }
+async function close() { try { await windowAPI.close() } catch {} }
 </script>
 
 <template>
-  <!-- TopBar 不加 pywebview-drag-region —— 只让 .brand 和 .spacer 可拖 -->
-  <!-- 这样按钮/链接的祖先链不匹配 selector，正常点击 -->
   <div class="topbar-content">
     <!-- 拖动区 1：品牌+图标 -->
-    <div class="brand pywebview-drag-region">
+    <div class="brand drag-region">
       <img class="logo" src="/icon.png" alt="AgentCluster" />
       <div>
         <div class="title">智能体集群</div>
@@ -43,8 +46,8 @@ async function close() { try { await api?.close() } catch {} }
       </div>
     </div>
     <!-- 拖动区 2：中间空白 -->
-    <div class="spacer pywebview-drag-region" />
-    <!-- 下面这些都没有 pywebview-drag-region 类 → 可正常点击 -->
+    <div class="spacer drag-region" />
+    <!-- 下面这些默认不可拖（按钮/链接等），Electron 上 .nav-item 和 .win-btn 会自动 no-drag -->
     <RouterLink to="/capabilities" class="nav-item">🛠 能力管理</RouterLink>
     <RouterLink to="/settings" class="nav-item">⚙ 设置</RouterLink>
     <template v-if="isDesktop">
@@ -67,12 +70,13 @@ async function close() { try { await api?.close() } catch {} }
   display: flex; align-items: center; height: 100%; padding: 0 20px; gap: 16px;
 }
 
-/* pywebview-drag-region：pywebview body 级 onBodyMouseDown 识别的类名
-   （customize.js 第 89 行 document.querySelectorAll('%(drag_selector)s')）
-   只在 easy_drag=False 时这个机制才生效（easy_drag=True 会额外让整个 window 可拖） */
-.pywebview-drag-region {
+/* 拖动区：Electron 用 -webkit-app-region: drag，pywebview 用 .pywebview-drag-region */
+.drag-region {
   user-select: none;
+  -webkit-app-region: drag;        /* Electron */
+  app-region: drag;                 /* 未来标准 */
 }
+/* 全局回退：如果 .pywebview-drag-region 样式存在，保持兼容 */
 
 .brand { display: flex; align-items: center; gap: 12px; }
 .logo { width: 32px; height: 32px; border-radius: 10px; object-fit: cover; box-shadow: 0 4px 12px rgba(var(--accent-rgb), 0.3); }
@@ -82,6 +86,11 @@ async function close() { try { await api?.close() } catch {} }
 /* 必须加 align-self:stretch + height:100% 让它撑满顶栏高度 */
 .spacer { flex: 1; min-width: 20px; align-self: stretch; height: 100%; }
 
+/* 按钮/链接是可点击区，覆盖拖动属性 */
+.nav-item, .win-btn {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
 .nav-item { color: rgb(var(--text-rgb)); text-decoration: none; font-size: calc(13px * var(--font-scale)); padding: 6px 12px; border-radius: 8px; transition: background .2s; user-select: none; &:hover { background: rgba(var(--surface-rgb), 0.06); } }
 .win-btn {
   width: 32px; height: 28px; border: none; background: transparent;

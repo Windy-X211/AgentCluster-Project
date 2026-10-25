@@ -1,5 +1,6 @@
 // 统一 API 客户端
-const BASE = '/api'
+import { API_BASE } from '@/utils/env'
+const BASE = `${API_BASE}/api`
 
 // —— 插件调试面板领域类型 ——
 export interface ParamDefinition {

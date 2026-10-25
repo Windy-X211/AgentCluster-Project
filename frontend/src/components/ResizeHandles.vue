@@ -1,16 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount } from 'vue'
-import { isDesktop } from '@/utils/env'
-
-let api: any = null
-let ready = false
-
-function bindApi() {
-  const w = window as any
-  if (w.pywebview?.api) { api = w.pywebview.api; ready = true }
-}
-onMounted(() => { bindApi(); if (!ready) window.addEventListener('pywebviewready', bindApi) })
-onBeforeUnmount(() => window.removeEventListener('pywebviewready', bindApi))
+import { isDesktop, windowAPI } from '@/utils/env'
 
 // 手动缩放状态
 interface DragState {
@@ -28,8 +18,8 @@ let drag: DragState | null = null
 let rafId = 0
 
 function onMouseMove(ev: MouseEvent) {
-  if (!drag || !api) return
-  // 下一帧再调 Python，减少调用频率
+  if (!drag) return
+  // 下一帧再调窗口 API，减少调用频率
   cancelAnimationFrame(rafId)
   rafId = requestAnimationFrame(() => {
     const { dir, startX, startY, startLeft, startTop, startW, startH, minW, minH } = drag!
@@ -39,36 +29,17 @@ function onMouseMove(ev: MouseEvent) {
     const startBottom = startTop + startH
 
     switch (dir) {
-      case 'right':
-        newW = Math.max(cx - startLeft, minW); break
-      case 'left':
-        newW = Math.max(startRight - cx, minW);
-        newL = startRight - newW; break
-      case 'bottom':
-        newH = Math.max(cy - startTop, minH); break
-      case 'top':
-        newH = Math.max(startBottom - cy, minH);
-        newT = startBottom - newH; break
-      case 'br':
-        newW = Math.max(cx - startLeft, minW);
-        newH = Math.max(cy - startTop, minH); break
-      case 'bl':
-        newW = Math.max(startRight - cx, minW);
-        newH = Math.max(cy - startTop, minH);
-        newL = startRight - newW; break
-      case 'tr':
-        newW = Math.max(cx - startLeft, minW);
-        newH = Math.max(startBottom - cy, minH);
-        newT = startBottom - newH; break
-      case 'tl':
-        newW = Math.max(startRight - cx, minW);
-        newH = Math.max(startBottom - cy, minH);
-        newL = startRight - newW;
-        newT = startBottom - newH; break
+      case 'right':  newW = Math.max(cx - startLeft, minW); break
+      case 'left':   newW = Math.max(startRight - cx, minW); newL = startRight - newW; break
+      case 'bottom': newH = Math.max(cy - startTop, minH); break
+      case 'top':    newH = Math.max(startBottom - cy, minH); newT = startBottom - newH; break
+      case 'br':     newW = Math.max(cx - startLeft, minW); newH = Math.max(cy - startTop, minH); break
+      case 'bl':     newW = Math.max(startRight - cx, minW); newH = Math.max(cy - startTop, minH); newL = startRight - newW; break
+      case 'tr':     newW = Math.max(cx - startLeft, minW); newH = Math.max(startBottom - cy, minH); newT = startBottom - newH; break
+      case 'tl':     newW = Math.max(startRight - cx, minW); newH = Math.max(startBottom - cy, minH); newL = startRight - newW; newT = startBottom - newH; break
     }
-    // Fire-and-forget：单次 set_bounds（Win32 SetWindowPos 原子移动+缩放），
-    // 比每帧两次 move+resize 桥调用少一半跨线程开销，避免 WebView2 重绘露白
-    try { api.set_bounds(newL, newT, newW, newH) } catch {}
+    // 原子 setBounds（Electron 是 BrowserWindow.setBounds，pywebview 是 set_bounds）
+    try { windowAPI.setBounds(newL, newT, newW, newH) } catch {}
   })
 }
 
@@ -82,16 +53,15 @@ function onMouseUp() {
 
 async function startResize(dir: string, ev: MouseEvent) {
   ev.preventDefault()
-  if (!api?.get_bounds) return
-  // 记录初始状态（Python 端拿窗口 bounds）
+  // 记录初始状态（统一适配层）
   let bounds: any = {}
-  try { bounds = await api.get_bounds() } catch { return }
+  try { bounds = await windowAPI.getBounds() } catch { return }
   drag = {
     dir,
     startX: ev.screenX, startY: ev.screenY,
     startLeft: bounds.x, startTop: bounds.y,
     startW: bounds.width, startH: bounds.height,
-    minW: 960, minH: 600,  // 与 create_window min_size 一致，避免拖到更小被钳制跳动
+    minW: 960, minH: 600,
   }
   window.addEventListener('mousemove', onMouseMove)
   window.addEventListener('mouseup', onMouseUp)

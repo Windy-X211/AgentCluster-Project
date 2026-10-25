@@ -6,6 +6,7 @@ import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, t
 import { renderChatMarkdown } from '@/utils/markdown'
 import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
 import { api } from '@/api'
+import { API_BASE } from '@/utils/env'
 import FileViewer, { type ViewerFile } from './FileViewer.vue'
 
 /** 去掉消息首尾纯空行（保留中间换行）—— 用于修复气泡顶部空白；顺带剥离 <continue> 续跑标记 */
@@ -237,7 +238,7 @@ async function uploadFiles(files: FileList | File[], relativePaths?: string[]): 
   })
   form.append('relative_paths', JSON.stringify(relPaths))
   try {
-    const r = await fetch('/api/fs/upload', { method: 'POST', body: form })
+    const r = await fetch(`${API_BASE}/api/fs/upload`, { method: 'POST', body: form })
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: '上传失败' }))
       throw new Error(err.detail || `HTTP ${r.status}`)
@@ -393,7 +394,7 @@ async function _verifyPaths(paths: string[]): Promise<any[]> {
   const form = new FormData()
   form.append('absolute_paths', JSON.stringify(paths))
   try {
-    const r = await fetch('/api/fs/upload', { method: 'POST', body: form })
+    const r = await fetch(`${API_BASE}/api/fs/upload`, { method: 'POST', body: form })
     if (!r.ok) return []
     const data = await r.json()
     return data.files || []
@@ -2124,7 +2125,7 @@ async function transcribeChunk(webmBlob: Blob) {
     let binary = ''
     for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192))
     const base64 = btoa(binary)
-    const r = await fetch('/api/asr/transcribe', {
+    const r = await fetch(`${API_BASE}/api/asr/transcribe`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ audio: base64, language: 'auto' })
     })

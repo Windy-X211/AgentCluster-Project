@@ -1,41 +1,41 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute } from 'vue-router'
-import { isDesktop } from '@/utils/env'
+import { isDesktop, windowAPI } from '@/utils/env'
 
 const route = useRoute()
 const isMax = ref(false)
-let api: any = null
-let ready = false
 
 const onHome = computed(() => route.path === '/' || route.path === '')
 
-function bindApi() {
-  const w = window as any
-  if (w.pywebview?.api) { api = w.pywebview.api; ready = true }
-}
 onMounted(() => {
-  bindApi()
-  if (!ready) window.addEventListener('pywebviewready', bindApi)
+  // 尝试获取当前最大化状态
+  windowAPI.isMaximized?.().then((v: any) => { if (typeof v === 'boolean') isMax.value = v }).catch(() => {})
+  // Electron 事件监听
+  if (window.electronAPI?.on) {
+    window.electronAPI.on('win:maximized', (v: boolean) => { isMax.value = v })
+  }
 })
-onBeforeUnmount(() => {
-  window.removeEventListener('pywebviewready', bindApi)
-})
-async function minimize() { try { await api?.minimize() } catch {} }
+
+async function minimize() { try { await windowAPI.minimize() } catch {} }
 async function toggleMax() {
   try {
-    if (isMax.value) { await api?.restore(); isMax.value = false }
-    else { await api?.maximize(); isMax.value = true }
+    const result = await windowAPI.toggleMax()
+    if (typeof result === 'boolean') isMax.value = result
+    else {
+      isMax.value = !isMax.value
+      if (isMax.value) await windowAPI.maximize()
+      else await windowAPI.restore()
+    }
   } catch {}
 }
-async function close() { try { await api?.close() } catch {} }
+async function close() { try { await windowAPI.close() } catch {} }
 </script>
 
 <template>
   <div v-if="isDesktop && !onHome" class="wc-root">
     <!-- 顶部 6px 透明拖动条（非 Home 页面顶栏缺拖动区） -->
-    <!-- pywebview-drag-region 让 pywebview body 级 onBodyMouseDown 识别 -->
-    <div class="wc-drag-strip pywebview-drag-region" @dblclick="toggleMax" />
+    <div class="wc-drag-strip" @dblclick="toggleMax" />
 
     <!-- 右上角窗口控制按钮 -->
     <div class="wc-buttons">
@@ -60,8 +60,7 @@ async function close() { try { await api?.close() } catch {} }
   pointer-events: none;
 }
 
-/* 6px 透明拖动条：纯 WebView2 原生 -webkit-app-region: drag */
-/* background: transparent —— 不要白色白条，完全隐形 */
+/* 6px 透明拖动条：-webkit-app-region: drag 同时适用于 Electron 和纯 WebView2 */
 .wc-drag-strip {
   height: 6px; width: 100%;
   pointer-events: auto;
