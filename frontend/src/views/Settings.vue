@@ -152,8 +152,32 @@ async function uninstallASR() {
   }
 }
 
+// 启动方式：client (默认) | web
+const launchMode = ref<'client' | 'web'>('client')
+const launchModeSaving = ref(false)
+
+async function loadLaunchMode() {
+  try {
+    const r = await api.launchMode.get()
+    launchMode.value = r.mode
+  } catch { /* 静默，用默认 */ }
+}
+
+async function saveLaunchMode(mode: 'client' | 'web') {
+  launchModeSaving.value = true
+  try {
+    await api.launchMode.set(mode)
+    launchMode.value = mode
+    showToast(mode === 'client' ? '已设置：下次启动打开桌面客户端' : '已设置：下次启动打开浏览器网页')
+  } catch (e: any) {
+    showToast('保存失败：' + (e?.message || e), 'err')
+  } finally {
+    launchModeSaving.value = false
+  }
+}
+
 onMounted(async () => {
-  await Promise.all([models.fetch(), settings.fetch()])
+  await Promise.all([models.fetch(), settings.fetch(), loadLaunchMode()])
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
@@ -500,6 +524,36 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
               {{ asrUninstalling ? '卸载中…' : '🗑 卸载模型' }}
             </button>
             <span class="asr-uninstall-hint">删除 SenseVoiceSmall 模型文件（约 936MB），释放磁盘空间。依赖包保留，重新使用时自动重新下载</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 启动方式 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>🚀 启动方式</span>
+          <span class="hint">下次双击 start.bat 时的行为</span>
+        </div>
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">启动模式</span>
+          </div>
+          <div class="appearance-row">
+            <label class="radio-label" :class="{ active: launchMode === 'client' }" @click="!launchModeSaving && saveLaunchMode('client')">
+              <input type="radio" name="launchMode" value="client" :checked="launchMode === 'client'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">🖥️ 桌面客户端</span>
+            </label>
+            <label class="radio-label" :class="{ active: launchMode === 'web' }" @click="!launchModeSaving && saveLaunchMode('web')">
+              <input type="radio" name="launchMode" value="web" :checked="launchMode === 'web'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">🌐 浏览器网页</span>
+            </label>
+          </div>
+          <div class="hint-empty" style="margin-top: 8px">
+            桌面客户端：启动后自动打开桌面应用窗口（完整功能）
+            <br />
+            浏览器网页：启动后端服务后自动打开浏览器 http://localhost:5173
           </div>
         </div>
       </div>

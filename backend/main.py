@@ -220,6 +220,34 @@ def health():
     return {"ok": True, "version": "0.2.0"}
 
 
+# ---- 启动模式（客户端 / 网页端）----
+# 写项目根的 .launch_mode.txt，供 start.bat 读取
+_LAUNCH_MODE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".launch_mode.txt")
+
+@app.get("/api/launch_mode")
+def get_launch_mode():
+    mode = "client"
+    if os.path.exists(_LAUNCH_MODE_FILE):
+        m = open(_LAUNCH_MODE_FILE, "r", encoding="utf-8").read().strip()
+        if m in ("client", "web"):
+            mode = m
+    return {"mode": mode}
+
+
+@app.put("/api/launch_mode")
+def set_launch_mode(body: dict):
+    mode = (body.get("mode") or "client").strip()
+    if mode not in ("client", "web"):
+        mode = "client"
+    try:
+        with open(_LAUNCH_MODE_FILE, "w", encoding="utf-8") as f:
+            f.write(mode)
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(500, f"failed to write .launch_mode.txt: {e}")
+    return {"mode": mode}
+
+
 # ---- 数据存储路径 ----
 @app.get("/api/storage/paths")
 def storage_paths():

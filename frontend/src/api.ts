@@ -274,5 +274,9 @@ export const api = {
   asr: {
     status: () => req<{ available: boolean }>('/asr/status'),
     uninstall: () => req<{ ok: boolean; msg: string }>('/asr/uninstall', { method: 'DELETE' }),
+  },
+  launchMode: {
+    get: () => req<{ mode: 'client' | 'web' }>('/launch_mode'),
+    set: (mode: 'client' | 'web') => req('/launch_mode', { method: 'PUT', body: JSON.stringify({ mode }) }),
   }
 }
