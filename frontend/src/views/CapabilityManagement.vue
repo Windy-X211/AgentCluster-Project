@@ -20,9 +20,13 @@ const activeTabDesc = () => tabs.find(t => t.key === activeTab.value)?.desc || '
 <template>
   <div class="cm-root region-plugins">
     <div class="top glass">
+      <!-- 返回按钮独立，不拖动 -->
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
-      <h2>🛠 能力管理</h2>
-      <span class="sub">{{ activeTabDesc() }}</span>
+      <!-- 标题 + 空白拖动区 -->
+      <div class="top-drag pywebview-drag-region">
+        <h2>🛠 能力管理</h2>
+        <span class="sub">{{ activeTabDesc() }}</span>
+      </div>
     </div>
 
     <!-- Tabs -->
@@ -47,7 +51,7 @@ const activeTabDesc = () => tabs.find(t => t.key === activeTab.value)?.desc || '
 
 <style scoped>
 .cm-root {
-  padding: 16px; height: 100vh;
+  padding: 16px; height: calc(100vh - var(--titlebar-h));
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .top {
@@ -55,6 +59,7 @@ const activeTabDesc = () => tabs.find(t => t.key === activeTab.value)?.desc || '
   display: flex; align-items: center; gap: 16px; flex-shrink: 0;
   h2 { font-size: calc(18px * var(--font-scale)); }
 }
+.top-drag { flex: 1; align-self: stretch; display: flex; align-items: center; gap: 12px; user-select: none; }
 .sub { font-size: calc(12px * var(--font-scale)); opacity: .5; }
 
 /* —— tabs —— */

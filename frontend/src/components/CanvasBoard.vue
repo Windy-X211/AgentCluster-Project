@@ -69,13 +69,13 @@ const browsing = ref(false)
 // AgentEditDialog 打开状态
 const editingAgent = ref<any>(null)
 
-// 头像渐变色（根据avatar_mode决定）
+// 头像渐变色（根据avatar_mode决定）—— 统一用 agent_id 作为 hash 种子，与对话区保持一致
 const avatarGradient = computed(() => {
   const mode = settings.data.avatar_mode || 'differentiated'
   if (mode === 'unified') {
-    return (name: string) => 'linear-gradient(135deg, var(--accent), var(--accent-2))'
+    return (agentId: number) => 'linear-gradient(135deg, var(--accent), var(--accent-2))'
   }
-  return (name: string) => getAvatarGradient(name)
+  return (agentId: number) => getAvatarGradient(agentId)
 })
 
 // 触发设置
@@ -112,82 +112,94 @@ type BubbleChunk = {
   toolStreamingArgs?: string // 参数流式中：累计的原始 JSON 片段
 }
 
-function bubbleFor(node: any): { chunks: BubbleChunk[]; streaming: boolean } | null {
+/** 预计算所有 agent 的气泡数据（单次遍历消息，避免 N×O(M) 的模板内重复计算） */
+const bubbleMap = computed<Map<number, { chunks: BubbleChunk[]; streaming: boolean } | null>>(() => {
+  const map = new Map<number, { chunks: BubbleChunk[]; streaming: boolean } | null>()
   const conv = bubbleConv.value
-  if (!conv) return null
+  if (!conv) return map
   const msgs = conv.messages || []
-  const aid = node.agent_id
-  const _trim = (s: string) => (s || '').replace(/^\s*\n+/, '').replace(/\n+\s*$/, '')
   const _stripAnno = (s: string) => (s || '').replace(/^\[[^\]]+\]\s*/, '').trim()
 
-  const chunks: BubbleChunk[] = []
-  let hasStreaming = false
+  // 预构建 tool_result 索引：tcId → result，以及有哪些 tcId 有结果
+  const resultMap = new Map<string, any>()
+  const hasResultSet = new Set<string>()
+  for (const m of msgs) {
+    if (m.role === 'tool_result' && m.tool_call_id) {
+      hasResultSet.add(m.tool_call_id)
+      resultMap.set(m.tool_call_id, m.result)
+    }
+  }
 
-  const hasResult = (tcId: string) => msgs.some((m: any) => m.role === 'tool_result' && m.tool_call_id === tcId)
-  const findResult = (tcId: string) => msgs.find((m: any) => m.role === 'tool_result' && m.tool_call_id === tcId)?.result
-
-  // —— 先建立"本智能体作为发送方的 A2A 信封目标集合" ——
-  // 成功发送的 send_message 会同时存在一条 tool_call 和一条 a2a 信封，
-  // 这里先把后者的目标名和 agent_id 都收集好，后面遇到对应的 tool_call 就跳过，避免重复渲染。
-  // 失败的 send_message 没有 A2A 信封 → 集合里找不到 → 仍显示工具调用（告知用户尝试过发送）。
-  const a2aTargets = new Set<string>()
+  // 按发送方 agent_id 收集 A2A 信封目标（用于去重 send_message 工具调用）
+  const a2aTargetsBySender = new Map<number, Set<string>>()
   for (const m of msgs) {
     if (m.role === 'a2a') {
       const env = (m as any).envelope || {}
-      const isSender = (m as any).from_agent_id === aid || env?.from?.agent_id === aid
-      if (isSender) {
-        if (env?.to?.name) a2aTargets.add(String(env.to.name))
-        if (env?.to?.agent_id) a2aTargets.add(String(env.to.agent_id))
+      const fromAgent = (m as any).from_agent_id ?? env?.from?.agent_id
+      if (fromAgent != null) {
+        let set = a2aTargetsBySender.get(fromAgent)
+        if (!set) { set = new Set(); a2aTargetsBySender.set(fromAgent, set) }
+        if (env?.to?.name) set.add(String(env.to.name))
+        if (env?.to?.agent_id) set.add(String(env.to.agent_id))
       }
     }
   }
 
+  // 遍历一次消息，按 agent_id 分组 chunks
+  const perChunks = new Map<number, BubbleChunk[]>()
+  const perStreaming = new Map<number, boolean>()
+  const ensure = (aid: number) => {
+    if (!perChunks.has(aid)) { perChunks.set(aid, []); perStreaming.set(aid, false) }
+  }
+
   for (const m of msgs) {
-    // ==== 1. 自己的深度思考 —— 仅流式时以单行流水呈现，思考完毕即隐藏 ====
-    if (m.role === 'assistant' && (m as any).agent_id === aid && m.streaming && (m as any).reasoning?.trim()) {
+    const aid = (m as any).agent_id
+    if (aid == null) continue
+    ensure(aid)
+    const chunks = perChunks.get(aid)!
+
+    // 1. 自己的深度思考
+    if (m.role === 'assistant' && m.streaming && (m as any).reasoning?.trim()) {
       chunks.push({ kind: 'reasoning', text: _stripAnno(stripContinueTag((m as any).reasoning)), streaming: true })
-      if (m.streaming) hasStreaming = true
+      perStreaming.set(aid, true)
     }
 
-    // ==== 2. 自己发的 cluster.send_message（沟通工具，显示消息预览） ====
-    // 如果该发送已成功产生 A2A 信封 → 跳过（避免重复，信封会在下面的块渲染）
-    if (m.role === 'tool_call' && (m as any).agent_id === aid
-        && (m as any).name === 'cluster.send_message') {
+    // 2. cluster.send_message（成功产生 A2A 信封则跳过）
+    if (m.role === 'tool_call' && (m as any).name === 'cluster.send_message') {
       const args = (m as any).args || {}
       const toName = args.to_agent != null ? String(args.to_agent) : '?'
       const msg = (args.message || '').trim()
-      if (msg && !a2aTargets.has(toName)) {
+      if (msg && !a2aTargetsBySender.get(aid)?.has(toName)) {
         chunks.push({ kind: 'call', text: `📤 → ${toName}：${msg}` })
       }
     }
 
-    // ==== 2b. 其他工具调用 → 用和对话界面一样的工具行样式，按输出顺序排列 ====
-    if (m.role === 'tool_call' && (m as any).agent_id === aid
-        && (m as any).name !== 'cluster.send_message') {
+    // 2b. 其他工具调用
+    if (m.role === 'tool_call' && (m as any).name !== 'cluster.send_message') {
       const tcId = (m as any).tool_call_id
-      const running = !hasResult(tcId)
+      const running = !hasResultSet.has(tcId)
       const args = (m as any).args || {}
       chunks.push({
         kind: 'tool',
         toolName: toolLabel((m as any).name, args),
         toolRunning: running,
         toolArgs: args,
-        toolResult: findResult(tcId),
+        toolResult: resultMap.get(tcId),
         toolFileName: extractToolFileName((m as any).name, args),
       })
     }
 
-    // ==== 3. 自己的正文回复 ====
-    if (m.role === 'assistant' && (m as any).agent_id === aid && (m.content || '').trim()) {
+    // 3. 正文回复
+    if (m.role === 'assistant' && (m.content || '').trim()) {
       chunks.push({ kind: 'text', text: stripContinueTag(m.content).trim() })
-      if (m.streaming) hasStreaming = true
+      if (m.streaming) perStreaming.set(aid, true)
     }
 
-    // ==== 4. 自己发出的 A2A 信封（📤 我→对方） — 接收方的不显示 ====
+    // 4. 自己发出的 A2A 信封
     if (m.role === 'a2a') {
       const env = (m as any).envelope || {}
-      const isSender = (m as any).from_agent_id === aid || env?.from?.agent_id === aid
-      if (isSender) {
+      const fromAgent = (m as any).from_agent_id ?? env?.from?.agent_id
+      if (fromAgent === aid) {
         const toName = env?.to?.name || String(env?.to?.agent_id || '?')
         const text = (env?.parts || [])
           .filter((p: any) => p?.type === 'text' && p?.text)
@@ -198,45 +210,52 @@ function bubbleFor(node: any): { chunks: BubbleChunk[]; streaming: boolean } | n
     }
   }
 
-  // 正在流式调用的工具（TS:/C: 到达但还没 push tool_call 消息的瞬间）→ 追加到末尾
-  const liveTC = toolCallFor(node)
-  if (liveTC) {
-    const hasLive = chunks.some(c => c.kind === 'tool' && c.toolName === toolLabel(liveTC.name, liveTC.streamingArgs) && c.toolRunning)
-    if (!hasLive) {
-      chunks.push({
-        kind: 'tool',
-        toolName: toolLabel(liveTC.name, liveTC.streamingArgs),
-        toolRunning: true,
-        toolArgs: {},
-        toolPhase: liveTC.phase,
-        toolStreamingArgs: liveTC.streamingArgs,
-      })
-      hasStreaming = true
+  // 附加 liveTC（流式工具调用，还没 push 到 msgs 的瞬间）
+  const isCurStreaming = convs.streaming && conv.id === convs.current
+  if (isCurStreaming) {
+    for (const [aidStr, liveTC] of Object.entries(convs.toolCalls)) {
+      const aid = Number(aidStr)
+      if (!Number.isFinite(aid)) continue
+      ensure(aid)
+      const chunks = perChunks.get(aid)!
+      const hasLive = chunks.some(c => c.kind === 'tool' && c.toolName === toolLabel(liveTC.name, liveTC.streamingArgs) && c.toolRunning)
+      if (!hasLive) {
+        chunks.push({
+          kind: 'tool',
+          toolName: toolLabel(liveTC.name, liveTC.streamingArgs),
+          toolRunning: true,
+          toolArgs: {},
+          toolPhase: liveTC.phase,
+          toolStreamingArgs: liveTC.streamingArgs,
+        })
+        perStreaming.set(aid, true)
+      }
     }
   }
 
-  if (convs.streaming && convs.speakingAgents.has(aid) && conv.id === convs.current) {
-    if (!chunks.length && !liveTC) {
-      return { chunks: [], streaming: true }
+  // 构建最终 map
+  for (const [aid, chunks] of perChunks) {
+    const hasStrm = perStreaming.get(aid) || false
+    if (chunks.length) {
+      map.set(aid, { chunks, streaming: hasStrm })
+    } else if (isCurStreaming && convs.speakingAgents.has(aid)) {
+      map.set(aid, { chunks: [], streaming: true })
+    } else {
+      map.set(aid, null)
     }
   }
 
-  if (!chunks.length && !liveTC) return null
-  return { chunks, streaming: hasStreaming || !!liveTC }
+  return map
+})
+
+/** 模板内读取：按 node.agent_id 取气泡数据（O(1) Map.get，替代原来 O(M) 的 bubbleFor） */
+function getBubbleForAgent(agentId: number) {
+  return bubbleMap.value.get(agentId) ?? null
 }
 
 function clipBubble(t: string): string {
   const s = (t || '').replace(/^\s*\n+/, '').replace(/\n+\s*$/, '').replace(/\s+/g, ' ').trim()
   return s.length > 150 ? s.slice(0, 150) + '…' : s
-}
-
-/** 当前节点正在流式调用的能力（无则 null）。独立于 bubbleFor，避免模板内嵌套 ! 断言。 */
-function toolCallFor(node: any): ToolCallPhase | null {
-  const conv = bubbleConv.value
-  if (!conv) return null
-  const aid = node.agent_id
-  if (!(convs.streaming && convs.speakingAgents.has(aid) && conv.id === convs.current)) return null
-  return convs.toolCalls[aid] || null
 }
 
 // 运行/流式状态按画布隔离：只有"运行中对话所属画布"才显示运行态
@@ -257,34 +276,49 @@ const runningOnThisCanvas = computed(() => {
 function nodeState(agentId: number): 'speaking' | 'calling' | 'waiting' | null {
   if (!runningOnThisCanvas.value) return null
   if (convs.streaming && convs.speakingAgents.has(agentId)) return 'speaking'
-  const edges = convs.callEdges || []
-  if (edges.some(d => d.from === agentId || d.to === agentId)) return 'calling'
+  const callEdges = convs.callEdges || []
+  if (callEdges.some(d => d.from === agentId || d.to === agentId)) return 'calling'
   return 'waiting'
 }
+
+// —— 查找表 computed：避免每次 O(nodes) 线性查找 ——
+const nodeById = computed(() => {
+  const m = new Map<number, any>()
+  for (const n of nodes.value) m.set(n.id, n)
+  return m
+})
+// (fromAgentId, toAgentId) → 该画布上是否有正向连线，用于判断 callEdge 匹配方向
+const forwardAgentPairs = computed(() => {
+  const set = new Set<string>()
+  for (const e of edges.value) {
+    const f = nodeById.value.get(e.from_node)
+    const t = nodeById.value.get(e.to_node)
+    if (f && t) set.add(`${f.agent_id}→${t.agent_id}`)
+  }
+  return set
+})
 
 // call 进行中：仅「调用方 → 对方」的一条连线流动；对方开始输出后（store 移除该条）结束
 function isEdgeActive(e: any): boolean {
   if (!runningOnThisCanvas.value) return false
   if (!convs.streaming || !convs.callEdges.length) return false
-  const from = nodes.value.find((x: any) => x.id === e.from_node)
-  const to = nodes.value.find((x: any) => x.id === e.to_node)
-  if (from == null || to == null) return false
+  const from = nodeById.value.get(e.from_node)
+  const to = nodeById.value.get(e.to_node)
+  if (!from || !to) return false
+  const fromAid = from.agent_id
+  const toAid = to.agent_id
   return convs.callEdges.some(d => {
-    // 两节点间优先匹配正向（调用方→对方）连线；不存在正向时才回退反向
-    const hasForward = edges.value.some((x: any) => {
-      const f = nodes.value.find((n: any) => n.id === x.from_node)
-      const t = nodes.value.find((n: any) => n.id === x.to_node)
-      return f != null && t != null && f.agent_id === d.from && t.agent_id === d.to
-    })
-    if (hasForward) return from.agent_id === d.from && to.agent_id === d.to
-    return (from.agent_id === d.from && to.agent_id === d.to) ||
-           (from.agent_id === d.to && to.agent_id === d.from)
+    const key = `${d.from}→${d.to}`
+    const hasForward = forwardAgentPairs.value.has(key)
+    if (hasForward) return fromAid === d.from && toAid === d.to
+    return (fromAid === d.from && toAid === d.to) ||
+           (fromAid === d.to && toAid === d.from)
   })
 }
 
 function isEdgeDim(e: any): boolean {
-  const from = nodes.value.find((x: any) => x.id === e.from_node)
-  const to = nodes.value.find((x: any) => x.id === e.to_node)
+  const from = nodeById.value.get(e.from_node)
+  const to = nodeById.value.get(e.to_node)
   return (from && agentById(from.agent_id)?.enabled === false) ||
          (to && agentById(to.agent_id)?.enabled === false)
 }
@@ -613,6 +647,10 @@ function toggleRun() {
 // 串行/并行切换开关
 async function toggleExecMode() {
   if (!canvas.value) return
+  if (runningOnThisCanvas.value) {
+    // 运行期间锁定执行模式，禁止切换
+    return
+  }
   canvas.value.execution_mode = canvas.value.execution_mode === 'parallel' ? 'serial' : 'parallel'
   await canvases.saveCurrent()
 }
@@ -798,8 +836,8 @@ function offsetEdgePath(p0: any, c1: any, c2: any, p3: any, dist: number) {
 }
 
 function computeEdge(e: any) {
-  const a = nodes.value.find((n: any) => n.id === e.from_node)
-  const b = nodes.value.find((n: any) => n.id === e.to_node)
+  const a = nodeById.value.get(e.from_node)
+  const b = nodeById.value.get(e.to_node)
   if (!a || !b) return null
   const { p1, p2, horizontal } = sideAnchors(a, b)
   let c1 = { ...p1 }, c2 = { ...p2 }
@@ -829,7 +867,7 @@ const edgeGeoms = computed(() => edges.value.map((e: any) => ({ e, g: computeEdg
 
 function tempPath() {
   if (!linking.value) return ''
-  const a = nodes.value.find((n: any) => n.id === linking.value!.from)
+  const a = nodeById.value.get(linking.value!.from)
   if (!a) return ''
   const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
   const dx = linking.value.mouseX - acx, dy = linking.value.mouseY - acy
@@ -951,18 +989,15 @@ const vTransform = computed(() => {
   return `translate(${tx.value}px, ${ty.value}px) scale(${scale.value})`
 })
 
-// ③ 气泡流式自动滚到底：发言者流式内容长度 + 消息数 + speakingAgent + 能力调用状态变化
+// ③ 气泡流式自动滚到底：只依赖触发内容变化的响应式字段
+//   不再遍历 msgs 算 streamLen（重复计算，bubbleMap 已遍历过一次）
 //   speakingAgents.size 让"并行时新增一个接收方"也能触发滚动跟随
 const bubbleScrollKey = computed(() => {
   const conv = bubbleConv.value
   if (!conv) return '0'
   const msgs = conv.messages || []
-  let streamLen = 0
-  for (const m of msgs) {
-    if (m.role === 'assistant' && m.streaming) streamLen += (m.content || '').length
-  }
   const tcKey = Object.entries(convs.toolCalls).map(([k, v]) => `${k}:${(v as any).name}:${(v as any).phase}`).join('|')
-  return `${convs.streaming ? 1 : 0}:${convs.speakingAgent ?? 0}:${convs.speakingAgents.size}:${convs.handoffActive ? 1 : 0}:${msgs.length}:${streamLen}:${tcKey}`
+  return `${convs.streaming ? 1 : 0}:${convs.speakingAgent ?? 0}:${convs.speakingAgents.size}:${convs.handoffActive ? 1 : 0}:${msgs.length}:${tcKey}`
 })
 
 // 气泡底部跟随：默认贴底；用户上滑即脱离，停止滑动 5s 后自动恢复跟随
@@ -1032,7 +1067,9 @@ function scrollAllBubblesToBottom() {
   })
 }
 
-watch(bubbleScrollKey, async () => {
+// 气泡流式自动滚到底：监听 bubbleMap（内容每次变化都重新计算，含 token 到达时的 content mutate）
+// 以及 bubbleScrollKey（speakingAgent 切换、toolCalls 变化等）
+watch([bubbleMap, bubbleScrollKey], async () => {
   await nextTick()
   // 等浏览器完成本帧布局后再滚，确保 scrollHeight 已包含最新文字
   requestAnimationFrame(scrollBubblesToBottom)
@@ -1047,19 +1084,22 @@ watch(() => bubbleConv.value?.id, async (id) => {
 }, { immediate: true })
 
 // 流式过程中持续贴底（token 逐段到达时 key 可能不变的兜底）
+// 用 rAF 自调度替代 while+setInterval：浏览器每帧最多跑一次，不强制 nextTick 重渲染
 watch(() => [convs.streaming, convs.speakingAgent] as const, async ([sp], oldVal) => {
-  // 新一轮流式开始时复位全部气泡的贴底状态（尊重用户此前在某气泡内的手动滚动）
   const prevSp = oldVal?.[0]
   if (sp && !prevSp) resetBubbleStick()
   if (!sp) return
-  while (convs.streaming) {
-    await nextTick()
+  let rafId = 0
+  const tick = () => {
+    if (!convs.streaming) return
     scrollBubblesToBottom()
-    await new Promise(r => setTimeout(r, 120))
+    rafId = requestAnimationFrame(tick)
   }
+  rafId = requestAnimationFrame(tick)
+  // 下一帧立即滚一次（内容刚到位）
   await nextTick()
   scrollBubblesToBottom()
-}, { immediate: true })
+})
 
 // 暴露 viewportRef 给父组件（钉住模式下 WorkspaceOverlay 要嵌入 viewport 内部）
 defineExpose({ viewportRef, computeNodeBbox })
@@ -1070,7 +1110,8 @@ defineExpose({ viewportRef, computeNodeBbox })
        @dragover.prevent @drop="onDrop" @wheel.passive="onWheel"
        @mousedown="startPan"
        @click="closeMenus" @contextmenu="showBgMenu">
-    <div class="grid-bg" ref="gridRef" />
+    <!-- 点状网格已移除 -->
+
 
     <!-- 工具栏（可折叠） -->
     <div class="canvas-toolbar" :class="{ collapsed: toolbarCollapsed }">
@@ -1085,8 +1126,8 @@ defineExpose({ viewportRef, computeNodeBbox })
                   @click.stop="toggleRun">
             {{ runningOnThisCanvas ? '⏹' : '▶' }}
           </button>
-          <button class="btn ghost em-collapsed" @click.stop="toggleExecMode"
-                  :title="canvas?.execution_mode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行'">
+          <button class="btn ghost em-collapsed" @click.stop="toggleExecMode" :disabled="runningOnThisCanvas"
+                  :title="runningOnThisCanvas ? '运行中：执行模式已锁定' : (canvas?.execution_mode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行')">
             {{ canvas?.execution_mode === 'parallel' ? '⇉' : '⇥' }}
           </button>
         </div>
@@ -1111,11 +1152,11 @@ defineExpose({ viewportRef, computeNodeBbox })
                   :title="runningOnThisCanvas ? '停止：中止定时触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时）运行集群'">
             {{ runningOnThisCanvas ? '⏹ 停止' : '▶ 运行' }}
           </button>
-          <div class="exec-mode-toggle" @click.stop
-               :title="canvas?.execution_mode === 'parallel' ? '并行：发送消息后继续运行' : '串行：发送消息后停止运行'">
+          <div class="exec-mode-toggle" @click.stop :class="{ disabled: runningOnThisCanvas }"
+               :title="runningOnThisCanvas ? '运行中：执行模式已锁定' : (canvas?.execution_mode === 'parallel' ? '并行：发送后继续运行' : '串行：阻塞等待对方回信')">
             <span class="em-label" :class="{ active: canvas?.execution_mode !== 'parallel' }">串行</span>
             <label class="em-switch">
-              <input type="checkbox" :checked="canvas?.execution_mode === 'parallel'" @change="toggleExecMode" @click.stop />
+              <input type="checkbox" :checked="canvas?.execution_mode === 'parallel'" :disabled="runningOnThisCanvas" @change="toggleExecMode" @click.stop />
               <span class="em-slider"></span>
             </label>
             <span class="em-label" :class="{ active: canvas?.execution_mode === 'parallel' }">并行</span>
@@ -1179,11 +1220,11 @@ defineExpose({ viewportRef, computeNodeBbox })
            @dblclick="toggleBubble(n)"
            @contextmenu="showCtxMenu($event, n)">
         <!-- 消息气泡：双击节点可隐藏；流式输出中也尊重用户的隐藏设置 -->
-        <div v-if="bubbleFor(n) && !bubbleHidden[n.id]"
-             class="node-bubble" :class="{ streaming: bubbleFor(n)?.streaming }"
+        <div v-if="getBubbleForAgent(n.agent_id) && !bubbleHidden[n.id]"
+             class="node-bubble" :class="{ streaming: getBubbleForAgent(n.agent_id)?.streaming }"
              @wheel.stop @scroll="onBubbleScroll">
           <!-- 深度思考 chunk（灰底折叠块，有区别特效） -->
-          <div v-for="(chunk, ci) in bubbleFor(n)!.chunks" :key="ci"
+          <div v-for="(chunk, ci) in getBubbleForAgent(n.agent_id)!.chunks" :key="ci"
                class="b-chunk" :class="'b-' + chunk.kind">
             <template v-if="chunk.kind === 'reasoning'">
               <div class="b-think">
@@ -1207,7 +1248,7 @@ defineExpose({ viewportRef, computeNodeBbox })
           </div>
         </div>
         <div class="node-head">
-          <div class="avatar" :style="{ background: avatarGradient(agentById(n.agent_id)?.name || n.agent_id) }">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
+          <div class="avatar" :style="{ background: avatarGradient(n.agent_id) }">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
           <div class="name">{{ agentById(n.agent_id)?.name || '未知' }}</div>
           <span v-if="agentById(n.agent_id)?.enabled === false" class="off-tag" title="已停用">⏸</span>
         </div>
@@ -1352,7 +1393,7 @@ defineExpose({ viewportRef, computeNodeBbox })
 
 <style scoped>
 .canvas-board { flex: 1; position: relative; overflow: hidden; min-height: 0; cursor: default;
-  backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(var(--surface-rgb), 0.04); }
+  backdrop-filter: none; -webkit-backdrop-filter: none; background: transparent; }
 .canvas-board.panning-active { cursor: grabbing; }
 .grid-bg { position: absolute; inset: 0; background-image: radial-gradient(circle, rgba(var(--surface-rgb), 0.06) 1px, transparent 1px); background-size: 24px 24px; pointer-events: none; z-index: 0; }
 

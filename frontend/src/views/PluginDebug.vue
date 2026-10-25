@@ -15,7 +15,7 @@ import PluginDebugPanel from '@/components/plugin-debug/PluginDebugPanel.vue'
 </template>
 
 <style scoped>
-.pd-root { padding: 16px; height: 100vh; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.pd-root { padding: 16px; height: calc(100vh - var(--titlebar-h)); display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .top {
   padding: 12px 20px; margin-bottom: 12px; display: flex; align-items: center; gap: 16px; flex-shrink: 0;
   h2 { font-size: calc(18px * var(--font-scale)); }

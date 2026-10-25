@@ -301,13 +301,27 @@ function pxToEdge(px: number, py: number, b: Bbox, ph: number): EdgeState {
 }
 
 // —— 位置：两套坐标系 ——
+/**
+ * 浮动模式下的视口钳制：用面板实际高度（而非写死的 420）计算最大 top，
+ * 保证面板既能完整留在视口内，又能一直拖到界面底部。
+ * 展示与拖动起点共用此结果，避免"存的值越界 → 拖动时面板跳一下"。
+ */
+function clampFloat(x: number, y: number) {
+  const h = panelH.value || panelEl.value?.offsetHeight || 420
+  return {
+    x: Math.max(8, Math.min(x, Math.max(8, window.innerWidth - PANEL_W - 8))),
+    y: Math.max(8, Math.min(y, Math.max(8, window.innerHeight - h - 8))),
+  }
+}
+
 const panelStyle = computed(() => {
   if (!props.pinned) {
     // 解锁浮动：body 下 fixed 屏幕像素
+    const p = clampFloat(props.floatX, props.floatY)
     return {
       position: 'fixed' as const,
-      left: Math.max(8, Math.min(props.floatX, window.innerWidth - PANEL_W - 8)) + 'px',
-      top: Math.max(8, Math.min(props.floatY, window.innerHeight - 420)) + 'px',
+      left: p.x + 'px',
+      top: p.y + 'px',
     }
   }
   // 钉住嵌入：viewport 内 absolute 画布坐标（由边对 + 位移从包围盒反推）
@@ -364,10 +378,10 @@ function startDrag(e: MouseEvent) {
     const base = b?.hasNodes ? edgeToPx(props.edge, b, panelH.value) : { x: 12, y: 12 }
     dragStart.value = { clientX: e.clientX, clientY: e.clientY, base, kind: 'pin' }
   } else {
-    // 解锁：浮动面板的屏幕坐标
+    // 解锁：浮动面板的屏幕坐标（取实际展示的钳制位置作为起点，避免跳变）
     dragStart.value = {
       clientX: e.clientX, clientY: e.clientY,
-      base: { x: props.floatX, y: props.floatY }, kind: 'float',
+      base: clampFloat(props.floatX, props.floatY), kind: 'float',
     }
   }
 }

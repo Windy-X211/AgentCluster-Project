@@ -3,6 +3,7 @@ import { api } from '@/api'
 import { useCanvasStore } from './canvas'
 import { useAgentStore } from './agent'
 import { useSettingsStore } from './settings'
+import { playSuccess, playError } from '@/utils/sound'
 
 /**
  * 行协议转义还原：后端 yield T:/RN: 等行前，会把 payload 中的
@@ -504,6 +505,7 @@ export const useConvStore = defineStore('conv', {
     _flushTimers: {} as Record<number, ReturnType<typeof setTimeout>>, // 会话 → 节流 flush 定时器
     _lastFlushAt: 0,           // 上次 flush 时间戳（ms）
     _unloadBound: false,       // 是否已绑定 beforeunload
+    _sendError: {} as Record<number, boolean>, // 会话 → 本轮 send 是否出现错误（E: 行 / 异常）
   }),
   getters: {
     /** 当前会话是否正在流式（发送/停止按钮据此切换：仅当前会话在流式才显示"停止"，
@@ -709,6 +711,7 @@ export const useConvStore = defineStore('conv', {
       this._callEdges[cid] = []
       this._toolCalls[cid] = {}
       this._toolPending[cid] = {}
+      this._sendError[cid] = false  // 本轮 send 错误标志（E: 行 / 网络异常 → true；用户主动 abort → 保持 false）
 
       // 绑定一次 beforeunload（幂等），关页/关标签会同步 XHR 强制保存
       this.bindBeforeUnload()
@@ -726,6 +729,8 @@ export const useConvStore = defineStore('conv', {
 
       // 先立刻落库一次（用户消息 + 空的 assistant 占位），中途 crash 也能保住用户输入
       await this.flushCurrentNow(false, cid)
+
+      let _aborted = false  // 用户主动停止：区别于真实错误，播放静音
 
       try {
         // 逐行解析新协议（signal 支持「停止」中止 fetch → 后端断连取消接力链）
@@ -758,12 +763,14 @@ export const useConvStore = defineStore('conv', {
         if (last?.streaming) last.streaming = false
       } catch (e: any) {
         if (e?.name === 'AbortError') {
+          _aborted = true
           const last = msgs[msgs.length - 1]
           if (last?.streaming) { last.streaming = false; last.content = (last.content || '') + ' [已停止]' }
         } else {
           // 传输/后端异常（HTTP 错误、断流、网络中断等）：给最后一条仍处于流式中的消息
           // 关闭流式位并补中断标记，避免它被 finally 的 flush 以 streaming:true + 空内容
           // 持久化——重开后会渲染成"空泡泡 + 永远闪烁的光标"
+          this._sendError[cid] = true
           const last = msgs[msgs.length - 1]
           if (last?.streaming) { last.streaming = false; last.content = (last.content || '') + ' [输出中断]' }
           throw e
@@ -805,6 +812,20 @@ export const useConvStore = defineStore('conv', {
           const found = this.list.find(x => x.id === this.current)
           if (found) this.current = found.id
           // 找不到就保留原 current —— abort 后后端 list 可能暂时没同步
+        }
+
+        // 提示音：仅画布运行模式（非独立对话）+ 用户主动 abort 静音
+        // 正常完成 → 愉悦音；有错误（E: 行 / 网络异常）→ 急促音
+        try {
+          if (!_aborted && this.running) {
+            const st = useSettingsStore()
+            if (st.data.sound_enabled !== false) {
+              if (this._sendError[cid]) playError()
+              else playSuccess()
+            }
+          }
+        } finally {
+          delete this._sendError[cid]
         }
       }
     },
@@ -925,6 +946,7 @@ export const useConvStore = defineStore('conv', {
         // 后端错误行（LLM 调用失败/运行时异常/上游 HTTP 错误）→ 必须呈现给用户，
         // 否则表现为"无缘无故停止运行"
         // ⚠️ 后端 _esc 转义了 err_msg 内的 \n/\r/\\（防止多行异常详情破坏行协议），这里用 _unesc 还原
+        this._sendError[cid] = true  // 后端报错 → 标记本轮为错误，finally 播放急促提示音
         const text = _unesc(line.slice(2))
         if (lastAssistant && lastAssistant.role === 'assistant' && lastAssistant.streaming) {
           lastAssistant.content = ((lastAssistant.content || '') + (lastAssistant.content ? '\n\n' : '') + text)

@@ -1187,11 +1187,20 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
             "对方也可用 cluster.send_message 回复你，支持往返多轮。"
             "打招呼/寒暄/用户直接问你简单问题 → 直接输出文字回复，不要调用 cluster.send_message。"
         )
-        if (canvas or {}).get("execution_mode", "serial") != "parallel":
+        exec_mode_for_prompt = (canvas or {}).get("execution_mode", "serial")
+        if exec_mode_for_prompt != "parallel":
             parts.append(
-                "【执行模式：串行】你本轮只能调用一次 cluster.send_message 联系一个成员；"
-                "发送消息后你会停止运行，由对方接着运行。如需联系多个成员，"
-                "请先与其中一个完成沟通，下一轮再联系其他成员。"
+                "【执行模式：串行】单线接力，一次只与一个成员沟通：\n"
+                "- cluster.send_message 会阻塞等待，对方收到消息后运行完成并回信，回信内容会作为**工具执行结果**返回给你；\n"
+                "- 你可以基于对方回信继续下一步操作（再发消息、执行其他工具、或输出最终回复）；\n"
+                "- 每轮只能给一个成员发消息，如需联系多人请在收到第一人回信后再发第二人。"
+            )
+        else:
+            parts.append(
+                "【执行模式：并行】多条消息并发发送：\n"
+                "- cluster.send_message 发送后立即返回发送状态，你可以在同一轮给多个成员发消息；\n"
+                "- 接收方会并发启动运行，各自独立处理；\n"
+                "- 你发送完消息后可继续自己的工作流程，无需等待接收方回复。"
             )
 
     # 不可 call 的（global 模式可见但不能 call / link 模式不可见）
@@ -1251,6 +1260,69 @@ async def _drain_agent_reply(conversation_id: int, target: dict, input_text: str
     return lines
 
 
+async def _serial_send_message_and_wait(
+    conversation_id: int, sender: dict, target: dict, message: str,
+    turn: dict, canvas: dict, conv: dict,
+) -> dict:
+    """串行模式专用：阻塞式 send_message — 构造信封 → 启动下游 B → await B 完整完成 →
+    从 B 的 turn.calls 中提取 B 给 sender 的回信，把回信内容作为 send_message 的 tool result 返回。
+
+    这让 A 的 tool loop 能把 B 的回信当作 send_message 的执行结果，A 可以继续基于回信做下一步决策。
+    """
+    env = build_call_envelope(conversation_id, sender, target, {"message": message})
+    # 落库 A2A 信封（新建消息避免覆盖）
+    fresh = get_by("conversations", conversation_id) or conv
+    fresh.setdefault("messages", []).append({
+        "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
+    })
+    upsert("conversations", fresh)
+
+    # 构造 B 的 child_turn（浅拷贝，让 B 的 turn 修改不污染 A）
+    child_turn = dict(turn)
+    child_turn["reply_to_msg_id"] = env.get("message_id")
+    child_turn["reply_to_from"] = sender.get("id")
+    # 给 B 一个独立的 calls 队列（B 的 send_message 回信会进这里）
+    child_turn["calls"] = []
+
+    # 运行 B 直到完成，同时收集 B 的所有输出行
+    yield_lines: list[str] = []
+    b_final_text = ""
+    try:
+        async for line in agent_reply(
+            conversation_id, target, render_envelope(env),
+            mode="linked", canvas=canvas, turn=child_turn,
+        ):
+            yield_lines.append(line)
+            # 提取 B 的 final_text（F: 行格式为 "F:xxx\n"）
+            if line.startswith("F:"):
+                b_final_text = line[2:].rstrip("\n")
+    except Exception as e:
+        return {"error": f"下游智能体 {target.get('name', '?')} 执行异常：{e}"}
+    mark_envelope_done(conversation_id, env.get("message_id"))
+
+    # 从 B 的 child_turn.calls 中提取 B 给 sender 的 send_message 回信
+    b_reply_msg = ""
+    for call in child_turn.get("calls", []):
+        if call.get("from_id") == target.get("id") and call.get("to_agent_id") == sender.get("id"):
+            b_reply_msg = call.get("message", "")
+            break
+
+    # 如果 B 没有显式 send_message 回信，取 B 的 final_text 作为回信
+    reply_content = b_reply_msg if b_reply_msg else b_final_text
+
+    return {
+        "ok": True,
+        "to": target.get("name"),
+        "to_agent_id": target.get("id"),
+        "reply": reply_content,
+        "b_final_text": b_final_text,
+        "b_explicit_reply": bool(b_reply_msg),
+        "note": "已收到对方回信",
+        # 把 B 的所有输出行也带回来（供 A 端 yield 给前端）
+        "_b_yield_lines": yield_lines,
+    }
+
+
 async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: str = "independent", canvas: dict | None = None, turn: dict | None = None):
     """让智能体回复，以 async generator 输出；最终结果会自动入库。
     链首调用创建本轮 A2A turn（visited/handoffs 等共享状态），递归接力时复用传入的 turn。
@@ -1266,6 +1338,7 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
             "reply_to_msg_id": None, "reply_to_from": None,
             "relay_depth": 0,   # 防递归爆炸：只有链首能触发 relay
             "_child_tasks": set(),  # 共享的后台 receiver 任务池（根退出时统一取消）
+            "_locked_exec_mode": (canvas or {}).get("execution_mode", "serial"),  # 运行时锁定：会话开始后不可切换
         }
     else:
         turn["relay_depth"] = turn.get("relay_depth", 0) + 1
@@ -1858,16 +1931,50 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # 下一轮 chat 前 strip 时，index >= 此值的 img_followup 要保留
             # （本轮刚追加，本轮 LLM 还没看过）；< 此值的是之前轮次的，替换为占位。
             _tool_round_start = len(messages)
+            exec_mode = turn.get("_locked_exec_mode", "serial")
+            _serial_send_handled = False  # 串行模式下标记已处理过 send_message（防止一轮多条）
             for tc in assistant_tool_calls:
                 fn = tc["function"]
                 try:
                     args = json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
                 except Exception:
                     args = {}
-                result = await asyncio.to_thread(_execute_tool, fn["name"], args,
-                                      conv_id=conversation_id,
-                                      tool_call_id=tc["id"],
-                                      agent_id=agent.get("id"))
+
+                # —— 串行模式：cluster.send_message 阻塞等待下游回信 ——
+                _is_send_msg = fn["name"] == "cluster.send_message"
+                if _is_send_msg and mode == "linked" and canvas and exec_mode != "parallel":
+                    if _serial_send_handled:
+                        # 串行模式一轮只能给一个目标发消息
+                        result = {"error": "串行模式下每轮只能调用一次 cluster.send_message；请等回信后下一轮再联系其他成员。"}
+                    else:
+                        _serial_send_handled = True
+                        # 复用 a2a 的目标解析与方向性校验
+                        target, err = _resolve_target(turn, args.get("to_agent"))
+                        if err:
+                            result = {"error": err}
+                        elif target.get("id") == agent.get("id"):
+                            result = {"error": "不能与自己消息"}
+                        elif not (args.get("message") or "").strip():
+                            result = {"error": "请提供 message（要发给对方的内容）"}
+                        else:
+                            yield f"RN:（串行模式：发送消息给 {target.get('name')}，等待对方回复...）\n"
+                            # SPEAK + A2A 信封由辅助函数内部落库但不 yield，这里先声明发送者切换
+                            yield f"SPEAK:{target.get('id')}\n"
+                            result = await _serial_send_message_and_wait(
+                                conversation_id, agent, target, args.get("message", ""),
+                                turn, canvas, conv,
+                            )
+                            # 把 B 的输出行 yield 给前端
+                            _b_lines = result.pop("_b_yield_lines", []) if isinstance(result, dict) else []
+                            for _bl in _b_lines:
+                                yield _bl
+                else:
+                    # 并行模式 / 非 send_message → 走普通同步执行路径
+                    result = await asyncio.to_thread(_execute_tool, fn["name"], args,
+                                          conv_id=conversation_id,
+                                          tool_call_id=tc["id"],
+                                          agent_id=agent.get("id"))
+
                 # 先判断是不是图片：一次调用同时给 truncate 和 followup 用，避免重复 I/O
                 img_followup = _build_image_followup(result)
                 result_str = _truncate_tool_result(result, is_image=(img_followup is not None))
@@ -1895,38 +2002,16 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # 导致"强制采纳"把整个运行提前掐死在任务中途。
             verify_retry_count = 0
 
-            # —— 串行/并行模式：cluster.send_message 后的行为差异 ——
-            if mode == "linked" and canvas:
+            # —— 并行模式：cluster.send_message 后保持运行，接力阶段并发启动接收方 ——
+            # 串行模式下 send_message 已在上面阻塞等待并返回 tool result，
+            # 不再需要这里的 break，也不需要接力阶段再启动 B。
+            if mode == "linked" and canvas and exec_mode == "parallel":
                 has_call = any(tc["function"]["name"] == "cluster.send_message" for tc in assistant_tool_calls)
                 if has_call:
-                    exec_mode = canvas.get("execution_mode", "serial")
-                    if exec_mode == "serial":
-                        # 串行：智能体发送消息后停止运行，接收方开始运行
-                        final_text_parts.append(assistant_text)
-                        break
-                    else:
-                        # 并行：智能体发送消息后可以继续运行，接收方并发启动
-                        yield f"RN:（并行模式：发送消息后继续运行，接收方并发启动）\n"
-                        for target, d in collect_call_targets(turn, agent):
-                            env = build_call_envelope(conversation_id, agent, target, d)
-                            fresh = get_by("conversations", conversation_id) or conv
-                            fresh.setdefault("messages", []).append({
-                                "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
-                            })
-                            upsert("conversations", fresh)
-                            yield f"SPEAK:{target.get('id')}\n"
-                            yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
-                            child_turn = dict(turn)
-                            child_turn["reply_to_msg_id"] = env.get("message_id")
-                            child_turn["reply_to_from"] = agent.get("id")
-                            task = asyncio.create_task(_drain_agent_reply(
-                                conversation_id, target, render_envelope(env),
-                                "linked", canvas, child_turn
-                            ))
-                            _register_child_task(turn, task)
-                            parallel_tasks.append((task, env))
+                    # 已通过 _execute_tool 排队（cmd_cluster_send_message），等循环结束后由接力阶段统一并发启动
+                    yield f"RN:（并行模式：消息已发送排队，继续运行，接力阶段并发启动接收方）\n"
 
-            continue  # 继续下一轮（串行模式下不会到这里，已经 break 了）
+            continue  # 继续下一轮（串行阻塞已返回给模型，继续 tool loop）
 
         # —— 无 tool_calls → 模型声称完成，进入独立验证 ——
         # 情况 A：没调用过任何工具 → 纯知识回答，直接采纳（与快通道类似）
@@ -2022,6 +2107,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     #     （受 MAX_CALL 预算 + A2A_MAX_RELAY_DEPTH 双重约束防爆炸）；
     #      成果接力（handoff）仅链首（relay_depth==0）触发防环 =====
     if mode == "linked" and canvas and turn.get("relay_depth", 0) <= A2A_MAX_RELAY_DEPTH:
+        exec_mode = turn.get("_locked_exec_mode", "serial")
+
         # 0) 本轮显式 cluster.send_message 联系过的目标（供后续 "是否已回复上游" 判定使用）
         contacted: set = set()
         for th in tool_history:
@@ -2065,13 +2152,43 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     yield f"RN:（正文回复已自动发回给 {_sender_name}）\n"
 
         # 1) cluster.send_message 排队的消息（含自动回复；允许往返多轮）
-        call_targets = collect_call_targets(turn, agent)
-        exec_mode = canvas.get("execution_mode", "serial")
-
-        if exec_mode == "parallel" and len(call_targets) > 1:
-            # 并行：所有接收方并发启动，最后统一输出
-            tasks = []
-            for target, d in call_targets:
+        # 串行模式：send_message 已在 tool 层阻塞处理（_serial_send_message_and_wait），
+        #           接力阶段跳过——避免重复发送。自动回复同样由串行阻塞机制覆盖。
+        # 并行模式：保持排队→接力阶段并发启动的行为
+        if exec_mode == "parallel":
+            call_targets = collect_call_targets(turn, agent)
+            if len(call_targets) > 1:
+                # 并行多条：所有接收方并发启动
+                tasks = []
+                for target, d in call_targets:
+                    env = build_call_envelope(conversation_id, agent, target, d)
+                    fresh = get_by("conversations", conversation_id) or conv
+                    fresh.setdefault("messages", []).append({
+                        "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
+                    })
+                    upsert("conversations", fresh)
+                    yield f"SPEAK:{target.get('id')}\n"
+                    yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
+                    child_turn = dict(turn)
+                    child_turn["reply_to_msg_id"] = env.get("message_id")
+                    child_turn["reply_to_from"] = agent.get("id")
+                    task = asyncio.create_task(_drain_agent_reply(
+                        conversation_id, target, render_envelope(env),
+                        "linked", canvas, child_turn,
+                    ))
+                    _register_child_task(turn, task)
+                    tasks.append((task, env))
+                for task, env in tasks:
+                    try:
+                        lines = await task
+                        for line in lines:
+                            yield line
+                    except Exception as e:
+                        yield f"RN:（并行任务异常：{e}）\n"
+                    mark_envelope_done(conversation_id, env.get("message_id"))
+            elif len(call_targets) == 1:
+                # 并行但只有一个目标 → 也走并发（统一用 asyncio.create_task）
+                target, d = call_targets[0]
                 env = build_call_envelope(conversation_id, agent, target, d)
                 fresh = get_by("conversations", conversation_id) or conv
                 fresh.setdefault("messages", []).append({
@@ -2088,37 +2205,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     "linked", canvas, child_turn,
                 ))
                 _register_child_task(turn, task)
-                tasks.append((task, env))
-            for task, env in tasks:
-                try:
-                    lines = await task
-                    for line in lines:
-                        yield line
-                except Exception as e:
-                    yield f"RN:（并行任务异常：{e}）\n"
-                mark_envelope_done(conversation_id, env.get("message_id"))
-        else:
-            # 串行：顺序处理（智能体发送消息后停止，接收方依次运行）
-            for target, d in call_targets:
-                env = build_call_envelope(conversation_id, agent, target, d)
-                fresh = get_by("conversations", conversation_id) or conv
-                fresh.setdefault("messages", []).append({
-                    "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
-                })
-                upsert("conversations", fresh)
-                yield f"SPEAK:{target.get('id')}\n"
-                yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
-                # 下游回复 call 时默认 reply_to 本条
-                turn["reply_to_msg_id"] = env.get("message_id")
-                turn["reply_to_from"] = agent.get("id")
-                async for line in agent_reply(
-                    conversation_id, target, render_envelope(env),
-                    mode="linked", canvas=canvas, turn=turn,
-                ):
+                lines = await task
+                for line in lines:
                     yield line
                 mark_envelope_done(conversation_id, env.get("message_id"))
-                turn["reply_to_msg_id"] = None
-                turn["reply_to_from"] = None
 
         # 2) 成果接力（A2A_HANDOFF_ENABLED=False 时 collect_relay_targets 返回空）
         for target, h in collect_relay_targets(turn, canvas, agent):

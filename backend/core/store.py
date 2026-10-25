@@ -157,6 +157,8 @@ DEFAULT_SETTINGS = {
     "max_tool_rounds": 50,
     # 独立对话模式（无画布）下的默认输出目录；为空则回退到进程 CWD
     "default_workdir": "",
+    # 画布运行停止时的提示音开关（完成=愉悦/错误=急促）
+    "sound_enabled": True,
 }
 
 

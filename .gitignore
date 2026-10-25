@@ -39,3 +39,5 @@
 **/.idea/
 .DS_Store
 Thumbs.db
+# pywebview WebView2 用户数据（localStorage 等，勿提交）
+.webview_data/

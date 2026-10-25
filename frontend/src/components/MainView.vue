@@ -85,9 +85,10 @@ function onOpenWorkspace(pos: { clientX: number; clientY: number }) {
     wsVisible.value = false
   } else {
     // 首次打开：以鼠标位置为中心
+    // 只记录期望位置；越界钳制交由 WorkspaceOverlay 按面板实际高度处理（允许落到底部）
     const halfW = 180
     wsGlobal.value.floatX = Math.max(8, Math.min(pos.clientX - halfW, window.innerWidth - 360 - 8))
-    wsGlobal.value.floatY = Math.max(8, Math.min(pos.clientY - 24, window.innerHeight - 420))
+    wsGlobal.value.floatY = Math.max(8, pos.clientY - 24)
     wsVisible.value = true
   }
 }

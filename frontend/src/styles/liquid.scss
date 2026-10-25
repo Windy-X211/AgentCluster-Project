@@ -1,5 +1,7 @@
 /* 液态玻璃美学主题 · 多套配色方案 */
+
 :root {
+  --titlebar-h: 0px;
   --bg-base: #0a0e1a;
   --bg-grad-1: #1a2340;
   --bg-grad-2: #2d1645;
@@ -114,6 +116,11 @@ body,
 #app {
   height: 100%;
   width: 100%;
+}
+
+/* 样式表加载后按主题纠正 html 底色（index.html 内联 #0a0e1a 仅用于首帧防白闪） */
+html {
+  background: var(--bg-base);
 }
 
 body {
@@ -280,9 +287,34 @@ option {
   grid-template-areas:
     "topbar topbar topbar topbar"
     "left   center handle   right";
-  height: 100vh;
+  height: calc(100vh - var(--titlebar-h));
   gap: 10px;
   padding: 10px;
+}
+
+/* —— 桌面独立窗口（pywebview frameless）—— */
+html.desktop-frameless {
+  /* 确保 html/body 完全填满窗口，不留空隙（DWM 阴影除外） */
+  height: 100%;
+  overflow: hidden;
+}
+
+html.desktop-frameless body {
+  /* 禁止 body 级滚动条（frameless 窗口不应该出现浏览器原生滚动条） */
+  overflow: hidden;
+  height: 100vh;
+  /* 让 WebView2 背景透明，配合 DWM 阴影/圆角 */
+  background-attachment: fixed;
+}
+
+html.desktop-frameless #app {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* 桌面独立窗口：恢复 padding-top 让顶栏玻璃圆角完整显示 */
+html.desktop-frameless .app-root {
+  padding-top: 6px;
 }
 
 .topbar {

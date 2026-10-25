@@ -5,6 +5,7 @@ import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, FONT_SC
 import { api } from '@/api'
 import FileExplorerDialog from '@/components/FileExplorerDialog.vue'
 import { getAvatarGradient } from '@/utils/avatar'
+import { testSuccess, testError } from '@/utils/sound'
 
 const models = useModelStore()
 const settings = useSettingsStore()
@@ -239,13 +240,24 @@ function avatarPreviewGradient(name: string): string {
   }
   return getAvatarGradient(name)
 }
+
+// —— 提示音设置 ——
+const soundEnabled = computed({
+  get() { return settings.data.sound_enabled !== false },
+  set(v: boolean) { settings.update({ sound_enabled: v }) }
+})
+function toggleSound() { soundEnabled.value = !soundEnabled.value }
 </script>
 
 <template>
   <div class="settings-root region-settings">
     <div class="top glass">
+      <!-- 返回按钮是独立区域，不能拖动 -->
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
-      <h2>设置中心</h2>
+      <!-- 标题 + 中间空白 合起来是可拖动区（pywebview 祖先链严格匹配） -->
+      <div class="top-drag pywebview-drag-region">
+        <h2>设置中心</h2>
+      </div>
     </div>
 
     <div class="panels">
@@ -427,6 +439,32 @@ function avatarPreviewGradient(name: string): string {
         </div>
       </div>
 
+      <!-- 提示音 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>🔔 提示音</span>
+          <span class="hint">画布运行结束时的声音反馈</span>
+        </div>
+        <div class="cap-block">
+          <div class="sound-row">
+            <button class="asr-switch" :class="{ on: soundEnabled }" @click="toggleSound">
+              <span class="asr-switch-knob"></span>
+            </button>
+            <div class="sound-desc">
+              <div class="sound-main">{{ soundEnabled ? '已启用' : '已关闭' }}</div>
+              <div class="sound-sub">{{ soundEnabled ? '运行完成播放愉悦音，出现错误播放急促音' : '画布运行结束时不播放任何声音' }}</div>
+            </div>
+          </div>
+          <div v-if="soundEnabled" class="sound-test-row">
+            <button class="btn sm ghost" @click="testSuccess">🎵 试听完成音</button>
+            <button class="btn sm ghost" @click="testError">⚠️ 试听错误音</button>
+          </div>
+          <div class="hint-empty" style="margin-top: 8px">
+            提示音使用浏览器 Web Audio 合成，无需加载外部音频文件
+          </div>
+        </div>
+      </div>
+
       <!-- 语音识别 -->
       <div class="panel glass">
         <div class="panel-title">
@@ -567,8 +605,10 @@ function avatarPreviewGradient(name: string): string {
 </template>
 
 <style scoped>
-.settings-root { padding: 16px; height: 100vh; overflow-y: auto; }
+.settings-root { padding: 16px; height: calc(100vh - var(--titlebar-h)); overflow-y: auto; }
 .top { padding: 12px 20px; margin: 0 auto 16px; max-width: 1100px; display: flex; align-items: center; gap: 16px; h2 { font-size: calc(18px * var(--font-scale)); } }
+/* 标题 + 空白拖动区：flex:1 占满剩余空间，撑满高度才能接收鼠标事件 */
+.top-drag { flex: 1; align-self: stretch; display: flex; align-items: center; user-select: none; }
 .panels { display: grid; gap: 16px; max-width: 1100px; margin: 0 auto; }
 .panel { padding: 18px; }
 .panel-title { font-size: calc(15px * var(--font-scale)); font-weight: 600; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
@@ -624,6 +664,13 @@ function avatarPreviewGradient(name: string): string {
 .asr-uninstall-btn { color: #f87171 !important; border-color: rgba(239,68,68,0.3) !important; }
 .asr-uninstall-btn:hover:not(:disabled) { background: rgba(239,68,68,0.12) !important; }
 .asr-uninstall-hint { font-size: 12px; color: var(--text); opacity: 0.5; }
+
+/* —— 提示音 —— */
+.sound-row { display: flex; align-items: flex-start; gap: 10px; margin-top: 4px; }
+.sound-desc { flex: 1; min-width: 0; }
+.sound-main { font-size: 14px; font-weight: 600; color: var(--text); }
+.sound-sub { font-size: 12px; color: var(--text); opacity: 0.55; margin-top: 2px; }
+.sound-test-row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 
 /* —— 外观设置 —— */
 .appearance-row { display: flex; gap: 12px; margin-bottom: 12px; }

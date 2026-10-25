@@ -47,6 +47,7 @@ status_text = "正在启动..."
 _auto_opened_browser = False
 # 启动中窗口进程句柄：每次 启动/重启 都会重新拉起一个；上一个还在运行则不重复开
 _splash_proc: subprocess.Popen | None = None
+_app_window_proc: subprocess.Popen | None = None
 
 
 # ---------- 工具函数 ----------
@@ -174,6 +175,40 @@ def _ensure_splash():
         _splash_proc = None
 
 
+def _open_app_window():
+    """拉起独立窗口（pywebview 包装前端 5173）。独立进程跑，避免与 pystray 事件循环冲突。
+    已在运行则不重复开。"""
+    global _app_window_proc
+    if _app_window_proc is not None and _app_window_proc.poll() is None:
+        return
+    try:
+        _app_window_proc = subprocess.Popen(
+            [_splash_python(), str(ROOT / "app_window.py")],
+            cwd=str(ROOT),
+            creationflags=WIN_FLAGS,
+            close_fds=True,
+        )
+    except Exception as e:
+        print(f"[启动器] 独立窗口拉起失败: {e}")
+        _app_window_proc = None
+
+
+def _kill_app_window():
+    """通过 PID 文件杀掉独立窗口进程（托盘退出/停服务时清理）。
+    覆盖单例命中路径拉起的窗口（_app_window_proc 为 None 的情况）。"""
+    try:
+        pid_file = ROOT / "app_window.pid"
+        if pid_file.exists():
+            pid = int(pid_file.read_text().strip())
+            subprocess.run(['taskkill', '/PID', str(pid), '/F'],
+                           timeout=3, capture_output=True,
+                           creationflags=WIN_FLAGS)
+            try: pid_file.unlink()
+            except Exception: pass
+    except Exception as e:
+        print(f"[启动器] 清理独立窗口异常: {e}")
+
+
 # ---------- 启动/停止 ----------
 
 def start_backend():
@@ -252,7 +287,7 @@ def start_frontend():
 
 
 def start_all():
-    global status_text, _auto_opened_browser
+    global status_text
     print("=" * 50)
     print("  智能体集群 AgentCluster - 一键启动")
     print("=" * 50)
@@ -271,30 +306,33 @@ def start_all():
         print(f"\n✅ 全部启动成功！")
         print(f"   前端: {FRONTEND_URL}")
         print(f"   后端: {BACKEND_URL}")
-        # 自动打开浏览器：本进程内最多尝试一次（重启/重复拉起不再弹）；
-        # 且仅当前端此前未在服务（页面还没打开过）时才真正打开，
-        # 否则 webbrowser.open 会把已最小化的浏览器窗口反复顶起（“最小化后又自动出现”）。
-        opened = False
-        if not _auto_opened_browser:
-            _auto_opened_browser = True
-            if not frontend_was_up:
-                opened = True
-                threading.Timer(1.2, lambda: webbrowser.open(FRONTEND_URL + "/#/")).start()
-        # 通知启动窗口收尾：首次启动会顺带打开界面，其余场景仅提示就绪
-        write_status("done|启动完成，正在打开界面..." if opened else "done|✅ 服务已就绪")
     else:
         status_text = f"⚠️ 部分失败 (后端={'OK' if ok1 else 'FAIL'}, 前端={'OK' if ok2 else 'FAIL'})"
+    # 自动打开独立窗口：只要前端就绪就开（窗口包装的是前端 5173，不依赖后端）。
+    # 本进程内最多自动开一次；且仅当前端此前未在服务（页面还没打开过）时才开，
+    # 避免重启时把已关闭的窗口反复顶起。
+    # 自动开窗：只要前端是新起的且就绪就开（不依赖后端；重启后也会开）
+    opened = False
+    if not frontend_was_up and ok2:
+        opened = True
+        threading.Timer(1.2, _open_app_window).start()
+    # 通知启动窗口收尾
+    if opened:
+        write_status("done|启动完成，正在打开界面...")
+    elif ok1 and ok2:
+        write_status("done|✅ 服务已就绪")
+    else:
         write_status("done|⚠️ 部分服务启动失败，请查看托盘状态")
     if icon: update_menu()
 
 
 def stop_all():
     """停止所有子进程（带超时兜底，最多 8 秒）"""
-    global backend_proc, frontend_proc
+    global backend_proc, frontend_proc, _app_window_proc, _splash_proc
     print("[启动器] 正在停止所有服务...")
 
-    # 1) 优雅 terminate + wait 最多 3s
-    for p in (backend_proc, frontend_proc):
+    # 1) 优雅 terminate + wait 最多 3s（含启动窗口/独立窗口进程）
+    for p in (backend_proc, frontend_proc, _app_window_proc, _splash_proc):
         if p and p.poll() is None:
             try:
                 p.terminate()
@@ -307,6 +345,11 @@ def stop_all():
                 try: p.kill()
                 except Exception: pass
     backend_proc = frontend_proc = None
+    _app_window_proc = None
+    _splash_proc = None
+
+    # 兜底：通过 PID 文件杀独立窗口（覆盖单例路径拉起的窗口）
+    _kill_app_window()
 
     # 2) 兜底：按端口强制杀（kill_port 内部已用 CREATE_NO_WINDOW，避免闪 cmd 黑框）
     for port in (BACKEND_PORT, 5173):
@@ -368,29 +411,38 @@ def make_image(running: bool = True) -> Image.Image:
 
 
 def update_menu():
-    """每 3 秒刷新：用实时健康检查回写 status_text，避免启动期 FAIL 文案永久残留。"""
+    """每 3 秒刷新：用实时健康检查回写 status_text，避免启动期 FAIL 文案永久残留。
+
+    关键：仅在 status_text 真正变化时才重建菜单（icon.update_menu()）。
+    因为 pystray 的 update_menu() 内部会 DestroyMenu + CreateMenu，
+    若右键菜单正打开着就会把它销毁，导致鼠标悬停高亮异常。
+    平时只更新 icon.title（tooltip）即可。
+    """
     if not icon: return
     global status_text
     # 启动/停止过渡态由 start_all/stop_all 设置，这里只在明确运行或停止后覆盖
     if status_text.startswith("正在启动") or status_text.startswith("正在停止"):
         icon.title = f"AgentCluster  {status_text}"
-        try: icon.update_menu()
-        except Exception: pass
         return
     h = check_health()
     if h["backend"] and h["frontend"]:
-        status_text = "✅ 运行中"
+        new_status = "✅ 运行中"
     elif not h["backend"] and not h["frontend"]:
-        if status_text != "⏹ 已停止":
-            status_text = "⏹ 已停止"
+        new_status = "⏹ 已停止"
     else:
-        status_text = f"⚠️ 部分失败 (后端={'OK' if h['backend'] else 'FAIL'}, 前端={'OK' if h['frontend'] else 'FAIL'})"
-    icon.title = f"AgentCluster  {status_text}"
-    try: icon.update_menu()
-    except Exception: pass
+        new_status = f"⚠️ 部分失败 (后端={'OK' if h['backend'] else 'FAIL'}, 前端={'OK' if h['frontend'] else 'FAIL'})"
+
+    icon.title = f"AgentCluster  {new_status}"
+    if new_status != status_text:
+        status_text = new_status
+        try: icon.update_menu()
+        except Exception: pass
 
 
 # ---------- 菜单动作 ----------
+
+def on_open_window(icon=None, item=None):
+    _open_app_window()
 
 def on_open_frontend(icon=None, item=None):
     webbrowser.open(FRONTEND_URL + "/#/")
@@ -405,28 +457,21 @@ def on_stop(icon=None, item=None):
     threading.Thread(target=stop_all, daemon=True).start()
 
 def on_exit(ic=None, item=None):
-    """❌ 退出 —— 后台线程停服务，立即关托盘（不等 stop_all 完成）"""
+    """❌ 退出 —— 同步停服务确保退出干净，再关托盘"""
     print("[退出] on_exit")
     clear_status_file()  # 让还在等待的启动中窗口退出
-    # 后台停服务（不阻塞托盘关闭）
-    threading.Thread(target=lambda: (stop_all(), sys.exit(0)), daemon=True).start()
-    # 立即关托盘
+    # 同步停所有服务（确保退出干净，最多 8s；stop_all 内含 _kill_app_window）
+    stop_all()
+    # 关托盘
     try:
         if ic: ic.stop()
         elif icon: icon.stop()
     except Exception as e:
         print(f"[退出] icon.stop() 异常: {e}")
     print("[退出] tray icon 已关闭")
-
-
-def on_force_exit(ic=None, item=None):
-    """硬关闭：只关托盘，子进程留给用户手动清理"""
-    print("[退出] 硬关闭")
-    try:
-        if ic: ic.stop()
-        elif icon: icon.stop()
-    except Exception: pass
     sys.exit(0)
+
+
 
 def on_start_if_needed(icon=None, item=None):
     if is_running():
@@ -441,22 +486,21 @@ def run_tray():
     global icon
     menu = pystray.Menu(
         pystray.MenuItem(
-            lambda item: f"状态: {status_text}", None, enabled=False, default=True
+            lambda item: f"状态: {status_text}", None, enabled=False
         ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("🚀 启动服务", on_start_if_needed),
         pystray.MenuItem("🔄 重启全部", on_restart),
         pystray.MenuItem("⏹ 停止全部服务", on_stop),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("🌐 打开界面", on_open_frontend),
+        # 左键点击托盘图标 → 直接打开界面（pystray 左键事件会找到 default=True 的项）
+        pystray.MenuItem("🌐 打开界面", on_open_window, default=True),
+        pystray.MenuItem("🌐 用浏览器打开", on_open_frontend),
         pystray.MenuItem("⚙ 后端健康检查", on_open_backend),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("❌ 退出 (停服务)", on_exit),
-        pystray.MenuItem("⚠️ 强制关闭托盘", on_force_exit),
+        pystray.MenuItem("❌ 退出程序", on_exit),
     )
     icon = pystray.Icon("agentcluster", make_image(running=True), "AgentCluster", menu)
-    # 双击图标 → 直接退出
-    icon.default_action = on_exit
     icon.title = f"AgentCluster  {status_text}"
 
     # 后台自动启动（包装异常）
@@ -510,6 +554,9 @@ if __name__ == "__main__":
     # 单例：已有托盘在跑就不再拉起第二个（避免重复弹浏览器 / 端口打架 / 多实例 Vite 互抢，
     # 这是“最小化后浏览器又被反复顶起”的根因之一）。需要打开界面请点托盘菜单「🌐 打开界面」。
     if _already_running():
+        # 服务已在跑，直接拉起独立窗口（用户点启动多半是想看到界面），再退出
+        _open_app_window()
+        time.sleep(2)
         sys.exit(0)
     try:
         run_tray()

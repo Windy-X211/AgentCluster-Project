@@ -1,0 +1,1 @@
+export const isDesktop = new URLSearchParams(location.search).get('app') === 'pywebview'
