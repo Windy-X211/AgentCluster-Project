@@ -17,19 +17,35 @@ onMounted(() => {
   }
 })
 
-async function minimize() { try { await windowAPI.minimize() } catch {} }
-async function toggleMax() {
+async function minimize() {
+  console.log('[WC] minimize click, isDesktop=', isDesktop, 'electronAPI=', !!window.electronAPI, 'win=', !!window.electronAPI?.window)
   try {
-    const result = await windowAPI.toggleMax()
-    if (typeof result === 'boolean') isMax.value = result
-    else {
-      isMax.value = !isMax.value
-      if (isMax.value) await windowAPI.maximize()
-      else await windowAPI.restore()
+    if (window.electronAPI?.window?.minimize) {
+      const r = await window.electronAPI.window.minimize()
+      console.log('[WC] minimize IPC returned:', r)
+    } else {
+      console.warn('[WC] electronAPI.window.minimize missing!')
     }
-  } catch {}
+  } catch (e) { console.error('[WC] minimize error:', e) }
 }
-async function close() { try { await windowAPI.close() } catch {} }
+async function toggleMax() {
+  console.log('[WC] toggleMax click')
+  try {
+    if (window.electronAPI?.window?.toggleMax) {
+      const r = await window.electronAPI.window.toggleMax()
+      console.log('[WC] toggleMax IPC returned:', r)
+      if (typeof r === 'boolean') isMax.value = r
+    }
+  } catch (e) { console.error('[WC] toggleMax error:', e) }
+}
+async function close() {
+  console.log('[WC] close click')
+  try {
+    if (window.electronAPI?.window?.close) {
+      await window.electronAPI.window.close()
+    }
+  } catch (e) { console.error('[WC] close error:', e) }
+}
 </script>
 
 <template>

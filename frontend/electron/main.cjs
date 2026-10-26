@@ -691,16 +691,17 @@ function createTray() {
 
 function registerIPC() {
   // 窗口控制
-  ipcMain.handle('win:minimize', () => mainWindow?.minimize())
-  ipcMain.handle('win:maximize', () => mainWindow?.isMaximized() || mainWindow?.maximize())
-  ipcMain.handle('win:unmaximize', () => mainWindow?.unmaximize())
+  ipcMain.handle('win:minimize', () => { _log('[IPC] win:minimize'); mainWindow?.minimize() })
+  ipcMain.handle('win:maximize', () => { _log('[IPC] win:maximize'); return mainWindow?.isMaximized() || mainWindow?.maximize() })
+  ipcMain.handle('win:unmaximize', () => { _log('[IPC] win:unmaximize'); mainWindow?.unmaximize() })
   ipcMain.handle('win:toggleMax', () => {
+    _log('[IPC] win:toggleMax, mainWindow=', !!mainWindow, 'isMaximized=', mainWindow?.isMaximized())
     if (!mainWindow) return false
     if (mainWindow.isMaximized()) { mainWindow.unmaximize(); return false }
     mainWindow.maximize(); return true
   })
-  ipcMain.handle('win:restore', () => mainWindow?.unmaximize() || mainWindow?.show())
-  ipcMain.handle('win:close', () => mainWindow?.close())
+  ipcMain.handle('win:restore', () => { _log('[IPC] win:restore'); mainWindow?.unmaximize() || mainWindow?.show() })
+  ipcMain.handle('win:close', () => { _log('[IPC] win:close'); mainWindow?.close() })
   ipcMain.handle('win:getBounds', () => {
     if (!mainWindow) return { x: 0, y: 0, width: 1280, height: 820 }
     const b = mainWindow.getBounds()

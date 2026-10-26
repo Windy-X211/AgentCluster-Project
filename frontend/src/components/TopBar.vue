@@ -1,22 +1,20 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { RouterLink } from 'vue-router'
-import { isDesktop } from '@/utils/env'
+import { isDesktop, windowAPI } from '@/utils/env'
 import { useSnap } from '@/composables/useSnap'
 
 const isMax = ref(false)
-let api: any = null
-let ready = false
 
-function bindApi() {
-  const w = window as any
-  if (w.pywebview?.api) { api = w.pywebview.api; ready = true }
-}
 onMounted(() => {
-  bindApi()
-  if (!ready) window.addEventListener('pywebviewready', bindApi)
   if (isDesktop) document.documentElement.classList.add('desktop-frameless')
-  // Aero Snap 边缘吸附：叠加在 pywebview 原生拖动之上
+  // 同步初始最大化状态
+  windowAPI.isMaximized?.().then((v: boolean | null) => { if (typeof v === 'boolean') isMax.value = v }).catch(() => {})
+  // Electron 最大化状态事件
+  if (window.electronAPI?.on) {
+    window.electronAPI.on('win:maximized', (v: boolean) => { isMax.value = v })
+  }
+  // Aero Snap 边缘吸附：叠加在原生拖动之上
   if (isDesktop) {
     const { attachDragRegion } = useSnap()
     const brand = document.querySelector('.brand.pywebview-drag-region') as HTMLElement | null
@@ -26,17 +24,17 @@ onMounted(() => {
   }
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('pywebviewready', bindApi)
   document.documentElement.classList.remove('desktop-frameless')
 })
-async function minimize() { try { await api?.minimize() } catch {} }
+async function minimize() { try { await windowAPI.minimize() } catch {} }
 async function toggleMax() {
   try {
-    if (isMax.value) { await api?.restore(); isMax.value = false }
-    else { await api?.maximize(); isMax.value = true }
+    const r = await windowAPI.toggleMax()
+    if (typeof r === 'boolean') isMax.value = r
+    else isMax.value = !isMax.value
   } catch {}
 }
-async function close() { try { await api?.close() } catch {} }
+async function close() { try { await windowAPI.close() } catch {} }
 </script>
 
 <template>
