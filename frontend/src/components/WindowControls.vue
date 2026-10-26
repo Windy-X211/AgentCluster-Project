@@ -9,6 +9,10 @@ const isMax = ref(false)
 const onHome = computed(() => route.path === '/' || route.path === '')
 
 onMounted(() => {
+  // 诊断：preload 是否工作
+  console.log('[WC] mounted, isDesktop=', isDesktop, 'onHome=', onHome.value)
+  console.log('[WC] window.electronAPI=', !!window.electronAPI)
+  console.log('[WC] window.electronAPI?.window=', !!window.electronAPI?.window)
   // 尝试获取当前最大化状态
   windowAPI.isMaximized?.().then((v: any) => { if (typeof v === 'boolean') isMax.value = v }).catch(() => {})
   // Electron 事件监听
