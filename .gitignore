@@ -46,3 +46,5 @@ Thumbs.db
 /frontend/electron-main.log
 # Windows 伪设备
 /nul
+# Launch mode preference (client/web)
+.launch_mode.txt

@@ -34,6 +34,7 @@ _log('app.isPackaged=' + app.isPackaged + ' argv=' + JSON.stringify(process.argv
 // app.isPackaged: electron-builder 打包后自动为 true
 // --prod 命令行参数: 直接跑 electron . 时强制用 dist/（开发机调试用）
 const FORCE_PROD = process.argv.includes('--prod')
+const TRAY_ONLY = process.argv.includes('--tray-only')
 const IS_DEV = !app.isPackaged && !FORCE_PROD
 const ROOT = path.resolve(__dirname, '..')               // frontend/ (开发) 或 app.asar/ (打包)
 const PROJECT_ROOT = path.resolve(ROOT, '..')           // 项目根（backend/ 在这里）
@@ -526,6 +527,24 @@ async function _checkHealth() {
 }
 
 function _buildTrayMenuTemplate(statusText) {
+  if (TRAY_ONLY) {
+    // Web 模式：后端+dist server 由 start.bat 启动
+    return [
+      { label: `Web 模式 · ${statusText}`, enabled: false },
+      { type: 'separator' },
+      { label: '🌐 打开浏览器', default: true, click: () => shell.openExternal(`http://localhost:5173`) },
+      { label: '🔄 重启全部', click: async () => {
+          _dialogSync('重启提示', '请直接关闭 start.bat 窗口后重新运行')
+      }},
+      { type: 'separator' },
+      { label: '⚙ 打开设置', click: () => shell.openExternal(`http://localhost:5173/#/settings`) },
+      { type: 'separator' },
+      { label: '❌ 退出并停止服务', click: () => {
+          _killWebProcesses()
+          app.quit()
+      }},
+    ]
+  }
   return [
     { label: `状态: ${statusText}`, enabled: false },
     { type: 'separator' },
@@ -583,6 +602,24 @@ function _updateTrayStatus(newStatus) {
   _trayStatus = newStatus
   tray.setToolTip(`AgentCluster  ${newStatus}`)
   try { tray.setContextMenu(Menu.buildFromTemplate(_buildTrayMenuTemplate(newStatus))) } catch {}
+}
+
+// Web 模式退出时：杀掉 start.bat 启动的 python + node（按端口匹配）
+function _killWebProcesses() {
+  try {
+    const { execSync } = require('child_process')
+    for (const port of [BACKEND_PORT, 5173]) {
+      try {
+        const out = execSync(`netstat -ano | findstr :${port} | findstr LISTENING`, { encoding: 'utf8' })
+        const m = out.trim().split(/\s+/)
+        const pid = parseInt(m[m.length - 1], 10)
+        if (pid && pid !== process.pid) {
+          try { process.kill(pid, 'SIGTERM') } catch {}
+          try { execSync(`taskkill /F /PID ${pid}`, { encoding: 'utf8', stdio: 'pipe' }) } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
 }
 
 function _dialogSync(title, msg) {
@@ -720,6 +757,12 @@ if (app.isPackaged) {
 }
 
 app.whenReady().then(async () => {
+  if (TRAY_ONLY) {
+    _log('=== TRAY-ONLY 模式：不启动后端/不建主窗口 ===')
+    createTray()
+    return
+  }
+
   createSplash()
   splashStep('正在初始化启动器...', 5)
 
@@ -763,8 +806,12 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  stopBackend()
-  stopDistServer()
+  if (TRAY_ONLY) {
+    _killWebProcesses()
+  } else {
+    stopBackend()
+    stopDistServer()
+  }
 })
 
 app.on('activate', async () => {
