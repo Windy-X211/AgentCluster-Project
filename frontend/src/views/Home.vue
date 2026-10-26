@@ -54,7 +54,11 @@ function onRootDblClick(e: MouseEvent) {
 }
 
 onMounted(async () => {
-  await Promise.all([agents.fetch(), canvases.fetch(), models.fetch(), settings.fetch(), convs.fetch()])
+  try {
+    await Promise.all([agents.fetch(), canvases.fetch(), models.fetch(), settings.fetch(), convs.fetch()])
+  } catch (e) {
+    console.error('[Home] 初始化数据加载失败:', e)
+  }
   if (!convs.current && convs.list.length) convs.current = convs.list[0].id
   // 通知 Electron 主进程：Vue 数据已就绪，可以显示主窗口了（防白屏闪烁）
   // 浏览器模式下 window.electronAPI 不存在，?. 安全调用直接跳过

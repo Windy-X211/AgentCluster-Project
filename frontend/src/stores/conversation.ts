@@ -4,7 +4,6 @@ import { useCanvasStore } from './canvas'
 import { useAgentStore } from './agent'
 import { useSettingsStore } from './settings'
 import { playSuccess, playError } from '@/utils/sound'
-import { API_BASE } from '@/utils/env'
 
 /**
  * 行协议转义还原：后端 yield T:/RN: 等行前，会把 payload 中的
@@ -735,7 +734,7 @@ export const useConvStore = defineStore('conv', {
 
       try {
         // 逐行解析新协议（signal 支持「停止」中止 fetch → 后端断连取消接力链）
-        const r = await fetch(`${API_BASE}/api/conversations/` + cid + '/send', {
+        const r = await fetch('/api/conversations/' + cid + '/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ agent_id: agentId, content }),

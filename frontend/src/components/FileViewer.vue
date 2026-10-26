@@ -692,7 +692,7 @@ onBeforeUnmount(() => {
 }
 .fv-close:hover { background: rgba(255, 80, 80, 0.28); border-color: rgba(255, 80, 80, 0.5); }
 
-.fv-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px; position: relative; }
+.fv-body { flex: 1; min-height: 0; overflow: auto; overflow-anchor: none; padding: 10px 12px; position: relative; }
 .fv-body.editing { padding: 8px 10px; overflow: hidden; display: flex; }
 .fv-hint { padding: 30px 12px; text-align: center; font-size: calc(12.5px * var(--font-scale)); opacity: .65; }
 .fv-hint.err { color: #ffb0b0; opacity: 1; display: flex; flex-direction: column; align-items: center; gap: 12px; }
@@ -744,7 +744,7 @@ onBeforeUnmount(() => {
 }
 .fv-tab:hover { background: rgba(var(--accent-rgb), 0.15); }
 .fv-tab.on { background: rgba(var(--accent-rgb), 0.22); border-color: rgba(var(--accent-rgb), 0.5); }
-.fv-table-wrap { overflow: auto; }
+.fv-table-wrap { overflow: auto; overflow-anchor: none; }
 .fv-table { border-collapse: collapse; font-size: calc(12px * var(--font-scale)); min-width: 100%; }
 .fv-table th, .fv-table td {
   border: 1px solid rgba(var(--surface-rgb), 0.14);

@@ -13,13 +13,19 @@
                                     └── score < threshold → 把验证反馈回灌循环
 
 核心目标：彻底杜绝"任务未完成就提前终止"。
+
+集群协作感知：当 agent_info / cluster_context / delegated_tasks 传入时，
+验证器会调整判断标准，允许智能体只完成其分工范围内的工作、
+已派发/移交的子任务不纳入"未完成"判定。
 """
 import json
 from typing import Any
 
 
 def _deterministic_check(user_input: str, tool_history: list[dict],
-                         assistant_text: str) -> dict:
+                         assistant_text: str,
+                         agent_info: dict | None = None,
+                         cluster_context: str | None = None) -> dict:
     """确定性规则检查 — 不依赖 LLM，零开销。
 
     返回：
@@ -114,27 +120,42 @@ def _deterministic_check(user_input: str, tool_history: list[dict],
 
 # —— LLM 验证 prompt ——
 _VERIFY_SYSTEM = (
-    "你是一个任务完成度验证器。独立审查智能体的最后回复是否真正完成了用户的请求。\n"
+    "你是一个任务完成度验证器。独立审查智能体的最后回复是否真正完成了它**应当负责的**工作。\n"
     "只输出 JSON：\n"
     "{\n"
-    "  \"complete\": true/false,     // 是否真正完成\n"
-    "  \"score\": 0.0-1.0,           // 完成度评分\n"
+    "  \"complete\": true/false,     // 是否真正完成了自己分工范围内的工作\n"
+    "  \"score\": 0.0-1.0,           // 完成度评分（仅针对该智能体的分工，不是整个项目）\n"
     "  \"feedback\": \"...\",        // 具体哪里没做到 / 还缺什么\n"
     "  \"next_step\": \"...\"        // 如果未完成，建议下一步该做什么（一句话）\n"
     "}\n\n"
-    "验证标准：\n"
-    "1. 用户明确要求的操作是否都执行了？\n"
-    "2. 调用过的工具结果是否被正确消费（不是拿到结果就假装做完）？\n"
-    "3. 如果工具执行失败或返回错误，是否被妥善处理或说明了？\n"
-    "4. 有没有幻觉——声称做了某件事但实际没做？\n"
-    "宁严勿松：如果不确定 complete=false。"
+    "验证标准（按优先级）：\n"
+    "1. 【核心原则】如果提供了「智能体角色/分工」，以它为准判断该智能体是否完成了**自己负责的部分**，\n"
+    "   不要用完整的用户原始请求要求它做完所有事——团队协作中每个成员只负责一块。\n"
+    "2. 【派发豁免】如果列出了「已派发/移交的任务」，这些任务已经由其他成员负责，\n"
+    "   不应计入当前智能体的『未完成』清单。\n"
+    "3. 用户明确要求的操作（在该智能体分工范围内的）是否都执行了？\n"
+    "4. 调用过的工具结果是否被正确消费（不是拿到结果就假装做完）？\n"
+    "5. 如果工具执行失败或返回错误，是否被妥善处理或说明了？\n"
+    "6. 有没有幻觉——声称做了某件事但实际没做？\n"
+    "宁严勿松，但在团队分工场景下**不要越权要求该智能体做不属于它的事**。"
 )
 
 
 async def _llm_verify(interface: dict, model: str, user_input: str,
                      tool_history: list[dict], assistant_text: str,
-                     deterministic: dict) -> dict:
+                     deterministic: dict,
+                     agent_info: dict | None = None,
+                     cluster_context: str | None = None,
+                     delegated_tasks: list[dict] | None = None) -> dict:
     """LLM 独立验证 —— 非流式调用。
+
+    Args:
+        agent_info: 智能体自身信息 dict，含 name/description/system_prompt 等；
+                    用于告知验证器"这个智能体在团队中扮演什么角色"
+        cluster_context: 集群协作上下文字符串（来自 _build_cluster_context），
+                        包含成员列表、沟通权限等；让验证器理解团队结构
+        delegated_tasks: 已派发/移交的任务列表，每项含 target（接收方）和 task 描述；
+                        这些任务的完成责任已转移给其他成员，不应作为当前智能体的"未完成"
 
     Returns:
       dict with keys: complete, score, feedback, next_step, method
@@ -159,12 +180,35 @@ async def _llm_verify(interface: dict, model: str, user_input: str,
                              "请据此判断主模型是否基于真实图片作答，而非幻觉。]")
         tool_summary_lines.append(f"- {th.get('name')}({json.dumps(th.get('args') or {}, ensure_ascii=False)[:150]}) → {result_str}{_img_note}")
 
+    # —— 构造集群协作信息块（仅当有集群上下文时注入）——
+    cluster_block = ""
+    if agent_info or cluster_context or delegated_tasks:
+        parts = ["\n\n【集群协作上下文】"]
+        if agent_info:
+            name = agent_info.get("name", "该智能体")
+            desc = (agent_info.get("description") or "").strip()
+            sp_first = (agent_info.get("system_prompt") or "").strip().split("\n")[0]
+            role_brief = desc or sp_first or ""
+            parts.append(f"- 当前验证对象：{name}（agent_id={agent_info.get('id', '?')}）")
+            if role_brief:
+                parts.append(f"- 角色/分工：{role_brief[:200]}")
+        if cluster_context:
+            parts.append(f"- 团队结构：{cluster_context[:500]}")
+        if delegated_tasks:
+            parts.append("- 已派发/移交的任务（这些不由当前智能体负责完成）：")
+            for dt in delegated_tasks:
+                target = dt.get("target", "?")
+                task_desc = dt.get("task") or dt.get("message") or "(无描述)"
+                parts.append(f"  → 派发给 {target}：{task_desc[:200]}")
+        cluster_block = "\n".join(parts)
+
     user_msg = (
-        f"【用户原始请求】\n{user_input}\n\n"
+        f"【智能体收到的输入】\n{user_input}\n\n"
         f"【本轮调用的工具历史】\n"
         + ("\n".join(tool_summary_lines) if tool_summary_lines else "（未调用任何工具）")
         + f"\n\n【确定性规则检查发现的问题】\n"
         + (deterministic.get("evidence") or "（未发现明显问题）")
+        + cluster_block
         + f"\n\n【智能体的最终回复】\n{assistant_text or '（空）'}"
     )
 
@@ -245,8 +289,18 @@ async def _llm_verify(interface: dict, model: str, user_input: str,
 
 async def verify_completion(interface: dict, model: str, user_input: str,
                            tool_history: list[dict], assistant_text: str,
-                           retry_count: int = 0, max_retries: int = 2) -> dict:
+                           retry_count: int = 0, max_retries: int = 2,
+                           agent_info: dict | None = None,
+                           cluster_context: str | None = None,
+                           delegated_tasks: list[dict] | None = None) -> dict:
     """独立验证入口。
+
+    Args:
+        agent_info: 智能体自身信息（name/description/system_prompt/id），
+                    集群模式下用于告知验证器"该智能体负责什么分工"
+        cluster_context: 集群协作上下文字符串，让验证器理解团队结构
+        delegated_tasks: 已派发/移交的任务列表（cluster.send_message 给下游的），
+                        这些不由当前智能体负责完成
 
     返回：
       {
@@ -260,7 +314,8 @@ async def verify_completion(interface: dict, model: str, user_input: str,
       }
     """
     # Phase 1：确定性规则
-    det = _deterministic_check(user_input, tool_history, assistant_text)
+    det = _deterministic_check(user_input, tool_history, assistant_text,
+                               agent_info=agent_info, cluster_context=cluster_context)
 
     if det["blocked"]:
         # 发现明确的未完成证据 → 强制继续循环，不用 LLM 验证
@@ -296,7 +351,10 @@ async def verify_completion(interface: dict, model: str, user_input: str,
 
     try:
         result = await _llm_verify(interface, model, user_input, tool_history,
-                                    assistant_text, det)
+                                    assistant_text, det,
+                                    agent_info=agent_info,
+                                    cluster_context=cluster_context,
+                                    delegated_tasks=delegated_tasks)
         result["deterministic"] = det
 
         if result["score"] >= threshold:

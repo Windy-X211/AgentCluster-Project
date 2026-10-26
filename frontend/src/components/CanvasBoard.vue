@@ -40,7 +40,7 @@ const viewportRef = ref<HTMLElement | null>(null)
 const scale = ref(1)
 const tx = ref(0)
 const ty = ref(0)
-const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5
+const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5, ZOOM_STEP = 1.25
 
 // 节点拖动
 const dragging = ref<{ node: any; dx: number; dy: number } | null>(null)
@@ -371,16 +371,30 @@ const FLOATY_GUARD = '.ctx-menu, .mode-picker, .modal-bg, .picker-mask, .node-bu
 function onWheel(e: WheelEvent) {
   // 浮层内的滚轮 → 正常滚动浮层内容，画布不动
   if ((e.target as HTMLElement)?.closest(FLOATY_GUARD)) return
-  e.preventDefault()
-  kickWillMove(true)
+  // 注：监听以 passive 注册，preventDefault 无效也无需（board overflow:hidden 无默认滚动）
+  // 同一帧内的多次滚轮增量合并（高分辨率滚轮一帧可触发多次 wheel）：
+  // zoom 是布局级缩放，每次 scale 变化都要全量重排，逐 tick 提交 = 一帧多次全量布局 → 卡顿
+  // 滚轮灵敏度：每档缩放 ±25%（Figma/Excalidraw 同级手感）
+  const factor = -e.deltaY > 0 ? ZOOM_STEP : 1 / ZOOM_STEP
+  pendingZoom = { mx: e.clientX, my: e.clientY, factor: (pendingZoom?.factor ?? 1) * factor }
+  if (!zoomRafId) zoomRafId = requestAnimationFrame(applyPendingZoom)
+}
+
+// 每帧最多提交一次缩放：锚点取帧内最后一次鼠标位置，factor 累乘
+let pendingZoom: { mx: number; my: number; factor: number } | null = null
+let zoomRafId = 0
+function applyPendingZoom() {
+  zoomRafId = 0
+  const p = pendingZoom
+  pendingZoom = null
+  if (!p) return
   const rect = boardRef.value!.getBoundingClientRect()
-  const mx = e.clientX - rect.left
-  const my = e.clientY - rect.top
+  const mx = p.mx - rect.left
+  const my = p.my - rect.top
 
   const prev = scale.value
-  const delta = -e.deltaY
-  const factor = delta > 0 ? 1.1 : 1 / 1.1
-  const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prev * factor))
+  const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prev * p.factor))
+  if (next === prev) return
 
   // 以鼠标位置为锚点：缩放后鼠标下的画布点保持不动
   const newTx = mx - (mx - tx.value) * (next / prev)
@@ -392,23 +406,12 @@ function onWheel(e: WheelEvent) {
 }
 
 // —— 画布平移 ——
-// will-change: transform 仅在交互期挂载：常驻合成层会让放大后的文字停留在旧光栅纹理上发糊，
-// 交互结束移除 → 浏览器强制按当前 scale 重新光栅化，文字恢复锐利
-const willMove = ref(false)
-let willMoveTimer: ReturnType<typeof setTimeout> | null = null
-function kickWillMove(autoRelease: boolean) {
-  willMove.value = true
-  if (willMoveTimer) clearTimeout(willMoveTimer)
-  if (autoRelease) willMoveTimer = setTimeout(() => { willMove.value = false; willMoveTimer = null }, 200)
-}
-function releaseWillMove() {
-  if (willMoveTimer) { clearTimeout(willMoveTimer); willMoveTimer = null }
-  willMove.value = false
-}
+// 文字始终清晰方案：平移走外层 .pan-layer 的 transform（纯 translate，不缩放纹理），
+// 缩放走内层 .viewport 的 CSS zoom（布局级缩放，浏览器按当前缩放的真实字号排版并矢量光栅化），
+// 任何 scale 下文字都是原生渲染，无需 will-change 挂载/释放的重光栅化过渡
 function startPan(e: MouseEvent) {
   if (e.button !== 0) return
   if ((e.target as HTMLElement).closest('.node, .btn, input, label, select, textarea, canvas-toolbar, .ws-panel, .ws-trash, .ws-ctx, .ws-modal-bg')) return
-  kickWillMove(false)
   panning.value = { sx: e.clientX, sy: e.clientY, ox: tx.value, oy: ty.value }
   e.preventDefault()
 }
@@ -418,7 +421,7 @@ function doPan(e: MouseEvent) {
   ty.value = panning.value.oy + (e.clientY - panning.value.sy)
   syncGrid()
 }
-function endPan() { if (panning.value) { panning.value = null; releaseWillMove() } }
+function endPan() { if (panning.value) { panning.value = null } }
 
 // 网格跟随平移/缩放 → 画布视觉上无限大
 const gridRef = ref<HTMLElement | null>(null)
@@ -429,6 +432,34 @@ function syncGrid() {
   const size = 24 * scale.value
   g.style.backgroundSize = `${size}px ${size}px`
 }
+
+// —— zoom 缩放下的滚动位置锁定 ——
+// 锁定方式是"相对滚动进度"而非 ratio 乘法：Chromium 对 CSS zoom 下 scroll offset 的
+// 语义（layout 坐标自动保持 vs 需按视觉比例补偿）并不统一，ratio 乘法在其中一种语义下
+// 是双重补偿，反而制造滚动。按 rel = scrollTop/(scrollHeight-clientHeight) 记录并在
+// 新 zoom 布局后按新 max 恢复，两种语义下都精确锁定视觉阅读位置。
+// 回写会派发 scroll 事件 → 用 suppressBubbleScroll 标志让 onBubbleScroll 忽略，
+// 否则被误判"用户上滑"，5s 后 _scheduleResume 强拉底部造成二次跳动
+const ZOOM_SCROLLABLES = '.node-bubble, .ws-body, .wt-body, .ws-console-output, .fv-body, .fv-table-wrap'
+let suppressBubbleScroll = false
+watch(scale, (next, prev) => {
+  if (!prev || next === prev) return
+  const vp = viewportRef.value
+  if (!vp) return
+  const saved: { el: HTMLElement; rel: number }[] = []
+  vp.querySelectorAll<HTMLElement>(ZOOM_SCROLLABLES).forEach(el => {
+    const max = el.scrollHeight - el.clientHeight
+    if (max > 0) saved.push({ el, rel: el.scrollTop / max })
+  })
+  nextTick(() => {
+    saved.forEach(({ el, rel }) => {
+      const max = el.scrollHeight - el.clientHeight
+      if (max > 0) el.scrollTop = rel * max
+    })
+    suppressBubbleScroll = true
+    requestAnimationFrame(() => { suppressBubbleScroll = false })
+  })
+})
 
 // 监听空格
 const onKeyDown = (e: KeyboardEvent) => { if (e.code === 'Space') spaceDown.value = true }
@@ -950,6 +981,9 @@ onBeforeUnmount(() => {
   window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('mouseup', onMouseUpGlobal)
   window.removeEventListener('mousemove', onMouseMove)
+  // 取消待执行的 rAF（缩放提交 / 视图同步），避免卸载后回调访问空 ref
+  if (zoomRafId) { cancelAnimationFrame(zoomRafId); zoomRafId = 0 }
+  if (viewSyncRaf) { cancelAnimationFrame(viewSyncRaf); viewSyncRaf = 0 }
   // 清理所有气泡上挂的延迟恢复定时器，避免销毁后定时器仍持有 DOM
   resetBubbleStick()
 })
@@ -977,16 +1011,28 @@ function emitCanvasActivate() {
 watch(() => canvas.value?.id, () => {
   nextTick(() => { fitAll(); bubbleHidden.value = {} })
 })
-watch([() => canvas.value?.id, scale], () => {
+// 画布切换 / 挂载首次 → 立即广播激活（MainView 需尽早拿到 viewportEl / bbox）
+watch(() => canvas.value?.id, () => {
   nextTick(emitCanvasActivate)
 }, { immediate: true })
-watch([() => nodes.value?.length, tx, ty, scale], () => {
-  nextTick(refreshBboxAndEmit)
-}, { flush: 'post' })
+// 视图变换（平移/缩放/节点数）→ bbox 重算与 activate 广播合并到下一帧执行：
+// post-flush watcher 若每次 tick 都同步跑 getBoundingClientRect，会在 zoom 重排之外
+// 再触发强制同步布局（wheel/mousemove 频率高于帧率时一帧多次全量布局 → 缩放平移卡顿）；
+// rAF 合并后每帧最多一次全量测量，MainView 侧 bbox/scale 更新延迟一帧无感知
+let viewSyncRaf = 0
+function scheduleViewSync() {
+  if (viewSyncRaf) return
+  viewSyncRaf = requestAnimationFrame(() => {
+    viewSyncRaf = 0
+    refreshBboxAndEmit()
+    emitCanvasActivate()
+  })
+}
+watch([() => nodes.value?.length, tx, ty, scale], scheduleViewSync, { flush: 'post' })
 
-// 每次 transform 变化时强制 style 更新
+// 平移层 style：只做 translate（不缩放文字纹理）；缩放由 .viewport 的 CSS zoom 承担
 const vTransform = computed(() => {
-  return `translate(${tx.value}px, ${ty.value}px) scale(${scale.value})`
+  return `translate(${tx.value}px, ${ty.value}px)`
 })
 
 // ③ 气泡流式自动滚到底：只依赖触发内容变化的响应式字段
@@ -1028,6 +1074,8 @@ function _scheduleResume(el: HTMLElement) {
 function onBubbleScroll(e: Event) {
   const el = e.target as HTMLElement
   if (!el || !el.classList.contains('node-bubble')) return
+  // 程序性 scrollTop 回写（zoom 缩放补偿）不是用户滚动，跳过贴底状态判定
+  if (suppressBubbleScroll) return
   if (isBubbleNearBottom(el)) {
     // 滑回底部 → 取消待执行的恢复定时器，立即恢复跟随
     _clearFollowTimer(el)
@@ -1176,85 +1224,86 @@ defineExpose({ viewportRef, computeNodeBbox })
       </template>
     </div>
 
-    <!-- 可缩放 / 可平移的视口 -->
-    <div class="viewport" ref="viewportRef" :class="{ 'will-move': willMove }" :style="{ transform: vTransform }"
-         @contextmenu="showBgMenu">
-      <svg class="edge-layer">
-        <g v-for="item in edgeGeoms" :key="item.e.id">
-          <path v-if="item.g" :d="item.g.d"
-                :class="['edge-hit', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
-                @dblclick="removeEdge(item.e.id)" />
-          <path v-if="item.g" :d="item.g.d"
-                :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
-                marker-end="url(#arrow)" pointer-events="none" />
-          <path v-if="item.g" class="edge-mid"
-                :class="{ dim: isEdgeDim(item.e) }"
-                :transform="`translate(${item.g.midX},${item.g.midY}) rotate(${item.g.midAngle})`"
-                d="M -5,-4 L 5,0 L -5,4 Z" />
-        </g>
-        <path v-if="linking" :d="tempPath()" class="edge temp" />
-        <!-- 边缘对齐辅助线 -->
-        <g v-if="dragging && (snapGuides.x.length || snapGuides.y.length)" class="snap-guides" pointer-events="none">
-          <line v-for="gx in snapGuides.x" :key="'gx-' + gx"
-                :x1="gx" :y1="-9999" :x2="gx" :y2="9999"
-                stroke="#b472ff" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
-          <line v-for="gy in snapGuides.y" :key="'gy-' + gy"
-                :x1="-9999" :y1="gy" :x2="9999" :y2="gy"
-                stroke="#b472ff" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
-        </g>
-        <defs>
-          <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#6ea8ff" /></marker>
-        </defs>
-      </svg>
+    <!-- 平移层（transform 纯平移） + 缩放层（CSS zoom 布局级缩放，文字始终矢量清晰） -->
+    <div class="pan-layer" :style="{ transform: vTransform }">
+      <div class="viewport" ref="viewportRef" :style="{ zoom: scale }" @contextmenu="showBgMenu">
+        <svg class="edge-layer">
+          <g v-for="item in edgeGeoms" :key="item.e.id">
+            <path v-if="item.g" :d="item.g.d"
+                  :class="['edge-hit', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
+                  @dblclick="removeEdge(item.e.id)" />
+            <path v-if="item.g" :d="item.g.d"
+                  :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
+                  marker-end="url(#arrow)" pointer-events="none" />
+            <path v-if="item.g" class="edge-mid"
+                  :class="{ dim: isEdgeDim(item.e) }"
+                  :transform="`translate(${item.g.midX},${item.g.midY}) rotate(${item.g.midAngle})`"
+                  d="M -5,-4 L 5,0 L -5,4 Z" />
+          </g>
+          <path v-if="linking" :d="tempPath()" class="edge temp" />
+          <!-- 边缘对齐辅助线 -->
+          <g v-if="dragging && (snapGuides.x.length || snapGuides.y.length)" class="snap-guides" pointer-events="none">
+            <line v-for="gx in snapGuides.x" :key="'gx-' + gx"
+                  :x1="gx" :y1="-9999" :x2="gx" :y2="9999"
+                  stroke="#b472ff" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
+            <line v-for="gy in snapGuides.y" :key="'gy-' + gy"
+                  :x1="-9999" :y1="gy" :x2="9999" :y2="gy"
+                  stroke="#b472ff" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
+          </g>
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#6ea8ff" /></marker>
+          </defs>
+        </svg>
 
-      <div v-for="n in nodes" :key="n.id" class="node glass-soft"
-           :class="{
-             disabled: agentById(n.agent_id)?.enabled === false,
-             speaking: nodeState(n.agent_id) === 'speaking',
-             calling: nodeState(n.agent_id) === 'calling',
-             waiting: nodeState(n.agent_id) === 'waiting',
-           }"
-           :style="{ left: n.x + 'px', top: n.y + 'px' }"
-           @mousedown="startDrag($event, n)"
-           @mouseup="endLink($event, n.id)"
-           @dblclick="toggleBubble(n)"
-           @contextmenu="showCtxMenu($event, n)">
-        <!-- 消息气泡：双击节点可隐藏；流式输出中也尊重用户的隐藏设置 -->
-        <div v-if="getBubbleForAgent(n.agent_id) && !bubbleHidden[n.id]"
-             class="node-bubble" :class="{ streaming: getBubbleForAgent(n.agent_id)?.streaming }"
-             @wheel.stop @scroll="onBubbleScroll">
-          <!-- 深度思考 chunk（灰底折叠块，有区别特效） -->
-          <div v-for="(chunk, ci) in getBubbleForAgent(n.agent_id)!.chunks" :key="ci"
-               class="b-chunk" :class="'b-' + chunk.kind">
-            <template v-if="chunk.kind === 'reasoning'">
-              <div class="b-think">
-                <span class="b-think-icon">🧠</span>
-                <span class="b-think-text">{{ cyclicWindow(chunk.text || '', 50) }}</span>
-                <span class="b-think-cursor">▌</span>
-              </div>
-            </template>
-            <template v-else-if="chunk.kind === 'call'">
-              <span class="b-call">{{ chunk.text }}</span>
-            </template>
-            <template v-else-if="chunk.kind === 'tool'">
-              <div class="b-tool-row" :class="{ running: chunk.toolRunning }">
-                <span class="b-tool-icon" :class="{ spinning: chunk.toolRunning }">{{ chunk.toolRunning ? '⟳' : '✓' }}</span>
-                <span class="b-tool-label">{{ chunk.toolName }}<template v-if="chunk.toolFileName"> <span class="b-tool-fn">（{{ chunk.toolFileName }}）</span></template></span>
-              </div>
-            </template>
-            <template v-else>
-              <span class="b-text markdown" v-html="renderMarkdown(chunk.text)"></span>
-            </template>
+        <div v-for="n in nodes" :key="n.id" class="node glass-soft"
+             :class="{
+               disabled: agentById(n.agent_id)?.enabled === false,
+               speaking: nodeState(n.agent_id) === 'speaking',
+               calling: nodeState(n.agent_id) === 'calling',
+               waiting: nodeState(n.agent_id) === 'waiting',
+             }"
+             :style="{ left: n.x + 'px', top: n.y + 'px' }"
+             @mousedown="startDrag($event, n)"
+             @mouseup="endLink($event, n.id)"
+             @dblclick="toggleBubble(n)"
+             @contextmenu="showCtxMenu($event, n)">
+          <!-- 消息气泡：双击节点可隐藏；流式输出中也尊重用户的隐藏设置 -->
+          <div v-if="getBubbleForAgent(n.agent_id) && !bubbleHidden[n.id]"
+               class="node-bubble" :class="{ streaming: getBubbleForAgent(n.agent_id)?.streaming }"
+               @wheel.stop @scroll="onBubbleScroll">
+            <!-- 深度思考 chunk（灰底折叠块，有区别特效） -->
+            <div v-for="(chunk, ci) in getBubbleForAgent(n.agent_id)!.chunks" :key="ci"
+                 class="b-chunk" :class="'b-' + chunk.kind">
+              <template v-if="chunk.kind === 'reasoning'">
+                <div class="b-think">
+                  <span class="b-think-icon">🧠</span>
+                  <span class="b-think-text">{{ cyclicWindow(chunk.text || '', 50) }}</span>
+                  <span class="b-think-cursor">▌</span>
+                </div>
+              </template>
+              <template v-else-if="chunk.kind === 'call'">
+                <span class="b-call">{{ chunk.text }}</span>
+              </template>
+              <template v-else-if="chunk.kind === 'tool'">
+                <div class="b-tool-row" :class="{ running: chunk.toolRunning }">
+                  <span class="b-tool-icon" :class="{ spinning: chunk.toolRunning }">{{ chunk.toolRunning ? '⟳' : '✓' }}</span>
+                  <span class="b-tool-label">{{ chunk.toolName }}<template v-if="chunk.toolFileName"> <span class="b-tool-fn">（{{ chunk.toolFileName }}）</span></template></span>
+                </div>
+              </template>
+              <template v-else>
+                <span class="b-text markdown" v-html="renderMarkdown(chunk.text)"></span>
+              </template>
+            </div>
           </div>
-        </div>
-        <div class="node-head">
-          <div class="avatar" :style="{ background: avatarGradient(n.agent_id) }">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
-          <div class="name">{{ agentById(n.agent_id)?.name || '未知' }}</div>
-          <span v-if="agentById(n.agent_id)?.enabled === false" class="off-tag" title="已停用">⏸</span>
-        </div>
-        <div class="node-actions">
-          <button class="btn xs ghost ctx-action" @click.stop="openChatPicker($event, n)">💬 对话</button>
-          <button class="btn xs ghost ctx-action" @mousedown.stop @click.stop="startLink($event, n.id)">🔗 连线</button>
+          <div class="node-head">
+            <div class="avatar" :style="{ background: avatarGradient(n.agent_id) }">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
+            <div class="name">{{ agentById(n.agent_id)?.name || '未知' }}</div>
+            <span v-if="agentById(n.agent_id)?.enabled === false" class="off-tag" title="已停用">⏸</span>
+          </div>
+          <div class="node-actions">
+            <button class="btn xs ghost ctx-action" @click.stop="openChatPicker($event, n)">💬 对话</button>
+            <button class="btn xs ghost ctx-action" @mousedown.stop @click.stop="startLink($event, n.id)">🔗 连线</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1397,8 +1446,11 @@ defineExpose({ viewportRef, computeNodeBbox })
 .canvas-board.panning-active { cursor: grabbing; }
 .grid-bg { position: absolute; inset: 0; background-image: radial-gradient(circle, rgba(var(--surface-rgb), 0.06) 1px, transparent 1px); background-size: 24px 24px; pointer-events: none; z-index: 0; }
 
-.viewport { position: absolute; inset: 0; transform-origin: 0 0; z-index: 1; }
-.viewport.will-move { will-change: transform; }
+/* 平移层：transform 只做纯平移，不产生纹理缩放，文字永不发糊 */
+.pan-layer { position: absolute; inset: 0; z-index: 1; }
+/* 缩放层：CSS zoom 为布局级缩放，浏览器按当前缩放的真实字号排版并矢量光栅化，
+   任何缩放比例下文字都保持原生锐利，无需 will-change / 重光栅化过渡 */
+.viewport { position: absolute; inset: 0; }
 
 .canvas-toolbar { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; justify-content: space-between; gap: 10px; z-index: 10; pointer-events: none;
   transition: max-height .3s ease, opacity .25s ease; overflow: hidden; }
@@ -1503,7 +1555,7 @@ marker#arrow path { fill: var(--accent); }
   50%      { opacity: 1;    transform: scale(1.15); }
 }
 
-.node-bubble { position: absolute; bottom: calc(100% + 12px); left: 50%; transform: translateX(-50%); width: 230px; padding: 8px 10px 16px; font-size: calc(11.5px * var(--font-scale)); line-height: 1.5; color: var(--text); white-space: pre-wrap; word-break: break-word; background: rgba(var(--node-bg-rgb), 0.94); border: 1px solid rgba(var(--accent-rgb), 0.4); border-radius: 10px; box-shadow: 0 8px 24px rgba(var(--shadow-rgb), 0.45); max-height: 140px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; pointer-events: auto; z-index: 6; cursor: default; scrollbar-width: thin; scrollbar-color: rgba(var(--accent-rgb), 0.5) transparent; animation: bubbleIn 0.25s ease; }
+.node-bubble { position: absolute; bottom: calc(100% + 12px); left: 50%; transform: translateX(-50%); width: 230px; padding: 8px 10px 16px; font-size: calc(11.5px * var(--font-scale)); line-height: 1.5; color: var(--text); white-space: pre-wrap; word-break: break-word; background: rgba(var(--node-bg-rgb), 0.94); border: 1px solid rgba(var(--accent-rgb), 0.4); border-radius: 10px; box-shadow: 0 8px 24px rgba(var(--shadow-rgb), 0.45); max-height: 140px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; pointer-events: auto; z-index: 6; cursor: default; scrollbar-width: thin; scrollbar-color: rgba(var(--accent-rgb), 0.5) transparent; animation: bubbleIn 0.25s ease; }
 .node-bubble::-webkit-scrollbar { width: 6px; }
 .node-bubble::-webkit-scrollbar-track { background: transparent; }
 .node-bubble::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.45); border-radius: 3px; }

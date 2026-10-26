@@ -43,8 +43,8 @@ const PROJECT_ROOT = path.resolve(ROOT, '..')           // 项目根（backend/ 
 const BACKEND_DIR = path.join(PROJECT_ROOT, 'backend')
 const BACKEND_PORT = 8870
 const DIST_PORT = 5173        // prod 模式也用 5173 服务 dist → 浏览器也能访问
-const DEV_URL = 'http://localhost:5173'
-const PROD_URL = `http://localhost:${DIST_PORT}`
+const DEV_URL = 'http://127.0.0.1:5173'
+const PROD_URL = `http://127.0.0.1:${DIST_PORT}`
 const PRELOAD = path.join(__dirname, 'preload.cjs')
 
 // 进程句柄
@@ -82,44 +82,35 @@ function _killPortIfBusy(port) {
 
 // 检测系统 Node.js（Electron 内置 Node 不能 spawn 外部 http server，会 ACCESS_VIOLATION）
 function _detectSystemNode() {
-  const candidates = [
-    // 项目本地
-    path.join(PROJECT_ROOT, 'node-v20.18.0-win-x64', 'node.exe'),
-    path.join(ROOT, 'node', 'node.exe'),
-    // 常见安装路径
-    'E:\\app\\node-v20.18.0-win-x64\\node.exe',
-    'C:\\Program Files\\nodejs\\node.exe',
-  ]
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p
-  }
-  // 环境变量 PATH 里找
+  // Electron 内置 Node 不能 spawn 外部 http server（会 ACCESS_VIOLATION），
+  // 必须用系统 Node.js；纯走 PATH，保证跨设备可用
   try {
     const where = require('child_process').execSync('where node', { encoding: 'utf8', timeout: 2000 }).trim()
     const first = where.split('\n')[0].trim()
-    if (first && fs.existsSync(first)) return first
-  } catch {}
+    if (first && fs.existsSync(first)) {
+      _log('Found system node via PATH: ' + first)
+      return first
+    }
+  } catch {
+    _log('where node failed, PATH 中找不到 Node.js')
+  }
   return null
 }
 
 function _detectPython() {
-  // 优先 venv，然后真实安装路径，最后系统 PATH
-  const candidates = [
+  // 优先项目内 venv（相对路径，跨设备可用），否则走 PATH
+  const venvCandidates = [
     path.join(PROJECT_ROOT, '.venv', 'Scripts', 'python.exe'),
     path.join(PROJECT_ROOT, 'venv', 'Scripts', 'python.exe'),
-    'C:\\Users\\qiqi\\AppData\\Local\\Programs\\Python\\Python314\\python.exe',
-    'C:\\Python314\\python.exe',
-    'C:\\Python313\\python.exe',
-    'C:\\Program Files\\Python314\\python.exe',
   ]
-  for (const p of candidates) {
+  for (const p of venvCandidates) {
     if (fs.existsSync(p)) {
-      _log('Found python: ' + p)
+      _log('Found venv python: ' + p)
       return p
     }
   }
-  // fallback: 走 PATH（会用用户系统的 python）
-  _log('Python not found in known paths, falling back to PATH "python"')
+  // 走 PATH（会用用户系统配置的 python）
+  _log('Falling back to PATH "python"')
   return 'python'
 }
 
@@ -427,6 +418,11 @@ async function createMainWindow() {
   if (IS_DEV) {
     await waitFrontendReady(DEV_URL)
   }
+  // 窗口图标：优先项目根的 agentcluster.ico（Windows 多分辨率最佳），再 fallback png
+  const _winIconPath = fs.existsSync(path.join(PROJECT_ROOT, 'agentcluster.ico'))
+    ? path.join(PROJECT_ROOT, 'agentcluster.ico')
+    : (fs.existsSync(path.join(ROOT, 'public', 'icon.png')) ? path.join(ROOT, 'public', 'icon.png') : undefined)
+
   mainWindow = new BrowserWindow({
     width: 1280, height: 820,
     minWidth: 960, minHeight: 600,
@@ -436,6 +432,7 @@ async function createMainWindow() {
     fullscreenable: true,
     title: '智能体集群 AgentCluster',
     backgroundColor: '#0a0e1a', // 与前端 --bg-base 一致，防白闪
+    icon: _winIconPath,
     show: false,
     webPreferences: {
       preload: PRELOAD,
@@ -595,8 +592,9 @@ function _dialogSync(title, msg) {
 }
 
 function createTray() {
-  // 图标：优先项目图标，否则用 Electron 默认图标路径
+  // 图标：优先项目 agentcluster.ico（Windows 多分辨率最佳），否则 png fallback
   const iconPaths = [
+    path.join(PROJECT_ROOT, 'agentcluster.ico'),
     path.join(ROOT, 'public', 'icon.png'),
     path.join(ROOT, 'dist', 'icon.png'),
     path.join(ROOT, 'public', 'icon.jpg'),
@@ -725,20 +723,26 @@ app.whenReady().then(async () => {
   createSplash()
   splashStep('正在初始化启动器...', 5)
 
-  // Prod 模式：先起 dist server（让 localhost 5173 可访问）
+  // Prod 模式：先起 dist server（让 127.0.0.1:5173 可访问）
   if (!IS_DEV) {
     splashStep('正在启动前端静态服务...', 15)
-    startDistServer().catch(err => {
+    try {
+      await startDistServer()
+    } catch (err) {
       console.warn('[Electron] Dist server 启动失败:', err.message)
       try { _dialogSync('前端构建缺失', err.message) } catch {}
-    })
+    }
   }
 
-  // 后台拉起后端（不阻塞窗口创建）
+  // 启动后端并等待就绪（必须在 createMainWindow 之前完成，否则 Home.vue 的 fetch 会因后端未就绪而失败）
   splashStep('正在启动后端服务...', 25)
-  startBackend().then(() => {
+  try {
+    await startBackend()
     splashStep('后端就绪', 55)
-  }).catch(err => console.warn('[Electron] 后端拉起失败（窗口仍可打开）:', err.message))
+  } catch (err) {
+    console.warn('[Electron] 后端拉起失败（窗口仍可打开）:', err.message)
+    splashStep('后端启动超时', 55)
+  }
 
   try {
     splashStep('正在准备界面...', 70)

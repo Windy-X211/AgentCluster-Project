@@ -74,7 +74,7 @@
     </div>
 
     <!-- 回收站：按项目树层级绘制被删文件卡片 -->
-    <div v-if="trashOpen" class="ws-trash glass" :style="trashStyle"
+    <div v-if="trashOpen" class="ws-trash glass" :class="{ embedded: pinned }" :style="trashStyle"
          @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
       <div class="wt-head" @mousedown="startTrashDrag">
         <span class="wt-ico">🗑</span>
@@ -1228,6 +1228,13 @@ function peopleTitle(row: any) {
   box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
   overflow: hidden;
 }
+/* 钉住嵌入 viewport（CSS zoom 布局级缩放）时禁用 backdrop-filter：
+   zoom 已按真实字号光栅化文字，无旧 transform: scale 的纹理缓存发糊问题，
+   禁用仅为避免钉住态与浮动态的视觉差异 */
+.ws-panel.embedded, .ws-trash.embedded {
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+  background: rgba(var(--node-bg-rgb), 0.97);
+}
 .ws-head {
   display: flex; align-items: center; gap: 8px;
   padding: 10px 12px; cursor: grab;
@@ -1254,7 +1261,7 @@ function peopleTitle(row: any) {
 .ws-btn.ok { background: rgba(100, 220, 160, 0.15); border-color: rgba(100, 220, 160, 0.4); color: var(--green-ink); }
 .ws-btn.danger { background: rgba(255, 80, 80, 0.18); border-color: rgba(255, 80, 80, 0.42); color: var(--red-ink); }
 
-.ws-body { flex: 1; overflow-y: auto; padding: 6px 6px 8px; min-height: 60px; }
+.ws-body { flex: 1; overflow-y: auto; overflow-anchor: none; padding: 6px 6px 8px; min-height: 60px; }
 .ws-empty { padding: 22px 12px; text-align: center; font-size: calc(12px * var(--font-scale)); opacity: .6; display: flex; flex-direction: column; align-items: center; gap: 10px; }
 
 .ws-tree { display: flex; flex-direction: column; }
@@ -1355,7 +1362,7 @@ function peopleTitle(row: any) {
 .ws-console-head:active { cursor: grabbing; }
 .ws-console-float .ws-modal-foot { padding: 6px 10px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); flex-shrink: 0; }
 .ws-console-output {
-  flex: 1; min-height: 0; margin: 0 10px; overflow: auto;
+  flex: 1; min-height: 0; margin: 0 10px; overflow: auto; overflow-anchor: none;
   white-space: pre-wrap; word-break: break-word;
   background: rgba(var(--shadow-rgb), 0.45); border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 8px;
   color: #bfe6c6; font-size: calc(12.5px * var(--font-scale)); font-family: Consolas, "Courier New", monospace;
@@ -1401,7 +1408,7 @@ function peopleTitle(row: any) {
 .wt-ico { font-size: calc(14px * var(--font-scale)); }
 .wt-title { font-size: calc(12.5px * var(--font-scale)); font-weight: 600; flex: 1; }
 .wt-actions { display: flex; gap: 4px; flex-wrap: wrap; }
-.wt-body { flex: 1; overflow-y: auto; padding: 10px; }
+.wt-body { flex: 1; overflow-y: auto; overflow-anchor: none; padding: 10px; }
 .wt-empty { padding: 24px 12px; text-align: center; font-size: calc(12px * var(--font-scale)); opacity: .6; }
 .wt-grid { display: flex; flex-direction: column; gap: 8px; }
 .wt-card {

@@ -292,27 +292,11 @@ option {
   padding: 10px;
 }
 
-/* —— 桌面独立窗口（Electron / pywebview 通用）—— */
+/* —— 桌面独立窗口（pywebview frameless）—— */
 html.desktop-frameless {
   /* 确保 html/body 完全填满窗口，不留空隙（DWM 阴影除外） */
   height: 100%;
   overflow: hidden;
-}
-
-/* 拖动区统一机制：
- *  - Electron:  -webkit-app-region: drag  CSS 自动生效（preload 不需要额外处理）
- *  - pywebview:  .pywebview-drag-region 类名被 app_window.py 的 DRAG_REGION_SELECTOR 识别
- * 两者同时生效互不干扰，pywebview 方案下 -webkit-app-region: drag 被忽略，反之亦然 */
-.drag-region {
-  -webkit-app-region: drag;
-  app-region: drag;
-  user-select: none;
-}
-/* pywebview 兼容别名（旧组件用的类名） */
-.pywebview-drag-region {
-  -webkit-app-region: drag;
-  app-region: drag;
-  user-select: none;
 }
 
 html.desktop-frameless body {

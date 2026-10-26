@@ -48,27 +48,32 @@ def build_ico() -> Path:
 
 # ---------- 2. 创建项目内快捷方式 ----------
 def create_shortcut(ico: Path):
-    import shutil
     import pythoncom
     from win32com.client import Dispatch
 
-    pythonw = shutil.which("pythonw") or shutil.which("python") or sys.executable
-    if pythonw.endswith("python.exe") and not pythonw.endswith("pythonw.exe"):
-        pythonw = pythonw.replace("python.exe", "pythonw.exe")
+    start_bat = ROOT / "start.bat"
+    if not start_bat.exists():
+        raise FileNotFoundError(f"找不到 start.bat: {start_bat}")
 
     lnk_path = ROOT / "AgentCluster.lnk"
+    vbs_path = ROOT / "launcher.vbs"
+    if not vbs_path.exists():
+        raise FileNotFoundError(f"找不到 launcher.vbs: {vbs_path}")
 
     pythoncom.CoInitialize()
     shell = Dispatch("WScript.Shell")
     lnk = shell.CreateShortcut(str(lnk_path))
-    lnk.TargetPath = pythonw
-    lnk.Arguments = f'"{ROOT / "start_tray.py"}"'
+    # 用 wscript.exe 静默执行 launcher.vbs，VBS 内部用 SW_HIDE 启动 start.bat
+    # 彻底避免任何终端窗口闪烁
+    lnk.TargetPath = "wscript.exe"
+    lnk.Arguments = f'"{vbs_path}"'
     lnk.WorkingDirectory = str(ROOT)
     lnk.IconLocation = str(ico) + ",0"
     lnk.Description = "AgentCluster 智能体集群"
     lnk.Save()
     pythoncom.CoUninitialize()
     print(f"[LNK] 已生成: {lnk_path}")
+    print(f"      Target: {lnk.TargetPath} {lnk.Arguments}")
     return lnk_path
 
 
