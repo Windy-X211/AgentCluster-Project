@@ -370,9 +370,7 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
             <span class="font-scale-edge">大</span>
             <span class="font-scale-value">{{ Math.round(layout.fontScale * 100) }}%</span>
           </div>
-          <div class="hint-empty" style="margin-top: 8px">
-            只调整文字大小，不影响界面布局；设置自动保存，刷新后仍然生效
-          </div>
+
         </div>
 
         <div class="cap-block">
@@ -393,9 +391,7 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
               <div class="theme-name">{{ t.name }}</div>
             </div>
           </div>
-          <div class="hint-empty" style="margin-top: 8px">
-            切换全局配色方案，设置自动保存，刷新后仍然生效
-          </div>
+
         </div>
 
         <div class="cap-block">
@@ -550,11 +546,7 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
               <span class="radio-text">🌐 浏览器网页</span>
             </label>
           </div>
-          <div class="hint-empty" style="margin-top: 8px">
-            桌面客户端：启动后自动打开桌面应用窗口（完整功能）
-            <br />
-            浏览器网页：启动后端服务后自动打开浏览器 http://localhost:5173
-          </div>
+
         </div>
       </div>
 
