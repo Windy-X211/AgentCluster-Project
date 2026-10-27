@@ -2019,7 +2019,14 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             final_text_parts.append(assistant_text)
             break
 
-        # 情况 B：调用过工具但模型说"我做完了" → 必须过验证器
+        # 情况 B：调用过工具但模型说"我做完了"
+        # 普通对话模式（workflow_mode=none）跳过验证器，直接采纳——验证器仅对 plan/spec/goal 工作流模式生效
+        workflow_mode = agent.get("workflow_mode", "none")
+        if workflow_mode == "none":
+            final_text_parts.append(assistant_text)
+            break
+
+        # plan/spec/goal 工作流模式 → 必须过验证器
         yield f"RN:（进入独立验证器检查...）\n"
         verification = await verify_completion(
             interface, model, user_input, tool_history, assistant_text,
