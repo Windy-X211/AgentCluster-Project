@@ -1,4 +1,7 @@
 import json
+import sys
+import traceback
+import asyncio
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
@@ -99,8 +102,22 @@ async def send_message(cid: int, m: MsgIn):
     mode = conv.get("mode", "independent")
 
     async def gen():
-        async for chunk in agent_reply(cid, agent, m.content, mode, canvas):
-            yield chunk
+        try:
+            async for chunk in agent_reply(cid, agent, m.content, mode, canvas):
+                yield chunk
+        except asyncio.CancelledError:
+            # 客户端主动断开 / 停止 → 正常中止，不打印错误
+            print(f"[conversations] gen() cancelled for conv {cid}, agent {m.agent_id}", file=sys.stderr)
+            raise  # StreamingResponse 需要 CancelledError 正常传播给 ASGI
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[conversations] gen() FATAL for conv {cid}, agent {m.agent_id}: {e}\n{tb}", file=sys.stderr)
+            # yield 一条 E: 错误行给前端（如果连接还能写）
+            try:
+                err_text = str(e).replace("\n", "\\n")
+                yield f"E:后端崩溃：{err_text}\n"
+            except Exception:
+                pass
 
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
 

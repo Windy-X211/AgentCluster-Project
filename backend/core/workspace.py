@@ -551,8 +551,10 @@ def read_file(workdir: str, path: str) -> dict:
     except UnicodeDecodeError:
         try:
             content = p.read_text(encoding="gbk")
-        except Exception as e:
-            return {"error": f"编码无法识别：{e}"}
+        except Exception:
+            # 兜底：用 utf-8 替代坏字节，保证预览/编辑至少能打开
+            raw = p.read_bytes()
+            content = raw.decode("utf-8", errors="replace")
     return {"ok": True, "path": str(p), "name": p.name, "ext": ext,
             "size": p.stat().st_size, "content": content}
 

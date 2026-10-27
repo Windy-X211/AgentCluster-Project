@@ -145,7 +145,6 @@ export function convDisplayName(c: any): string {
   const msgs = c?.messages || []
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
-    if (m.relay) continue
     if (m.role !== 'user' && m.role !== 'assistant') continue
     const t = (m.content || '').replace(/\s+/g, ' ').trim()
     if (!t) continue
@@ -589,7 +588,7 @@ export const useConvStore = defineStore('conv', {
     async deleteMessage(visibleIdx: number): Promise<{ ok: boolean; msg?: string; removed?: number }> {
       const c = this.currentData()
       if (!c) return { ok: false, msg: '无当前会话' }
-      const visibleMsgs = (c.messages || []).filter((m: any) => !m.relay)
+      const visibleMsgs = c.messages || []
       if (visibleIdx < 0 || visibleIdx >= visibleMsgs.length) return { ok: false, msg: '索引越界' }
       const target = visibleMsgs[visibleIdx]
       const rawIdx = (c.messages || []).indexOf(target)
@@ -612,7 +611,7 @@ export const useConvStore = defineStore('conv', {
     async undoFromUserMessage(visibleIdx: number): Promise<{ ok: boolean; msg?: string; restoredOps?: number }> {
       const c = this.currentData()
       if (!c) return { ok: false, msg: '无当前会话' }
-      const visibleMsgs = (c.messages || []).filter((m: any) => !m.relay)
+      const visibleMsgs = c.messages || []
       if (visibleIdx < 0 || visibleIdx >= visibleMsgs.length) return { ok: false, msg: '索引越界' }
       const target = visibleMsgs[visibleIdx]
       if (target.role !== 'user') return { ok: false, msg: '仅可对用户消息执行撤销' }
@@ -731,6 +730,7 @@ export const useConvStore = defineStore('conv', {
       await this.flushCurrentNow(false, cid)
 
       let _aborted = false  // 用户主动停止：区别于真实错误，播放静音
+      const t0 = Date.now()  // 本轮起点：判断是否长任务（长任务完成才响提示音，闲聊不打扰）
 
       try {
         // 逐行解析新协议（signal 支持「停止」中止 fetch → 后端断连取消接力链）
@@ -814,10 +814,10 @@ export const useConvStore = defineStore('conv', {
           // 找不到就保留原 current —— abort 后后端 list 可能暂时没同步
         }
 
-        // 提示音：仅画布运行模式（非独立对话）+ 用户主动 abort 静音
+        // 提示音：画布运行模式 + 手动跑的长任务（>10s）+ 用户主动 abort 静音
         // 正常完成 → 愉悦音；有错误（E: 行 / 网络异常）→ 急促音
         try {
-          if (!_aborted && this.running) {
+          if (!_aborted && (this.running || Date.now() - t0 > 10000)) {
             const st = useSettingsStore()
             if (st.data.sound_enabled !== false) {
               if (this._sendError[cid]) playError()
@@ -898,37 +898,33 @@ export const useConvStore = defineStore('conv', {
       if (left.length !== edges.length) this._callEdges[cid] = left
     },
 
-    /** 记录发言者。串行=替换（同时只有一个），并行=累加（多个接收方同时高亮）。
-     *  并行模式下若只保留一个，画布上永远只亮最后一个接收方，
-     *  表现成"一个发送方同时唤起 N 个智能体、却只有一个被唤醒"。
+    /** 记录发言者：每次 SPEAK 都把 speakingAgents 重置为只包含新 agent。
+     *  并行模式下后端用 _drain_agent_reply 把各 agent 的输出缓冲后顺序 yield，
+     *  配合修复后的后端在每个 agent 内容前重新 emit SPEAK:X，speakingAgents 会随
+     *  SPEAK 正确切换——不需要累加（累加会导致已说完的 agent 继续高亮不清）。
      *  按 cid 操作对应会话的状态，避免并发流互相干扰。 */
     _setSpeaker(cid: number, agentId: number) {
       this._speakingAgent[cid] = agentId
-      const c = this.list.find(x => x.id === cid)
-      const canvas = c?.canvas_id != null
-        ? useCanvasStore().list.find(x => x.id === c.canvas_id)
-        : null
-      if (canvas?.execution_mode === 'parallel') {
-        const next = new Set(this._speakingAgents[cid] ?? new Set())
-        next.add(agentId)
-        this._speakingAgents[cid] = next
-      } else {
-        this._speakingAgents[cid] = new Set([agentId])
-      }
+      // 无论串行/并行，每次 SPEAK 都重置 speakingAgents 为只包含当前发言者
+      // 后端顺序 yield 各 agent 的缓冲内容，配合修复后每个 agent 内容前都有 SPEAK:X，
+      // 高亮会正确跟随当前正在输出的 agent 切换
+      this._speakingAgents[cid] = new Set([agentId])
     },
 
     _handleLine(c: any, line: string) {
       const cid = c.id
       const msgs: RichMsg[] = c.messages || []
       const lastAssistant = msgs[msgs.length - 1]
-      const curAgent = this._speakingAgent[cid] ?? null   // 当前发言者（工具调用的发起者）
+      let curAgent = this._speakingAgent[cid] ?? null   // 当前发言者（工具调用的发起者）—— let 以便 SPEAK: 行处理后同步更新
       const relayPhase = this._relayPhase.has(cid)         // 本会话是否已进入接力段
 
       if (line === 'DONE') {
         this._handoffActive.delete(cid)
+        this._relayPhase.delete(cid)
         this._callEdges[cid] = []
         this._toolCalls[cid] = {}
         this._toolPending[cid] = {}
+        this._speakingAgent[cid] = null
         this._speakingAgents[cid] = new Set()
         return
       }
@@ -1122,7 +1118,10 @@ export const useConvStore = defineStore('conv', {
         // 切换发言者：结束当前流式消息（空泡泡直接丢弃），后续进入接力段（聊天区过滤）
         const id = parseInt(line.slice(6), 10)
         _closeTailAssistant(msgs)
-        if (!Number.isNaN(id)) this._setSpeaker(cid, id)
+        if (!Number.isNaN(id)) {
+          this._setSpeaker(cid, id)
+          curAgent = id   // 同步更新局部变量，让后续 A2A:/T:/RN:/C: 行用正确的 agent_id
+        }
         this._relayPhase.add(cid)
         this._handoffActive.add(cid)
       } else if (line.startsWith('A2A:')) {

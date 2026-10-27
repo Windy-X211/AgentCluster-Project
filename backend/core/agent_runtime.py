@@ -27,10 +27,13 @@ from core.a2a import (
     TURN_CTX, collect_relay_targets, collect_call_targets,
     build_handoff_envelope, build_call_envelope,
     render_envelope, mark_envelope_done, CALL_TOOL, A2A_HANDOFF_ENABLED,
-    _resolve_target,
+    _resolve_target, _can_send_to, _agents_connected,
 )
 from plugins import PLUGIN_REGISTRY, run_plugin, set_stop_event, reset_stop_event
-from core.validator import verify_completion
+from core.workflows import (
+    workflow_tools_for, workflow_preamble, stage_gate,
+    run_workflow_tool, load_workflow, save_workflow, goal_assess,
+)
 
 logger = logging.getLogger("agent_runtime")
 
@@ -633,6 +636,17 @@ def _register_child_task(turn: dict | None, task: asyncio.Task) -> None:
 
     def _on_done(_t: asyncio.Task) -> None:
         pool.discard(_t)
+        # 捕获未处理的 task 异常——避免 "Task exception was never retrieved" 静默丢失
+        try:
+            exc = _t.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                import traceback, sys
+                tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                print(f"[runtime] child task FAILED: {exc}\n{tb}", file=sys.stderr)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
     task.add_done_callback(_on_done)
 
@@ -893,6 +907,10 @@ def _execute_tool(name: str, arguments: dict,
 
         try:
             arguments = _sanitize_tool_arguments(name, arguments or {})
+            # —— 工作流工具拦截：plan.*/spec.*/goal.* → 派发到 run_workflow_tool ——
+            _wf_prefix = name.split(".", 1)[0]
+            if _wf_prefix in ("plan", "spec", "goal"):
+                return run_workflow_tool(name, arguments or {}, conv_id or 0, agent_id or 0)
             if name in COMMAND_META:
                 return run_command(name, **(arguments or {}))
             # 插件执行：注入能力参数预设的固定参数（模型不可见、不可改，固定值优先覆盖）
@@ -1248,26 +1266,16 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
     return "\n".join(p for p in parts if p), speaker_names
 
 
-async def _drain_agent_reply(conversation_id: int, target: dict, input_text: str,
-                             mode: str, canvas: dict | None, turn: dict) -> list[str]:
-    """并行模式辅助：运行 agent_reply 并收集所有输出行到列表（供主生成器后续 yield）。"""
-    lines: list[str] = []
-    try:
-        async for line in agent_reply(conversation_id, target, input_text, mode, canvas, turn):
-            lines.append(line)
-    except Exception as e:
-        lines.append(f"RN:（并行接收方 {target.get('name', '?')} 异常：{e}）\n")
-    return lines
-
-
 async def _serial_send_message_and_wait(
     conversation_id: int, sender: dict, target: dict, message: str,
-    turn: dict, canvas: dict, conv: dict,
-) -> dict:
-    """串行模式专用：阻塞式 send_message — 构造信封 → 启动下游 B → await B 完整完成 →
-    从 B 的 turn.calls 中提取 B 给 sender 的回信，把回信内容作为 send_message 的 tool result 返回。
+    turn: dict, canvas: dict, conv: dict, result: dict | None = None,
+):
+    """串行模式专用 send_message — 实时 yield 下游 B 的每一行（与并行模式流式体验一致），
+    同时在 B 完全结束后通过 `result` 字典回传结构化的回信信息。
 
-    这让 A 的 tool loop 能把 B 的回信当作 send_message 的执行结果，A 可以继续基于回信做下一步决策。
+    改造前是先收集全部行再一次性返回 → B 的画布泡泡要等 B 完成才突然全显示；
+    改造后是 async generator，每收到一行就 yield 给前端 → B 的泡泡逐 token 流式更新，
+    与并行模式（queue + drain）体验完全一致。
     """
     env = build_call_envelope(conversation_id, sender, target, {"message": message})
     # 落库 A2A 信封（新建消息避免覆盖）
@@ -1277,6 +1285,13 @@ async def _serial_send_message_and_wait(
     })
     upsert("conversations", fresh)
 
+    # 先 yield A2A: 信封行（让前端 RightPanel 显示信封卡片，与并行模式顺序一致）
+    yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
+
+    # 把 env 放进 result，让调用方在异常时也能回传
+    if result is not None:
+        result["_env"] = env
+
     # 构造 B 的 child_turn（浅拷贝，让 B 的 turn 修改不污染 A）
     child_turn = dict(turn)
     child_turn["reply_to_msg_id"] = env.get("message_id")
@@ -1284,20 +1299,26 @@ async def _serial_send_message_and_wait(
     # 给 B 一个独立的 calls 队列（B 的 send_message 回信会进这里）
     child_turn["calls"] = []
 
-    # 运行 B 直到完成，同时收集 B 的所有输出行
-    yield_lines: list[str] = []
     b_final_text = ""
     try:
         async for line in agent_reply(
             conversation_id, target, render_envelope(env),
             mode="linked", canvas=canvas, turn=child_turn,
         ):
-            yield_lines.append(line)
-            # 提取 B 的 final_text（F: 行格式为 "F:xxx\n"）
+            if line.strip() == "DONE":
+                continue
             if line.startswith("F:"):
                 b_final_text = line[2:].rstrip("\n")
+            yield line
     except Exception as e:
-        return {"error": f"下游智能体 {target.get('name', '?')} 执行异常：{e}"}
+        if result is not None:
+            result.clear()
+            result["error"] = f"下游智能体 {target.get('name', '?')} 执行异常：{e}"
+            result.setdefault("_env", env)
+        else:
+            # 防御性：result 未提供时至少 yield 错误行让前端知道
+            yield f"RN:（串行接收方 {target.get('name', '?')} 异常：{e}）\n"
+        return
     mark_envelope_done(conversation_id, env.get("message_id"))
 
     # 从 B 的 child_turn.calls 中提取 B 给 sender 的 send_message 回信
@@ -1310,17 +1331,18 @@ async def _serial_send_message_and_wait(
     # 如果 B 没有显式 send_message 回信，取 B 的 final_text 作为回信
     reply_content = b_reply_msg if b_reply_msg else b_final_text
 
-    return {
-        "ok": True,
-        "to": target.get("name"),
-        "to_agent_id": target.get("id"),
-        "reply": reply_content,
-        "b_final_text": b_final_text,
-        "b_explicit_reply": bool(b_reply_msg),
-        "note": "已收到对方回信",
-        # 把 B 的所有输出行也带回来（供 A 端 yield 给前端）
-        "_b_yield_lines": yield_lines,
-    }
+    if result is not None:
+        result.clear()
+        result.update({
+            "_env": env,
+            "ok": True,
+            "to": target.get("name"),
+            "to_agent_id": target.get("id"),
+            "reply": reply_content,
+            "b_final_text": b_final_text,
+            "b_explicit_reply": bool(b_reply_msg),
+            "note": "已收到对方回信",
+        })
 
 
 async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: str = "independent", canvas: dict | None = None, turn: dict | None = None):
@@ -1418,6 +1440,8 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
 
 async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str, mode: str, canvas: dict | None, turn: dict, is_relay: bool = False):
     conv = get_by("conversations", conversation_id) or {"id": conversation_id, "messages": []}
+    # 记录初始消息数，用于 final upsert 时把内存中累积但未落库的 tool entries 合并进去
+    _conv_initial_len = len(conv.get("messages", []))
 
     # 选定模型 + 接口：由 agent_reply 入口统一分配好存进 turn（并行模式下可能挑了
     # default_model 之外的槽；串行模式直接等于 agent.model 或 interface.default_model）
@@ -1436,6 +1460,14 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             from core.a2a import HANDOFF_TOOL
             tools.append(HANDOFF_TOOL)
 
+    # —— 工作流模式：plan/spec/goal 注入专属工具 + 加载状态 ——
+    _wf_mode = agent.get("workflow_mode", "none")
+    _wf = {}
+    if _wf_mode in ("plan", "spec", "goal"):
+        # 追加工作流工具 schema（不会与已有工具重名，plan.* / spec.* / goal.* 命名空间隔离）
+        tools.extend(workflow_tools_for(_wf_mode))
+        _wf = load_workflow(conversation_id, agent.get("id", 0), _wf_mode)
+
     # 构建历史
     messages = []
     cluster_context = ""
@@ -1444,6 +1476,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         cluster_context, speaker_names = _build_cluster_context(canvas, agent)
     _wd_probe = turn.get("_wd_probe") if turn else None
     system_prompt_base = _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe)
+    # 保存不带工作流 preamble 的核心 prompt（每轮刷新 preamble 时复用）
+    _system_prompt_core = system_prompt_base
+    if _wf_mode in ("plan", "spec", "goal") and _wf:
+        system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})
     for m in conv.get("messages", []):
         # a2a 信封只用于前端展示，不进 LLM 历史（未知 role 会被接口拒绝）
@@ -1496,10 +1532,54 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
     final_text_parts = []
     tool_history = []  # 本轮执行的工具列表（用于入库 assistant message 的 tool_calls 字段）
-    parallel_tasks = []  # 并行模式：并发接收方任务 [(asyncio_task, env)]
+    parallel_tasks = []  # 并行模式：并发接收方任务 [asyncio_task]
     max_tool_rounds = _max_tool_rounds(agent)
     assistant_reasoning = ""  # 让循环外可访问
     _last_assistant_text = ""  # 让循环外可访问
+
+    # ===== 并行模式实时输出桥接 =====
+    # 接收方 asyncio task 边运行边把输出行 push 到这个 Queue，
+    # 主生成器在 chat 流式循环/每轮 tool 执行后 drain 并 yield——
+    # 这样接收方的流式输出（T:/RN:/SPEAK:）不会被 _drain_agent_reply 缓存到 task 完成后才一次性吐出。
+    _recv_queue: asyncio.Queue = asyncio.Queue()
+    _recv_done_count = 0  # 已完成的接收方数量（标记 "__DONE__" 时递增）
+    _recv_expected_count = 0  # 预期启动的接收方总数
+
+    async def _push_agent_to_queue(cid, tgt, inp_text, m, c, child_turn):
+        """接收方 agent_reply 包装：每行 put 到 _recv_queue（带 agent_id），完成后 put __DONE__ 标记。
+        注意：过滤掉嵌套 agent_reply 的 DONE 行——它是内部结束标记，不应传给前端清状态；
+        前端的 DONE 只应由顶层 agent_reply 在整个 SSE 流结束时 yield 一次。"""
+        try:
+            async for line in agent_reply(cid, tgt, inp_text, m, c, child_turn):
+                if line.strip() == "DONE":
+                    continue
+                await _recv_queue.put((tgt.get("id"), line))
+        except Exception as e:
+            await _recv_queue.put((tgt.get("id"), f"RN:（并行接收方 {tgt.get('name', '?')} 异常：{e}）\n"))
+        await _recv_queue.put((None, "__DONE__"))
+
+    def _drain_recv_lines(sender_id: int | None = None):
+        """非阻塞 drain 接收方队列：返回 [(line, need_speak_switch), ...]
+        自动处理 SPEAK: 切换——当 drain 到不同 agent_id 的输出前，先加一条 SPEAK:X。
+        drain 结束后若 sender_id 有效，加一条 SPEAK 切回发送方。"""
+        out: list[tuple[str, bool]] = []  # (content, is_speak)
+        last_aid = None
+        nonlocal _recv_done_count
+        try:
+            while True:
+                aid, line = _recv_queue.get_nowait()
+                if line == "__DONE__":
+                    _recv_done_count += 1
+                    continue
+                if aid != last_aid:
+                    out.append((f"SPEAK:{aid}\n", True))
+                    last_aid = aid
+                out.append((line, False))
+        except asyncio.QueueEmpty:
+            pass
+        if sender_id is not None and last_aid is not None and last_aid != sender_id:
+            out.append((f"SPEAK:{sender_id}\n", True))
+        return out
 
     # ===== 分层自适应路由：默认快通道 =====
     # 非 linked 模式一律从快通道开始（把 <continue> 续跑提示动态附加到当前用户消息）；
@@ -1690,6 +1770,17 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     for round_idx in range(max_tool_rounds):
         is_last_round = (round_idx == max_tool_rounds - 1)
         tool_choice = "auto"
+
+        # —— 工作流：每轮刷新 wf 状态 + 更新 system prompt preamble（让模型感知阶段变化）—
+        # —— plan 阶段门控：stage_gate 只 yield 前端通知，不注入 messages ——
+        if _wf_mode in ("plan", "spec", "goal"):
+            _wf = load_workflow(conversation_id, agent.get("id", 0), _wf_mode)
+            if _wf_mode == "plan":
+                _gate_msg = stage_gate(_wf_mode, _wf, user_input, conversation_id, agent.get("id", 0))
+                if _gate_msg:
+                    yield f"RN:{_esc(_gate_msg)}\n"
+            # 每轮重建 system prompt：核心 + 最新 preamble（stage 变化后 preamble 过期需刷新）
+            messages[0] = {"role": "system", "content": _system_prompt_core + workflow_preamble(_wf_mode, _wf)}
         if is_last_round and tools:
             tool_choice = "none"  # 强制让模型输出文字（但验证器会兜底）
 
@@ -1715,6 +1806,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         _garbage_aborted = False # 是否因流式垃圾中止本轮
         try:
             async for kind, payload in _gen:
+                # 每收到一个模型 token 前，先 drain 接收方可能已输出的行——
+                # 让并行接收方的流式输出在发送方继续运行时就能实时到达前端
+                if _recv_expected_count > 0:
+                    for line, _ in _drain_recv_lines(agent.get("id")):
+                        yield line
                 if kind == "text":
                     _delta = round_text_scan.feed(payload)
                     if _delta:
@@ -1956,18 +2052,45 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                             result = {"error": "不能与自己消息"}
                         elif not (args.get("message") or "").strip():
                             result = {"error": "请提供 message（要发给对方的内容）"}
+                        elif not any(n.get("agent_id") == target.get("id") for n in canvas.get("nodes", [])):
+                            # 目标不在当前画布上 → 拒绝（镜像 cmd_cluster_send_message 的画布检查）
+                            result = {"error": f"「{target.get('name')}」不在当前画布上"}
                         else:
-                            yield f"RN:（串行模式：发送消息给 {target.get('name')}，等待对方回复...）\n"
-                            # SPEAK + A2A 信封由辅助函数内部落库但不 yield，这里先声明发送者切换
-                            yield f"SPEAK:{target.get('id')}\n"
-                            result = await _serial_send_message_and_wait(
-                                conversation_id, agent, target, args.get("message", ""),
-                                turn, canvas, conv,
-                            )
-                            # 把 B 的输出行 yield 给前端
-                            _b_lines = result.pop("_b_yield_lines", []) if isinstance(result, dict) else []
-                            for _bl in _b_lines:
-                                yield _bl
+                            # 方向性校验 + 回复豁免（镜像 cmd_cluster_send_message）
+                            from_id = agent.get("id")
+                            to_id = target.get("id")
+                            can_initiate = _can_send_to(canvas, from_id, to_id)
+                            has_any_link = _agents_connected(canvas, from_id, to_id)
+                            is_reply = (turn.get("reply_to_from") == to_id)
+                            if not can_initiate and not (has_any_link and is_reply):
+                                if has_any_link:
+                                    result = {"error": (
+                                        f"与「{target.get('name')}」的连线方向是对方→你，"
+                                        f"你不能主动发起 call；但可以在对方先找你之后再回复"
+                                    )}
+                                else:
+                                    result = {"error": (
+                                        f"与「{target.get('name')}」尚未连线，无法消息；"
+                                        f"请先在画布上从你的节点拖一条连线指向对方"
+                                    )}
+                            else:
+                                yield f"RN:（串行模式：发送消息给 {target.get('name')}，等待对方回复...）\n"
+                                # SPEAK 切换：声明接收方 B 成为当前发言者（A2A 信封由 helper 内部 yield）
+                                yield f"SPEAK:{target.get('id')}\n"
+                                # 改造为 async generator：helper 内部先 yield A2A:env，再实时 yield B 的每一行
+                                # → 串行模式与并行模式（queue + drain）流式体验完全一致
+                                _result_holder: dict = {}
+                                async for _bl in _serial_send_message_and_wait(
+                                    conversation_id, agent, target, args.get("message", ""),
+                                    turn, canvas, conv, result=_result_holder,
+                                ):
+                                    yield _bl
+                                result = _result_holder
+                                # 清除 helper 内部用的 _env 元数据，避免污染 tool result 传给模型
+                                if isinstance(result, dict):
+                                    result.pop("_env", None)
+                                # B 全部输出完毕后切回发送方（A）
+                                yield f"SPEAK:{agent.get('id')}\n"
                 else:
                     # 并行模式 / 非 send_message → 走普通同步执行路径
                     result = await asyncio.to_thread(_execute_tool, fn["name"], args,
@@ -1996,20 +2119,49 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     yield f"I:{tc['id']}|{json.dumps(img_refs, ensure_ascii=False)}\n"
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
 
+            # 每次工具执行后都尝试 drain 接收方队列——
+            # 工具执行的 await 期间 event loop 会让接收方 task 运行，输出到 Queue，
+            # 在 continue 下一轮 / break 出 tool loop 前把这些输出 flush 给前端
+            if _recv_expected_count > 0:
+                for line, _ in _drain_recv_lines(agent.get("id")):
+                    yield line
+
             # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
             # 否则模型每轮工具之间"过渡解说文字"都会触发一次验证器（上一条工具常有
             # 未消化的报错 → deterministic blocked），3 次配额会被无进展地耗光，
             # 导致"强制采纳"把整个运行提前掐死在任务中途。
             verify_retry_count = 0
 
-            # —— 并行模式：cluster.send_message 后保持运行，接力阶段并发启动接收方 ——
-            # 串行模式下 send_message 已在上面阻塞等待并返回 tool result，
-            # 不再需要这里的 break，也不需要接力阶段再启动 B。
+            # —— 并行模式：cluster.send_message 后立即启动接收方（不等接力阶段）——
+            # 串行模式下 send_message 已在上面阻塞等待并返回 tool result。
+            # collect_call_targets 会同时从 turn["calls"] 中移除已处理消息，
+            # 接力阶段（L2239）的 collect_call_targets 只会看到自动回复追加的消息。
             if mode == "linked" and canvas and exec_mode == "parallel":
-                has_call = any(tc["function"]["name"] == "cluster.send_message" for tc in assistant_tool_calls)
-                if has_call:
-                    # 已通过 _execute_tool 排队（cmd_cluster_send_message），等循环结束后由接力阶段统一并发启动
-                    yield f"RN:（并行模式：消息已发送排队，继续运行，接力阶段并发启动接收方）\n"
+                call_targets = collect_call_targets(turn, agent)
+                if call_targets:
+                    for target, d in call_targets:
+                        env = build_call_envelope(conversation_id, agent, target, d)
+                        fresh = get_by("conversations", conversation_id) or conv
+                        fresh.setdefault("messages", []).append({
+                            "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
+                        })
+                        upsert("conversations", fresh)
+                        yield f"SPEAK:{target.get('id')}\n"
+                        yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
+                        child_turn = dict(turn)
+                        child_turn["reply_to_msg_id"] = env.get("message_id")
+                        child_turn["reply_to_from"] = agent.get("id")
+                        task = asyncio.create_task(_push_agent_to_queue(
+                            conversation_id, target, render_envelope(env),
+                            "linked", canvas, child_turn,
+                        ))
+                        _register_child_task(turn, task)
+                        parallel_tasks.append((task, env))
+                        _recv_expected_count += 1
+                    # drain 接收方已输出的行（非阻塞，有就立即 yield）
+                    for line, _ in _drain_recv_lines(agent.get("id")):
+                        yield line
+                    yield f"RN:（并行模式：已立即启动 {len(call_targets)} 个接收方，继续运行）\n"
 
             continue  # 继续下一轮（串行阻塞已返回给模型，继续 tool loop）
 
@@ -2020,77 +2172,123 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             break
 
         # 情况 B：调用过工具但模型说"我做完了"
-        # 普通对话模式（workflow_mode=none）跳过验证器，直接采纳——验证器仅对 plan/spec/goal 工作流模式生效
-        workflow_mode = agent.get("workflow_mode", "none")
-        if workflow_mode == "none":
+        # —— 工作流专属验证：spec 用 checklist 自动 DONE，goal 用 goal_assess 评分
+        # —— plan / none 跳过，直接采纳
+        workflow_mode = _wf_mode or agent.get("workflow_mode", "none")
+        if workflow_mode not in ("spec", "goal"):
             final_text_parts.append(assistant_text)
             break
 
-        # plan/spec/goal 工作流模式 → 必须过验证器
-        yield f"RN:（进入独立验证器检查...）\n"
-        verification = await verify_completion(
-            interface, model, user_input, tool_history, assistant_text,
-            retry_count=verify_retry_count, max_retries=MAX_VERIFY_RETRIES,
-        )
+        # 重新加载最新 wf（本轮工作流工具执行后 run_workflow_tool 已落盘）
+        if workflow_mode in ("spec", "goal"):
+            _wf = load_workflow(conversation_id, agent.get("id", 0), workflow_mode)
 
-        if verification.get("adopt"):
-            # 验证通过 → 采纳
-            score = verification.get("score", 1.0)
-            method = verification.get("method", "unknown")
-            yield f"RN:✓ 验证通过（score={score:.2f}, method={method}）\n"
-            final_text_parts.append(assistant_text)
-            break
-        else:
-            # 验证未通过 → 把反馈回灌进 messages，让模型修正
-            verify_retry_count += 1
-            feedback = verification.get("feedback", "任务似乎未完成，请继续处理")
-            next_step = verification.get("next_step", "")
-            score = verification.get("score", 0.0)
-            yield f"RN:✗ 验证未通过（score={score:.2f}，第 {verify_retry_count}/{MAX_VERIFY_RETRIES} 次修正）\n"
-            yield f"RN:验证反馈：{feedback[:200]}{'...' if len(feedback) > 200 else ''}\n"
-
-            # 回灌一条 system 消息（位置放在最前面不行，放在刚结束的 assistant 之后作为新指引）
-            correction_parts = ["[验证器反馈] 你上一轮的回复未能完成用户请求。"]
-            if feedback:
-                correction_parts.append(f"问题：{feedback}")
-            if next_step:
-                correction_parts.append(f"建议下一步：{next_step}")
-            if score < 0.3:
-                correction_parts.append("⚠️ 完成度评分极低，请彻底重新审视用户请求，不要跳过任何必要步骤。")
-
-            # 注：用 user role 而非 system —— 部分国产模型（glm/sensenova）不允许 system 出现在对话中间，
-            # 会直接返回 400。改用 user role 在所有 OpenAI 兼容接口上都能正常回灌纠错指令。
-            messages.append({
-                "role": "user",
-                "content": "\n".join(correction_parts) + "\n请基于上述反馈继续处理，必要时重新调用工具。",
-            })
-
-            # 硬保障：如果验证重试次数超过上限但还没到 max_tool_rounds 的最后一轮，
-            # 再给一次机会；如果已经是最后一轮或验证重试耗尽，强制采纳避免死循环
-            if verify_retry_count >= MAX_VERIFY_RETRIES:
-                yield f"RN:（验证重试已达上限，强制采纳当前回复以防止死循环）\n"
+        # spec 模式：完全依赖 checklist 专属机制——DONE 则采纳，否则提示继续勾剩余验收项
+        if workflow_mode == "spec":
+            if _wf.get("stage") == "DONE":
+                yield f"RN:✓ spec 验收清单全部通过，工作流完成\n"
                 final_text_parts.append(assistant_text)
                 break
-
-            # 还有轮数 → 继续循环让模型修正
-            if is_last_round:
-                # 虽然是最后一轮，但为了让模型再修正一次，我们在 messages 里追加了修正指引
-                # 利用 max_tool_rounds 的剩余空间；如果确实没空间了，就强制采纳
+            # checklist 未全部通过 → 告知剩余项，让模型继续推进
+            cl = _wf.get("checklist") or []
+            cp = _wf.get("checklist_passed", {}) or {}
+            remaining = [c for c in cl if not cp.get(c, False)]
+            passed_count = sum(1 for c in cl if cp.get(c, False))
+            verify_retry_count += 1
+            if remaining:
+                _remaining_brief = "\n".join(f"  - {c}" for c in remaining[:5])
+                if len(remaining) > 5:
+                    _remaining_brief += f"\n  ... 以及其他 {len(remaining) - 5} 项"
+                yield f"RN:spec 验收尚未全部通过（{passed_count}/{len(cl)}），剩余 {len(remaining)} 项\n"
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[spec 验收未完成] 验收清单 {passed_count}/{len(cl)} 项已通过，"
+                        f"剩余 {len(remaining)} 项未通过。\n剩余验收项：\n{_remaining_brief}\n"
+                        "请继续调用 spec.checklist_check 逐项勾选，直到全部通过为止。"
+                    ),
+                })
+            else:
+                # checklist 为空（模型还没调 spec.generate 或全部勾成 passed 了但 stage 没更新）
+                yield f"RN:spec 工作流未完成，提示模型继续推进...\n"
+                messages.append({
+                    "role": "user",
+                    "content": "[spec 工作流] 当前阶段：" + _wf.get("stage", "?") +
+                               "。请继续按 spec 工作流机制推进（生成规格→锁定→逐项执行→勾选验收清单）。",
+                })
+            if verify_retry_count >= MAX_VERIFY_RETRIES or is_last_round:
+                yield f"RN:（spec 验收重试已达上限或最后一轮，强制采纳）\n"
                 final_text_parts.append(assistant_text)
                 break
             continue
 
-        break  # 兜底：正常情况下上面已经 break 了
+        # goal 模式：stage 已是 DONE → 直接采纳
+        if workflow_mode == "goal" and _wf.get("stage") == "DONE":
+            yield f"RN:✓ goal 达成度评分达标，工作流完成\n"
+            final_text_parts.append(assistant_text)
+            break
 
-    # —— 并行模式：等待所有并发接收方完成，输出其流式内容 ——
-    for task, env in parallel_tasks:
-        try:
-            lines = await task
-            for line in lines:
+        # goal 模式：调用专属 goal_assess（替代通用 verify_completion）
+        if workflow_mode == "goal":
+            yield f"RN:（进入 goal 专属达成度评估...）\n"
+            goal_result = await goal_assess(interface, model, _wf, tool_history, assistant_text)
+            save_workflow(conversation_id, agent.get("id", 0), _wf)
+            if goal_result.get("adopt"):
+                score = goal_result.get("score", 0.0)
+                yield f"RN:✓ goal 评估通过（score={score:.2f}≥阈值），目标达成\n"
+                final_text_parts.append(assistant_text)
+                break
+            else:
+                score = goal_result.get("score", 0.0)
+                gaps = goal_result.get("gaps", "")
+                next_step = goal_result.get("next_step", "")
+                yield f"RN:✗ goal 评估未通过（score={score:.2f}）\n"
+                if gaps:
+                    yield f"RN:剩余缺口：{gaps[:200]}{'...' if len(gaps) > 200 else ''}\n"
+                verify_retry_count += 1
+                correction_parts = ["[goal 评估反馈] 本轮达成度未达标，请继续推进。"]
+                if gaps:
+                    correction_parts.append(f"剩余缺口：{gaps}")
+                if next_step:
+                    correction_parts.append(f"建议下一步：{next_step}")
+                messages.append({
+                    "role": "user",
+                    "content": "\n".join(correction_parts) + "\n请继续推进直到达成度达标。",
+                })
+                if verify_retry_count >= MAX_VERIFY_RETRIES or is_last_round:
+                    yield f"RN:（评估重试已达上限或最后一轮，强制采纳）\n"
+                    final_text_parts.append(assistant_text)
+                    break
+                continue
+
+        break  # 兜底：正常情况下上面已经 break/continue 了
+
+    # —— 并行模式：等待所有并发接收方完成，持续 drain Queue 实时输出 ——
+    # 用 drain-while-waiting 替代裸 await task：在等待期间持续 drain Queue，
+    # 确保接收方的流式输出不会因为生成器卡在 await 上而延迟到达前端。
+    if parallel_tasks:
+        _envs = {task: env for task, env in parallel_tasks}
+        _pending = list(_envs.keys())
+        _done: list[asyncio.Task] = []
+        while _pending or _recv_done_count < len(parallel_tasks):
+            if not _pending:
+                # 所有 task 已完成，但 Queue 里可能还有未 drain 的行
+                break
+            done, _pending = await asyncio.wait(_pending, timeout=0.1)
+            # 每次 wait 后都 drain queue —— event loop 切换后接收方可能输出了新行
+            for line, _ in _drain_recv_lines(agent.get("id")):
                 yield line
-        except Exception as e:
-            yield f"RN:（并行任务异常：{e}）\n"
-        mark_envelope_done(conversation_id, env.get("message_id"))
+            for t in done:
+                _done.append(t)
+                env = _envs[t]
+                try:
+                    t.result()  # 重新 raise 异常（try/except 块外不会被吞）
+                except Exception as e:
+                    yield f"RN:（并行任务异常：{e}）\n"
+                mark_envelope_done(conversation_id, env.get("message_id"))
+        # 最终 drain：确保 Queue 清空
+        for line, _ in _drain_recv_lines(agent.get("id")):
+            yield line
 
     # 存最终 assistant 文字（如果最后一轮没文字但执行了工具，前端可以不展示）
     final_text = strip_continue("".join(final_text_parts))
@@ -2104,11 +2302,19 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     }
     if is_relay:
         final_entry["relay"] = True
+    # 先把 final_entry 加到内存 conv，统一合并
     conv["messages"].append(final_entry)
+
+    # reload → 合并 → upsert：tool loop 中提前启动的并发接收方可能已写入 store，
+    # 需要以 store 为基底（含接收方消息），再把内存中累积但未落库的新消息（tool entries + final_entry）
+    # 追加进去，避免覆盖接收方写入或丢失本轮产出
+    fresh_conv = get_by("conversations", conversation_id) or conv
+    for m in conv["messages"][_conv_initial_len:]:
+        fresh_conv.setdefault("messages", []).append(m)
 
     yield f"F:{final_text}\n"
     # 接力前先落库当前智能体产出，避免下游脏写覆盖
-    upsert("conversations", conv)
+    upsert("conversations", fresh_conv)
 
     # ===== 消息接力：cluster.send_message / 自动回复 在任意 relay 层级都处理
     #     （受 MAX_CALL 预算 + A2A_MAX_RELAY_DEPTH 双重约束防爆炸）；
@@ -2161,12 +2367,13 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         # 1) cluster.send_message 排队的消息（含自动回复；允许往返多轮）
         # 串行模式：send_message 已在 tool 层阻塞处理（_serial_send_message_and_wait），
         #           接力阶段跳过——避免重复发送。自动回复同样由串行阻塞机制覆盖。
-        # 并行模式：保持排队→接力阶段并发启动的行为
+        # 并行模式：手动 cluster.send_message 已在 tool loop 末尾被提前消费并启动接收方，
+        #           这里 collect_call_targets 只会看到自动回复（auto_reply）追加的消息。
         if exec_mode == "parallel":
             call_targets = collect_call_targets(turn, agent)
-            if len(call_targets) > 1:
-                # 并行多条：所有接收方并发启动
-                tasks = []
+            if call_targets:
+                # 统一处理：多目标和单目标都用 drain-while-waiting 循环
+                _jb_tasks = []  # [(task, env)]
                 for target, d in call_targets:
                     env = build_call_envelope(conversation_id, agent, target, d)
                     fresh = get_by("conversations", conversation_id) or conv
@@ -2179,43 +2386,30 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     child_turn = dict(turn)
                     child_turn["reply_to_msg_id"] = env.get("message_id")
                     child_turn["reply_to_from"] = agent.get("id")
-                    task = asyncio.create_task(_drain_agent_reply(
+                    task = asyncio.create_task(_push_agent_to_queue(
                         conversation_id, target, render_envelope(env),
                         "linked", canvas, child_turn,
                     ))
                     _register_child_task(turn, task)
-                    tasks.append((task, env))
-                for task, env in tasks:
-                    try:
-                        lines = await task
-                        for line in lines:
-                            yield line
-                    except Exception as e:
-                        yield f"RN:（并行任务异常：{e}）\n"
-                    mark_envelope_done(conversation_id, env.get("message_id"))
-            elif len(call_targets) == 1:
-                # 并行但只有一个目标 → 也走并发（统一用 asyncio.create_task）
-                target, d = call_targets[0]
-                env = build_call_envelope(conversation_id, agent, target, d)
-                fresh = get_by("conversations", conversation_id) or conv
-                fresh.setdefault("messages", []).append({
-                    "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
-                })
-                upsert("conversations", fresh)
-                yield f"SPEAK:{target.get('id')}\n"
-                yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
-                child_turn = dict(turn)
-                child_turn["reply_to_msg_id"] = env.get("message_id")
-                child_turn["reply_to_from"] = agent.get("id")
-                task = asyncio.create_task(_drain_agent_reply(
-                    conversation_id, target, render_envelope(env),
-                    "linked", canvas, child_turn,
-                ))
-                _register_child_task(turn, task)
-                lines = await task
-                for line in lines:
+                    _jb_tasks.append((task, env))
+                    _recv_expected_count += 1
+                # drain-while-waiting：接力阶段发送方已结束，等待期间持续 drain Queue
+                _envs = {t: env for t, env in _jb_tasks}
+                _pending = list(_envs.keys())
+                while _pending:
+                    done, _pending = await asyncio.wait(_pending, timeout=0.1)
+                    for line, _ in _drain_recv_lines(agent.get("id")):
+                        yield line
+                    for t in done:
+                        env = _envs[t]
+                        try:
+                            t.result()
+                        except Exception as e:
+                            yield f"RN:（接力并行任务异常：{e}）\n"
+                        mark_envelope_done(conversation_id, env.get("message_id"))
+                # 最终 drain
+                for line, _ in _drain_recv_lines(agent.get("id")):
                     yield line
-                mark_envelope_done(conversation_id, env.get("message_id"))
 
         # 2) 成果接力（A2A_HANDOFF_ENABLED=False 时 collect_relay_targets 返回空）
         for target, h in collect_relay_targets(turn, canvas, agent):
@@ -2232,6 +2426,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 conversation_id, target, render_envelope(env),
                 mode="linked", canvas=canvas, turn=turn,
             ):
+                if line.strip() == "DONE":
+                    continue
                 yield line
             mark_envelope_done(conversation_id, env.get("message_id"))
 

@@ -1039,8 +1039,12 @@ const seqMap = computed(() => {
   return m
 })
 
-// ② relay 过滤：排除发给其他智能体的接力消息，A2A 信封卡片保留
-const visibleMsgs = computed(() => (conv.value?.messages || []).filter((m: any) => !m.relay))
+// ② 消息过滤：过滤掉 relay 段的 role=user 消息——那些是 A2A 信封渲染文本（render_envelope），
+//     仅在下游 agent 内部作 user_input 传给 LLM，协议层内部消息不应该显示成用户泡泡。
+//     relay 的 assistant / a2a / tool_call / tool_result 照常显示——那是接收方的真实输出。
+const visibleMsgs = computed(() =>
+  (conv.value?.messages || []).filter((m: any) => !(m?.role === 'user' && m?.relay))
+)
 
 /** 渲染项：以"用户消息"为分界线，把每两条用户消息之间的全部智能体输出
  *  （assistant 消息 + a2a 信封组，按原顺序）整合成一个 turn：
