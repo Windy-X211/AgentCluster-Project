@@ -923,7 +923,7 @@ _AUTO_REPLY_SYSTEM = (
 
 
 async def _should_auto_reply(interface: dict, model: str, sender_message: str,
-                             reply_text: str, sender_name: str) -> bool:
+                             reply_text: str, sender_name: str, reasoning_level: str = "off") -> bool:
     """判断被联系智能体的正文是否为给发送方的直接回复。
     True=正文应自动回传发送方；False=不回传（任务产出/转发给其他成员）。
     默认 False（保守：A 可能只是派发任务，避免把任务产出误发给 A）。"""
@@ -935,7 +935,7 @@ async def _should_auto_reply(interface: dict, model: str, sender_message: str,
                 f"【接收方 B 的回复正文】\n{(reply_text or '')[:1500]}"
             )},
         ]
-        async for kind, payload in chat(interface, model, messages, stream=False, reasoning_level=agent.get("reasoning_level", "off")):
+        async for kind, payload in chat(interface, model, messages, stream=False, reasoning_level=reasoning_level):
             if kind == "message":
                 content = (payload.get("content") or "").strip()
                 try:
@@ -2139,7 +2139,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 _should_send = False
                 try:
                     _should_send = await asyncio.wait_for(
-                        _should_auto_reply(interface, model, user_input, final_text, _sender_name),
+                        _should_auto_reply(interface, model, user_input, final_text, _sender_name,
+                                           reasoning_level=agent.get("reasoning_level", "off")),
                         timeout=10.0
                     )
                 except asyncio.TimeoutError:

@@ -266,14 +266,14 @@ def _diag_payload(payload: dict, model: str) -> str:
     return f"model={model} stream={payload.get('stream')} tool_choice={tc_choice}{tools_info}\n" + "\n".join(lines)
 
 
-def _inject_reasoning(payload: dict, model: str, level: str) -> None:
-    """根据模型名和推理等级，向 payload 注入对应的推理参数（使用 reasoning_detector 模块）。"""
+def _inject_reasoning(payload: dict, model: str, level: str, interface_url: str = "") -> None:
+    """根据模型名、接口地址和推理等级，向 payload 注入对应的推理参数。"""
     from core.reasoning_detector import detect_protocol, inject_reasoning_payload as _inject
     if not level or level == "off" or not model:
         return
-    # llm.py 只有 interface dict，没有 base_url 的 protocol 检测上下文，
-    # 用 openai-chat 作为默认协议，inject_reasoning_payload 内部会根据模型名做正确分发。
-    _inject(payload, model, level, protocol="openai-chat")
+    # 根据接口 URL 自动识别协议类型，确保 DeepSeek/GLM/Qwen 等国产模型走正确的参数分支
+    protocol = detect_protocol(interface_url) if interface_url else "openai-chat"
+    _inject(payload, model, level, protocol=protocol)
 
 
 def _sanitize_payload(payload: dict) -> None:
@@ -428,8 +428,8 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
         # 没传 tools 但指定了非默认 tool_choice（如 required）→ 仍传 tool_choice
         payload["tool_choice"] = tool_choice
 
-    # —— 推理等级注入：根据模型名向 payload 添加 reasoning_effort / thinking 等参数 ——
-    _inject_reasoning(payload, model, reasoning_level)
+    # —— 推理等级注入：根据接口协议 + 模型名向 payload 添加 thinking / reasoning_effort 等参数 ——
+    _inject_reasoning(payload, model, reasoning_level, interface.get("url", ""))
 
     # —— payload 兼容性清洗：修正对国产模型（glm/sensenova 等）常见的不兼容字段 ——
     _sanitize_payload(payload)

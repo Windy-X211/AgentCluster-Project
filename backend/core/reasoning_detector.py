@@ -255,45 +255,66 @@ def inject_reasoning_payload(payload: dict, model: str, level: str, protocol: st
 
     level: 用户选择的等级值（"off"/"low"/"high"/"max" 或服务商原始值）
     detected_parameter: 检测器返回的参数路径，优先使用
+
+    重要：off 档不是"什么都不注入"——DeepSeek/GLM/Qwen 等模型默认原生输出思考，
+    必须显式注入禁用参数才能真正关闭思考。
     """
-    if not level or level == "off" or not model:
+    if not model:
         return
 
     param = detected_parameter or PROTOCOL_PARAMETERS.get(protocol, "reasoning_effort")
     ml = model.lower()
-
-    # OpenAI reasoning_effort
-    if param in ("reasoning_effort", "reasoning.effort"):
-        effort_map = {"low": "low", "high": "medium", "max": "high", "medium": "medium"}
-        ev = effort_map.get(level, level)
-        payload["reasoning_effort"] = ev
-        return
+    is_off = not level or level == "off"
 
     # DeepSeek / GLM thinking
     if param == "thinking" and ("deepseek" in ml or "glm" in ml):
-        budget = _BUDGET_MAP.get(level, 4096)
-        payload["thinking"] = {"type": "enabled", "budget": budget}
+        if is_off:
+            payload["thinking"] = {"type": "disabled"}
+        else:
+            budget = _BUDGET_MAP.get(level, 4096)
+            payload["thinking"] = {"type": "enabled", "budget": budget}
         return
 
     # Claude thinking
     if param == "thinking" and "claude" in ml:
-        budget = _BUDGET_MAP.get(level, 4096)
-        payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        if is_off:
+            payload["thinking"] = {"type": "disabled", "budget_tokens": 0}
+        else:
+            budget = _BUDGET_MAP.get(level, 4096)
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
         return
 
     # Qwen enable_thinking
     if param == "enable_thinking":
-        budget = _BUDGET_MAP.get(level, 4096)
-        payload["enable_thinking"] = True
-        payload["thinking_budget"] = budget
+        if is_off:
+            payload["enable_thinking"] = False
+            payload.pop("thinking_budget", None)
+        else:
+            budget = _BUDGET_MAP.get(level, 4096)
+            payload["enable_thinking"] = True
+            payload["thinking_budget"] = budget
         return
 
     # Gemini thinking_level
     if param == "thinking_level":
-        payload["thinking_level"] = level
+        if is_off:
+            # Gemini 用 thinking_level="none" 关闭；不传也关
+            payload["thinking_level"] = "none"
+        else:
+            payload["thinking_level"] = level
         return
 
-    # 兜底：通用 reasoning_effort
+    # OpenAI reasoning_effort（OpenAI 模型默认不思考，reasoning_effort=none 显式关闭）
+    if param in ("reasoning_effort", "reasoning.effort"):
+        if is_off:
+            payload["reasoning_effort"] = "none"
+        else:
+            effort_map = {"low": "low", "high": "medium", "max": "high", "medium": "medium"}
+            ev = effort_map.get(level, level)
+            payload["reasoning_effort"] = ev
+        return
+
+    # 兜底：level=off 不注入；有值时用 reasoning_effort
     effort_map = {"low": "low", "high": "medium", "max": "high"}
     ev = effort_map.get(level)
     if ev:

@@ -33,5 +33,5 @@
   "sort_order": 0,
   "workflow_mode": "goal",
   "group_id": 1,
-  "reasoning_level": "high"
+  "reasoning_level": "off"
 }
