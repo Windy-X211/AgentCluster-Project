@@ -214,7 +214,8 @@ export const api = {
     list: () => req<any[]>('/model_interfaces'),
     create: (d: any) => req('/model_interfaces', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/model_interfaces/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
-    remove: (id: number) => req(`/model_interfaces/${id}`, { method: 'DELETE' })
+    remove: (id: number) => req(`/model_interfaces/${id}`, { method: 'DELETE' }),
+    detectReasoning: (iid: number, modelName: string) => req<any>(`/model_interfaces/${iid}/reasoning/${encodeURIComponent(modelName)}`),
   },
   settings: {
     get: () => req<any>('/settings'),
