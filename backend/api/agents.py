@@ -12,6 +12,7 @@ class AgentIn(BaseModel):
     system_prompt: str = ""
     model: str = ""
     interface_id: int | None = None
+    reasoning_level: str = "off"  # 推理等级 "off"/"low"/"high"/"max"
     commands: list[str] = []
     skills: list[str] = []
     plugins: list[str] = []

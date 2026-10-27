@@ -941,7 +941,7 @@ _AUTO_REPLY_SYSTEM = (
 
 
 async def _should_auto_reply(interface: dict, model: str, sender_message: str,
-                             reply_text: str, sender_name: str) -> bool:
+                             reply_text: str, sender_name: str, reasoning_level: str = "off") -> bool:
     """判断被联系智能体的正文是否为给发送方的直接回复。
     True=正文应自动回传发送方；False=不回传（任务产出/转发给其他成员）。
     默认 False（保守：A 可能只是派发任务，避免把任务产出误发给 A）。"""
@@ -953,7 +953,7 @@ async def _should_auto_reply(interface: dict, model: str, sender_message: str,
                 f"【接收方 B 的回复正文】\n{(reply_text or '')[:1500]}"
             )},
         ]
-        async for kind, payload in chat(interface, model, messages, stream=False):
+        async for kind, payload in chat(interface, model, messages, stream=False, reasoning_level=reasoning_level):
             if kind == "message":
                 content = (payload.get("content") or "").strip()
                 try:
@@ -1609,7 +1609,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
         try:
             async for kind, payload in chat(interface, model, messages, stream=True,
-                                             tools=fast_tools, tool_choice=fast_tool_choice):
+                                             tools=fast_tools, tool_choice=fast_tool_choice, reasoning_level=agent.get("reasoning_level", "off")):
                 if kind == "text":
                     _delta = fast_text_scan.feed(payload)
                     if _delta:
@@ -1800,7 +1800,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         # 降到几乎为零。最近一轮的图片 followup 保留（本轮 LLM 还没回过，必须让它看到）。
         messages = _strip_prev_image_followups(messages, keep_from_idx=_tool_round_start)
 
-        _gen = chat(interface, model, messages, stream=True, tools=tools or None, tool_choice=tool_choice)
+        _gen = chat(interface, model, messages, stream=True, tools=tools or None, tool_choice=tool_choice, reasoning_level=agent.get("reasoning_level", "off"))
         _garbage_hits = 0        # 流式重复垃圾命中次数
         _garbage_buf = ""        # 滚动文本窗口（用于重复字符检测）
         _garbage_aborted = False # 是否因流式垃圾中止本轮
@@ -2345,7 +2345,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 _should_send = False
                 try:
                     _should_send = await asyncio.wait_for(
-                        _should_auto_reply(interface, model, user_input, final_text, _sender_name),
+                        _should_auto_reply(interface, model, user_input, final_text, _sender_name,
+                                           reasoning_level=agent.get("reasoning_level", "off")),
                         timeout=10.0
                     )
                 except asyncio.TimeoutError:

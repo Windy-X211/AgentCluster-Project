@@ -1008,11 +1008,73 @@ function onModelDdOutside(e: MouseEvent) {
   if (modelTriggerEl.value && modelTriggerEl.value.contains(tgt)) return
   if (modelPopEl.value && modelPopEl.value.contains(tgt)) return
   modelDdOpen.value = false
+  reasoningDdOpen.value = false
 }
 
 watch(modelDdOpen, async (open) => {
-  if (open) { await nextTick(); updateModelDdPos() }
+  if (open) {
+    await nextTick()
+    updateModelDdPos()
+    fetchReasoningCapabilities()
+  }
+  if (!open) { reasoningDdOpen.value = false }
 })
+
+// ============ 推理等级选择（动态检测） ============
+const DEFAULT_REASONING_LEVELS = [
+  { value: 'off',  label: 'Off',  desc: '不启用推理' },
+  { value: 'low',  label: 'Low',  desc: '轻度推理' },
+  { value: 'high', label: 'High', desc: '深度推理' },
+  { value: 'max',  label: 'Max',  desc: '最大推理' },
+]
+const reasoningLevels = ref<any[]>(DEFAULT_REASONING_LEVELS)
+const reasoningDdOpen = ref(false)
+const reasoningSupported = ref(false)
+const reasoningLoading = ref(false)
+
+function reasoningLevelLabel(v?: string): string {
+  const opts = reasoningLevels.value
+  const opt = opts.find((o: any) => o.value === (v || 'off'))
+  return opt ? opt.label : 'Off'
+}
+
+async function fetchReasoningCapabilities() {
+  const a = currentAgent.value
+  if (!a || !a.interface_id || !a.model) {
+    reasoningSupported.value = false
+    return
+  }
+  reasoningLoading.value = true
+  try {
+    const res = await api.models.detectReasoning(a.interface_id, a.model)
+    if (res.status === 'confirmed' && res.options?.length) {
+      reasoningLevels.value = [
+        { value: 'off', label: 'Off', desc: '不启用推理' },
+        ...res.options.map((o: any) => ({ value: o.value, label: o.label, desc: '' })),
+      ]
+      reasoningSupported.value = true
+    } else if (res.status === 'unsupported') {
+      reasoningSupported.value = false
+    } else {
+      // unknown — 仍显示默认四级，用户可自行尝试
+      reasoningLevels.value = DEFAULT_REASONING_LEVELS
+      reasoningSupported.value = true
+    }
+  } catch {
+    reasoningLevels.value = DEFAULT_REASONING_LEVELS
+    reasoningSupported.value = true
+  } finally {
+    reasoningLoading.value = false
+  }
+}
+
+async function selectReasoningLevel(level: string) {
+  reasoningDdOpen.value = false
+  const a = currentAgent.value
+  if (!a) return
+  await agents.update(a.id, { ...a, reasoning_level: level })
+}
+// ============ 推理等级选择 end ============
 // ============ 模型快速切换下拉 end ============
 
 const conv = computed(() => convs.currentData())
@@ -2352,7 +2414,7 @@ async function deleteSelected() {
 }
 function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true }
 function onDocKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false }
+    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
 }
 
 /** 聊天消息内附件点击事件委托（冒泡到 document 处理，支持 v-html 渲染的附件卡片） */
@@ -2985,6 +3047,23 @@ onBeforeUnmount(() => {
                       <span v-if="mi.default_model === mid" class="model-default-tag">默认</span>
                     </div>
                   </template>
+                </div>
+                <!-- 推理等级选择 -->
+                <div v-if="currentAgent && reasoningSupported" class="reasoning-section">
+                  <div class="reasoning-head" @click.stop="reasoningDdOpen = !reasoningDdOpen">
+                    <span class="reasoning-label">推理等级</span>
+                    <span class="reasoning-cur">{{ reasoningLevelLabel(currentAgent?.reasoning_level) }}</span>
+                    <span class="dd-chev" :class="{ open: reasoningDdOpen }">▾</span>
+                  </div>
+                  <div v-if="reasoningDdOpen" class="reasoning-opts">
+                    <div v-for="opt in reasoningLevels" :key="opt.value"
+                         class="reasoning-opt" :class="{ active: (currentAgent?.reasoning_level || 'off') === opt.value }"
+                         @click.stop="selectReasoningLevel(opt.value)">
+                      <span class="reasoning-opt-name">{{ opt.label }}</span>
+                      <span class="reasoning-opt-desc">{{ opt.desc }}</span>
+                      <span v-if="(currentAgent?.reasoning_level || 'off') === opt.value" class="reasoning-check">✓</span>
+                    </div>
+                  </div>
                 </div>
               </div>
             </Teleport>
@@ -3629,8 +3708,8 @@ onBeforeUnmount(() => {
 .model-dd-trigger:hover { background: rgba(var(--accent2-rgb), 0.18); border-color: rgba(var(--accent2-rgb), 0.45); }
 .model-dd-trigger:disabled { opacity: .5; cursor: not-allowed; }
 .model-dd-trigger:disabled:hover { background: rgba(var(--accent2-rgb), 0.10); border-color: rgba(var(--accent2-rgb), 0.28); }
-.model-dd-pop { max-height: min(420px, calc(100vh - 140px)); }
-.model-iface-list { overflow-y: auto; max-height: min(400px, calc(100vh - 160px)); display: flex; flex-direction: column; gap: 2px; }
+.model-dd-pop { max-height: min(460px, calc(100vh - 140px)); display: flex; flex-direction: column; }
+.model-iface-list { overflow-y: auto; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
 .model-iface-head {
   display: flex; align-items: center; justify-content: space-between; gap: 6px;
   padding: 6px 8px 4px; margin-top: 2px;
@@ -3647,6 +3726,46 @@ onBeforeUnmount(() => {
   flex-shrink: 0; font-size: calc(10px * var(--font-scale)); color: var(--purple-ink);
   background: rgba(var(--accent2-rgb), 0.18); border: 1px solid rgba(var(--accent2-rgb), 0.3);
   padding: 0 5px; border-radius: 999px; line-height: 1.5;
+}
+/* 推理等级选择 */
+.reasoning-section {
+  border-top: 1px solid rgba(var(--surface-rgb), 0.1);
+  padding: 4px 0;
+  position: relative;
+  flex-shrink: 0;
+}
+.reasoning-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; cursor: pointer; border-radius: 6px;
+  transition: background .15s;
+}
+.reasoning-head:hover { background: rgba(var(--surface-rgb), 0.08); }
+.reasoning-label {
+  font-size: calc(12px * var(--font-scale)); font-weight: 600; color: var(--text);
+}
+.reasoning-cur {
+  margin-left: auto; font-size: calc(11.5px * var(--font-scale)); color: var(--purple-ink);
+  font-weight: 500;
+}
+.reasoning-opts {
+  padding: 2px 4px;
+}
+.reasoning-opt {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 6px; cursor: pointer;
+  transition: background .15s;
+}
+.reasoning-opt:hover { background: rgba(var(--surface-rgb), 0.08); }
+.reasoning-opt.active { background: rgba(var(--accent2-rgb), 0.18); }
+.reasoning-opt-name {
+  font-size: calc(12px * var(--font-scale)); font-weight: 600; color: var(--text);
+  min-width: 36px;
+}
+.reasoning-opt-desc {
+  font-size: calc(10.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.5);
+}
+.reasoning-check {
+  margin-left: auto; color: var(--accent); font-size: 14px; font-weight: 700;
 }
 
 .row2 { display: flex; gap: 6px; align-items: flex-end; }

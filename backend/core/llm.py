@@ -266,6 +266,16 @@ def _diag_payload(payload: dict, model: str) -> str:
     return f"model={model} stream={payload.get('stream')} tool_choice={tc_choice}{tools_info}\n" + "\n".join(lines)
 
 
+def _inject_reasoning(payload: dict, model: str, level: str, interface_url: str = "") -> None:
+    """根据模型名、接口地址和推理等级，向 payload 注入对应的推理参数。"""
+    from core.reasoning_detector import detect_protocol, inject_reasoning_payload as _inject
+    if not level or level == "off" or not model:
+        return
+    # 根据接口 URL 自动识别协议类型，确保 DeepSeek/GLM/Qwen 等国产模型走正确的参数分支
+    protocol = detect_protocol(interface_url) if interface_url else "openai-chat"
+    _inject(payload, model, level, protocol=protocol)
+
+
 def _sanitize_payload(payload: dict) -> None:
     """原地清洗 payload，修正对国产模型（glm/sensenova 等）常见的不兼容字段。
 
@@ -372,7 +382,7 @@ def _sanitize_payload(payload: dict) -> None:
 
 
 async def chat(interface: dict, model: str, messages: list, stream: bool = False, tools: list | None = None,
-               tool_choice: str = "auto") -> AsyncGenerator:
+               tool_choice: str = "auto", reasoning_level: str = "off") -> AsyncGenerator:
     """调用 LLM，支持流式/非流式。
     流式输出：yield ("text", str) | ("tool_call", {id, name, arguments}) | ("tool_result", {tool_call_id, content}) （仅 LLM 返回的 tool_call）
     非流式输出：yield ("message", dict) — 完整 assistant message（含可能的 tool_calls）
@@ -417,6 +427,9 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
     elif tool_choice != "none" and tool_choice != "auto":
         # 没传 tools 但指定了非默认 tool_choice（如 required）→ 仍传 tool_choice
         payload["tool_choice"] = tool_choice
+
+    # —— 推理等级注入：根据接口协议 + 模型名向 payload 添加 thinking / reasoning_effort 等参数 ——
+    _inject_reasoning(payload, model, reasoning_level, interface.get("url", ""))
 
     # —— payload 兼容性清洗：修正对国产模型（glm/sensenova 等）常见的不兼容字段 ——
     _sanitize_payload(payload)
@@ -682,7 +695,8 @@ _429_BACKOFFS = [10, 20, 40]
 
 
 async def chat_with_failover(interface: dict, model: str, messages: list, stream: bool = False,
-                             tools: list | None = None, tool_choice: str = "auto") -> AsyncGenerator:
+                             tools: list | None = None, tool_choice: str = "auto",
+                             reasoning_level: str = "off") -> AsyncGenerator:
     """带自动故障转移的 chat 包装器。
 
     机制：
@@ -718,7 +732,7 @@ async def chat_with_failover(interface: dict, model: str, messages: list, stream
             _err_kind = None   # async for 内收到的错误（None=无错误）
             _err_payload = None
             try:
-                async for kind, payload in chat(interface, try_model, messages, stream, tools, tool_choice):
+                async for kind, payload in chat(interface, try_model, messages, stream, tools, tool_choice, reasoning_level):
                     if kind == "error":
                         _err_kind = kind
                         _err_payload = payload

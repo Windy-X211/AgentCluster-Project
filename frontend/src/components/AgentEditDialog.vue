@@ -17,6 +17,7 @@ function initForm(a: any) {
     perception_scope: a?.perception_scope || 'link',
     workflow_mode: a?.workflow_mode || 'none',
     group_id: a?.group_id ?? null,
+    reasoning_level: a?.reasoning_level || 'off',
   }
 }
 const form = ref<any>(initForm(props.agent))
@@ -188,6 +189,14 @@ async function remove() {
             <option v-for="o in modelOptions" :key="o" :value="o">{{ o }}</option>
           </select>
           <input v-else class="input" v-model="form.model" :placeholder="currentInterface?.default_model || '留空则用接口默认'" />
+        </label>
+        <label>推理等级
+          <select class="input" v-model="form.reasoning_level">
+            <option value="off">Off · 不启用</option>
+            <option value="low">Low · 轻度推理</option>
+            <option value="high">High · 深度推理</option>
+            <option value="max">Max · 最大推理</option>
+          </select>
         </label>
         <label>工具调用最大轮数
           <input class="input" type="number" min="1" step="1"
