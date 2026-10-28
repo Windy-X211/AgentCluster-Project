@@ -192,7 +192,9 @@ export const api = {
     remove: (id: number) => req(`/conversations/${id}`, { method: 'DELETE' }),
     runs: () => req<any>('/conversations/runs'),
     running: (id: number) => req<any>(`/conversations/${id}/running?include_base=1`),
-    stop: (id: number) => req(`/conversations/${id}/stop`, { method: 'POST' }),
+    // agentId 给定 → 只停该智能体；缺省 → 停该会话全部智能体
+    stop: (id: number, agentId?: number | null) =>
+      req(`/conversations/${id}/stop`, { method: 'POST', body: JSON.stringify(agentId != null ? { agent_id: agentId } : {}) }),
     send: (id: number, d: any, onChunk: (s: string) => void) => new Promise<void>(async (res, rej) => {
       try {
         const r = await fetch(BASE + `/conversations/${id}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) })

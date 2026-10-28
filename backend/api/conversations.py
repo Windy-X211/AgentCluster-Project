@@ -15,14 +15,20 @@ router = APIRouter()
 
 class ConvIn(BaseModel):
     name: str = "新对话"
-    mode: str = "independent"  # independent | linked
+    mode: str = "independent"  # independent | linked（历史字段，保留兼容）
     agent_ids: list[int] = []
     canvas_id: int | None = None
+    workdir: str | None = None  # 会话级工作区（切换对话时前端同步回画布）
+    execution_mode: str | None = None  # 会话级串并行模式 serial|parallel（同 workdir 语义）
 
 
 class MsgIn(BaseModel):
     agent_id: int
     content: str
+
+
+class StopIn(BaseModel):
+    agent_id: int | None = None  # 给定则只停该智能体；None 停整个会话
 
 
 class RestoreReq(BaseModel):
@@ -73,10 +79,10 @@ def update_conv(cid: int, data: dict):
     - 默认只更新元信息（mode / canvas_id / name / agent_ids），保留 messages 历史。
     - 若 data 里显式带了 messages 字段 → 用它整段替换（支持前端流式同步）。
     - data 含 reset_messages=True 时清空对话历史（不删除会话本身）。"""
-    cur = get_by("conversations", cid)
+    cur = run_registry.peek_live_conv(cid) or get_by("conversations", cid)
     if not cur:
         raise HTTPException(404, "not found")
-    for k in ("mode", "canvas_id", "name", "agent_ids"):
+    for k in ("mode", "canvas_id", "name", "agent_ids", "workdir", "execution_mode"):
         if k in data:
             cur[k] = data[k]
     if "messages" in data and isinstance(data["messages"], list):
@@ -102,21 +108,27 @@ def remove_conv(cid: int):
 
 @router.post("/{cid}/send")
 async def send_message(cid: int, m: MsgIn):
-    conv = get_by("conversations", cid)
+    conv = run_registry.peek_live_conv(cid) or get_by("conversations", cid)
     if not conv:
         raise HTTPException(404, "not found")
     agent = get_by("agents", m.agent_id)
     if not agent:
         raise HTTPException(404, "agent not found")
-    if run_registry.is_running(cid):
-        raise HTTPException(409, "该会话正在运行中")
+    # 防重入按「会话 + 智能体」：同一会话其它智能体可并发运行
+    if run_registry.is_running(cid, m.agent_id):
+        raise HTTPException(409, "该智能体正在运行中")
     canvas = get_by("canvases", conv.get("canvas_id")) if conv.get("canvas_id") else None
-    mode = conv.get("mode", "independent")
+    # 会话级串并行模式：会话记录优先覆盖画布当前设置（与 workdir 同语义）
+    if canvas is not None and conv.get("execution_mode"):
+        canvas = {**canvas, "execution_mode": conv["execution_mode"]}
+    # 统一为「新建会话」语义：绑了画布 → 集群上下文（cluster 工具/集群提示）；未绑 → 纯对话
+    mode = "linked" if conv.get("canvas_id") else "independent"
 
     # 运行与连接解耦：agent_reply 在后台任务里跑（事件缓冲 + 广播），
     # 本响应只是"订阅视图"——客户端断开（关窗/断网/刷新）不再中止运行，
     # 重开窗口经 GET /{cid}/running + GET /{cid}/events 恢复显示。
-    session = run_registry.start(cid, agent, m.content, mode, canvas, base_conv=conv)
+    session = run_registry.start(cid, agent, m.content, mode, canvas, base_conv=conv,
+                                 workdir=conv.get("workdir"))
 
     async def gen():
         try:
@@ -131,17 +143,21 @@ async def send_message(cid: int, m: MsgIn):
 
 @router.get("/{cid}/running")
 def get_running(cid: int, include_base: bool = Query(False, description="附带 send 时刻的会话基底快照（重连恢复用）")):
-    """查询该会话是否正在运行；include_base=1 时附带基底消息（前端重置后全量重放）。"""
-    s = run_registry.get(cid)
-    if not s:
-        return {"running": False, "conv_id": cid}
-    return s.describe(include_base=include_base)
+    """查询该会话的运行：running=bool + runs[]（每个 (会话,智能体) 运行一条）。
+    include_base=1 时每条附带基底消息（取最早开始的运行做重置基底，最保守公共前缀）。"""
+    runs = run_registry.runs_of(cid)
+    running = [s.describe(include_base=include_base) for s in runs if s.running]
+    if not running:
+        return {"running": False, "runs": [], "conv_id": cid}
+    return {"running": True, "runs": running, "conv_id": cid}
 
 
 @router.get("/{cid}/events")
-async def stream_events(cid: int, since: int = Query(0, description="从该序号之后重放（恢复场景固定 since=0 全量重放）")):
-    """订阅该会话的运行事件流：先重放缓冲，再实时跟随，直到 DONE 结束。"""
-    s = run_registry.get(cid)
+async def stream_events(cid: int,
+                        since: int = Query(0, description="从该序号之后重放（恢复场景固定 since=0 全量重放）"),
+                        agent_id: int | None = Query(None, description="只订阅该智能体的运行；缺省取最早开始的运行")):
+    """订阅该会话某个运行的事件流：先重放缓冲，再实时跟随，直到 DONE 结束。"""
+    s = run_registry.get(cid, agent_id)
     if not s:
         raise HTTPException(404, "没有可恢复的运行（已结束且缓冲已过期）")
 
@@ -156,9 +172,12 @@ async def stream_events(cid: int, since: int = Query(0, description="从该序�
 
 
 @router.post("/{cid}/stop")
-def stop_run(cid: int):
-    """显式停止该会话的后台运行（连接断开不再中止，必须显式调用）。"""
-    return {"ok": run_registry.stop(cid)}
+def stop_run(cid: int, body: StopIn | None = None):
+    """显式停止该会话的后台运行。
+    body.agent_id 给定 → 只停该智能体（对话区停止按钮）；
+    缺省/None → 停掉整个会话全部智能体（画布停止按钮）。"""
+    agent_id = body.agent_id if body else None
+    return {"ok": run_registry.stop(cid, agent_id)}
 
 
 # ==============================================================

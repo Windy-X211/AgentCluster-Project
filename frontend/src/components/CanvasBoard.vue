@@ -51,7 +51,6 @@ const panning = ref<{ sx: number; sy: number; ox: number; oy: number } | null>(n
 const spaceDown = ref(false)
 
 const ctxMenu = ref<{ node: any; x: number; y: number } | null>(null)
-const chatPicker = ref<{ node: any; x: number; y: number } | null>(null)
 // 画布空白区域右键菜单
 const bgMenu = ref<{ x: number; y: number } | null>(null)
 // 消息气泡：每个节点的隐藏状态（按画布 id 持久化在画布的 meta 字段里）
@@ -89,14 +88,14 @@ const canvas = computed(() => canvases.current)
 const nodes = computed(() => canvas.value?.nodes || [])
 const edges = computed(() => canvas.value?.edges || [])
 
-// —— 节点消息气泡：取本画布的集群对话（优先当前选中的）——
+// —— 节点消息气泡：取本画布的会话（优先当前选中的，否则该画布最近活跃的）——
 const bubbleConv = computed(() => {
   const cid = canvas.value?.id
   if (!cid) return null
   const cur = convs.currentData()
-  if (cur && cur.mode === 'linked' && cur.canvas_id === cid) return cur
-  const list = convs.list.filter((c: any) => c.mode === 'linked' && c.canvas_id === cid)
-  return list.length ? list[list.length - 1] : null
+  if (cur && (cur.canvas_id ?? null) === cid) return cur
+  const list = convs.list.filter((c: any) => (c.canvas_id ?? null) === cid)
+  return list.length ? list[0] : null   // list 按活跃度降序：最近活跃的在最前
 })
 
 type BubbleChunk = {
@@ -265,7 +264,7 @@ const runningCanvasId = computed<number | null>(() => {
   return null
 })
 
-/** 画布上所有 agent_id 集合（用于 independent 模式下判断"此画布是否有运行 agent"） */
+/** 画布上所有 agent_id 集合（判断"此画布是否有运行 agent"） */
 const canvasAgentIds = computed<Set<number>>(() => {
   const s = new Set<number>()
   for (const n of (canvas.value?.nodes || [])) if (n?.agent_id != null) s.add(n.agent_id)
@@ -275,9 +274,9 @@ const canvasAgentIds = computed<Set<number>>(() => {
 const runningOnThisCanvas = computed(() => {
   const cid = canvas.value?.id
   if (cid == null) return false
-  // 常规路径：conv 直接绑定了 canvas_id（running 模式 / linked 模式）
+  // 常规路径：运行中的会话绑定了本画布
   if (runningCanvasId.value === cid) return true
-  // 兜底：independent 模式下 conv 没绑 canvas_id，但 speakingAgents 里有此画布上的 agent
+  // 兜底：会话没绑 canvas_id，但 speakingAgents 里有此画布上的 agent
   if (convs.streaming) {
     const sp = convs.speakingAgents
     if (sp && sp.size > 0) {
@@ -561,13 +560,13 @@ function showBgMenu(e: MouseEvent) {
   // 仅在真正空白（没有点到节点/连线/工具栏/浮层）时弹出
   const target = e.target as HTMLElement
   if (target?.closest('.node, .edge, .edge-hit, .edge-mid, .canvas-toolbar, .hint, .canvas-mini, .collapse-btn')) return
-  if (target?.closest('.ctx-menu, .mode-picker, .ctx-item, .modal-bg, .conv-float')) return  // 浮层自己会处理，别拦
+  if (target?.closest('.ctx-menu, .ctx-item, .modal-bg, .conv-float')) return  // 浮层自己会处理，别拦
   e.preventDefault()
-  ctxMenu.value = null; chatPicker.value = null
+  ctxMenu.value = null
   bgMenu.value = { x: e.clientX, y: e.clientY }
   clampToViewport(bgMenu as any, '.ctx-menu')
 }
-function closeMenus() { ctxMenu.value = null; chatPicker.value = null; bgMenu.value = null }
+function closeMenus() { ctxMenu.value = null; bgMenu.value = null }
 
 // —— 工作区交互：全部 emit 给外层 MainView（全局单例 WorkspaceOverlay 持有者） ——
 function toggleWorkspace() {
@@ -600,25 +599,25 @@ function removeEdge(edgeId: number) {
   canvases.saveCurrent()
 }
 
-function openChatPicker(e: MouseEvent, node: any) {
-  e.stopPropagation()
-  closeMenus()
-  chatPicker.value = { node, x: e.clientX, y: e.clientY }
-  clampToViewport(chatPicker, '.mode-picker')
-}
-
-async function doChat(node: any, mode: 'independent' | 'linked') {
+async function doChat(node: any) {
   closeMenus()
   const canvasId = canvas.value?.id ?? null
-  // 复用当前会话（携带上下文），只有顶部「＋独立/＋集群」才新建重置
+  // 统一「对话」：确保当前会话绑定本画布（一个会话记录一个画布的全部消息）。
+  // 当前会话已有历史但绑的是别的画布/未绑定 → 新建会话，避免不同画布消息混在一个记录里
   let conv = convs.currentData()
-  if (!conv) {
-    conv = await convs.create({ name: '', mode, agent_ids: [node.agent_id], canvas_id: canvasId })
-  } else if (conv.mode !== mode || (mode === 'linked' && (conv.canvas_id ?? null) !== canvasId)) {
-    // 模式/画布不一致时原地切换，保留 messages 历史
+  const hasMsgs = !!(conv && Array.isArray(conv.messages) && conv.messages.length)
+  if (!conv || ((conv.canvas_id ?? null) !== canvasId && hasMsgs)) {
+    conv = await convs.create({
+      name: '新对话',
+      agent_ids: [node.agent_id],
+      canvas_id: canvasId,
+      workdir: canvas.value?.workdir ?? null,
+      execution_mode: canvas.value?.execution_mode ?? null,
+    })
+  } else if ((conv.canvas_id ?? null) !== canvasId) {
+    // 空会话：直接换绑本画布
     await convs.update(conv.id, {
-      mode,
-      canvas_id: mode === 'linked' ? canvasId : (conv.canvas_id ?? canvasId),
+      canvas_id: canvasId,
       agent_ids: Array.from(new Set([...(conv.agent_ids || []), node.agent_id])),
     })
   } else if (!(conv.agent_ids || []).includes(node.agent_id)) {
@@ -701,6 +700,11 @@ async function toggleExecMode() {
   }
   canvas.value.execution_mode = canvas.value.execution_mode === 'parallel' ? 'serial' : 'parallel'
   await canvases.saveCurrent()
+  // 会话级记录：与工作区同语义，只更新当前激活且绑定本画布的会话
+  const cur = convs.currentData()
+  if (cur && (cur.canvas_id ?? null) === canvas.value.id) {
+    await convs.update(cur.id, { execution_mode: canvas.value.execution_mode })
+  }
 }
 
 // —— 画布命名 ——
@@ -977,6 +981,11 @@ async function saveWorkdir() {
     const i = canvases.list.findIndex(x => x.id === canvas.value!.id)
     if (i >= 0) canvases.list[i] = canvases.current
     wdOpen.value = false
+    // 会话级记录：用户更改只更新当前激活且绑定本画布的会话
+    const cur = convs.currentData()
+    if (cur && (cur.canvas_id ?? null) === canvases.current!.id) {
+      await convs.update(cur.id, { workdir: res.workdir ?? null })
+    }
   } catch (e: any) {
     alert('保存工作区失败：' + (e?.message || e))
   }
@@ -1031,6 +1040,28 @@ watch(() => canvas.value?.id, () => {
 // 画布切换 / 挂载首次 → 立即广播激活（MainView 需尽早拿到 viewportEl / bbox）
 watch(() => canvas.value?.id, () => {
   nextTick(emitCanvasActivate)
+}, { immediate: true })
+
+// 切换对话 / 打开画布 → 把会话记录的工作区与串并行模式同步回画布（画布当前设置跟随会话记录）。
+// 画布存储值一并更新：运行时会话 workdir 为空的场景回退到画布值，保证「显示 == 实际运行」。
+watch([() => canvas.value?.id, () => convs.current,
+       () => convs.currentData()?.workdir, () => convs.currentData()?.execution_mode], () => {
+  const cv = canvas.value
+  const cur = convs.currentData() as any
+  if (!cv || !cur || (cur.canvas_id ?? null) !== cv.id) return
+  if (cur.workdir != null && (cv.workdir || null) !== cur.workdir) {
+    void api.canvases.setWorkdir(cv.id, cur.workdir).then((res: any) => {
+      if (canvas.value?.id !== cv.id) return   // 期间已切画布：不覆盖
+      canvases.current = { ...canvas.value, workdir: res?.workdir ?? cur.workdir }
+      const i = canvases.list.findIndex(x => x.id === cv.id)
+      if (i >= 0) canvases.list[i] = canvases.current
+      nextTick(emitCanvasActivate)
+    })
+  }
+  if (cur.execution_mode && cv.execution_mode !== cur.execution_mode) {
+    canvas.value.execution_mode = cur.execution_mode
+    void canvases.saveCurrent()
+  }
 }, { immediate: true })
 // 视图变换（平移/缩放/节点数）→ bbox 重算与 activate 广播合并到下一帧执行：
 // post-flush watcher 若每次 tick 都同步跑 getBoundingClientRect，会在 zoom 重排之外
@@ -1318,7 +1349,7 @@ defineExpose({ viewportRef, computeNodeBbox })
             <span v-if="agentById(n.agent_id)?.enabled === false" class="off-tag" title="已停用">⏸</span>
           </div>
           <div class="node-actions">
-            <button class="btn xs ghost ctx-action" @click.stop="openChatPicker($event, n)">💬 对话</button>
+            <button class="btn xs ghost ctx-action" @click.stop="doChat(n)">💬 对话</button>
             <button class="btn xs ghost ctx-action" @mousedown.stop @click.stop="startLink($event, n.id)">🔗 连线</button>
           </div>
         </div>
@@ -1366,27 +1397,6 @@ defineExpose({ viewportRef, computeNodeBbox })
 
     <!-- AgentEditDialog（画布节点 → 编辑智能体） -->
     <AgentEditDialog v-if="editingAgent" :agent="editingAgent" @close="editingAgent = null" />
-
-    <!-- 💬 对话模式选择器 -->
-    <Teleport to="body">
-      <div v-if="chatPicker" class="mode-picker glass" :style="{ left: chatPicker.x + 'px', top: chatPicker.y + 'px' }" @click.stop>
-        <div class="mp-title">{{ agentById(chatPicker.node.agent_id)?.name || '未知' }} · 选择对话模式</div>
-        <div class="mp-item independent" @click="doChat(chatPicker.node, 'independent')">
-          <div class="mp-icon">⚡</div>
-          <div class="mp-body">
-            <div class="mp-label">独立对话</div>
-            <div class="mp-desc">此智能体单独工作，感知不到集群其他成员</div>
-          </div>
-        </div>
-        <div class="mp-item linked" @click="doChat(chatPicker.node, 'linked')">
-          <div class="mp-icon">🌐</div>
-          <div class="mp-body">
-            <div class="mp-label">集群对话</div>
-            <div class="mp-desc">按画布编排协作，感知节点间分工与成果</div>
-          </div>
-        </div>
-      </div>
-    </Teleport>
 
     <!-- 触发设置对话框 -->
     <Teleport to="body">
@@ -1685,17 +1695,6 @@ marker#arrow path { fill: var(--accent); }
 .sub-item:hover { background: rgba(var(--accent2-rgb), 0.15); color: var(--accent2-light); }
 .sub-item.checked { color: var(--accent2-light); background: rgba(var(--accent2-rgb), 0.12); }
 .sub-item.checked::before { content: '✓ '; color: var(--accent-2); }
-
-/* 💬 模式选择器 */
-.mode-picker { position: fixed; min-width: 260px; padding: 10px; z-index: 9998; box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5); }
-.mp-title { font-size: calc(11px * var(--font-scale)); padding: 4px 6px 8px; color: rgba(var(--text-rgb), 0.5); text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid rgba(var(--surface-rgb), 0.08); margin-bottom: 6px; }
-.mp-item { display: flex; gap: 10px; padding: 10px; border-radius: 8px; cursor: pointer; font-size: calc(12px * var(--font-scale)); margin-bottom: 4px; border: 1px solid transparent; transition: all .15s;
-  .independent:hover { background: rgba(100,220,160,0.15); border-color: rgba(100,220,160,0.3); }
-  .linked:hover { background: rgba(var(--accent2-rgb), 0.15); border-color: rgba(var(--accent2-rgb), 0.3); }
-}
-.mp-icon { font-size: calc(20px * var(--font-scale)); flex-shrink: 0; }
-.mp-label { font-size: calc(13px * var(--font-scale)); font-weight: 500; margin-bottom: 2px; }
-.mp-desc { font-size: calc(11px * var(--font-scale)); opacity: .55; line-height: 1.4; }
 
 /* 新建画布对话框 */
 .modal-bg { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.5); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 1000; }

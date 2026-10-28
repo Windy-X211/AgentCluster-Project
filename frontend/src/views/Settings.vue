@@ -260,7 +260,7 @@ const avatarMode = computed({
 
 function avatarPreviewGradient(name: string): string {
   if (avatarMode.value === 'unified') {
-    return 'linear-gradient(135deg, #6376b8, #8d73c4)'
+    return 'linear-gradient(135deg, var(--accent), var(--accent-2))'
   }
   return getAvatarGradient(name)
 }

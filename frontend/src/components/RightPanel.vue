@@ -67,7 +67,7 @@ function turnElapsedLabel(turn: any): string {
     if (typeof e === 'number' && e > end) end = e
   }
   if (start === Infinity) return ''
-  const live = isTurnActive(turn.start)
+  const live = isTurnActive(turn)
   let elapsed: number
   if (live) {
     elapsed = nowTick.value - start
@@ -1101,20 +1101,51 @@ const seqMap = computed(() => {
   return m
 })
 
-// ② 消息过滤：过滤掉所有 relay=true 的消息——后端 is_relay=True 标记接力链下游 agent
-//     （集群中其他智能体）的全部输出，右侧对话区只保留源头 agent 与用户的对话。
-//     a2a 信封无 relay 字段，始终保留（集群通信的协议证据，不是下游 agent 的输出）。
-const visibleMsgs = computed(() =>
-  (conv.value?.messages || []).filter((m: any) => !m?.relay)
-)
+/** 从 a2a 信封的 parts 中拼接出纯文字（text 类型 part 用 \n\n 连接） */
+function extractEnvelopeText(envelope: any): string {
+  if (!envelope?.parts) return ''
+  return envelope.parts
+    .filter((p: any) => p.type === 'text' && p.text)
+    .map((p: any) => p.text)
+    .join('\n\n')
+}
+
+// ② 消息范围：对话区是「下拉框选中智能体 A 的专属视角」——
+//     · 左 侧：A 自己的 assistant / tool 输出（agent_id === cur）
+//     · 右 侧：发给 A 的消息载体（user 消息 to_agent_id === cur / a2a 信封 to === cur）
+//     · A 发出的 a2a 信封（from === cur）也出现在左 侧，作为 A 的输出一部分
+//     · 其它智能体 B 的 assistant/tool 输出**不进入对话区**（画布节点气泡仍按各自 agent_id 全量展示）
+//     未选中智能体（cur == null）时展示全量。左右侧由 renderItems 分段决定。
+const visibleMsgs = computed(() => {
+  const all = conv.value?.messages || []
+  const cur = currentAgentId.value
+  if (cur == null) return all
+  const fromOf = (m: any): number | null => m.from_agent_id ?? m.envelope?.from?.agent_id ?? null
+  const toOf = (m: any): number | null => m.envelope?.to?.agent_id ?? null
+  return all.filter((m: any) => {
+    if (m.role === 'user') return m.to_agent_id == null || m.to_agent_id === cur
+    if (m.role === 'a2a') return fromOf(m) === cur || toOf(m) === cur
+    // 对话区只显示选中智能体自己的输出；其它智能体的 assistant/tool 不进对话区
+    return m.agent_id === cur
+  })
+})
 
 /** 渲染项：以"用户消息"为分界线，把每两条用户消息之间的全部智能体输出
- *  （assistant 消息 + a2a 信封组，按原顺序）整合成一个 turn：
- *  - { type:'user', msg, idx }
- *  - { type:'turn', start, end, children:[ {kind:'assistant',msg,idx} | {kind:'a2a',key,items,latest} ] }
- *  turn 内的全部内容收进同一个固定大小"过程框"流式展示（详见过程窗口逻辑）。 */
+ *  （assistant 消息 + a2a 信封组，按原顺序）按「左右侧」再切成连续段：
+ *  - { type:'user', msg, idx }                     —— 用户恒在右侧
+ *  - { type:'turn', start, end, side, children:[ {kind:'assistant',msg,idx,side} | {kind:'a2a',key,items,latest,side} ] }
+ *    side='left'  = 下拉框选中智能体的输出（对话对象）
+ *    side='right' = 其它发送方（其它智能体发给它的消息）
+ *  同侧连续子块收进同一个固定大小"过程框"流式展示（详见过程窗口逻辑）。 */
 const renderItems = computed(() => {
   const msgs = visibleMsgs.value
+  const cur = currentAgentId.value
+  const sideOf = (m: any): 'left' | 'right' => {
+    if (m.role === 'user') return 'right'   // 用户是发送方
+    if (cur == null) return 'left'          // 未选中智能体：全部靠左（经典布局）
+    if (m.role === 'a2a') return m.envelope?.from?.agent_id === cur ? 'left' : 'right'
+    return m.agent_id === cur ? 'left' : 'right'
+  }
   const out: any[] = []
   let i = 0
   while (i < msgs.length) {
@@ -1127,20 +1158,43 @@ const renderItems = computed(() => {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result') { i++; continue }
       if (m2.role === 'a2a') {
-        // 连续的 a2a 信封合并成一组（保留原两级折叠样式）
-        const grp: any = { kind: 'a2a', key: 'a2ag-' + i, items: [], latest: m2.envelope }
-        while (i < msgs.length && (msgs[i] as any).role === 'a2a') {
-          grp.items.push({ msg: msgs[i] as any, idx: i })
-          grp.latest = (msgs[i] as any).envelope
+        const side = sideOf(m2)
+        if (side === 'right') {
+          // 发给当前选中智能体的信封：直接展开为 plain 子块，模板以消息泡泡显示文字
+          children.push({ kind: 'a2a-plain', msg: m2, idx: i, side })
           i++
+        } else {
+          // 当前智能体发出的信封：保留信封样式，连续的合并成一组
+          const grp: any = { kind: 'a2a', key: 'a2ag-' + i, items: [], latest: m2.envelope, side }
+          while (i < msgs.length && (msgs[i] as any).role === 'a2a' && sideOf(msgs[i]) === side) {
+            grp.items.push({ msg: msgs[i] as any, idx: i })
+            grp.latest = (msgs[i] as any).envelope
+            i++
+          }
+          children.push(grp)
         }
-        children.push(grp)
       } else {
-        children.push({ kind: 'assistant', msg: m2, idx: i })
+        children.push({ kind: 'assistant', msg: m2, idx: i, side: sideOf(m2) })
         i++
       }
     }
-    out.push({ type: 'turn', start, end: i - 1, children })
+    const end = i - 1
+    if (!children.length) {
+      // 只有工具行（尚无正文）的一轮：占一段，保持原有流式占位行为
+      out.push({ type: 'turn', start, end, children, side: 'left' })
+      continue
+    }
+    // 按左右侧切成连续段：同侧相邻子块归入同一段
+    let g = 0
+    while (g < children.length) {
+      const side = children[g].side
+      const segStart = g === 0 ? start : children[g].idx
+      let ge = g
+      while (ge + 1 < children.length && children[ge + 1].side === side) ge++
+      const segEnd = ge + 1 < children.length ? children[ge + 1].idx - 1 : end
+      out.push({ type: 'turn', start: segStart, end: segEnd, children: children.slice(g, ge + 1), side })
+      g = ge + 1
+    }
   }
   return out
 })
@@ -1366,22 +1420,14 @@ function onProcessScroll(turnStart: number, e: Event) {
   ;(el as any).__stickBottom = false
   ;(el as any).__lastUserScroll = Date.now()
 }
-/** 所有"轮"的边界（每两条用户消息之间的非用户消息区间）—— 用于按轮归属判断 */
-const turns = computed(() => {
-  const msgs = visibleMsgs.value
-  const list: { start: number, end: number }[] = []
-  let i = 0
-  while (i < msgs.length) {
-    if ((msgs[i] as any).role === 'user') { i++; continue }
-    const start = i
-    while (i < msgs.length && (msgs[i] as any).role !== 'user') i++
-    list.push({ start, end: i - 1 })
-  }
-  return list
-})
-function turnOf(idx: number): { start: number, end: number } | null {
-  for (const t of turns.value) {
-    if (idx >= t.start && idx <= t.end) return t
+/** 所有"段"的边界（renderItems 切出的左右侧连续段）—— 用于按段归属判断 */
+const turns = computed(() =>
+  renderItems.value.filter((x: any) => x.type === 'turn').map((x: any) => ({ start: x.start, end: x.end }))
+)
+/** idx 所属的段（完整渲染项，含 side / children） */
+function turnOf(idx: number): any | null {
+  for (const t of renderItems.value) {
+    if (t.type === 'turn' && idx >= t.start && idx <= t.end) return t
   }
   return null
 }
@@ -1393,10 +1439,15 @@ function turnStartIdx(): number {
   }
   return 0
 }
-/** 该 turn 是否仍在流式（用于强制过程框展开，避免工具行/思考中途消失） */
-function isTurnActive(turnStart: number): boolean {
+/** 该段是否仍在流式（用于强制过程框展开，避免工具行/思考中途消失）：
+ *  仅「最后一轮」的段才可能活跃；且段内确有流式消息（或尚无任何子块的占位段）。
+ *  同轮内其它侧的已完成消息不受影响，可正常提出为最终气泡。 */
+function isTurnActive(seg: any): boolean {
   if (!convs.streaming) return false
-  return turnStart === turnStartIdx()
+  if (!seg || seg.type !== 'turn') return false
+  if (seg.start < turnStartIdx()) return false   // 不是最后一轮
+  if (!seg.children.length) return true          // 尚无正文的占位段（工具/等待期）
+  return seg.children.some((ch: any) => ch.kind === 'assistant' && isStreamingMsg(ch.msg))
 }
 /** 该 assistant 是否被"提出来"作为最终正文气泡：仅在其所属轮彻底停止后、
  *  且是"该轮最后一条带正文的 assistant"时成立。流式未结束一律留在过程框里 */
@@ -1406,7 +1457,7 @@ function isPromotedMessage(idx: number): boolean {
   if (!m || m.role !== 'assistant') return false
   const t = turnOf(idx)
   if (!t) return false
-  if (isTurnActive(t.start)) return false
+  if (isTurnActive(t)) return false
   if (isStreamingMsg(m)) return false
   if (!trimMsgContent(m.content)) return false
   for (let i = t.end; i >= t.start; i--) {
@@ -1415,11 +1466,13 @@ function isPromotedMessage(idx: number): boolean {
   }
   return false
 }
-/** 该轮是否含有"过程"内容（任一子块的思考 / 工具 / 截图 / 非末条正文 / a2a 信封） */
+/** 该轮是否含有"过程"内容（任一子块的思考 / 工具 / 截图 / 非末条正文 / a2a 信封组）
+ *  注意：a2a-plain 是独立于过程框的最终消息，不算过程内容 */
 function turnHasContent(turn: any): boolean {
   if (!turn) return false
   for (const ch of turn.children) {
     if (ch.kind === 'a2a') return true
+    if (ch.kind === 'a2a-plain') continue  // a2a-plain 不在过程框内，跳过
     const m = ch.msg as any
     if ((m.reasoning || '').trim()) return true
     if (hasTools(ch.idx)) return true
@@ -1430,7 +1483,7 @@ function turnHasContent(turn: any): boolean {
 }
 /** 本轮"提出来"的 assistant 索引（停止后最后一条带正文的 assistant）；流式中或无正文返回 -1 */
 function turnPromotedIdx(turn: any): number {
-  if (!turn || isTurnActive(turn.start)) return -1
+  if (!turn || isTurnActive(turn)) return -1
   for (let j = turn.children.length - 1; j >= 0; j--) {
     const ch = turn.children[j]
     if (ch.kind === 'assistant' && trimMsgContent(ch.msg.content)) return ch.idx
@@ -1450,10 +1503,13 @@ function turnLastAssistantIdx(turn: any): number {
   }
   return turn.start
 }
-/** 轮首智能体名（取第一个 assistant 子块） */
+/** 轮首智能体名：优先取 assistant 子块；只有 a2a-plain 时取信封 from.name（发送方） */
 function turnName(turn: any): string {
   const ch = turn?.children?.find((c: any) => c.kind === 'assistant')
-  return ch ? (agentNameOf(ch.msg.agent_id) || '') : ''
+  if (ch) return agentNameOf(ch.msg.agent_id) || ''
+  const plain = turn?.children?.find((c: any) => c.kind === 'a2a-plain')
+  if (plain) return plain.msg?.envelope?.from?.name || ''
+  return ''
 }
 function turnAvatar(turn: any): string {
   return (turnName(turn) || '智能体').slice(0, 1).toUpperCase()
@@ -1493,26 +1549,28 @@ function childAgentLabel(child: any, turn: any): string {
 }
 /** 该轮是否完全无内容可渲染（用于 .empty 隐藏整块） */
 function turnEmpty(turn: any): boolean {
-  if (isTurnActive(turn.start)) return false
+  if (isTurnActive(turn)) return false
   if (turnPromotedIdx(turn) >= 0) return false
+  // 有 a2a-plain 也不算空（它是独立于过程框的最终消息）
+  if (turn.children?.some((ch: any) => ch.kind === 'a2a-plain')) return false
   return !turnHasContent(turn)
 }
-/** 过程框是否处于"展开"状态：本轮流式中强制展开；停止后由 processOpen 决定 */
-function isProcessOpen(turnStart: number): boolean {
-  if (isTurnActive(turnStart)) return true
-  return processOpen.value.has(turnStart)
+/** 过程框是否处于"展开"状态：本段流式中强制展开；停止后由 processOpen 决定 */
+function isProcessOpen(seg: any): boolean {
+  if (isTurnActive(seg)) return true
+  return processOpen.value.has(seg.start)
 }
-/** 是否渲染过程框：本轮流式中（承载流式光标 / 工具行）或停止后用户主动展开且有过程内容 */
-function showProcessWindow(turnStart: number, turn: any): boolean {
-  if (isTurnActive(turnStart)) {
-    return turn.children.some((ch: any) => ch.kind === 'assistant' && isStreamingMsg(ch.msg)) || turnHasContent(turn)
+/** 是否渲染过程框：本段流式中（承载流式光标 / 工具行）或停止后用户主动展开且有过程内容 */
+function showProcessWindow(seg: any): boolean {
+  if (isTurnActive(seg)) {
+    return seg.children.some((ch: any) => ch.kind === 'assistant' && isStreamingMsg(ch.msg)) || turnHasContent(seg)
   }
-  return turnHasContent(turn) && processOpen.value.has(turnStart)
+  return turnHasContent(seg) && processOpen.value.has(seg.start)
 }
 /** 是否显示 "(>过程)" 折叠钮：仅停止后且有过程内容时（流式中过程框始终展开，无需折叠钮） */
-function showProcToggle(turnStart: number, turn: any): boolean {
-  if (isTurnActive(turnStart)) return false
-  return turnHasContent(turn)
+function showProcToggle(seg: any): boolean {
+  if (isTurnActive(seg)) return false
+  return turnHasContent(seg)
 }
 function toggleProcess(turnStart: number) {
   const s = new Set(processOpen.value)
@@ -1534,7 +1592,7 @@ function scrollProcessBoxesToBottom() {
   for (const [turnStart, el] of processBoxes) {
     const turn = renderItems.value.find((it: any) => it.type === 'turn' && it.start === turnStart)
     if (!turn) continue
-    if (!isTurnActive(turnStart)) continue
+    if (!isTurnActive(turn)) continue
     stickProcessBox(el)
   }
 }
@@ -2078,7 +2136,11 @@ let _wasStreamingForProc = false
 watch(() => convs.streaming, async (v) => {
   if (_wasStreamingForProc && !v) {
     const s = new Set(processOpen.value)
-    s.delete(turnStartIdx())
+    // 收敛「本轮」的全部左右侧段（side 切分后一轮可能拆成多段）
+    const tsi = turnStartIdx()
+    for (const it of renderItems.value) {
+      if (it.type === 'turn' && it.start >= tsi) s.delete(it.start)
+    }
     processOpen.value = s
     const stick = stickBottom.value
     await nextTick()
@@ -2136,7 +2198,8 @@ async function send() {
   setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
 }
 function sendStop() {
-  void convs.stopSend()
+  // 只停「下拉框选中的智能体」；画布上的停止按钮停当前会话全部
+  void convs.stopSend(currentAgentId.value)
 }
 
 async function toggleVoiceInput() {
@@ -2241,24 +2304,16 @@ function kindLabel(kind: string): string {
 }
 // 工具行标签直接用 conversation.ts 的统一 toolLabel（已内置伪协议清洗 + settings meta 查询）
 // 不再维护本地硬编码映射，避免和画布/对话区行为分叉
-async function newConv(mode: 'independent' | 'linked') {
-  const names: Record<string, string> = { independent: '独立对话', linked: '集群对话' }
-  // 重置画布上下文：清空当前画布绑定的集群对话历史（画布气泡的数据源）
-  const cid = canvas.value?.id
-  if (cid != null) {
-    // 只重置「还有历史」的会话：空会话再 PUT 一次是纯浪费
-    // （每次 PUT = 读+重写整个会话文件 + fsync，几十到上百毫秒），并行发请求
-    const linked = convs.list.filter((c: any) =>
-      c.mode === 'linked' && c.canvas_id === cid && !(Array.isArray(c.messages) && c.messages.length === 0))
-    if (linked.length) {
-      await Promise.all(linked.map((c: any) => convs.update(c.id, { reset_messages: true })))
-    }
-  }
+async function newConv() {
+  // 统一「新建」：一个会话记录一个画布的用户与智能体消息；
+  // 带上当前设置的工作区与串并行模式（画布打开时以画布当前设置为准）
+  const cur = convs.currentData() as any
   await convs.create({
-    name: names[mode],
-    mode,
+    name: '新对话',
     agent_ids: currentAgentId.value ? [currentAgentId.value] : [],
-    canvas_id: canvas.value?.id
+    canvas_id: canvas.value?.id ?? null,
+    workdir: canvas.value?.workdir ?? cur?.workdir ?? null,
+    execution_mode: canvas.value?.execution_mode ?? cur?.execution_mode ?? null,
   })
 }
 function selectConv(id: number) {
@@ -2448,7 +2503,7 @@ onMounted(async () => {
   if (!convs.list.length) await convs.fetch()
   convs.ensureCurrent()
   if (!currentAgentId.value && agents.list.length) currentAgentId.value = agents.list[0].id
-  if (!convs.list.length) await newConv('independent')
+  if (!convs.list.length) await newConv()
 })
 // 从设置/能力管理等页面返回首页时，浏览器/KeepAlive 会把脱离文档流的可滚动元素
 // scrollTop 归零；这里保存 / 还原消息区与会话列表的滚动位置。
@@ -2579,8 +2634,7 @@ onBeforeUnmount(() => {
           <span class="conv-count">{{ convs.list.length }}</span>
           <span class="flex-spacer"></span>
           <div class="new-conv-bar">
-            <button class="btn sm ghost" type="button" @click="newConv('independent')" title="新建独立对话（智能体单独工作）">＋ 独立</button>
-            <button class="btn sm ghost purple" type="button" @click="newConv('linked')" title="新建集群对话（按画布编排协作）">＋ 集群</button>
+            <button class="btn sm ghost" type="button" @click="newConv()" title="新建对话（记录本画布的用户与智能体消息）">＋ 新建</button>
           </div>
         </div>
       </div>
@@ -2613,7 +2667,6 @@ onBeforeUnmount(() => {
                    @contextmenu="onConvContext($event, c.id)">
                 <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
                 <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
-                <span class="mode-tag" :class="c.mode">{{ c.mode === 'linked' ? '集群' : '独立' }}</span>
                 <span class="conv-body">
                   <span class="conv-name">{{ convDisplayName(c) }}</span>
                   <span class="conv-time">{{ convTimeLabel(c) }}</span>
@@ -2790,27 +2843,43 @@ onBeforeUnmount(() => {
                提出作为正常气泡，过程框折叠为名称后的 "(>过程)" -->
           <div v-else-if="it.type === 'turn'"
                class="msg assistant turn"
-               :class="{ empty: turnEmpty(it), streaming: isTurnActive(it.start) }"
+               :class="{ empty: turnEmpty(it), streaming: isTurnActive(it), right: it.side === 'right' }"
                @contextmenu.prevent.stop="onMsgContextMenu($event, turnLastAssistantIdx(it))">
+            <!-- 头像与 col-wrap 同行（像用户消息那样），左右镜像靠 msg 的 flex-direction 切换 -->
+            <div class="avatar" :style="{ background: turnAvatarGradient(it) }">{{ turnAvatar(it) }}</div>
             <div class="col-wrap">
-              <!-- 头像 + 名字行 + 过程折叠钮（每轮只出现一次，无边框、字号字体差异化） -->
+              <!-- 名字 + 过程折叠钮 -->
               <div class="head-row">
-                <div class="avatar" :style="{ background: turnAvatarGradient(it) }">{{ turnAvatar(it) }}</div>
                 <div v-if="turnName(it)" class="who-assistant">{{ turnName(it) }}</div>
-                <span v-if="turnElapsedLabel(it)" class="turn-elapsed" :class="{ active: isTurnActive(it.start) }">{{ turnElapsedLabel(it) }}</span>
-                <span v-if="showProcToggle(it.start, it)"
+                <span v-if="turnElapsedLabel(it)" class="turn-elapsed" :class="{ active: isTurnActive(it) }">{{ turnElapsedLabel(it) }}</span>
+                <span v-if="showProcToggle(it)"
                       class="proc-toggle"
-                      :class="{ open: isProcessOpen(it.start) }"
-                      @click.stop="toggleProcess(it.start)">{{ isProcessOpen(it.start) ? '(▾过程)' : '(>过程)' }}</span>
+                      :class="{ open: isProcessOpen(it) }"
+                      @click.stop="toggleProcess(it.start)">{{ isProcessOpen(it) ? '(▾过程)' : '(>过程)' }}</span>
               </div>
 
-              <!-- 过程框：固定大小 + 内部滚动，整合本轮全部智能体输出（顺序保持）；
+              <!-- a2a-plain：发给当前选中智能体的信封，直接以消息泡泡显示文字内容（独立于过程框） -->
+              <template v-for="ch in it.children.filter((c: any) => c.kind === 'a2a-plain')" :key="'plain-' + ch.idx">
+                <div class="a2a-plain-wrap">
+                  <div v-if="extractEnvelopeText(ch.msg.envelope)"
+                       class="bubble markdown"
+                       v-html="renderChatMarkdown(trimMsgContent(extractEnvelopeText(ch.msg.envelope)))" />
+                  <template v-for="(p, pi) in (ch.msg.envelope?.parts || []).filter((pp: any) => pp.type === 'artifact')" :key="'art-' + pi">
+                    <details class="tc-body" open>
+                      <summary>📎 {{ p.name }}（{{ p.mime_type }}）</summary>
+                      <pre>{{ p.content }}</pre>
+                    </details>
+                  </template>
+                </div>
+              </template>
+
+              <!-- 过程框：固定大小 + 内部滚动，整合本段全部智能体输出（顺序保持）；
                    展开时位于折叠钮下方、最终正文气泡上方 -->
-              <div v-if="showProcessWindow(it.start, it)" class="process-window">
+              <div v-if="showProcessWindow(it)" class="process-window">
                 <div class="process-body"
                      :ref="(el) => onProcessBox(it.start, el as HTMLElement | null)"
                      @scroll.passive="onProcessScroll(it.start, $event)">
-                  <template v-for="ch in it.children" :key="ch.kind === 'a2a' ? ch.key : ('a-' + ch.idx)">
+                  <template v-for="ch in it.children.filter((c: any) => c.kind !== 'a2a-plain')" :key="ch.kind === 'a2a' ? ch.key : ('a-' + ch.idx)">
 
                     <!-- a2a 信封组：保留原两级折叠样式，作为本轮过程的一部分按顺序展示 -->
                     <div v-if="ch.kind === 'a2a'" class="a2a-group-wrap">
@@ -3117,7 +3186,7 @@ onBeforeUnmount(() => {
               </svg>
             </span>
           </button>
-          <button v-if="!convs.streaming" class="btn send" @click="send" aria-label="发送消息">发送</button>
+          <button v-if="!convs.agentStreaming(currentAgentId)" class="btn send" @click="send" aria-label="发送消息">发送</button>
           <button v-else class="btn send stop-btn" @click="sendStop" aria-label="停止输出">
             <span class="stop-icon" aria-hidden="true"></span>
           </button>
@@ -3216,14 +3285,14 @@ onBeforeUnmount(() => {
 .conv-item .conv-time { font-size: calc(10px * var(--font-scale)); opacity: .45; font-family: Consolas, monospace; line-height: 1.2; }
 .conv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
-.mode-tag { font-size: calc(10px * var(--font-scale)); padding: 1px 5px; border-radius: 4px; background: rgba(var(--surface-rgb), 0.1); flex-shrink: 0; }
-.mode-tag.linked { background: rgba(var(--accent2-rgb), 0.2); color: var(--purple-ink); }
 
-.chat-box { flex: 1; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 10px; }
+.chat-box { flex: 1; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
 .no-conv { text-align: center; opacity: .5; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
 /* ============ 消息容器 ============ */
-.msg { display: flex; gap: 6px; max-width: 90%; }
+.msg { display: flex; gap: 6px; max-width: 82%; min-width: 0; }
+/* 相邻 turn 段（智能体输出块）之间额外拉开间距，避免左右交替时挤在一起 */
+.msg.assistant.turn + .msg.assistant.turn { margin-top: 6px; }
 /* 用户消息靠右（row-reverse：头像在右，泡泡在左） */
 .msg.user { align-self: flex-end; flex-direction: row-reverse; }
 .msg.user .bubble {
@@ -3231,12 +3300,23 @@ onBeforeUnmount(() => {
   border-color: rgba(var(--accent-rgb), 0.35);
   border-top-right-radius: 4px;
 }
-/* 助手消息靠左，纵向堆叠（头像行 + 泡泡 + 工具行） */
-.msg.assistant { align-self: flex-start; flex-direction: column; }
+/* 助手消息：头像 + 内容区同行（头像在左），纵向堆叠在外部容器里；
+   右侧段整体 flex-direction: row-reverse 让头像挪到右边（与用户消息镜像对称） */
+.msg.assistant { align-self: flex-start; flex-direction: row; }
 .msg.assistant .bubble {
   background: var(--tint-soft-bg);
   border-top-left-radius: 4px;
 }
+/* 右侧段：头像在右、内容区在左；内容区内部 bubble/过程框全部靠右对齐 */
+.msg.assistant.right { align-self: flex-end; flex-direction: row-reverse; }
+.msg.assistant.right .col-wrap { align-items: flex-end; }
+.msg.assistant.right .bubble {
+  border-top-left-radius: 8px;
+  border-top-right-radius: 4px;
+  align-self: flex-end;
+  max-width: 100%;
+}
+.msg.assistant.right .process-window { align-self: flex-end; }
 .msg.assistant.streaming .bubble { border-color: rgba(var(--accent-rgb), 0.4); box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.1); }
 /* 思考过程：单行（流式打字机 / 停止后截断首行），点击展开全文 */
 .think-stream {
@@ -3339,7 +3419,7 @@ onBeforeUnmount(() => {
 .process-body::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.28); border-radius: 999px; }
 .process-body::-webkit-scrollbar-track { background: transparent; }
 
-.col-wrap { display: flex; flex-direction: column; gap: 3px; }
+.col-wrap { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
 .head-row { display: flex; align-items: center; gap: 6px; }
 .avatar {
   position: relative; overflow: hidden;
@@ -3383,6 +3463,12 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(var(--surface-rgb), 0.08);
   position: relative;
   transition: border-color .15s, box-shadow .15s;
+  /* 自适应宽度：短内容自然窄，长内容撑到父容器 max-width 后自动换行 */
+  width: fit-content;
+  max-width: 100%;
+  box-sizing: border-box;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 /* 当 bubble 带 .markdown class 时，由全局样式接管排版 */
 .bubble.markdown { white-space: normal; }

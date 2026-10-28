@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any
 from core.store import load, save, upsert, get_by, next_id
 import core.store as store  # 运行时访问 store.ROOT（可变，set_root() 会修改）
+from core import run_registry  # 运行期共享会话对象（并发按智能体运行的落库一致性）
 from core.llm import chat_with_failover as chat, ModelDegenerateError, ModelRepetitionError, _encode_tool_name
 from core.commands import run_command, filter_tools, COMMAND_META, WORKDIR_CTX
 from core.smart_search import SMART_SEARCH_CTX
@@ -633,15 +634,29 @@ def _release_all_for_owner(owner_tag: str) -> None:
 # （child_turn = dict(turn) 是浅拷贝，集合对象全程共享），根 agent_reply 退出时统一取消。
 
 
-def _register_child_task(turn: dict | None, task: asyncio.Task) -> None:
-    """把一个后台 receiver 任务登记到 turn 共享集合，便于根调用退出时统一取消。"""
+def _register_child_task(turn: dict | None, task: asyncio.Task, run_session=None) -> None:
+    """把一个后台 receiver 任务登记到 turn 共享集合（便于根调用退出时统一取消），
+    同时如果传入了 RunSession，也登记到 session.child_tasks。
+
+    done callback 里额外检查：session.task + 所有 child_tasks 是否都完成。
+    用于精确停止后 pump 已退出但 child_tasks 还在跑的场景——
+    所有任务都结束时触发 run_registry._on_session_children_done 补 DONE + 设 ended_at。"""
     if turn is None:
         return
     pool: set = turn.setdefault("_child_tasks", set())
     pool.add(task)
+    if run_session is not None:
+        run_session.child_tasks.add(task)
 
     def _on_done(_t: asyncio.Task) -> None:
         pool.discard(_t)
+        if run_session is not None:
+            run_session.child_tasks.discard(_t)
+            # 精确停止后 pump 已退出，等所有 child_tasks 都 done 时才收尾
+            try:
+                run_registry._on_session_children_done(run_session)
+            except Exception:
+                pass
         # 捕获未处理的 task 异常——避免 "Task exception was never retrieved" 静默丢失
         try:
             exc = _t.exception()
@@ -1225,9 +1240,10 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
                 "【执行模式：并行】多条消息并发发送，所有成员同时运行：\n"
                 "- cluster.send_message 发送后立即返回发送状态，可在同一轮给多个成员发消息；\n"
                 "- 接收方会并发启动运行，各自独立处理自己的分工区域；\n"
-                "- **关键：你发送完消息后必须继续执行自己的分工任务**——不要停下来等待接收方回复，"
-                "不要只做汇报/规划/分工，你也有实际工作要完成（调用工具做代码审查、运行测试、检查配置等）；\n"
-                "- 等你和所有接收方都完成各自的工作后，再汇总最终结果回复用户。"
+                "- 发送完消息后你可以自由选择：如果自己还有分工区域需要处理（如代码审查、运行测试、检查配置等），"
+                "可以继续调用工具执行；如果你的部分已完成、只需等待接收方产出，也可以直接输出总结结束运行——"
+                "接收方会在后台继续运行，你结束后系统会把他们的输出继续展示给用户；\n"
+                "- 不建议你发送完消息后仅做汇报/规划/分工就结束——如果确实没有其他事可做，结束也完全可以。"
             )
 
     # 不可 call 的（global 模式可见但不能 call / link 模式不可见）
@@ -1290,7 +1306,7 @@ def _serial_reply_upstream(
     reply_env = build_call_envelope(conversation_id, sender, target, {
         "message": message, "reply_to": turn.get("reply_to_msg_id"),
     })
-    fresh = get_by("conversations", conversation_id) or conv
+    fresh = run_registry.live_conv(conversation_id) or conv
     fresh.setdefault("messages", []).append({
         "role": "a2a", "envelope": reply_env, "ts": datetime.utcnow().isoformat(),
     })
@@ -1332,7 +1348,7 @@ async def _serial_send_message_and_wait(
     """
     env = build_call_envelope(conversation_id, sender, target, {"message": message})
     # 落库 A2A 信封（新建消息避免覆盖）
-    fresh = get_by("conversations", conversation_id) or conv
+    fresh = run_registry.live_conv(conversation_id) or conv
     fresh.setdefault("messages", []).append({
         "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
     })
@@ -1398,10 +1414,15 @@ async def _serial_send_message_and_wait(
         })
 
 
-async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: str = "independent", canvas: dict | None = None, turn: dict | None = None):
+async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: str = "independent", canvas: dict | None = None, turn: dict | None = None, workdir: str | None = None, run_session=None):
     """让智能体回复，以 async generator 输出；最终结果会自动入库。
     链首调用创建本轮 A2A turn（visited/handoffs 等共享状态），递归接力时复用传入的 turn。
-    is_relay=True 表示本段是接力链（下游），入库消息带 relay:true 供前端聊天区过滤。"""
+    workdir：会话级工作区（send 时刻的快照），优先于画布工作区。
+    run_session：run_registry.RunSession（顶层 pump 传入），把 spawn 的子任务登记到 session.child_tasks，
+    让 run_registry.stop 按 agent_id 精确接管停止。"""
+    if workdir:
+        # 浅拷贝覆盖：不污染 store 画布对象；下游递归会继续透传这份 canvas
+        canvas = {**(canvas or {}), "workdir": workdir}
     is_relay = turn is not None
     if turn is None:
         turn = {
@@ -1414,6 +1435,7 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
             "relay_depth": 0,   # 防递归爆炸：只有链首能触发 relay
             "_child_tasks": set(),  # 共享的后台 receiver 任务池（根退出时统一取消）
             "_locked_exec_mode": (canvas or {}).get("execution_mode", "serial"),  # 运行时锁定：会话开始后不可切换
+            "_run_session": run_session,  # RunSession 引用：让所有 spawn 的子任务登记到 session.child_tasks
         }
     else:
         turn["relay_depth"] = turn.get("relay_depth", 0) + 1
@@ -1497,7 +1519,8 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
 
 
 async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str, mode: str, canvas: dict | None, turn: dict, is_relay: bool = False):
-    conv = get_by("conversations", conversation_id) or {"id": conversation_id, "messages": []}
+    # 运行期共享对象：同会话并发运行读写同一份 dict，避免 get_by deepcopy 互相覆盖
+    conv = run_registry.live_conv(conversation_id)
     # 记录初始消息数，用于 final upsert 时把内存中累积但未落库的 tool entries 合并进去
     _conv_initial_len = len(conv.get("messages", []))
 
@@ -1564,7 +1587,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     user_msg_ref = messages[-1]
 
     # 保存用户消息（接力段的 user 输入是 A2A 信封渲染文本，前端聊天区过滤）
-    user_entry = {"role": "user", "content": user_input, "ts": datetime.utcnow().isoformat()}
+    user_entry = {"role": "user", "content": user_input, "ts": datetime.utcnow().isoformat(),
+                  "to_agent_id": agent.get("id")}  # 接收方=本轮运行的智能体（对话区按它过滤"接收的消息"）
     if is_relay:
         user_entry["relay"] = True
     conv.setdefault("messages", []).append(user_entry)
@@ -1604,16 +1628,27 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     _recv_expected_count = 0  # 预期启动的接收方总数
 
     async def _push_agent_to_queue(cid, tgt, inp_text, m, c, child_turn):
-        """接收方 agent_reply 包装：每行 put 到 _recv_queue（带 agent_id），完成后 put __DONE__ 标记。
+        """接收方 agent_reply 包装：每行 put 到 _recv_queue（带 agent_id），
+        同时直接 push 到父 session 的事件缓冲（让前端能直接看到并行接收方的输出，
+        即使父 pump 被精确停止后也不丢失），完成后 put __DONE__ 标记。
+
         注意：过滤掉嵌套 agent_reply 的 DONE 行——它是内部结束标记，不应传给前端清状态；
         前端的 DONE 只应由顶层 agent_reply 在整个 SSE 流结束时 yield 一次。"""
+        parent_session = child_turn.get("_run_session") if child_turn else None
         try:
             async for line in agent_reply(cid, tgt, inp_text, m, c, child_turn):
                 if line.strip() == "DONE":
                     continue
                 await _recv_queue.put((tgt.get("id"), line))
+                # 同时直接 push 到父 session 的事件缓冲
+                # （并行接收方继续输出，前端能独立订阅到它们的行）
+                if parent_session is not None:
+                    parent_session.push(line)
         except Exception as e:
-            await _recv_queue.put((tgt.get("id"), f"RN:（并行接收方 {tgt.get('name', '?')} 异常：{e}）\n"))
+            err_line = f"RN:（并行接收方 {tgt.get('name', '?')} 异常：{e}）\n"
+            await _recv_queue.put((tgt.get("id"), err_line))
+            if parent_session is not None:
+                parent_session.push(err_line)
         await _recv_queue.put((None, "__DONE__"))
 
     def _drain_recv_lines(sender_id: int | None = None):
@@ -2209,7 +2244,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 if call_targets:
                     for target, d in call_targets:
                         env = build_call_envelope(conversation_id, agent, target, d)
-                        fresh = get_by("conversations", conversation_id) or conv
+                        fresh = run_registry.live_conv(conversation_id) or conv
                         fresh.setdefault("messages", []).append({
                             "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
                         })
@@ -2223,7 +2258,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                             conversation_id, target, render_envelope(env),
                             "linked", canvas, child_turn,
                         ))
-                        _register_child_task(turn, task)
+                        _register_child_task(turn, task, turn.get("_run_session"))
                         parallel_tasks.append((task, env))
                         _recv_expected_count += 1
                     # drain 接收方已输出的行（非阻塞，有就立即 yield）
@@ -2244,28 +2279,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         # —— plan / none 跳过，直接采纳
         workflow_mode = _wf_mode or agent.get("workflow_mode", "none")
         if workflow_mode not in ("spec", "goal"):
-            # —— 并行模式熔断：已启动并行接收方但模型说"我做完了"，不要退出 ——
-            # 并行模式下发送方和接收方各自独立运行，发送方不能因为发完消息就停——
-            # 它也有自己的分工区域要处理（静态审查、冒烟测试等）。
-            # 如果模型过早结束，注入强提示让它继续执行自己的任务。
-            _exec_mode = turn.get("_locked_exec_mode", "serial")
-            if _exec_mode == "parallel" and parallel_tasks:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "[系统提示 · 并行模式]\n"
-                        "你已给团队成员发送了任务分工，他们正在并行执行。"
-                        "但你自己的任务还没做完——你也有分工区域需要处理。\n"
-                        "**立即行动**：停止汇报/等待，继续执行你的工作（调用工具做代码审查、运行测试、"
-                        "检查配置等），直到你负责的部分全部完成。"
-                    ),
-                })
-                verify_retry_count += 1
-                if verify_retry_count >= MAX_VERIFY_RETRIES or is_last_round:
-                    yield f"RN:（并行模式强制采纳：验证重试已达上限或最后一轮）\n"
-                    final_text_parts.append(assistant_text)
-                    break
-                continue
+            # 非工作流模式：直接采纳模型的完成声明。
+            # 并行模式下，即使已启动了接收方任务，发送方也可以自由结束——
+            # 接收方会在后台继续运行并通过 Queue 把输出展示给用户；
+            # 发送方无需强迫自己继续做工具调用。
             final_text_parts.append(assistant_text)
             break
 
@@ -2353,6 +2370,36 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
         break  # 兜底：正常情况下上面已经 break/continue 了
 
+    # —— 先存最终 assistant 文字 + 发 F: 给前端 ——
+    # 提前到并行等待之前：让前端立即知道发送方已完成自己的工作（去掉节点高亮），
+    # 即使后端还在等待接收方完成。
+    final_text = strip_continue("".join(final_text_parts))
+    # 去掉首尾连续空行，保留中间换行
+    final_text = final_text.strip("\n")
+    final_entry = {
+        "role": "assistant",
+        "content": final_text,
+        "ts": datetime.utcnow().isoformat(),
+        "agent_id": agent.get("id"), "reasoning": assistant_reasoning or None, "tool_history": tool_history,
+    }
+    if is_relay:
+        final_entry["relay"] = True
+    # 先把 final_entry 加到内存 conv，统一合并
+    conv["messages"].append(final_entry)
+
+    # reload → 合并 → upsert：tool loop 中提前启动的并发接收方可能已写入 store，
+    # 需要以 store 为基底（含接收方消息），再把内存中累积但未落库的新消息（tool entries + final_entry）
+    # 追加进去，避免覆盖接收方写入或丢失本轮产出
+    # live_conv 下 conv 即共享对象（已含并发写入），无需再合并，避免自我追加重复
+    fresh_conv = run_registry.live_conv(conversation_id) or conv
+    if fresh_conv is not conv:
+        for m in conv["messages"][_conv_initial_len:]:
+            fresh_conv.setdefault("messages", []).append(m)
+
+    yield f"F:{final_text}\n"
+    # 接力前先落库当前智能体产出，避免下游脏写覆盖
+    upsert("conversations", fresh_conv)
+
     # —— 并行模式：等待所有并发接收方完成，持续 drain Queue 实时输出 ——
     # 用 drain-while-waiting 替代裸 await task：在等待期间持续 drain Queue，
     # 确保接收方的流式输出不会因为生成器卡在 await 上而延迟到达前端。
@@ -2379,32 +2426,6 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         # 最终 drain：确保 Queue 清空
         for line, _ in _drain_recv_lines(agent.get("id")):
             yield line
-
-    # 存最终 assistant 文字（如果最后一轮没文字但执行了工具，前端可以不展示）
-    final_text = strip_continue("".join(final_text_parts))
-    # 去掉首尾连续空行，保留中间换行
-    final_text = final_text.strip("\n")
-    final_entry = {
-        "role": "assistant",
-        "content": final_text,
-        "ts": datetime.utcnow().isoformat(),
-        "agent_id": agent.get("id"), "reasoning": assistant_reasoning or None, "tool_history": tool_history,
-    }
-    if is_relay:
-        final_entry["relay"] = True
-    # 先把 final_entry 加到内存 conv，统一合并
-    conv["messages"].append(final_entry)
-
-    # reload → 合并 → upsert：tool loop 中提前启动的并发接收方可能已写入 store，
-    # 需要以 store 为基底（含接收方消息），再把内存中累积但未落库的新消息（tool entries + final_entry）
-    # 追加进去，避免覆盖接收方写入或丢失本轮产出
-    fresh_conv = get_by("conversations", conversation_id) or conv
-    for m in conv["messages"][_conv_initial_len:]:
-        fresh_conv.setdefault("messages", []).append(m)
-
-    yield f"F:{final_text}\n"
-    # 接力前先落库当前智能体产出，避免下游脏写覆盖
-    upsert("conversations", fresh_conv)
 
     # ===== 消息接力：cluster.send_message / 自动回复 在任意 relay 层级都处理
     #     （受 MAX_CALL 预算 + A2A_MAX_RELAY_DEPTH 双重约束防爆炸）；
@@ -2467,7 +2488,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 _jb_tasks = []  # [(task, env)]
                 for target, d in call_targets:
                     env = build_call_envelope(conversation_id, agent, target, d)
-                    fresh = get_by("conversations", conversation_id) or conv
+                    fresh = run_registry.live_conv(conversation_id) or conv
                     fresh.setdefault("messages", []).append({
                         "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
                     })
@@ -2481,7 +2502,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                         conversation_id, target, render_envelope(env),
                         "linked", canvas, child_turn,
                     ))
-                    _register_child_task(turn, task)
+                    _register_child_task(turn, task, turn.get("_run_session"))
                     _jb_tasks.append((task, env))
                     _recv_expected_count += 1
                 # drain-while-waiting：接力阶段发送方已结束，等待期间持续 drain Queue
@@ -2506,7 +2527,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         for target, h in collect_relay_targets(turn, canvas, agent):
             env = build_handoff_envelope(conversation_id, agent, target, final_text, h)
             # 每目标重载会话再追加信封，避免覆盖下游已写入的消息
-            fresh = get_by("conversations", conversation_id) or conv
+            fresh = run_registry.live_conv(conversation_id) or conv
             fresh.setdefault("messages", []).append({
                 "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
             })

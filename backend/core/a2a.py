@@ -262,7 +262,8 @@ def collect_call_targets(turn: dict, agent: dict) -> list[tuple[dict, dict]]:
 def mark_envelope_done(conv_id: int, message_id: str) -> None:
     """下游处理完毕 → 重载会话把该信封的 task 状态置为 completed（避免脏写覆盖）。"""
     try:
-        conv = get_by("conversations", conv_id)
+        from core import run_registry  # 延迟导入避免循环依赖
+        conv = run_registry.live_conv(conv_id)
         if not conv:
             return
         changed = False

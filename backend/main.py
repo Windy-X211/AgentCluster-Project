@@ -329,10 +329,11 @@ def _is_under(p: _P, root: _P) -> bool:
 
 
 def _collect_workdir_roots() -> list[_P]:
-    """收集所有画布 workdir + 全局 default_workdir，供 /api/fs/image 放行工作区图片。
+    """收集所有画布 workdir + 会话级 workdir + 全局 default_workdir，供 /api/fs/image 放行工作区图片。
 
     智能体常把图片生成在画布工作区里（如 PPT 导出的 qa_png/overview.png），
     这些路径不在 _safe_resolve 的固定允许根内，缩略图走 /api/fs/image 加载时需放行。
+    会话可携带自己的工作区（与画布不同），同样需要放行。
     """
     roots: list[_P] = []
     try:
@@ -344,6 +345,15 @@ def _collect_workdir_roots() -> list[_P]:
                     roots.append(_P(wd).resolve())
                 except Exception:
                     pass
+        # 会话级工作区：走 list payload 缓存，只解析 workdir 字段，避免全量构建会话对象
+        import json as _json
+        for _key, _payload in _store.load_list_payloads("conversations", lambda c: str(c.get("id", 0))):
+            try:
+                wd = (_json.loads(_payload) or {}).get("workdir")
+                if wd:
+                    roots.append(_P(wd).resolve())
+            except Exception:
+                continue
         s = _store.load("settings") or {}
         dwd = s.get("default_workdir")
         if dwd:
