@@ -4,6 +4,7 @@ import { useCanvasStore } from './canvas'
 import { useAgentStore } from './agent'
 import { useSettingsStore } from './settings'
 import { playSuccess, playError } from '@/utils/sound'
+import { API_BASE } from '@/utils/env'
 
 /**
  * 行协议转义还原：后端 yield T:/RN: 等行前，会把 payload 中的
@@ -25,14 +26,37 @@ export function stripContinueTag(s: string | null | undefined): string {
   return (s || '').replace(/<\s*continue\s*>/gi, '')
 }
 
-/** 结束末尾的流式 assistant；若它一个字都没有（不是任何工具行的锚点，因为锚点必在工具卡片之前）
- *  → 直接移除，避免留下空消息泡泡。 */
-function _closeTailAssistant(msgs: RichMsg[]): void {
-  const last = msgs[msgs.length - 1]
-  if (!last || last.role !== 'assistant' || !last.streaming) return
-  last.streaming = false
-  if ((last.content || '').trim() || (last.reasoning || '').trim()) return
-  msgs.pop()
+// 结束流式 assistant 的空占位逻辑已统一收敛到 _finishRun 兜底清理（串并穿插输出下，
+// 一刀切关末尾会关错发言者；改由 SPEAK:/A2A: 按 agent 定位关闭 + 运行收尾统一清理）。
+
+/** 从末尾往前找指定 agent 的流式 assistant 索引（越过工具行/信封/其它 agent 的消息，止于 user 边界）。
+ *  串并穿插输出（SPEAK:A→B片段→SPEAK:A→A片段…）下按 agent 归属定位，
+ *  才能保证每个 agent 的正文始终汇成一条完整消息（不碎片化、不错归属）。 */
+function _lastStreamingAssistantIdx(msgs: RichMsg[], agentId: number | null | undefined): number {
+  if (agentId == null) return -1
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i] as any
+    if (m.role === 'user') break
+    if (m.role === 'assistant' && m.streaming && (m.agent_id ?? null) === agentId) return i
+  }
+  return -1
+}
+
+/** 找本轮内可续写的流式 assistant（T:/RN:/E: 等文本行的归属目标）：
+ *  1) 该 agent 存在 streaming 消息（_lastStreamingAssistantIdx 定位）；
+ *  2) 且它之后（本轮内）没有该 agent 自己的工具行——工具调用是段落边界，
+ *     工具后的正文/思考应新开一条（对齐历史版本"工具前解说 / 工具后总结分段、不混一条"）。
+ *  串并穿插输出下，同一 agent 因 SPEAK 切回被分批送达的同性质内容仍汇成一段；
+ *  工具前后的内容则不会错误拼接。 */
+function _resumableAssistantOf(msgs: RichMsg[], agentId: number | null | undefined): RichMsg | null {
+  const i = _lastStreamingAssistantIdx(msgs, agentId)
+  if (i < 0) return null
+  for (let j = i + 1; j < msgs.length; j++) {
+    const r = (msgs[j] as any).role
+    if (r === 'user') break
+    if ((r === 'tool_call' || r === 'tool_result') && ((msgs[j] as any).agent_id ?? null) === agentId) return null
+  }
+  return msgs[i]
 }
 
 // 集群编排命令结果 → 需要刷新的画布/智能体（保持画布不残留旧内容）
@@ -482,6 +506,10 @@ export const useConvStore = defineStore('conv', {
     // speakingAgents 是集合，画布节点靠它做 "speaking" 高亮；
     // speakingAgent 保留为"最近一个"，供聊天区等只关心单一发言者的逻辑兼容。
     _speakingAgents: {} as Record<number, Set<number>>,         // 会话 → 并行发言集合
+    _originSpeaker: {} as Record<number, number | null>,        // 会话 → 本轮集群调用的源头发送者（切回源头时恢复可见段）
+    // 会话 → 运行时锁定的执行模式（镜像后端 turn._locked_exec_mode：会话开始后切模式不影响本轮）。
+    // 串行 = speakingAgents 替换（同时只有一个高亮）；并行 = 累加（多个接收方同时高亮）。
+    _execModeLocked: {} as Record<number, string | null>,
     _relayPhase: new Set<number>(),                             // 已进入接力段的会话集合
     _handoffActive: new Set<number>(),                          // 正在 cluster.handoff / A2A 接力的会话集合
     _callEdges: {} as Record<number, { from: number; to: number; tcId: string }[]>, // 会话 → call 进行中的连线流动
@@ -505,6 +533,7 @@ export const useConvStore = defineStore('conv', {
     _lastFlushAt: 0,           // 上次 flush 时间戳（ms）
     _unloadBound: false,       // 是否已绑定 beforeunload
     _sendError: {} as Record<number, boolean>, // 会话 → 本轮 send 是否出现错误（E: 行 / 异常）
+    _adopting: new Set<number>(), // 正在接管恢复的后端运行会话（防重复订阅）
   }),
   getters: {
     /** 当前会话是否正在流式（发送/停止按钮据此切换：仅当前会话在流式才显示"停止"，
@@ -584,15 +613,12 @@ export const useConvStore = defineStore('conv', {
     /** 删除单条消息（仅删除该条，保留其余消息）。
      *  若删除的是带 tool_calls 的 assistant 消息，后端会连带删除紧随的 tool 结果，
      *  避免留下孤立 tool 消息让模型"记得"刚才做过的事。
-     *  前端可见消息可能经过 relay 过滤，需把可见索引映射回原始 messages 索引。 */
-    async deleteMessage(visibleIdx: number): Promise<{ ok: boolean; msg?: string; removed?: number }> {
+     *  @param target 消息对象引用（前端可见区经过过滤，按对象引用 indexOf 定位原始索引） */
+    async deleteMessage(target: any): Promise<{ ok: boolean; msg?: string; removed?: number }> {
       const c = this.currentData()
       if (!c) return { ok: false, msg: '无当前会话' }
-      const visibleMsgs = c.messages || []
-      if (visibleIdx < 0 || visibleIdx >= visibleMsgs.length) return { ok: false, msg: '索引越界' }
-      const target = visibleMsgs[visibleIdx]
       const rawIdx = (c.messages || []).indexOf(target)
-      if (rawIdx < 0) return { ok: false, msg: '找不到原始消息' }
+      if (rawIdx < 0) return { ok: false, msg: '找不到消息' }
       try {
         const r = await api.convs.deleteMessage(c.id, rawIdx)
         await this.fetch()
@@ -607,16 +633,14 @@ export const useConvStore = defineStore('conv', {
     },
 
     /** 撤销：删除该用户消息及其后的所有对话，并还原之后的所有文件操作。
-     *  仅对用户消息（role === 'user'）有效。 */
-    async undoFromUserMessage(visibleIdx: number): Promise<{ ok: boolean; msg?: string; restoredOps?: number }> {
+     *  仅对用户消息（role === 'user'）有效。
+     *  @param target 用户消息对象引用 */
+    async undoFromUserMessage(target: any): Promise<{ ok: boolean; msg?: string; restoredOps?: number }> {
       const c = this.currentData()
       if (!c) return { ok: false, msg: '无当前会话' }
-      const visibleMsgs = c.messages || []
-      if (visibleIdx < 0 || visibleIdx >= visibleMsgs.length) return { ok: false, msg: '索引越界' }
-      const target = visibleMsgs[visibleIdx]
-      if (target.role !== 'user') return { ok: false, msg: '仅可对用户消息执行撤销' }
       const rawIdx = (c.messages || []).indexOf(target)
-      if (rawIdx < 0) return { ok: false, msg: '找不到原始消息' }
+      if (rawIdx < 0) return { ok: false, msg: '找不到消息' }
+      if (target.role !== 'user') return { ok: false, msg: '仅可对用户消息执行撤销' }
       try {
         const r = await api.convs.undoFrom(c.id, rawIdx)
         await this.fetch()
@@ -649,7 +673,7 @@ export const useConvStore = defineStore('conv', {
         if (useSyncXHR) {
           // beforeunload 里 fetch 会被浏览器取消，用同步 XHR 兜底（仅 Chrome/Edge 支持）
           const xhr = new XMLHttpRequest()
-          xhr.open('PUT', `/api/conversations/${cid}`, false) // false = 同步
+          xhr.open('PUT', `${API_BASE}/api/conversations/${cid}`, false) // false = 同步
           xhr.setRequestHeader('Content-Type', 'application/json')
           try { xhr.send(JSON.stringify(payload)) } catch { /* ignore */ }
         } else {
@@ -685,10 +709,12 @@ export const useConvStore = defineStore('conv', {
       if (this._unloadBound || typeof window === 'undefined') return
       this._unloadBound = true
       const handler = () => {
-        // 关页时尽力保存所有正在流式的会话 + 当前会话（流式按会话隔离，可能不止一个）
-        const ids = new Set<number>(this.streamingConvIds)
+        // 关页时尽力保存会话。运行中的会话跳过：后端节流落库负责，
+        // 前端整段 PUT 会覆盖后端半路写入（且多前端实例在线时会互相踩踏）
+        const ids = new Set<number>()
         if (this.current != null) ids.add(this.current)
         for (const cid of ids) {
+          if (this.streamingConvIds.has(cid)) continue
           try { this.flushCurrentNow(true, cid) } catch { /* ignore */ }
         }
       }
@@ -699,6 +725,8 @@ export const useConvStore = defineStore('conv', {
 
     async send(agentId: number, content: string) {
       if (this.current == null) await this.create()
+      // 防重入：本会话已有运行中的流（后端同样会对并发 send 返回 409）
+      if (this.streamingConvIds.has(this.current!)) return
       const c = this.currentData()
       const cid = this.current!  // 捕获本次发送的会话 id：整个流程（含 finally）都按此 id 操作，
       // 用户中途切换会话不会影响本流的收尾与状态复位
@@ -711,6 +739,10 @@ export const useConvStore = defineStore('conv', {
       this._toolCalls[cid] = {}
       this._toolPending[cid] = {}
       this._sendError[cid] = false  // 本轮 send 错误标志（E: 行 / 网络异常 → true；用户主动 abort → 保持 false）
+      this._originSpeaker[cid] = agentId  // 本轮源头 speaker（切回源头时恢复可见段）
+      // 运行时锁定执行模式（镜像后端 turn._locked_exec_mode）：本轮内高亮行为不随画布设置漂移
+      const _cv = (c as any).canvas_id != null ? useCanvasStore().list.find((x: any) => x.id === (c as any).canvas_id) : null
+      this._execModeLocked[cid] = _cv?.execution_mode || 'serial'
 
       // 绑定一次 beforeunload（幂等），关页/关标签会同步 XHR 强制保存
       this.bindBeforeUnload()
@@ -726,108 +758,241 @@ export const useConvStore = defineStore('conv', {
       const ctrl = new AbortController()
       this._ctrls.set(cid, ctrl)
 
-      // 先立刻落库一次（用户消息 + 空的 assistant 占位），中途 crash 也能保住用户输入
+      // 先立刻落库一次（用户消息 + 空的 assistant 占位）：后端 send 端点以此为运行基底快照，
+      // 重开窗口恢复时用它 + 全量重放行协议重建界面
       await this.flushCurrentNow(false, cid)
 
       let _aborted = false  // 用户主动停止：区别于真实错误，播放静音
       const t0 = Date.now()  // 本轮起点：判断是否长任务（长任务完成才响提示音，闲聊不打扰）
 
+      let ok = false
       try {
-        // 逐行解析新协议（signal 支持「停止」中止 fetch → 后端断连取消接力链）
-        const r = await fetch('/api/conversations/' + cid + '/send', {
+        // 逐行解析新协议。运行已与连接解耦（后端后台任务 + 事件缓冲），
+        // 断连不再中止智能体，由 _recoverRun 重新订阅恢复
+        ok = await this._drainEventStream(c, `${API_BASE}/api/conversations/${cid}/send`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ agent_id: agentId, content }),
           signal: ctrl.signal,
         })
-        if (!r.ok) throw new Error(r.statusText)
-        const reader = r.body!.getReader()
-        const decoder = new TextDecoder(); let buf = ''
-        let tickCount = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buf += decoder.decode(value, { stream: true })
-          let idx: number
-          while ((idx = buf.indexOf('\n')) !== -1) {
-            const line = buf.slice(0, idx); buf = buf.slice(idx + 1)
-            if (!line.trim()) continue
-            this._handleLine(c, line)
-            // 每 ~6 行（约 1.2s）触发一次节流 flush —— 让后端逐步追上前端内存里的流式内容
-            tickCount++
-            if (tickCount % 6 === 0) this.scheduleFlushCurrent(1200, cid)
-          }
-        }
-        // 收尾
-        const last = msgs[msgs.length - 1]
-        if (last?.streaming) last.streaming = false
       } catch (e: any) {
         if (e?.name === 'AbortError') {
           _aborted = true
-          const last = msgs[msgs.length - 1]
-          if (last?.streaming) { last.streaming = false; last.content = (last.content || '') + ' [已停止]' }
         } else {
-          // 传输/后端异常（HTTP 错误、断流、网络中断等）：给最后一条仍处于流式中的消息
-          // 关闭流式位并补中断标记，避免它被 finally 的 flush 以 streaming:true + 空内容
-          // 持久化——重开后会渲染成"空泡泡 + 永远闪烁的光标"
-          this._sendError[cid] = true
-          const last = msgs[msgs.length - 1]
-          if (last?.streaming) { last.streaming = false; last.content = (last.content || '') + ' [输出中断]' }
-          throw e
-        }
-      } finally {
-        // 仅复位本会话的流式状态，不影响其他可能正在并行的会话
-        this.streamingConvIds.delete(cid)
-        this._ctrls.delete(cid)
-        this._speakingAgent[cid] = null
-        this._speakingAgents[cid] = new Set()
-        this._relayPhase.delete(cid)
-        this._handoffActive.delete(cid)
-        this._callEdges[cid] = []
-        this._toolCalls[cid] = {}
-        this._toolPending[cid] = {}
-        // 兜底：清空本轮所有残留的 streaming 标记（正常结束 / 中断 / 异常统一收敛到这里），
-        // 确保最终落库的 messages 不带"活的"流式标记，防止空泡泡+光标被持久化
-        // 同时为所有有 startedAt 但尚未记录 endedAt 的消息补上结束时间戳（用于最终用时计算）
-        const endedAt = Date.now()
-        for (const m of msgs) {
-          const anyM = m as any
-          if (anyM.streaming) anyM.streaming = false
-          if (typeof anyM.startedAt === 'number' && typeof anyM.endedAt !== 'number') anyM.endedAt = endedAt
-        }
-        // 兜底：丢掉末尾仍然一个字都没有的 assistant 占位（模型整轮没输出正文时，
-        // 不让空占位落库/渲染成空消息泡泡；带工具的锚点必在工具卡片之前，不会被误删）
-        while (msgs.length) {
-          const m = msgs[msgs.length - 1] as any
-          if (m?.role !== 'assistant' || (m.content || '').trim() || (m.reasoning || '').trim() || m.tool_calls) break
-          msgs.pop()
-        }
-        // 取消挂起的节流 flush（马上要手动 flush + fetch）
-        this.cancelScheduledFlush(cid)
-        // 关键：先把最终状态（包含已停止标记）立刻写回后端，再 fetch 刷新
-        await this.flushCurrentNow(false, cid)
-        // 刷新列表（保守：find 失败不把 current 清 null，避免内存里的 messages 被"闪空"）
-        await this.fetch()
-        if (this.current != null) {
-          const found = this.list.find(x => x.id === this.current)
-          if (found) this.current = found.id
-          // 找不到就保留原 current —— abort 后后端 list 可能暂时没同步
-        }
-
-        // 提示音：画布运行模式 + 手动跑的长任务（>10s）+ 用户主动 abort 静音
-        // 正常完成 → 愉悦音；有错误（E: 行 / 网络异常）→ 急促音
-        try {
-          if (!_aborted && (this.running || Date.now() - t0 > 10000)) {
-            const st = useSettingsStore()
-            if (st.data.sound_enabled !== false) {
-              if (this._sendError[cid]) playError()
-              else playSuccess()
-            }
-          }
-        } finally {
-          delete this._sendError[cid]
+          // 传输/后端异常（断网、后端重启、流中断）：运行在后端继续 → 恢复订阅直到结束
+          ok = await this._recoverRun(cid)
         }
       }
+      if (!ok && !_aborted) {
+        // 恢复彻底失败（长时间不可达）：给末尾流式消息补中断标记，避免持久化"空泡泡+闪烁光标"
+        this._sendError[cid] = true
+        const cc = (this.list.find(x => x.id === cid) as any) || c
+        const ms: RichMsg[] = cc.messages || []
+        const last = ms[ms.length - 1] as any
+        if (last?.streaming) { last.streaming = false; last.content = (last.content || '') + ' [输出中断]' }
+      }
+      await this._finishRun(cid, c, _aborted, t0)
+    },
+
+    /** 拉取行协议流并逐行喂给 _handleLine；返回是否以 DONE 行正常结束。
+     *  网络异常 / AbortError 向外抛出，由调用方决定重连恢复或中止收尾。
+     *  运行期间不做前端 PUT：落库由后端节流负责（多前端实例同时在线时避免双写竞争）。 */
+    async _drainEventStream(c: any, url: string, init?: RequestInit): Promise<boolean> {
+      const r = await fetch(url, init)
+      if (!r.ok) throw new Error(await r.text().catch(() => r.statusText) || r.statusText)
+      const reader = r.body!.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      let sawDone = false
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        let idx: number
+        while ((idx = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, idx); buf = buf.slice(idx + 1)
+          if (!line.trim()) continue
+          this._handleLine(c, line)
+          if (line === 'DONE') sawDone = true
+        }
+      }
+      return sawDone
+    },
+
+    /** 断连后恢复：运行在后端继续，从基底快照重置本地消息 + 全量重放行协议重建界面。
+     *  返回 true=运行已结束（重放完成或后端已落库）；false=恢复失败（不可达等）。 */
+    async _recoverRun(cid: number): Promise<boolean> {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        if (attempt > 0) await new Promise(r => setTimeout(r, Math.min(1000 * attempt, 5000)))
+        try {
+          const st = await api.convs.running(cid)
+          if (!st?.running) {
+            // 已结束：后端已完整落库，以服务端数据为准
+            await this._reloadConv(cid)
+            return true
+          }
+          const c = this.list.find(x => x.id === cid)
+          if (!c) return true  // 会话已被删除 → 当作结束
+          // 基底重置：丢弃本地半截状态，从 send 时刻快照 + 全量重放重建（幂等，可反复重入）
+          c.messages = JSON.parse(JSON.stringify(st.base_conv?.messages || []))
+          this.streamingConvIds.add(cid)
+          const ctrl = this._ctrls.get(cid) ?? new AbortController()
+          this._ctrls.set(cid, ctrl)
+          const done = await this._drainEventStream(c, `${API_BASE}/api/conversations/${cid}/events?since=0`, { signal: ctrl.signal })
+          if (done) return true
+          // events 流中途又断（未收到 DONE）→ 下一轮重试
+        } catch (e: any) {
+          if (e?.name === 'AbortError') return true  // 本地兜底 abort → 结束等待，收尾交给 _finishRun
+          // 网络仍不可达 → 退避重试
+        }
+      }
+      return false
+    },
+
+    /** 从后端重载单个会话（恢复流程发现运行已结束时对齐服务端状态） */
+    async _reloadConv(cid: number) {
+      try {
+        const c = await api.convs.get(cid)
+        if (c?.messages) {
+          for (const m of c.messages) {
+            if (m && typeof m === 'object' && m.streaming) m.streaming = false
+            if (m && !m.image_refs && Array.isArray(m.images) && m.images.length) m.image_refs = m.images
+          }
+        }
+        const i = this.list.findIndex(x => x.id === cid)
+        if (i >= 0 && c) this.list[i] = c
+        else if (c) this.list.push(c)
+      } catch { /* 会话可能已被删除 → 静默 */ }
+    },
+
+    /** 运行收尾（send 正常结束 / 恢复结束 / 中止共用）：复位流式状态、清残留标记、落库、刷新 */
+    async _finishRun(cid: number, cOrig: any, _aborted: boolean, t0: number) {
+      // 仅复位本会话的流式状态，不影响其他可能正在并行的会话
+      this.streamingConvIds.delete(cid)
+      this._ctrls.delete(cid)
+      this._speakingAgent[cid] = null
+      this._speakingAgents[cid] = new Set()
+      this._originSpeaker[cid] = null
+      this._execModeLocked[cid] = null
+      this._relayPhase.delete(cid)
+      this._handoffActive.delete(cid)
+      this._callEdges[cid] = []
+      this._toolCalls[cid] = {}
+      this._toolPending[cid] = {}
+      // 恢复流程可能替换过 list 中的对象 → 重新定位当前引用
+      const c = (this.list.find(x => x.id === cid) as any) || cOrig
+      const msgs: RichMsg[] = c?.messages || []
+      // 兜底：清空本轮所有残留的 streaming 标记（正常结束 / 中断 / 异常统一收敛到这里），
+      // 确保最终落库的 messages 不带"活的"流式标记，防止空泡泡+光标被持久化
+      // 同时为所有有 startedAt 但尚未记录 endedAt 的消息补上结束时间戳（用于最终用时计算）
+      const endedAt = Date.now()
+      // 先清掉所有"一个字都没有"的流式占位（串并穿插下可能残留在列表中途；
+      // 其后的工具结果不算它的锚点——工具锚点是无 streaming 标记的 C: 行空 assistant）
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i] as any
+        if (m?.role === 'assistant' && m.streaming && !(m.content || '').trim() && !(m.reasoning || '').trim()) {
+          msgs.splice(i, 1)
+        }
+      }
+      for (const m of msgs) {
+        const anyM = m as any
+        if (anyM.streaming) anyM.streaming = false
+        if (typeof anyM.startedAt === 'number' && typeof anyM.endedAt !== 'number') anyM.endedAt = endedAt
+      }
+      // 兜底：丢掉末尾仍然一个字都没有的 assistant 占位（模型整轮没输出正文时，
+      // 不让空占位落库/渲染成空消息泡泡；带工具的锚点必在工具卡片之前，不会被误删）
+      while (msgs.length) {
+        const m = msgs[msgs.length - 1] as any
+        if (m?.role !== 'assistant' || (m.content || '').trim() || (m.reasoning || '').trim() || m.tool_calls) break
+        msgs.pop()
+      }
+      // 兜底 2：串并穿插输出下，中途也可能残留孤立空占位（其后紧跟其它 agent 的消息/信封，
+      // 末尾清理够不到）→ 全列表清一遍。带工具行的锚点保留（工具卡片要挂在它下面渲染）。
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i] as any
+        if (m?.role !== 'assistant' || (m.content || '').trim() || (m.reasoning || '').trim() || m.tool_calls) continue
+        let anchored = false
+        for (let j = i + 1; j < msgs.length; j++) {
+          const r = (msgs[j] as any)?.role
+          if (r === 'tool_call' || r === 'tool_result') { anchored = true; break }
+          if (r === 'assistant' || r === 'user' || r === 'a2a') break
+        }
+        if (!anchored) msgs.splice(i, 1)
+      }
+      // 取消挂起的节流 flush（马上要手动 flush + fetch）
+      this.cancelScheduledFlush(cid)
+      // 关键：先把最终状态立刻写回后端，再 fetch 刷新
+      await this.flushCurrentNow(false, cid)
+      // 刷新列表（保守：find 失败不把 current 清 null，避免内存里的 messages 被"闪空"）
+      await this.fetch()
+      if (this.current != null) {
+        const found = this.list.find(x => x.id === this.current)
+        if (found) this.current = found.id
+        // 找不到就保留原 current —— abort 后后端 list 可能暂时没同步
+      }
+
+      // 提示音：画布运行模式 + 手动跑的长任务（>10s）+ 用户主动 abort 静音
+      // 正常完成 → 愉悦音；有错误（E: 行 / 网络异常）→ 急促音
+      try {
+        if (!_aborted && (this.running || Date.now() - t0 > 10000)) {
+          const st = useSettingsStore()
+          if (st.data.sound_enabled !== false) {
+            if (this._sendError[cid]) playError()
+            else playSuccess()
+          }
+        }
+      } finally {
+        delete this._sendError[cid]
+      }
+    },
+
+    /** 挂载时恢复：查询后端正在运行的会话并逐个接管显示（Electron 重开窗 / 浏览器打开均生效） */
+    async restoreRunning() {
+      try {
+        const r = await api.convs.runs()
+        const running: any[] = r?.running || []
+        for (const run of running) {
+          const cid = run?.conv_id
+          if (cid == null || this._adopting.has(cid)) continue
+          void this._adoptRun(cid, run.agent_id ?? null)
+        }
+      } catch { /* 后端不可达 / 无运行 → 静默 */ }
+    },
+
+    /** 接管一个后端运行中的会话：标记运行态 → 恢复订阅 → 统一收尾 */
+    async _adoptRun(cid: number, agentId: number | null) {
+      if (!this.list.find(x => x.id === cid)) return
+      this._adopting.add(cid)
+      const t0 = Date.now()
+      try {
+        // 运行态标记（重放中 SPEAK:/TS:/C: 行会进一步补全发言者与工具状态）
+        this.streamingConvIds.add(cid)
+        if (agentId != null) {
+          this._speakingAgent[cid] = agentId
+          this._speakingAgents[cid] = new Set([agentId])
+        }
+        this._sendError[cid] = false
+        const ok = await this._recoverRun(cid)
+        if (!ok) {
+          this._sendError[cid] = true
+          const c = this.list.find(x => x.id === cid) as any
+          const msgs: RichMsg[] = c?.messages || []
+          const last = msgs[msgs.length - 1] as any
+          if (last?.streaming) { last.streaming = false; last.content = (last.content || '') + ' [输出中断]' }
+        }
+        await this._finishRun(cid, null, false, t0)
+      } finally {
+        this._adopting.delete(cid)
+      }
+    },
+
+    /** 挂载兜底：优先恢复上次选中的会话（localStorage 记忆），否则最新活跃会话 */
+    ensureCurrent() {
+      if (this.current != null && this.list.find(x => x.id === this.current)) return
+      let saved: number | null = null
+      try { saved = +(localStorage.getItem('agent-cluster.conversation.current') || '') || null } catch { /* ignore */ }
+      if (saved != null && this.list.find(x => x.id === saved)) { this.current = saved; return }
+      this.current = this.list[0]?.id ?? null
     },
 
     // —— 运行/停止：按节点右键配置的触发方式（manual 等待 / cron 定时）——
@@ -843,22 +1008,29 @@ export const useConvStore = defineStore('conv', {
       this.running = false
       this.runCanvasId = null
       if (this._timer) { clearInterval(this._timer); this._timer = null }
-      // 中止当前会话的流式（流式按会话隔离，停止运行只影响当前会话）
+      // 中止当前会话的运行（流式按会话隔离，停止运行只影响当前会话）
       const cid = this.current
-      if (cid != null) {
-        const ctrl = this._ctrls.get(cid)
-        if (ctrl) { ctrl.abort(); this._ctrls.delete(cid) }
-      }
+      if (cid != null) void this.stopSend()
     },
-    /** 停止当前对话流：仅触发 abort，让 send() 的 catch/finally 走完整的收尾路径
-     *  （写 "[已停止]" 标记 + flush + fetch + 复位 streaming 状态）。
-     *  切勿在此处删除 _ctrls 或重置 streaming，否则 fetch 收尾流程会失效。 */
-    stopSend() {
+    /** 停止当前对话流：运行与连接解耦后必须显式通知后端取消任务，
+     *  流随后端 STOP/DONE 行自然结束并走 _finishRun 的完整收尾路径。
+     *  8s 兜底：后端未响应时本地 abort 仅断开订阅视图（不再影响后端运行）。 */
+    async stopSend() {
       const cid = this.current
-      if (cid != null) {
-        const ctrl = this._ctrls.get(cid)
-        if (ctrl) ctrl.abort()
+      if (cid == null) return
+      try {
+        await api.convs.stop(cid)
+      } catch {
+        this._abortLocal(cid)
+        return
       }
+      setTimeout(() => {
+        if (this.streamingConvIds.has(cid)) this._abortLocal(cid)
+      }, 8000)
+    },
+    _abortLocal(cid: number) {
+      const ctrl = this._ctrls.get(cid)
+      if (ctrl) ctrl.abort()
     },
     async _cronTick() {
       if (!this.running || this.runCanvasId == null) return
@@ -898,17 +1070,26 @@ export const useConvStore = defineStore('conv', {
       if (left.length !== edges.length) this._callEdges[cid] = left
     },
 
-    /** 记录发言者：每次 SPEAK 都把 speakingAgents 重置为只包含新 agent。
-     *  并行模式下后端用 _drain_agent_reply 把各 agent 的输出缓冲后顺序 yield，
-     *  配合修复后的后端在每个 agent 内容前重新 emit SPEAK:X，speakingAgents 会随
-     *  SPEAK 正确切换——不需要累加（累加会导致已说完的 agent 继续高亮不清）。
-     *  按 cid 操作对应会话的状态，避免并发流互相干扰。 */
+    /** 记录发言者（对齐历史版本按执行模式分流的高亮行为）：
+     *  - 串行：speakingAgents 替换为当前 agent（同一时刻只有一个节点高亮发言）
+     *  - 并行：speakingAgents 累加（一个发送方同时唤起 N 个接收方，同时高亮）
+     *  执行模式优先取本轮 send 时锁定的值（镜像后端 turn._locked_exec_mode），
+     *  恢复重放场景无锁定值时回落画布当前设置。 */
     _setSpeaker(cid: number, agentId: number) {
       this._speakingAgent[cid] = agentId
-      // 无论串行/并行，每次 SPEAK 都重置 speakingAgents 为只包含当前发言者
-      // 后端顺序 yield 各 agent 的缓冲内容，配合修复后每个 agent 内容前都有 SPEAK:X，
-      // 高亮会正确跟随当前正在输出的 agent 切换
-      this._speakingAgents[cid] = new Set([agentId])
+      let execMode = this._execModeLocked[cid] ?? null
+      if (execMode == null) {
+        const c = this.list.find((x: any) => x.id === cid)
+        const canvas = c?.canvas_id != null ? useCanvasStore().list.find((x: any) => x.id === c.canvas_id) : null
+        execMode = canvas?.execution_mode ?? 'serial'
+      }
+      if (execMode === 'parallel') {
+        const next = new Set(this._speakingAgents[cid] ?? new Set<number>())
+        next.add(agentId)
+        this._speakingAgents[cid] = next
+      } else {
+        this._speakingAgents[cid] = new Set([agentId])
+      }
     },
 
     _handleLine(c: any, line: string) {
@@ -926,14 +1107,29 @@ export const useConvStore = defineStore('conv', {
         this._toolPending[cid] = {}
         this._speakingAgent[cid] = null
         this._speakingAgents[cid] = new Set()
+        this._originSpeaker[cid] = null
+        this._execModeLocked[cid] = null
+        return
+      }
+
+      if (line === 'STOP') {
+        // 后台运行被显式停止（POST /stop）：不算错误，给末尾流式消息补 [已停止] 标记
+        this._sendError[cid] = false
+        const target = _resumableAssistantOf(msgs, curAgent)
+          || (lastAssistant?.role === 'assistant' && lastAssistant.streaming ? lastAssistant : null)
+        if (target) {
+          target.streaming = false
+          target.content = (target.content || '') + ' [已停止]'
+        }
         return
       }
 
       if (line === 'RESET') {
         // 快通道检测到 <continue> → 后端清空本轮已流出的正文/思考，慢通道重新生成
-        if (lastAssistant && lastAssistant.role === 'assistant' && lastAssistant.streaming) {
-          lastAssistant.content = ''
-          lastAssistant.reasoning = ''
+        const own = _resumableAssistantOf(msgs, curAgent)
+        if (own) {
+          own.content = ''
+          own.reasoning = ''
         }
         return
       }
@@ -944,8 +1140,10 @@ export const useConvStore = defineStore('conv', {
         // ⚠️ 后端 _esc 转义了 err_msg 内的 \n/\r/\\（防止多行异常详情破坏行协议），这里用 _unesc 还原
         this._sendError[cid] = true  // 后端报错 → 标记本轮为错误，finally 播放急促提示音
         const text = _unesc(line.slice(2))
-        if (lastAssistant && lastAssistant.role === 'assistant' && lastAssistant.streaming) {
-          lastAssistant.content = ((lastAssistant.content || '') + (lastAssistant.content ? '\n\n' : '') + text)
+        // 错误文本按当前发言者归属（避免落到其他 agent 的消息上）
+        const own = _resumableAssistantOf(msgs, curAgent)
+        if (own) {
+          own.content = ((own.content || '') + (own.content ? '\n\n' : '') + text)
         } else {
           msgs.push({ role: 'assistant', content: text, streaming: false, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
         }
@@ -957,9 +1155,11 @@ export const useConvStore = defineStore('conv', {
         // ⚠️ 后端 _esc 转义了 payload 内的 \n/\r/\\，这里用 _unesc 还原
         const text = stripContinueTag(_unesc(line.slice(3)))
         console.log('[RN] 收到思考增量 len=' + text.length + ', 预览=' + text.slice(0, 40).replace(/\n/g, '\\n'))
-        if (lastAssistant && lastAssistant.role === 'assistant' && lastAssistant.streaming) {
-          lastAssistant.reasoning = (lastAssistant.reasoning || '') + text
-          console.log('[RN] 已累加到 lastAssistant，累计总长=' + (lastAssistant.reasoning || '').length)
+        // 按 agent 归属续写（不盲取末尾）：串并穿插输出下末尾可能是其他 agent 的消息
+        const own = _resumableAssistantOf(msgs, curAgent)
+        if (own) {
+          own.reasoning = (own.reasoning || '') + text
+          console.log('[RN] 已累加到本 agent 的流式消息，累计总长=' + (own.reasoning || '').length)
         } else {
           // 思考先于正文到达（快通道常见）→ 先开一条流式 assistant 承接思考
           msgs.push({ role: 'assistant', content: '', reasoning: text, streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
@@ -968,11 +1168,12 @@ export const useConvStore = defineStore('conv', {
       } else if (line.startsWith('T:')) {
         // 对方开始输出文字 → 结束指向它的 call 连线流动
         this._callTargetOutputted(cid)
-        // 普通文字 → 追加到当前流式 assistant
+        // 普通文字 → 追加到「当前发言者自己的」流式 assistant
         // ⚠️ 后端 _esc 转义了 payload 内的 \n/\r/\\，这里用 _unesc 还原
         const text = stripContinueTag(_unesc(line.slice(2)))
-        if (lastAssistant && lastAssistant.role === 'assistant' && lastAssistant.streaming) {
-          lastAssistant.content = (lastAssistant.content || '') + text
+        const own = _resumableAssistantOf(msgs, curAgent)
+        if (own) {
+          own.content = (own.content || '') + text
         } else {
           // 懒创建：正文真正到达时才开新的 assistant（不在 R: 后预建空泡泡，
           // 一次性多工具调用会产生 N-1 条空 assistant → 空消息泡泡）
@@ -1017,8 +1218,9 @@ export const useConvStore = defineStore('conv', {
             this._callEdges[cid].push({ from: curAgent, to: toId, tcId })
           }
         }
-        // 结束当前流式 assistant
-        if (lastAssistant?.streaming) lastAssistant.streaming = false
+        // 结束「当前发言者自己的」流式 assistant（串并穿插下末尾可能是其他 agent 的消息，不能一刀切）
+        const ownC = _resumableAssistantOf(msgs, curAgent)
+        if (ownC) ownC.streaming = false
         // 工具卡片要挂在「前面最近一条同 agent 的 assistant」下才渲染得出来：
         // 末尾（跳过连续 tool_call/tool_result 后）不是同 agent 的 assistant
         // （接力切换发言者 / 正文还没到）→ 补一条空 assistant 作为工具行锚点
@@ -1072,10 +1274,9 @@ export const useConvStore = defineStore('conv', {
         // ⚠️ 不能每个 R: 都开：一次性调用多个工具会产生 N-1 条没有任何内容的空 assistant，
         // 它们永远收不到正文 → 渲染成空消息泡泡，还会把 tool_result 和 tool_call 拆散归属。
         if (remain <= 0) {
-          let j = msgs.length - 1
-          while (j >= 0 && (msgs[j].role === 'tool_call' || msgs[j].role === 'tool_result')) j--
-          const tailA = j >= 0 ? msgs[j] : null
-          const hasOpen = !!tailA && tailA.role === 'assistant' && tailA.streaming && !(tailA.content || '').trim()
+          // 按当前发言者归属判断是否已有"正在输入"空占位（串并穿插下末尾可能是其他 agent 的消息）
+          const own = _resumableAssistantOf(msgs, curAgent)
+          const hasOpen = !!own && !(own.content || '').trim()
           if (!hasOpen) {
             msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
           }
@@ -1115,9 +1316,23 @@ export const useConvStore = defineStore('conv', {
         // 最终完整文本（通常前端不需要，已经有流式拼接了）
         this._callTargetOutputted(cid)
       } else if (line.startsWith('SPEAK:')) {
-        // 切换发言者：结束当前流式消息（空泡泡直接丢弃），后续进入接力段（聊天区过滤）
+        // 切换发言者：结束「旧发言者自己的」流式消息（末尾空占位直接丢弃），保持消息流时间序；
+        // 后续进入接力段（聊天区过滤）。不能一刀切关末尾——串并穿插输出下末尾可能是新发言者的消息。
         const id = parseInt(line.slice(6), 10)
-        _closeTailAssistant(msgs)
+        if (curAgent != null && curAgent !== id) {
+          const oldIdx = _lastStreamingAssistantIdx(msgs, curAgent)
+          if (oldIdx >= 0) {
+            const old = msgs[oldIdx] as any
+            // 只清空的流式占位（R: 后开的"正在输入"，被切换打断即无意义，直接移除；
+            // 工具锚点是无 streaming 标记的 C: 行空 assistant，不受影响）。
+            // 有内容的流式消息继续保持 streaming——该 agent 再次发言时按归属续写，
+            // 汇成一条完整消息（对齐历史版本"每个 agent 一段正文"的视觉）。
+            if (!(old.content || '').trim() && !(old.reasoning || '').trim()) {
+              old.streaming = false
+              msgs.splice(oldIdx, 1)
+            }
+          }
+        }
         if (!Number.isNaN(id)) {
           this._setSpeaker(cid, id)
           curAgent = id   // 同步更新局部变量，让后续 A2A:/T:/RN:/C: 行用正确的 agent_id
@@ -1125,11 +1340,20 @@ export const useConvStore = defineStore('conv', {
         this._relayPhase.add(cid)
         this._handoffActive.add(cid)
       } else if (line.startsWith('A2A:')) {
-        // A2A 消息信封：关闭当前流式消息 → 插入信封卡片（正文由后续 T: 懒创建）
+        // A2A 消息信封：结束「发送方自己的」流式消息 → 插入信封卡片（正文由后续 T: 懒创建）
         let env: any = null
         try { env = JSON.parse(line.slice(4)) } catch { env = { _raw: line.slice(4) } }
         this._handoffActive.add(cid)
-        _closeTailAssistant(msgs)
+        const fromAid = env?.from?.agent_id ?? curAgent
+        const fromIdx = _lastStreamingAssistantIdx(msgs, fromAid)
+        if (fromIdx >= 0) {
+          const fromMsg = msgs[fromIdx] as any
+          // 同 SPEAK:：只有空占位直接移除，有内容的流式消息保持（后续按归属续写）
+          if (!(fromMsg.content || '').trim() && !(fromMsg.reasoning || '').trim()) {
+            fromMsg.streaming = false
+            msgs.splice(fromIdx, 1)
+          }
+        }
         // 信封带双 agent_id：from.agent_id=发送方（画布源节点也应显示这条"我发出的"消息）
         //                 to.agent_id=接收方（画布目标节点应显示这条"我收到的"消息）
         msgs.push({

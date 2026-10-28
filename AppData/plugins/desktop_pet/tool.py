@@ -21,6 +21,9 @@ _PLUGIN_DIR = str(Path(__file__).resolve().parent)
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
+# 未指定 model_path 时的默认模型（插件自带）
+_DEFAULT_MODEL_DIR = Path(_PLUGIN_DIR) / "assets" / "符玄"
+
 # 模块级状态（进程级，多次 run() 调用间保持）
 _window = None
 _lock = threading.Lock()
@@ -86,7 +89,11 @@ def _cmd_show(kwargs):
     global _current_model, _window, _current_pos, _current_scale
     model_path = kwargs.get("model_path") or _current_model
     if not model_path:
-        return {"error": "首次 show 需要 model_path 参数"}
+        # 未指定模型路径：默认使用插件自带的符玄模型
+        if _DEFAULT_MODEL_DIR.exists():
+            model_path = str(_DEFAULT_MODEL_DIR)
+        else:
+            return {"error": f"未指定 model_path，且默认模型不存在：{_DEFAULT_MODEL_DIR}"}
 
     x = kwargs.get("x", _current_pos["x"])
     y = kwargs.get("y", _current_pos["y"])

@@ -7,7 +7,12 @@ export const useCanvasStore = defineStore('canvas', {
     async fetch() {
       this.list = await api.canvases.list()
       const curId = this.current?.id
-      this.current = (curId != null && this.list.find(x => x.id === curId)) || this.list[0] || null
+      // 整页重载后内存清空 → 从 localStorage 恢复上次选中的画布
+      let savedId: number | null = null
+      try { savedId = +(localStorage.getItem('agent-cluster.canvas.current') || '') || null } catch { /* ignore */ }
+      this.current = (curId != null && this.list.find(x => x.id === curId)) ||
+        (savedId != null && this.list.find((x: any) => x.id === savedId)) ||
+        this.list[0] || null
     },
     async create(d: any = {}) {
       const name = d.name || `画布 ${this.list.length + 1}`

@@ -1,13 +1,11 @@
 import json
-import sys
-import traceback
 import asyncio
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import Any
 from core.store import load, upsert, delete_by, get_by, next_id, load_list_payloads
-from core.agent_runtime import agent_reply
+from core import run_registry
 from core.file_backup import (
     list_file_ops, restore_op, restore_range, _load_conv_ops,
 )
@@ -62,6 +60,13 @@ def create_conv(c: ConvIn):
     return upsert("conversations", item)
 
 
+@router.get("/runs")
+def list_runs():
+    """所有正在运行的会话（跨窗口恢复用：Electron / 浏览器任一前端挂载时查询）。
+    注意：必须注册在 GET /{cid} 之前，否则 "runs" 会被当作 cid 匹配。"""
+    return {"running": run_registry.list_running()}
+
+
 @router.put("/{cid}")
 def update_conv(cid: int, data: dict):
     """更新会话。
@@ -94,32 +99,66 @@ def remove_conv(cid: int):
     return {"ok": delete_by("conversations", cid)}
 
 
+
 @router.post("/{cid}/send")
 async def send_message(cid: int, m: MsgIn):
-    conv = get_by("conversations", cid) or HTTPException(404, "not found")
-    agent = get_by("agents", m.agent_id) or HTTPException(404, "agent not found")
+    conv = get_by("conversations", cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    agent = get_by("agents", m.agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    if run_registry.is_running(cid):
+        raise HTTPException(409, "该会话正在运行中")
     canvas = get_by("canvases", conv.get("canvas_id")) if conv.get("canvas_id") else None
     mode = conv.get("mode", "independent")
 
+    # 运行与连接解耦：agent_reply 在后台任务里跑（事件缓冲 + 广播），
+    # 本响应只是"订阅视图"——客户端断开（关窗/断网/刷新）不再中止运行，
+    # 重开窗口经 GET /{cid}/running + GET /{cid}/events 恢复显示。
+    session = run_registry.start(cid, agent, m.content, mode, canvas, base_conv=conv)
+
     async def gen():
         try:
-            async for chunk in agent_reply(cid, agent, m.content, mode, canvas):
-                yield chunk
+            async for line in session.subscribe(0):
+                yield line
         except asyncio.CancelledError:
-            # 客户端主动断开 / 停止 → 正常中止，不打印错误
-            print(f"[conversations] gen() cancelled for conv {cid}, agent {m.agent_id}", file=sys.stderr)
-            raise  # StreamingResponse 需要 CancelledError 正常传播给 ASGI
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[conversations] gen() FATAL for conv {cid}, agent {m.agent_id}: {e}\n{tb}", file=sys.stderr)
-            # yield 一条 E: 错误行给前端（如果连接还能写）
-            try:
-                err_text = str(e).replace("\n", "\\n")
-                yield f"E:后端崩溃：{err_text}\n"
-            except Exception:
-                pass
+            # 客户端断开只结束本次订阅，后台运行继续
+            raise
 
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
+
+
+@router.get("/{cid}/running")
+def get_running(cid: int, include_base: bool = Query(False, description="附带 send 时刻的会话基底快照（重连恢复用）")):
+    """查询该会话是否正在运行；include_base=1 时附带基底消息（前端重置后全量重放）。"""
+    s = run_registry.get(cid)
+    if not s:
+        return {"running": False, "conv_id": cid}
+    return s.describe(include_base=include_base)
+
+
+@router.get("/{cid}/events")
+async def stream_events(cid: int, since: int = Query(0, description="从该序号之后重放（恢复场景固定 since=0 全量重放）")):
+    """订阅该会话的运行事件流：先重放缓冲，再实时跟随，直到 DONE 结束。"""
+    s = run_registry.get(cid)
+    if not s:
+        raise HTTPException(404, "没有可恢复的运行（已结束且缓冲已过期）")
+
+    async def gen():
+        try:
+            async for line in s.subscribe(since):
+                yield line
+        except asyncio.CancelledError:
+            raise
+
+    return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
+
+
+@router.post("/{cid}/stop")
+def stop_run(cid: int):
+    """显式停止该会话的后台运行（连接断开不再中止，必须显式调用）。"""
+    return {"ok": run_registry.stop(cid)}
 
 
 # ==============================================================

@@ -59,7 +59,10 @@ onMounted(async () => {
   } catch (e) {
     console.error('[Home] 初始化数据加载失败:', e)
   }
-  if (!convs.current && convs.list.length) convs.current = convs.list[0].id
+  // 恢复上次选中的会话（localStorage 记忆），无记忆才回落最新活跃会话
+  convs.ensureCurrent()
+  // 接管后端仍在运行的会话（关窗重开 / 浏览器打开都能看到运行状态）
+  void convs.restoreRunning()
   // 通知 Electron 主进程：Vue 数据已就绪，可以显示主窗口了（防白屏闪烁）
   // 浏览器模式下 window.electronAPI 不存在，?. 安全调用直接跳过
   window.electronAPI?.notifyReady?.()

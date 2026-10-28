@@ -16,6 +16,9 @@ from contextvars import ContextVar
 # cluster.handoff / cluster.send_message（A2A 移交与发送消息（可往返多轮）工具）— 导入进本模块 globals，供 run_command 分发
 from core.a2a import cmd_cluster_handoff, HANDOFF_TOOL, cmd_cluster_send_message, CALL_TOOL
 
+# agent.smart_search（智能搜索子智能体）— 同样导入进 globals，供 run_command 反射分发
+from core.smart_search import cmd_agent_smart_search, SMART_SEARCH_TOOL  # noqa: F401
+
 
 # ======================================================
 #  后台进程管理（cmd.run 自动识别长运行命令并后台化）
@@ -415,6 +418,102 @@ def _start_bg_process(command: str, cwd: str, shell: bool = True,
         result["port"] = port
         result["port_probe"] = probe
     return result
+
+
+# 前台自动执行：无输出且进程存活满这么多秒 → 判定为 GUI/常驻进程，转后台不再阻塞智能体
+_FG_IDLE_TIMEOUT = 6.0
+
+
+def _run_foreground_auto(command: str, cwd: str, shell: bool = True,
+                         timeout: int = 60, classify_command: str | None = None) -> dict:
+    """自动模式的前台执行：短命令正常返回输出；长驻/GUI 进程自动转后台。
+
+    与 subprocess.run(capture_output=...) 的区别：
+      - stdout/stderr 重定向到文件而非管道 —— GUI 子进程继承的是文件句柄，
+        不会再让父进程永远等不到管道 EOF 而卡死；
+      - 轮询进程状态：进程退出即返回完整输出；若进程长时间不退出（无论是
+        GUI 程序还是未被关键词识别的常驻服务），自动注册为后台进程并立即返回，
+        避免智能体执行循环被阻塞到 timeout。
+    """
+    import tempfile
+    _cleanup_dead_bg()
+    classify = classify_command if classify_command is not None else command
+
+    log_dir = os.path.join(tempfile.gettempdir(), "agent_cluster_bg")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"fg_{os.getpid()}_{int(time.time())}.log")
+
+    try:
+        log_fh = open(log_path, "w+", encoding="utf-8", errors="replace")
+    except Exception:
+        log_fh = None
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=shell,
+            cwd=cwd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+            start_new_session=(os.name != "nt"),
+        )
+    except FileNotFoundError as e:
+        if log_fh: log_fh.close()
+        return {"error": f"命令不存在或路径错误: {e}", "command": command}
+    except Exception as e:
+        if log_fh: log_fh.close()
+        return {"error": str(e), "command": command}
+    finally:
+        if log_fh:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+
+    deadline = time.time() + max(1, int(timeout))
+    idle_deadline = time.time() + _FG_IDLE_TIMEOUT
+    last_size = 0
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            out = _read_log_text(log_path, 4000)
+            return {"stdout": out, "stderr": "", "returncode": rc,
+                    "command": classify, "cwd": cwd}
+        now = time.time()
+        # 有输出则刷新静默计时：持续产出说明是真正在干活的长命令，允许继续等
+        try:
+            cur_size = os.path.getsize(log_path)
+        except OSError:
+            cur_size = last_size
+        if cur_size != last_size:
+            last_size = cur_size
+            idle_deadline = now + _FG_IDLE_TIMEOUT
+        if now >= deadline or now >= idle_deadline:
+            # 进程仍存活 → 转后台，立即返回，不阻塞智能体
+            tail = _read_log_text(log_path, 4000)
+            with _BG_LOCK:
+                _BG_PROCESSES[proc.pid] = {
+                    "proc": proc,
+                    "command": classify,
+                    "cwd": cwd,
+                    "started_at": time.time(),
+                    "log_path": log_path,
+                }
+            return {
+                "ok": True,
+                "pid": proc.pid,
+                "command": classify,
+                "cwd": cwd,
+                "running": True,
+                "background": True,
+                "stdout": tail,
+                "log_path": log_path,
+                "note": "命令未在预期时间内结束，已转为后台运行（不阻塞智能体）。"
+                        "如需等待其完成，显式传 background=false。",
+            }
+        time.sleep(0.2)
 
 
 def cmd_cmd_bg_list() -> dict:
@@ -1391,12 +1490,17 @@ def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = T
             return _start_bg_process(exec_command, cwd_eff, shell=shell,
                                      classify_command=command)
 
-        # 前台阻塞执行（短命令）：捕获字节后按本地编码解码，避免中文乱码
-        r = subprocess.run(exec_command, shell=shell, capture_output=True, cwd=cwd_eff,
-                           timeout=timeout)
-        return {"stdout": _decode_console(r.stdout)[-4000:],
-                "stderr": _decode_console(r.stderr)[-2000:],
-                "returncode": r.returncode, "command": command, "cwd": cwd_eff}
+        # 显式要求前台阻塞（background=false）：保持原语义，等进程结束或超时
+        if background is False:
+            r = subprocess.run(exec_command, shell=shell, capture_output=True,
+                               cwd=cwd_eff, timeout=timeout)
+            return {"stdout": _decode_console(r.stdout)[-4000:],
+                    "stderr": _decode_console(r.stderr)[-2000:],
+                    "returncode": r.returncode, "command": command, "cwd": cwd_eff}
+
+        # 自动模式：前台优先，长驻/GUI 进程自动转后台，避免卡住智能体
+        return _run_foreground_auto(exec_command, cwd_eff, shell=shell,
+                                    timeout=timeout, classify_command=command)
     except subprocess.TimeoutExpired:
         return {"error": f"timeout（{timeout}s）—— 这条命令似乎在等待某些输出，"
                          f"如果是服务启动/文件监听等长运行进程，可用 background=true 参数后台启动，"
@@ -1686,6 +1790,7 @@ COMMAND_CN_LABELS = {
     "file.search": "🔍 搜索内容",
     "file.find": "🔎 查找文件",
     "workspace.search": "🌐 工作区检索",
+    "agent.smart_search": "🧠 智能搜索",
     "skill.invoke": "🔧 调用技能",
     "skill.read_section": "📑 读取技能章节",
     "cmd.run": "🚀 运行命令",
@@ -2218,7 +2323,7 @@ def cmd_cluster_list_capabilities() -> dict:
     hidden = RUNTIME_INJECTED_COMMANDS
     for t in COMMAND_TOOLS:
         name = t["function"]["name"]
-        if name in hidden or not name.startswith(("file.", "workspace.", "cmd.", "cluster.")):
+        if name in hidden or not name.startswith(("file.", "workspace.", "cmd.", "cluster.", "agent.")):
             continue
         meta = COMMAND_META.get(name, {})
         group = meta.get("group", "其他")
@@ -2584,6 +2689,9 @@ CLUSTER_TOOLS.append(CALL_TOOL)
 # 合并到全局命令表，让 filter_tools 自动生效
 COMMAND_TOOLS.extend(CLUSTER_TOOLS)
 
+# 智能搜索子智能体命令（独立于 cluster.*，作为一项可勾选能力）
+COMMAND_TOOLS.append(SMART_SEARCH_TOOL)
+
 # ---- 命令分组（前端命令选择器按组展示，可整组勾选或展开后单独勾选）----
 # 顺序即展示顺序；未列入分组的命令归入「其他」。
 COMMAND_GROUPS = [
@@ -2592,6 +2700,7 @@ COMMAND_GROUPS = [
         "file.patch", "file.structure", "file.search", "file.find",
     ]),
     ("工作区检索", ["workspace.search"]),
+    ("智能搜索", ["agent.smart_search"]),
     ("命令运行", ["cmd.run", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
     ("集群编排", [
         "cluster.list_agents", "cluster.list_capabilities",

@@ -2,6 +2,7 @@
     "name":  "agent-cluster",
     "version":  "0.1.0",
     "private":  true,
+    "description":  "智能体集群 · AgentCluster",
     "type":  "module",
     "scripts":  {
                     "dev":  "vite",

@@ -1,5 +1,8 @@
 // 统一 API 客户端
-const BASE = '/api'
+// 必须用绝对地址直打后端：prod 模式的 dist server 没有 /api proxy，
+// 相对路径会被 SPA fallback 兜成 index.html → JSON.parse 报 "not valid JSON"
+import { API_BASE } from '@/utils/env'
+const BASE = API_BASE + '/api'
 
 // —— 插件调试面板领域类型 ——
 export interface ParamDefinition {
@@ -163,14 +166,14 @@ export const api = {
     del: (path: string) => req<any>('/fs/delete', { method: 'DELETE', body: JSON.stringify({ path }) }),
     // —— 根级文件原始字节 / 二进制预览（供 FileViewer 预览上传附件等不属于任何画布的文件）——
     rawUrl: (path: string, v?: number) =>
-      BASE + `/api/fs/raw?path=` + encodeURIComponent(path) + (v ? `&v=${v}` : ''),
+      BASE + `/fs/raw?path=` + encodeURIComponent(path) + (v ? `&v=${v}` : ''),
     raw: async (path: string): Promise<ArrayBuffer> => {
-      const r = await fetch(BASE + `/api/fs/raw?path=` + encodeURIComponent(path))
+      const r = await fetch(BASE + `/fs/raw?path=` + encodeURIComponent(path))
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
       return r.arrayBuffer()
     },
     officePdf: async (path: string): Promise<string> => {
-      const r = await fetch(BASE + `/api/fs/office-pdf?path=` + encodeURIComponent(path))
+      const r = await fetch(BASE + `/fs/office-pdf?path=` + encodeURIComponent(path))
       if (!r.ok) {
         let d: any = null
         try { d = await r.json() } catch { /* 非 JSON 错误体 */ }
@@ -179,13 +182,17 @@ export const api = {
       return URL.createObjectURL(await r.blob())
     },
     run: async (path: string) =>
-      req<any>(`/api/fs/run?path=` + encodeURIComponent(path), { method: 'POST' }),
+      req<any>(`/fs/run?path=` + encodeURIComponent(path), { method: 'POST' }),
   },
   convs: {
     list: () => req<any[]>('/conversations'),
+    get: (id: number) => req<any>(`/conversations/${id}`),
     create: (d: any) => req('/conversations', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/conversations/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/conversations/${id}`, { method: 'DELETE' }),
+    runs: () => req<any>('/conversations/runs'),
+    running: (id: number) => req<any>(`/conversations/${id}/running?include_base=1`),
+    stop: (id: number) => req(`/conversations/${id}/stop`, { method: 'POST' }),
     send: (id: number, d: any, onChunk: (s: string) => void) => new Promise<void>(async (res, rej) => {
       try {
         const r = await fetch(BASE + `/conversations/${id}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) })

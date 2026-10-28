@@ -32,7 +32,7 @@ parameters:
   - name: "model_path"
     type: string
     required: false
-    description: "Live2D 模型目录或 model3.json 完整路径（show/switch 时使用）"
+    description: "Live2D 模型目录或 model3.json 完整路径（show/switch 时使用）。不指定时默认使用插件自带的符玄模型（desktop_pet/assets/符玄）"
 
   - name: "x"
     type: number

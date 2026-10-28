@@ -1101,11 +1101,11 @@ const seqMap = computed(() => {
   return m
 })
 
-// ② 消息过滤：过滤掉 relay 段的 role=user 消息——那些是 A2A 信封渲染文本（render_envelope），
-//     仅在下游 agent 内部作 user_input 传给 LLM，协议层内部消息不应该显示成用户泡泡。
-//     relay 的 assistant / a2a / tool_call / tool_result 照常显示——那是接收方的真实输出。
+// ② 消息过滤：过滤掉所有 relay=true 的消息——后端 is_relay=True 标记接力链下游 agent
+//     （集群中其他智能体）的全部输出，右侧对话区只保留源头 agent 与用户的对话。
+//     a2a 信封无 relay 字段，始终保留（集群通信的协议证据，不是下游 agent 的输出）。
 const visibleMsgs = computed(() =>
-  (conv.value?.messages || []).filter((m: any) => !(m?.role === 'user' && m?.relay))
+  (conv.value?.messages || []).filter((m: any) => !m?.relay)
 )
 
 /** 渲染项：以"用户消息"为分界线，把每两条用户消息之间的全部智能体输出
@@ -1261,7 +1261,7 @@ function imageRefsOfAssistant(idx: number): Array<{ type: 'data_url' | 'file'; s
  *  data_url → 原样返回；file 路径 → 走后端 /api/fs/image 接口按需加载 */
 function resolveImgSrc(ref: { type: 'data_url' | 'file'; src: string }): string {
   if (ref?.type === 'file' && ref.src) {
-    return `/api/fs/image?path=${encodeURIComponent(ref.src)}`
+    return `${API_BASE}/api/fs/image?path=${encodeURIComponent(ref.src)}`
   }
   return ref?.src || ''
 }
@@ -1786,7 +1786,7 @@ async function deleteMessageFromCtx() {
   const preview = (m.content || '').replace(/\s+/g, ' ').trim().slice(0, 30)
   if (!confirm(`删除这条消息？\n\n「${preview || '(空)'}」\n\n仅删除该条消息本身，其余对话保留。`)) return
   msgOpStatus.value = '正在删除…'
-  const r = await convs.deleteMessage(menu.msgIdx)
+  const r = await convs.deleteMessage(m)
   if (r.ok) {
     msgOpStatus.value = r.removed && r.removed > 1
       ? `✅ 已删除（含 ${r.removed} 条工具结果，智能体不再记得此轮）`
@@ -1809,7 +1809,7 @@ async function undoFromCtx() {
   const preview = (m.content || '').replace(/\s+/g, ' ').trim().slice(0, 30)
   if (!confirm(`撤销这条用户消息？\n\n「${preview || '(空)'}」\n\n该消息及其后的所有对话都会被删除，之后智能体修改的文件会被还原。`)) return
   msgOpStatus.value = '正在撤销…'
-  const r = await convs.undoFromUserMessage(menu.msgIdx)
+  const r = await convs.undoFromUserMessage(m)
   if (r.ok) {
     msgOpStatus.value = `✅ 已撤销${r.restoredOps ? `（还原 ${r.restoredOps} 项文件操作）` : ''}`
   } else {
@@ -1819,8 +1819,8 @@ async function undoFromCtx() {
 }
 
 // —— 编辑用户消息（仅最新一条）：撤销本轮对话并重新发送修改内容 ——
-const editDlg = ref<{ open: boolean; content: string; agentId: number | null; msgIdx: number }>(
-  { open: false, content: '', agentId: null, msgIdx: -1 }
+const editDlg = ref<{ open: boolean; content: string; agentId: number | null; msg: any; msgIdx: number }>(
+  { open: false, content: '', agentId: null, msg: null, msgIdx: -1 }
 )
 
 /** 该用户消息是否是最新一条用户消息（其后不再有 user 消息） */
@@ -1853,7 +1853,7 @@ function editMessageFromCtx() {
   if (rawIdx < 0) rawIdx = menu.msgIdx
   const agentId = agentIdAfterUserMsg(rawIdx) ?? currentAgentId.value ?? agents.list[0]?.id ?? null
   closeMsgCtx()
-  editDlg.value = { open: true, content: m.content || '', agentId, msgIdx: menu.msgIdx }
+  editDlg.value = { open: true, content: m.content || '', agentId, msg: m, msgIdx: menu.msgIdx }
 }
 
 async function confirmEditMessage() {
@@ -1872,7 +1872,7 @@ async function confirmEditMessage() {
   }
   editDlg.value = { ...dlg, open: false }
   msgOpStatus.value = '正在撤销并重新发送…'
-  const r = await convs.undoFromUserMessage(dlg.msgIdx)
+  const r = await convs.undoFromUserMessage(dlg.msg)
   if (!r.ok) {
     msgOpStatus.value = '❌ 撤销失败: ' + (r.msg || '未知错误')
     setTimeout(() => { msgOpStatus.value = '' }, 3000)
@@ -2136,7 +2136,7 @@ async function send() {
   setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
 }
 function sendStop() {
-  convs.stopSend()
+  void convs.stopSend()
 }
 
 async function toggleVoiceInput() {
@@ -2446,7 +2446,7 @@ function onChatAttachClick(e: MouseEvent) {
 onMounted(async () => {
   // 父级 Home 的 fetch 可能还没返回，这里先确保拉到列表，避免误判为空而重复新建
   if (!convs.list.length) await convs.fetch()
-  if (!convs.current && convs.list.length) convs.current = convs.list[0].id
+  convs.ensureCurrent()
   if (!currentAgentId.value && agents.list.length) currentAgentId.value = agents.list[0].id
   if (!convs.list.length) await newConv('independent')
 })

@@ -1,9 +1,15 @@
 """
 生成 AgentCluster 快捷方式 + 圆角 ICO 图标
 用法: python create_shortcut.py
-产物: agentcluster.ico +AgentCluster.lnk  (都在项目根目录)
+产物: agentcluster.ico + AgentCluster.lnk  (都在项目根目录)
+
+启动链路（进程链中不出现 cmd.exe，避免双击时弹出控制台）:
+    AgentCluster.lnk → pythonw.exe launcher.py → electron / backend / node
+pythonw.exe 是 Windows 专属的无控制台 Python 启动器，不创建控制台窗口；
+launcher.py 内部所有子进程也带 CREATE_NO_WINDOW 标志。
 """
 import sys
+import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -47,26 +53,49 @@ def build_ico() -> Path:
 
 
 # ---------- 2. 创建项目内快捷方式 ----------
+def _find_pythonw() -> str:
+    """查找 pythonw.exe（无控制台的 Python 启动器）。"""
+    candidates = []
+    # 首选：当前正在运行的解释器同目录（python.exe 和 pythonw.exe 总是成对存在）
+    try:
+        candidates.append(Path(sys.executable).with_name("pythonw.exe"))
+    except Exception:
+        pass
+    candidates += [
+        Path(r"F:\anaconda3\pythonw.exe"),
+        Path(r"C:\Users\yangq\anaconda3\pythonw.exe"),
+        Path(r"C:\ProgramData\anaconda3\pythonw.exe"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    # fallback: 在 PATH 里找
+    found = shutil.which("pythonw.exe")
+    if found:
+        return found
+    raise FileNotFoundError("找不到 pythonw.exe，无法生成快捷方式")
+
+
 def create_shortcut(ico: Path):
     import pythoncom
     from win32com.client import Dispatch
 
-    start_bat = ROOT / "start.bat"
-    if not start_bat.exists():
-        raise FileNotFoundError(f"找不到 start.bat: {start_bat}")
+    launcher = ROOT / "launcher.py"
+    if not launcher.exists():
+        raise FileNotFoundError(f"找不到 launcher.py: {launcher}")
 
+    pythonw = _find_pythonw()
     lnk_path = ROOT / "AgentCluster.lnk"
-    vbs_path = ROOT / "launcher.vbs"
-    if not vbs_path.exists():
-        raise FileNotFoundError(f"找不到 launcher.vbs: {vbs_path}")
 
     pythoncom.CoInitialize()
     shell = Dispatch("WScript.Shell")
     lnk = shell.CreateShortcut(str(lnk_path))
-    # 用 wscript.exe 静默执行 launcher.vbs，VBS 内部用 SW_HIDE 启动 start.bat
-    # 彻底避免任何终端窗口闪烁
-    lnk.TargetPath = "wscript.exe"
-    lnk.Arguments = f'"{vbs_path}"'
+    # 直接用 pythonw.exe 启动 launcher.py
+    # pythonw.exe 是 Windows 专属的无控制台 Python 启动器，
+    # 进程链中不会出现任何 cmd.exe 窗口
+    lnk.TargetPath = pythonw
+    # 用绝对路径传脚本，不依赖 WorkingDirectory 是否被系统接受
+    lnk.Arguments = f'"{launcher}"'
     lnk.WorkingDirectory = str(ROOT)
     lnk.IconLocation = str(ico) + ",0"
     lnk.Description = "AgentCluster 智能体集群"

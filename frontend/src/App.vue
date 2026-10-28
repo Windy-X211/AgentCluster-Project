@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { watch } from 'vue'
 import { RouterView } from 'vue-router'
-import { useLayoutStore } from '@/stores'
+import { useLayoutStore, useConvStore, useCanvasStore } from '@/stores'
 import GuideManager from '@/components/guide/GuideManager.vue'
 import BackgroundLayer from '@/components/BackgroundLayer.vue'
 import WindowControls from '@/components/WindowControls.vue'
@@ -19,6 +19,16 @@ function applyTheme(t: string) {
 
 watch(() => layout.fontScale, applyFontScale, { immediate: true })
 watch(() => layout.theme, applyTheme, { immediate: true })
+
+// 会话/画布选中项跨会话记忆：整页重载（Electron 重开窗 / 浏览器刷新）后恢复上次所在位置
+const convs = useConvStore()
+const canvases = useCanvasStore()
+watch(() => convs.current, v => {
+  if (v != null) { try { localStorage.setItem('agent-cluster.conversation.current', String(v)) } catch { /* ignore */ } }
+})
+watch(() => canvases.current?.id, v => {
+  if (v != null) { try { localStorage.setItem('agent-cluster.canvas.current', String(v)) } catch { /* ignore */ } }
+})
 </script>
 
 <template>

@@ -264,10 +264,27 @@ const runningCanvasId = computed<number | null>(() => {
   if (convs.streaming) return convs.currentData()?.canvas_id ?? null
   return null
 })
+
+/** 画布上所有 agent_id 集合（用于 independent 模式下判断"此画布是否有运行 agent"） */
+const canvasAgentIds = computed<Set<number>>(() => {
+  const s = new Set<number>()
+  for (const n of (canvas.value?.nodes || [])) if (n?.agent_id != null) s.add(n.agent_id)
+  return s
+})
+
 const runningOnThisCanvas = computed(() => {
   const cid = canvas.value?.id
   if (cid == null) return false
-  return runningCanvasId.value === cid
+  // 常规路径：conv 直接绑定了 canvas_id（running 模式 / linked 模式）
+  if (runningCanvasId.value === cid) return true
+  // 兜底：independent 模式下 conv 没绑 canvas_id，但 speakingAgents 里有此画布上的 agent
+  if (convs.streaming) {
+    const sp = convs.speakingAgents
+    if (sp && sp.size > 0) {
+      for (const aid of sp) if (canvasAgentIds.value.has(aid)) return true
+    }
+  }
+  return false
 })
 
 // 节点活跃状态 → 用于视觉特效

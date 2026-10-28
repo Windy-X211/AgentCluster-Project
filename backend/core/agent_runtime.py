@@ -23,6 +23,7 @@ from core.store import load, save, upsert, get_by, next_id
 import core.store as store  # 运行时访问 store.ROOT（可变，set_root() 会修改）
 from core.llm import chat_with_failover as chat, ModelDegenerateError, ModelRepetitionError, _encode_tool_name
 from core.commands import run_command, filter_tools, COMMAND_META, WORKDIR_CTX
+from core.smart_search import SMART_SEARCH_CTX
 from core.a2a import (
     TURN_CTX, collect_relay_targets, collect_call_targets,
     build_handoff_envelope, build_call_envelope,
@@ -552,8 +553,9 @@ def _max_tool_rounds(agent: dict | None = None) -> int:
 
 
 # ===== 并行模式下的模型分配器 =====
-# 同一家 API endpoint 下同一个 model name 视为一个"模型槽"——一个槽同一时刻
-# 只能给一个 agent 用（接口后端是单实例 / 同模型名并发冲突）。
+# 同一家 API endpoint 下同一个 model name 视为一个"模型槽"。
+# 并行模式下优先给每个 agent 分配一个空闲槽；当模型数不足（所有槽都被占用）时，
+# 退化为"共用"——允许同一个模型并行被多个 agent 同时使用（不排队阻塞）。
 # 串行模式全部 agent 直接走 default_model，不做任何分配。
 _MODEL_KEY_LOCK = asyncio.Lock()                                 # 保护占用表的原子操作
 # 占用表: (interface_url, model_name) → set[owner_tag]
@@ -563,11 +565,12 @@ _MODEL_OCCUPANCIES: dict[tuple[str, str], set[str]] = {}
 
 async def _occupy_model(agent: dict, interface: dict | None, owner_tag: str,
                          canvas: dict | None) -> str:
-    """并行模式下等待 → 占用一个模型槽。
+    """并行模式下分配一个模型。
 
     - 串行模式：直接算好 default_model 返回，不做任何登记。
     - 并行模式：在 Lock 内从 interface.models[] 里选一个当前空闲的槽，登记后返回。
-      如果所有备选都被占，则轮询等待（每次等 0.2s 后重新判断）。
+      如果所有备选都被占（模型数不足），则退化为共用——选择当前占用者最少的槽，
+      允许同一个模型并行被多个 agent 同时使用。
 
     上层（agent_reply 的 finally 块）必须调用 _release_model(owner_tag) 释放。
     释放动作**不依赖返回值**，只靠 owner_tag 从全局占用表里删掉。"""
@@ -583,7 +586,7 @@ async def _occupy_model(agent: dict, interface: dict | None, owner_tag: str,
         if exec_mode != "parallel":
             # 串行：直接返回，不登记
             return default_model
-        # 并行但指定了 model → 走下面的排队登记逻辑（确保独占）
+        # 并行但指定了 model → 只登记该模型（优先独占，被占满时共用）
         ordered = [default_model]
     else:
         # —— 并行模式，未指定 agent.model：从 interface.models[] 里挑一个空闲槽 ——
@@ -598,17 +601,20 @@ async def _occupy_model(agent: dict, interface: dict | None, owner_tag: str,
                 ordered.append(m)
 
     url = (interface or {}).get("url") or "_"
-    while True:
-        async with _MODEL_KEY_LOCK:
-            for m in ordered:
-                key = (url, m)
-                holders = _MODEL_OCCUPANCIES.setdefault(key, set())
-                # 自己可能已在占用表里（嵌套 relay 同 task 重入），视为空闲可重占
-                if not holders or holders == {owner_tag}:
-                    holders.add(owner_tag)
-                    return m
-        # 所有备选都被占 → 等释放后重检
-        await asyncio.sleep(0.2)
+    async with _MODEL_KEY_LOCK:
+        # 优先占用第一个空闲槽
+        for m in ordered:
+            key = (url, m)
+            holders = _MODEL_OCCUPANCIES.setdefault(key, set())
+            # 自己可能已在占用表里（嵌套 relay 同 task 重入），视为空闲可重占
+            if not holders or holders == {owner_tag}:
+                holders.add(owner_tag)
+                return m
+        # 模型数不够（所有候选槽都被占）：退化为共用——
+        # 选择当前占用者最少的槽，允许多个 agent 并行共用同一模型
+        m = min(ordered, key=lambda x: len(_MODEL_OCCUPANCIES.get((url, x), ())))
+        _MODEL_OCCUPANCIES.setdefault((url, m), set()).add(owner_tag)
+        return m
 
 
 def _release_all_for_owner(owner_tag: str) -> None:
@@ -1209,16 +1215,19 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
         if exec_mode_for_prompt != "parallel":
             parts.append(
                 "【执行模式：串行】单线接力，一次只与一个成员沟通：\n"
-                "- cluster.send_message 会阻塞等待，对方收到消息后运行完成并回信，回信内容会作为**工具执行结果**返回给你；\n"
-                "- 你可以基于对方回信继续下一步操作（再发消息、执行其他工具、或输出最终回复）；\n"
-                "- 每轮只能给一个成员发消息，如需联系多人请在收到第一人回信后再发第二人。"
+                "- 你主动给下游成员发 cluster.send_message → 阻塞等待对方运行完成，回信内容会作为**工具执行结果**返回给你；\n"
+                "- 对方也可能把任务继续转交其他成员（形成 A→B→C 传递链），整条链完成后回信逐级返回；\n"
+                "- 你若是被其他成员的消息唤起（对方正在等待你）→ 用 cluster.send_message(to_agent=对方, message=回复) 回复时，回信会**直接送达**对方，不会再次唤起对方运行；\n"
+                "- 每轮只能给一个成员发消息，如需联系多人请在收到回信后再发下一人。"
             )
         else:
             parts.append(
-                "【执行模式：并行】多条消息并发发送：\n"
-                "- cluster.send_message 发送后立即返回发送状态，你可以在同一轮给多个成员发消息；\n"
-                "- 接收方会并发启动运行，各自独立处理；\n"
-                "- 你发送完消息后可继续自己的工作流程，无需等待接收方回复。"
+                "【执行模式：并行】多条消息并发发送，所有成员同时运行：\n"
+                "- cluster.send_message 发送后立即返回发送状态，可在同一轮给多个成员发消息；\n"
+                "- 接收方会并发启动运行，各自独立处理自己的分工区域；\n"
+                "- **关键：你发送完消息后必须继续执行自己的分工任务**——不要停下来等待接收方回复，"
+                "不要只做汇报/规划/分工，你也有实际工作要完成（调用工具做代码审查、运行测试、检查配置等）；\n"
+                "- 等你和所有接收方都完成各自的工作后，再汇总最终结果回复用户。"
             )
 
     # 不可 call 的（global 模式可见但不能 call / link 模式不可见）
@@ -1264,6 +1273,50 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
             "【沟通权限】你在当前画布上没有连线，无法使用 cluster.send_message。"
         )
     return "\n".join(p for p in parts if p), speaker_names
+
+
+def _serial_reply_upstream(
+    conversation_id: int, sender: dict, target: dict, message: str,
+    turn: dict, conv: dict,
+) -> tuple[list[str], dict]:
+    """串行模式：回复上游（唤起自己的成员）→ 直接回信，不递归唤起对方。
+
+    上游正阻塞在 cluster.send_message 的工具执行上等待回信，这里不再让上游跑一轮 LLM：
+    1. 构造 reply 信封落库并产出 A2A 行（前端显示 回信人→上游 的信封卡片）；
+    2. 把回信 call 记入 turn["calls"]，上游 _serial_send_message_and_wait
+       从中提取显式回信，作为 tool result 返回给上游的 LLM；
+    3. 信封立即标记 completed（无需等待接收方运行）。
+    """
+    reply_env = build_call_envelope(conversation_id, sender, target, {
+        "message": message, "reply_to": turn.get("reply_to_msg_id"),
+    })
+    fresh = get_by("conversations", conversation_id) or conv
+    fresh.setdefault("messages", []).append({
+        "role": "a2a", "envelope": reply_env, "ts": datetime.utcnow().isoformat(),
+    })
+    upsert("conversations", fresh)
+    mark_envelope_done(conversation_id, reply_env.get("message_id"))
+    turn.setdefault("calls", []).append({
+        "from_id": sender.get("id"),
+        "to_agent_id": target.get("id"),
+        "message": message,
+        "reply_to": turn.get("reply_to_msg_id"),
+        "via": "serial_reply",
+    })
+    # 计入消息熔断预算（与 collect_call_targets 的 pair/总量口径一致，防 A↔B 往返死循环）
+    pair_counts = turn.setdefault("_pair_call_counts", {})
+    pair_key = (sender.get("id"), target.get("id"))
+    pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
+    turn["call_count"] = turn.get("call_count", 0) + 1
+    lines = [f"A2A:{json.dumps(reply_env, ensure_ascii=False)}\n"]
+    result = {
+        "ok": True,
+        "to": target.get("name"),
+        "to_agent_id": target.get("id"),
+        "reply": message,
+        "note": "回信已直接送达对方（对方正在等待你的处理结果）；请勿重复发送，继续后续工作或输出总结即可",
+    }
+    return lines, result
 
 
 async def _serial_send_message_and_wait(
@@ -1321,12 +1374,12 @@ async def _serial_send_message_and_wait(
         return
     mark_envelope_done(conversation_id, env.get("message_id"))
 
-    # 从 B 的 child_turn.calls 中提取 B 给 sender 的 send_message 回信
+    # 从 B 的 child_turn.calls 中提取 B 给 sender 的 send_message 显式回信
+    # （串行模式下 B 走 _serial_reply_upstream 直接回信路径时会写入；取最后一条=最终回复）
     b_reply_msg = ""
     for call in child_turn.get("calls", []):
         if call.get("from_id") == target.get("id") and call.get("to_agent_id") == sender.get("id"):
             b_reply_msg = call.get("message", "")
-            break
 
     # 如果 B 没有显式 send_message 回信，取 B 的 final_text 作为回信
     reply_content = b_reply_msg if b_reply_msg else b_final_text
@@ -1411,6 +1464,10 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
     turn["_model"] = selected_model
     turn["_model_interface"] = interface
 
+    # 注入智能搜索子智能体上下文：agent.smart_search 命令在 worker 线程执行时，
+    # 会读到本智能体当前选定的接口/模型，从而复用同一模型进行搜索。
+    _ss_token = SMART_SEARCH_CTX.set({"interface": interface, "model": selected_model})
+
     try:
         try:
             async for line in _agent_reply_inner(conversation_id, agent, user_input, mode, canvas, turn, is_relay):
@@ -1426,6 +1483,7 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
         _stop_event.set()
         reset_stop_event(_stop_token)
         TURN_CTX.reset(token)
+        SMART_SEARCH_CTX.reset(_ss_token)
         if _wd_token is not None:
             WORKDIR_CTX.reset(_wd_token)
         # 释放本 agent 占用的所有模型槽
@@ -2005,10 +2063,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 f"问题清单：\n{_invalid_block}\n"
                 "\n正确格式要求：\n"
                 "1. 必须通过 function calling 机制调用工具，**严禁**在正文里手写工具调用；\n"
-                "2. 工具名必须是可用工具列表中的真实名称（如 cmd.run / file.write / file.read 等）；\n"
+                "2. 工具名必须是可用工具列表中的真实名称（如 cmd_run / file_write / file_read 等，可用 system prompt 列出的名字为准）；\n"
                 "3. 参数必须是合法 JSON 对象，字符串值必须用双引号包裹，例如：\n"
-                "   - 正确：cmd.run: {\"command\": \"dir assets\\\\models 2>nul\"}\n"
-                "   - 正确：file.write: {\"path\": \"report.md\", \"content\": \"...\"}\n"
+                "   - 正确：cmd_run: {\"command\": \"dir assets\\\\models 2>nul\"}\n"
+                "   - 正确：file_write: {\"path\": \"report.md\", \"content\": \"...\"}\n"
                 "   - 错误：file.write<|channel|>commentary: {...}  ← 禁止夹带通道标签\n"
                 "   - 错误：{\"to_agent\": 总经理}  ← 裸标识符未加引号\n"
                 "\n请立即用正确格式重新发起调用，不要重复相同的错误。"
@@ -2073,6 +2131,16 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                                         f"与「{target.get('name')}」尚未连线，无法消息；"
                                         f"请先在画布上从你的节点拖一条连线指向对方"
                                     )}
+                            elif is_reply:
+                                # —— 串行模式：回复上游（唤起自己的成员）→ 直接回信，不递归唤起对方 ——
+                                # 上游正阻塞等待本次工具结果，回信内容作为 tool result 直达上游
+                                _reply_lines, result = _serial_reply_upstream(
+                                    conversation_id, agent, target, args.get("message", ""),
+                                    turn, conv,
+                                )
+                                yield f"RN:（串行模式：回信已直接送达 {target.get('name')}）\n"
+                                for _rl in _reply_lines:
+                                    yield _rl
                             else:
                                 yield f"RN:（串行模式：发送消息给 {target.get('name')}，等待对方回复...）\n"
                                 # SPEAK 切换：声明接收方 B 成为当前发言者（A2A 信封由 helper 内部 yield）
@@ -2176,6 +2244,28 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         # —— plan / none 跳过，直接采纳
         workflow_mode = _wf_mode or agent.get("workflow_mode", "none")
         if workflow_mode not in ("spec", "goal"):
+            # —— 并行模式熔断：已启动并行接收方但模型说"我做完了"，不要退出 ——
+            # 并行模式下发送方和接收方各自独立运行，发送方不能因为发完消息就停——
+            # 它也有自己的分工区域要处理（静态审查、冒烟测试等）。
+            # 如果模型过早结束，注入强提示让它继续执行自己的任务。
+            _exec_mode = turn.get("_locked_exec_mode", "serial")
+            if _exec_mode == "parallel" and parallel_tasks:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统提示 · 并行模式]\n"
+                        "你已给团队成员发送了任务分工，他们正在并行执行。"
+                        "但你自己的任务还没做完——你也有分工区域需要处理。\n"
+                        "**立即行动**：停止汇报/等待，继续执行你的工作（调用工具做代码审查、运行测试、"
+                        "检查配置等），直到你负责的部分全部完成。"
+                    ),
+                })
+                verify_retry_count += 1
+                if verify_retry_count >= MAX_VERIFY_RETRIES or is_last_round:
+                    yield f"RN:（并行模式强制采纳：验证重试已达上限或最后一轮）\n"
+                    final_text_parts.append(assistant_text)
+                    break
+                continue
             final_text_parts.append(assistant_text)
             break
 

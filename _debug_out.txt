@@ -1,0 +1,7 @@
+electron exists: True
+cwd: f:\PythonProjects\TraeProjects\智能体集群\frontend
+Test1 PID=9700
+Test1 poll=None
+Test2 PID=13640
+Test2 poll=None
+done

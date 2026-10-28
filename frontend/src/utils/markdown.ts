@@ -1,4 +1,5 @@
 import { marked } from 'marked'
+import { API_BASE } from './env'
 
 marked.setOptions({
   gfm: true,
@@ -273,13 +274,14 @@ function _postChatAttachments(html: string): string {
     })
 
   // 2. 图片缩略图标记：给 /api/fs/image 开头的 <img> 加 data-chat-img 属性 + 样式类
-  //    同时加外层 <span class="chat-img-wrap"> 让点击事件委托有挂载点
+  //    同时把相对路径补成绝对地址（prod 模式页面在 5173，相对路径会被 SPA fallback 吃掉）
   out = out.replace(/<img\b([^>]*)src="(\/api\/fs\/image\?[^"]+)"([^>]*)>/gi,
     (_m, preAttrs, src, postAttrs) => {
       const altMatch = (preAttrs + postAttrs).match(/alt="([^"]*)"/i)
       const alt = altMatch ? altMatch[1] : ''
-      return `<span class="chat-img-wrap" data-chat-img="1" data-src="${escAttrValue(src)}">` +
-        `<img${preAttrs}src="${src}"${postAttrs} class="chat-att-img" alt="${escAttrValue(alt)}">` +
+      const absSrc = API_BASE + src
+      return `<span class="chat-img-wrap" data-chat-img="1" data-src="${escAttrValue(absSrc)}">` +
+        `<img${preAttrs}src="${absSrc}"${postAttrs} class="chat-att-img" alt="${escAttrValue(alt)}">` +
         `</span>`
     })
 

@@ -276,16 +276,18 @@ class DesktopPetWindow:
             def paintEvent(self, e):
                 if not self._pix.isNull():
                     qp = QPainter(self)
-                    # 保持宽高比缩放并居中：宽高比一致时铺满窗口；
-                    # 不一致（过渡帧）时留白居中，绝不拉伸 → 永不变形
-                    if (self._pix.width() == self.width()
-                            and self._pix.height() == self.height()):
-                        qp.drawPixmap(0, 0, self._pix)  # 1:1 快速路径
+                    pw, ph = self.width(), self.height()
+                    iw, ih = self._pix.width(), self._pix.height()
+                    # 画布与窗口始终同宽高比（BASE_W:BASE_H），直接铺满拉伸——
+                    # 避免 KeepAspectRatio 居中取整产生的 ±1px 抖动；比例异常时才等比留白
+                    if iw > 0 and ih > 0 and abs(iw / ih - pw / ph) < 0.02:
+                        qp.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                        qp.drawPixmap(0, 0, pw, ph, self._pix, 0, 0, iw, ih)
                     else:
                         scaled = self._pix.scaled(
                             self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        qp.drawPixmap((self.width() - scaled.width()) // 2,
-                                      (self.height() - scaled.height()) // 2, scaled)
+                        qp.drawPixmap((pw - scaled.width()) // 2,
+                                      (ph - scaled.height()) // 2, scaled)
                     qp.end()
 
             def mousePressEvent(self, e):
@@ -301,14 +303,15 @@ class DesktopPetWindow:
                 self._dragging = False
 
             def wheelEvent(self, e):
-                """滚轮缩放：上滚放大，下滚缩小，以鼠标位置为基点。"""
+                """滚轮缩放：上滚放大，下滚缩小，以鼠标位置为基点。
+                即时到位（无过渡动画），避免逐帧窗口变化引起的取整抖动/闪烁。"""
                 delta = e.angleDelta().y()
                 if delta == 0:
                     return
                 step = 0.1 if delta > 0 else -0.1
                 new_scale = max(0.3, min(3.0, state["scale"] + step))
                 if new_scale != state["scale"]:
-                    _animate_scale_to(new_scale, e.globalPos())  # 平滑缩放，鼠标为基点
+                    _scale_immediate(new_scale, e.globalPos())
 
             def contextMenuEvent(self, e):
                 """右键菜单：鼠标跟随 / 鼠标避让 / 隐藏 / 关闭 / 切换模型。"""
@@ -495,6 +498,23 @@ class DesktopPetWindow:
                 _sync_render_size(s)  # 动画结束：画布一次性对齐目标缩放
 
         scale_timer.timeout.connect(_scale_tick)
+
+        # === 滚轮即时缩放：一次到位（无过渡动画）+ 画布分辨率防抖对齐 ===
+        # 逐帧动画会持续改变窗口尺寸/位置，叠加取整与重绘，产生可见晃动；
+        # 即时缩放只改一次几何，滚动停手后再一次性对齐渲染画布分辨率（保证清晰）。
+        _scale_sync_timer = QTimer()
+        _scale_sync_timer.setSingleShot(True)
+        _scale_sync_timer.timeout.connect(lambda: _sync_render_size(state["scale"]))
+
+        def _scale_immediate(to, anchor):
+            """立即缩放到位：停掉命令动画，设置几何，停手 120ms 后对齐画布。"""
+            anim["active"] = False
+            scale_timer.stop()
+            to = max(0.3, min(3.0, to))
+            if abs(to - state["scale"]) < 0.0005:
+                return
+            _apply_scale_geom(to, anchor, notify=True)
+            _scale_sync_timer.start(120)   # 防抖：滚动间隙不再触发，仅停手后对齐
 
         # === 鼠标跟随（眼睛/头部追踪鼠标，类似桌宠软件）===
         def _toggle_track(checked):

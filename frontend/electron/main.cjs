@@ -35,6 +35,7 @@ _log('app.isPackaged=' + app.isPackaged + ' argv=' + JSON.stringify(process.argv
 // --prod 命令行参数: 直接跑 electron . 时强制用 dist/（开发机调试用）
 const FORCE_PROD = process.argv.includes('--prod')
 const TRAY_ONLY = process.argv.includes('--tray-only')
+const NO_SINGLE_INSTANCE = process.argv.includes('--no-single-instance')
 const IS_DEV = !app.isPackaged && !FORCE_PROD
 const ROOT = path.resolve(__dirname, '..')               // frontend/ (开发) 或 app.asar/ (打包)
 const PROJECT_ROOT = path.resolve(ROOT, '..')           // 项目根（backend/ 在这里）
@@ -735,10 +736,10 @@ function registerIPC() {
 
 // ---------- App 生命周期 ----------
 
-// 单例锁：Windows 受限/沙箱环境下 requestSingleInstanceLock 会静默返回 false，
-// Electron 框架随即自动 quit app（不是抛异常，没法 try-catch）。
-// 所以开发模式直接跳过，打包后再启用。
-if (app.isPackaged) {
+// 单例锁：默认只允许一个实例跑。
+// --no-single-instance 参数：跳过单例锁（开发机调试 / Python launcher 启动时用）
+// app.isPackaged=false 时（直接跑 electron . 而不是打包后的 exe）也跳过
+if (app.isPackaged && !NO_SINGLE_INSTANCE) {
   const gotLock = app.requestSingleInstanceLock()
   _log('isPackaged单例锁 gotLock=' + gotLock)
   if (!gotLock) {
