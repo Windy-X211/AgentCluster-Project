@@ -258,6 +258,17 @@ const avatarMode = computed({
   set(v: string) { settings.update({ avatar_mode: v }) }
 })
 
+// —— 对话区显示 ——
+// 其他智能体发给当前智能体的消息：是否显示、显示在左侧还是右侧
+const showOtherAgents = computed({
+  get() { return settings.data.chat_show_other_agents !== false },
+  set(v: boolean) { settings.update({ chat_show_other_agents: v }) }
+})
+const otherAgentsSide = computed({
+  get() { return settings.data.chat_other_agents_side === 'left' ? 'left' : 'right' },
+  set(v: string) { settings.update({ chat_other_agents_side: v }) }
+})
+
 function avatarPreviewGradient(name: string): string {
   if (avatarMode.value === 'unified') {
     return 'linear-gradient(135deg, var(--accent), var(--accent-2))'
@@ -372,6 +383,33 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
           </div>
           <div class="hint-empty" style="margin-top: 8px">
             只调整文字大小，不影响界面布局；设置自动保存，刷新后仍然生效
+          </div>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">对话区显示</span>
+          </div>
+          <div class="asr-toggle">
+            <button class="asr-switch" :class="{ on: showOtherAgents }" @click="showOtherAgents = !showOtherAgents">
+              <span class="asr-switch-knob"></span>
+            </button>
+            <span class="asr-toggle-text">{{ showOtherAgents ? '显示其他智能体消息' : '隐藏其他智能体消息' }}</span>
+          </div>
+          <div class="appearance-row" style="margin-top: 10px">
+            <label class="radio-label" :class="{ active: otherAgentsSide === 'left', disabled: !showOtherAgents }">
+              <input type="radio" name="otherAgentsSide" value="left" v-model="otherAgentsSide" :disabled="!showOtherAgents" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">显示在左侧</span>
+            </label>
+            <label class="radio-label" :class="{ active: otherAgentsSide === 'right', disabled: !showOtherAgents }">
+              <input type="radio" name="otherAgentsSide" value="right" v-model="otherAgentsSide" :disabled="!showOtherAgents" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">显示在右侧</span>
+            </label>
+          </div>
+          <div class="hint-empty" style="margin-top: 8px">
+            控制当前智能体视角下，其他智能体发给它的消息是否显示、以及显示在左侧还是右侧
           </div>
         </div>
 

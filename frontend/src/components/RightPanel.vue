@@ -27,6 +27,11 @@ const models = useModelStore()
 const settings = useSettingsStore()
 const layout = useLayoutStore()
 
+// —— 对话区显示偏好（设置中心可配置）——
+// 其他智能体发给当前智能体的消息：是否显示、显示在左侧还是右侧
+const showOtherAgents = computed(() => settings.data.chat_show_other_agents !== false)
+const otherAgentsSide = computed<'left' | 'right'>(() => (settings.data.chat_other_agents_side === 'left' ? 'left' : 'right'))
+
 /** 消息是否处于"活动流式"状态：仅当全局确实在流（convs.streaming）且该消息标了 streaming
  *  才视为流式。避免历史遗留的 streaming:true（异常中断被持久化）渲染出永不消失的空泡泡+闪烁光标 */
 function isStreamingMsg(m: any): boolean {
@@ -1112,23 +1117,30 @@ function extractEnvelopeText(envelope: any): string {
 
 // ② 消息范围：对话区是「下拉框选中智能体 A 的专属视角」——
 //     · 左 侧：A 自己的 assistant / tool 输出（agent_id === cur）
-//     · 右 侧：发给 A 的消息载体（user 消息 to_agent_id === cur / a2a 信封 to === cur）
-//     · A 发出的 a2a 信封（from === cur）也出现在左 侧，作为 A 的输出一部分
+//     · 右 侧：发给 A 的消息——用户消息（to_agent_id === cur）+ 其他智能体发给 A 的消息
+//     · A2A 信封卡片（A→B 的 🤝 组）不再渲染；发给 A 的 a2a 信封以纯文本消息气泡呈现
+//     · A2A 协议输入（接力段收到的信封渲染文本）不作为消息渲染
 //     · 其它智能体 B 的 assistant/tool 输出**不进入对话区**（画布节点气泡仍按各自 agent_id 全量展示）
 //     未选中智能体（cur == null）时展示全量。左右侧由 renderItems 分段决定。
 const visibleMsgs = computed(() => {
   const all = conv.value?.messages || []
   const cur = currentAgentId.value
-  if (cur == null) return all
+  const isA2aInput = (m: any): boolean => m.role === 'user' &&
+    (m.a2a_input === true || (typeof m.content === 'string' && m.content.startsWith('【A2A 协议消息】')))
+  if (cur == null) return all.filter((m: any) => !isA2aInput(m))
   const fromOf = (m: any): number | null => m.from_agent_id ?? m.envelope?.from?.agent_id ?? null
   const toOf = (m: any): number | null => m.envelope?.to?.agent_id ?? null
   return all.filter((m: any) => {
-    if (m.role === 'user') return m.to_agent_id == null || m.to_agent_id === cur
-    if (m.role === 'a2a') return fromOf(m) === cur || toOf(m) === cur
-    // 对话区只显示选中智能体自己的输出；其它智能体的 assistant/tool 不进对话区
+    if (m.role === 'user') return !isA2aInput(m) && (m.to_agent_id == null || m.to_agent_id === cur)
+    if (m.role === 'a2a') {
+      if (fromOf(m) === cur) return true                 // 当前智能体自己发出的
+      if (toOf(m) === cur) return showOtherAgents.value  // 其他智能体发给它的（受设置开关控制）
+      return false
+    }
     return m.agent_id === cur
   })
 })
+
 
 /** 渲染项：以"用户消息"为分界线，把每两条用户消息之间的全部智能体输出
  *  （assistant 消息 + a2a 信封组，按原顺序）按「左右侧」再切成连续段：
@@ -1143,7 +1155,7 @@ const renderItems = computed(() => {
   const sideOf = (m: any): 'left' | 'right' => {
     if (m.role === 'user') return 'right'   // 用户是发送方
     if (cur == null) return 'left'          // 未选中智能体：全部靠左（经典布局）
-    if (m.role === 'a2a') return m.envelope?.from?.agent_id === cur ? 'left' : 'right'
+    if (m.role === 'a2a') return m.envelope?.from?.agent_id === cur ? 'left' : otherAgentsSide.value
     return m.agent_id === cur ? 'left' : 'right'
   }
   const out: any[] = []
@@ -1158,20 +1170,14 @@ const renderItems = computed(() => {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result') { i++; continue }
       if (m2.role === 'a2a') {
-        const side = sideOf(m2)
-        if (side === 'right') {
-          // 发给当前选中智能体的信封：直接展开为 plain 子块，模板以消息泡泡显示文字
-          children.push({ kind: 'a2a-plain', msg: m2, idx: i, side })
+        // 只渲染"发给当前智能体"的信封（from !== cur）；自己发出的不渲染信封卡片。
+        // 显示在左/右侧由 sideOf（设置项）决定，与"是否渲染"无关。
+        const isOwn = cur != null && m2.envelope?.from?.agent_id === cur
+        if (cur == null || isOwn) {
           i++
         } else {
-          // 当前智能体发出的信封：保留信封样式，连续的合并成一组
-          const grp: any = { kind: 'a2a', key: 'a2ag-' + i, items: [], latest: m2.envelope, side }
-          while (i < msgs.length && (msgs[i] as any).role === 'a2a' && sideOf(msgs[i]) === side) {
-            grp.items.push({ msg: msgs[i] as any, idx: i })
-            grp.latest = (msgs[i] as any).envelope
-            i++
-          }
-          children.push(grp)
+          children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: sideOf(m2) })
+          i++
         }
       } else {
         children.push({ kind: 'assistant', msg: m2, idx: i, side: sideOf(m2) })
@@ -1180,8 +1186,10 @@ const renderItems = computed(() => {
     }
     const end = i - 1
     if (!children.length) {
-      // 只有工具行（尚无正文）的一轮：占一段，保持原有流式占位行为
-      out.push({ type: 'turn', start, end, children, side: 'left' })
+      // 只有工具行（尚无正文）的一轮：占一段，保持原有流式占位行为；
+      // 若该段不含任何工具行（纯粹由被过滤的 A2A 信封造成）→ 不占段，避免空气泡
+      const hasTool = msgs.slice(start, end + 1).some((mm: any) => mm.role === 'tool_call' || mm.role === 'tool_result')
+      if (hasTool) out.push({ type: 'turn', start, end, children, side: 'left' })
       continue
     }
     // 按左右侧切成连续段：同侧相邻子块归入同一段
@@ -1190,7 +1198,7 @@ const renderItems = computed(() => {
       const side = children[g].side
       const segStart = g === 0 ? start : children[g].idx
       let ge = g
-      while (ge + 1 < children.length && children[ge + 1].side === side) ge++
+      while (ge + 1 < children.length && children[ge + 1].side === side && children[ge + 1].kind === children[g].kind) ge++
       const segEnd = ge + 1 < children.length ? children[ge + 1].idx - 1 : end
       out.push({ type: 'turn', start: segStart, end: segEnd, children: children.slice(g, ge + 1), side })
       g = ge + 1
@@ -1514,6 +1522,7 @@ function turnName(turn: any): string {
 function turnAvatar(turn: any): string {
   return (turnName(turn) || '智能体').slice(0, 1).toUpperCase()
 }
+
 
 function turnAvatarGradient(turn: any): string {
   const mode = settings.data.avatar_mode || 'differentiated'
@@ -2174,6 +2183,13 @@ watch(() => convs.current, async (id) => {
 // ① 节点💬直接对话：回填选中智能体并聚焦输入框
 watch(() => convs.selectedAgentId, (id) => {
   if (id != null) currentAgentId.value = id
+})
+// 切换智能体（下拉框 / 画布💬直接对话）：切回时从后端同步该会话已落库内容，
+// 让界面先显示落库结果、后续流式增量继续渲染（会话正在流式时 refreshConv 内部会跳过）
+watch(() => currentAgentId.value, (id) => {
+  if (id == null) return
+  const cid = convs.current
+  if (cid != null) void convs.refreshConv(cid)
 })
 watch(() => convs.focusChatAt, async (t) => {
   if (!t) return
@@ -2843,7 +2859,7 @@ onBeforeUnmount(() => {
                提出作为正常气泡，过程框折叠为名称后的 "(>过程)" -->
           <div v-else-if="it.type === 'turn'"
                class="msg assistant turn"
-               :class="{ empty: turnEmpty(it), streaming: isTurnActive(it), right: it.side === 'right' }"
+               :class="{ empty: turnEmpty(it), streaming: isTurnActive(it), 'side-r': it.side === 'right' }"
                @contextmenu.prevent.stop="onMsgContextMenu($event, turnLastAssistantIdx(it))">
             <!-- 头像与 col-wrap 同行（像用户消息那样），左右镜像靠 msg 的 flex-direction 切换 -->
             <div class="avatar" :style="{ background: turnAvatarGradient(it) }">{{ turnAvatar(it) }}</div>
@@ -3308,15 +3324,15 @@ onBeforeUnmount(() => {
   border-top-left-radius: 4px;
 }
 /* 右侧段：头像在右、内容区在左；内容区内部 bubble/过程框全部靠右对齐 */
-.msg.assistant.right { align-self: flex-end; flex-direction: row-reverse; }
-.msg.assistant.right .col-wrap { align-items: flex-end; }
-.msg.assistant.right .bubble {
+.msg.assistant.side-r { align-self: flex-end; flex-direction: row-reverse; }
+.msg.assistant.side-r .col-wrap { align-items: flex-end; }
+.msg.assistant.side-r .bubble {
   border-top-left-radius: 8px;
   border-top-right-radius: 4px;
   align-self: flex-end;
   max-width: 100%;
 }
-.msg.assistant.right .process-window { align-self: flex-end; }
+.msg.assistant.side-r .process-window { align-self: flex-end; }
 .msg.assistant.streaming .bubble { border-color: rgba(var(--accent-rgb), 0.4); box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.1); }
 /* 思考过程：单行（流式打字机 / 停止后截断首行），点击展开全文 */
 .think-stream {

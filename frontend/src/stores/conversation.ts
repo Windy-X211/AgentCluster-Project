@@ -29,9 +29,9 @@ export function stripContinueTag(s: string | null | undefined): string {
 // 结束流式 assistant 的空占位逻辑已统一收敛到 _finishRun 兜底清理（串并穿插输出下，
 // 一刀切关末尾会关错发言者；改由 SPEAK:/A2A: 按 agent 定位关闭 + 运行收尾统一清理）。
 
-/** 从末尾往前找指定 agent 的流式 assistant 索引（越过工具行/信封/其它 agent 的消息，止于 user 边界）。
- *  串并穿插输出（SPEAK:A→B片段→SPEAK:A→A片段…）下按 agent 归属定位，
- *  才能保证每个 agent 的正文始终汇成一条完整消息（不碎片化、不错归属）。 */
+/** 从末尾往前找指定 agent **仍在流式**的 assistant 索引（越过工具行/信封/其它 agent 的消息，止于 user 边界）。
+ *  串并穿插输出下按 agent 归属定位；发言者切走（SPEAK:/A2A:/F:）即闭合泡泡，
+ *  故只有"同一段连续输出"内的行能命中，该 agent 再次被唤起时会新开泡泡。 */
 function _lastStreamingAssistantIdx(msgs: RichMsg[], agentId: number | null | undefined): number {
   if (agentId == null) return -1
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -46,8 +46,8 @@ function _lastStreamingAssistantIdx(msgs: RichMsg[], agentId: number | null | un
  *  1) 该 agent 存在 streaming 消息（_lastStreamingAssistantIdx 定位）；
  *  2) 且它之后（本轮内）没有该 agent 自己的工具行——工具调用是段落边界，
  *     工具后的正文/思考应新开一条（对齐历史版本"工具前解说 / 工具后总结分段、不混一条"）。
- *  串并穿插输出下，同一 agent 因 SPEAK 切回被分批送达的同性质内容仍汇成一段；
- *  工具前后的内容则不会错误拼接。 */
+ *  同一 agent 的一段连续输出内（发言者未切走）分批送达的内容仍汇成一段；
+ *  发言者一旦切走/本轮定稿，泡泡已闭合不再命中 → 新发言新开一段，工具前后也不拼接。 */
 function _resumableAssistantOf(msgs: RichMsg[], agentId: number | null | undefined): RichMsg | null {
   const i = _lastStreamingAssistantIdx(msgs, agentId)
   if (i < 0) return null
@@ -80,7 +80,7 @@ export interface RichMsg {
   ts?: string
   startedAt?: number    // 流式开始毫秒时间戳（前端思考计时用，不依赖后端 ts）
   endedAt?: number      // 流式结束毫秒时间戳（用于计算最终用时，避免重挂载后 Date.now() 漂移）
-  relay?: boolean      // 接力链消息（聊天区过滤，画布气泡保留）
+  relay?: boolean      // 已弃用（仅历史数据兼容）；显示不再依赖它，归属只按 agent_id / a2a 信封解析
   agent_id?: number
   from_agent_id?: number  // a2a 信封额外字段：发送方 agent_id
   to_agent_id?: number    // 用户消息接收方：发送时下拉框选中的智能体（对话区按它过滤"接收的消息"）
@@ -165,7 +165,7 @@ export function sortConvsByActivity(list: any[]): any[] {
   })
 }
 
-/** 会话展示名：最新一条有内容的用户/助手消息（非 relay），单行截 20 字；无消息回退 c.name */
+/** 会话展示名：最新一条有内容的用户/助手消息，单行截 20 字；无消息回退 c.name */
 export function convDisplayName(c: any): string {
   const msgs = c?.messages || []
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -517,7 +517,7 @@ export const useConvStore = defineStore('conv', {
     // 会话 → 运行时锁定的执行模式（镜像后端 turn._locked_exec_mode：会话开始后切模式不影响本轮）。
     // 串行 = speakingAgents 替换（同时只有一个高亮）；并行 = 累加（多个接收方同时高亮）。
     _execModeLocked: {} as Record<number, string | null>,
-    _relayPhase: new Set<number>(),                             // 已进入接力段的会话集合
+
     _handoffActive: new Set<number>(),                          // 正在 cluster.handoff / A2A 接力的会话集合
     _callEdges: {} as Record<number, { from: number; to: number; tcId: string }[]>, // 会话 → call 进行中的连线流动
     // 能力调用流式状态：会话 → (agent_id → { name, phase })
@@ -593,6 +593,9 @@ export const useConvStore = defineStore('conv', {
       // 清洗历史遗留的 streaming 标记：fetch 时不可能存在进行中的流，
       // 防止之前异常中断被持久化的 streaming:true 在重开后渲染成"空泡泡+永久闪烁光标"
       for (const c of list) {
+        // 正在流式的会话：跳过清洗（保留本地实时流式消息），整对象替换会让
+        // send()/_handleLine 持有的引用脱钩、收尾 flush 用旧快照覆盖后端 → 运行时切换智能体丢输出
+        if (this.streamingConvIds.has(c?.id)) continue
         for (const m of c?.messages || []) {
           if (m && typeof m === 'object') {
             if (m.streaming) m.streaming = false
@@ -603,7 +606,20 @@ export const useConvStore = defineStore('conv', {
           }
         }
       }
-      this.list = sortConvsByActivity(list)
+      // 流式中的会话改用本地对象（含实时输出），其余用服务端最新；避免运行期对象脱钩
+      const merged = list.map((c: any) => {
+        if (this.streamingConvIds.has(c?.id)) {
+          const loc = this.list.find(x => x.id === c.id) as any
+          if (loc) {
+            for (const k of ['mode', 'canvas_id', 'name', 'agent_ids', 'workdir', 'execution_mode']) {
+              if (k in c) loc[k] = c[k]
+            }
+            return loc
+          }
+        }
+        return c
+      })
+      this.list = sortConvsByActivity(merged)
     },
     async create(d: any = { name: '新对话', agent_ids: [] }) {
       const c = await api.convs.create(d); this.list = sortConvsByActivity([c, ...this.list]); this.current = c.id; return c
@@ -611,8 +627,33 @@ export const useConvStore = defineStore('conv', {
     async update(id: number, d: any) {
       const c = await api.convs.update(id, d)
       const i = this.list.findIndex(x => x.id === id)
-      if (i >= 0) this.list[i] = c
+      // 只合并元信息，保留本地 messages 引用：运行中 send()/_handleLine 往 list 里的会话对象
+      // 写流式输出，整对象替换会让输出写到被丢弃的旧对象上 → 界面不更新 + 收尾 flush 用旧快照
+      // 覆盖后端已完整落库的内容（运行中切换智能体时丢输出）。
+      if (i >= 0 && c) {
+        const cur = this.list[i] as any
+        for (const k of ['mode', 'canvas_id', 'name', 'agent_ids', 'workdir', 'execution_mode']) {
+          if (k in c) cur[k] = (c as any)[k]
+        }
+      }
       return c
+    },
+    /** 从后端重新拉取单个会话并对齐到本地（"切回智能体时先同步已落库内容"）。
+     *  仅在该会话无流式运行时执行：若会话正在流式，本地已含实时输出，
+     *  整体替换会打断后续流式渲染，故以本地为准直接跳过。 */
+    async refreshConv(cid: number) {
+      if (cid == null || this.streamingConvIds.has(cid)) return
+      try {
+        const c = await api.convs.get(cid)
+        if (!c || !Array.isArray(c.messages)) return
+        for (const m of c.messages) {
+          if (m && typeof m === 'object' && m.streaming) m.streaming = false
+          if (m && !m.image_refs && Array.isArray(m.images) && m.images.length) m.image_refs = m.images
+        }
+        const i = this.list.findIndex(x => x.id === cid)
+        if (i >= 0) this.list[i] = c
+        else this.list.push(c)
+      } catch { /* 会话可能已被删除 / 后端短暂不可达 → 静默 */ }
     },
     async remove(id: number) { await api.convs.remove(id); this.list = this.list.filter(x => x.id !== id); if (this.current === id) this.current = this.list[0]?.id ?? null },
     async removeMany(ids: number[]) {
@@ -749,7 +790,7 @@ export const useConvStore = defineStore('conv', {
 
       if (isFirstRun) {
         // 链首不是接力段：复位本会话的接力/工具状态
-        this._relayPhase.delete(cid)
+
         this._handoffActive.delete(cid)
         this._callEdges[cid] = []
         this._toolCalls[cid] = {}
@@ -890,7 +931,7 @@ export const useConvStore = defineStore('conv', {
           this._ctrls.set(runKey, ctrl)
           const done = await this._drainEventStream(
             c, `${API_BASE}/api/conversations/${cid}/events?since=${seq}` +
-               (agentId != null ? `&agent_id=${agentId}` : ''), { signal: ctrl.signal }, runKey)
+          (agentId != null ? `&agent_id=${agentId}` : ''), { signal: ctrl.signal }, runKey)
           if (done) return true
           // events 流中途又断（未收到 DONE）→ 下一轮重试（_runSeq 已前进，从新断点续播）
         } catch (e: any) {
@@ -947,7 +988,7 @@ export const useConvStore = defineStore('conv', {
         this._speakingAgents[cid] = new Set()
         this._originSpeaker[cid] = null
         this._execModeLocked[cid] = null
-        this._relayPhase.delete(cid)
+
         this._handoffActive.delete(cid)
         this._callEdges[cid] = []
         this._toolCalls[cid] = {}
@@ -1241,12 +1282,7 @@ export const useConvStore = defineStore('conv', {
         this._runParts[runKey].add(id)
       }
       regPart(curAgent)
-      // 接力段（relay）只应隐藏「下游 agent」的输出：SPEAK 切回源头发送者（originSpeaker）后，
-      // 源头的后续输出必须恢复可见——否则 cluster.send_message 往返后（A→SPEAK:B→B输出→SPEAK:A→A继续输出），
-      // A 的正文仍被标 relay=true，被 visibleMsgs 过滤 → 过程框停在信封卡片上不再更新
-      const _originAid = this._originSpeaker[cid] ?? null
-      const relayPhase = this._relayPhase.has(cid) &&
-        (_originAid == null || curAgent !== _originAid)
+
 
       if (line === 'DONE') {
         // 本运行结束：只有该会话没有其它并发运行时才复位会话级共享状态
@@ -1258,7 +1294,7 @@ export const useConvStore = defineStore('conv', {
         const othersLeft = [...ra].some(a => a !== myAgent)
         if (!othersLeft) {
           this._handoffActive.delete(cid)
-          this._relayPhase.delete(cid)
+
           this._callEdges[cid] = []
           this._toolCalls[cid] = {}
           this._toolPending[cid] = {}
@@ -1303,7 +1339,7 @@ export const useConvStore = defineStore('conv', {
         if (own) {
           own.content = ((own.content || '') + (own.content ? '\n\n' : '') + text)
         } else {
-          msgs.push({ role: 'assistant', content: text, streaming: false, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
+          msgs.push({ role: 'assistant', content: text, streaming: false, ts: new Date().toISOString(), agent_id: curAgent ?? undefined })
         }
         return
       }
@@ -1320,7 +1356,7 @@ export const useConvStore = defineStore('conv', {
           console.log('[RN] 已累加到本 agent 的流式消息，累计总长=' + (own.reasoning || '').length)
         } else {
           // 思考先于正文到达（快通道常见）→ 先开一条流式 assistant 承接思考
-          msgs.push({ role: 'assistant', content: '', reasoning: text, streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
+          msgs.push({ role: 'assistant', content: '', reasoning: text, streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), agent_id: curAgent ?? undefined })
           console.log('[RN] 懒创建新的 assistant 来承接思考')
         }
       } else if (line.startsWith('T:')) {
@@ -1335,7 +1371,7 @@ export const useConvStore = defineStore('conv', {
         } else {
           // 懒创建：正文真正到达时才开新的 assistant（不在 R: 后预建空泡泡，
           // 一次性多工具调用会产生 N-1 条空 assistant → 空消息泡泡）
-          msgs.push({ role: 'assistant', content: text, streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
+          msgs.push({ role: 'assistant', content: text, streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), agent_id: curAgent ?? undefined })
         }
       } else if (line.startsWith('TS:')) {
         // 能力调用开始（名称已确定，参数仍在流式）→ 立即显示"正在调用: xxx"
@@ -1379,18 +1415,21 @@ export const useConvStore = defineStore('conv', {
         // 结束「当前发言者自己的」流式 assistant（串并穿插下末尾可能是其他 agent 的消息，不能一刀切）
         const ownC = _resumableAssistantOf(msgs, curAgent)
         if (ownC) ownC.streaming = false
-        // 工具卡片要挂在「前面最近一条同 agent 的 assistant」下才渲染得出来：
-        // 末尾（跳过连续 tool_call/tool_result 后）不是同 agent 的 assistant
-        // （接力切换发言者 / 正文还没到）→ 补一条空 assistant 作为工具行锚点
-        let k = msgs.length - 1
-        while (k >= 0 && (msgs[k].role === 'tool_call' || msgs[k].role === 'tool_result')) k--
-        const anchor = k >= 0 ? msgs[k] : null
-        if (anchor && anchor.role === 'assistant' && (anchor.agent_id ?? null) === (curAgent ?? null)) {
-          if (anchor.agent_id == null && curAgent != null) anchor.agent_id = curAgent
-        } else {
-          msgs.push({ role: 'assistant', content: '', ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
+        // 去重：同一次工具调用（同一 tool_call_id）只保留一条，避免接力/多连接下重复落库
+        if (!msgs.some((mm: any) => mm.role === 'tool_call' && mm.tool_call_id === tcId)) {
+          // 工具卡片要挂在「前面最近一条同 agent 的 assistant」下才渲染得出来：
+          // 末尾（跳过连续 tool_call/tool_result 后）不是同 agent 的 assistant
+          // （接力切换发言者 / 正文还没到）→ 补一条空 assistant 作为工具行锚点
+          let k = msgs.length - 1
+          while (k >= 0 && (msgs[k].role === 'tool_call' || msgs[k].role === 'tool_result')) k--
+          const anchor = k >= 0 ? msgs[k] : null
+          if (anchor && anchor.role === 'assistant' && (anchor.agent_id ?? null) === (curAgent ?? null)) {
+            if (anchor.agent_id == null && curAgent != null) anchor.agent_id = curAgent
+          } else {
+            msgs.push({ role: 'assistant', content: '', ts: new Date().toISOString(), startedAt: Date.now(), agent_id: curAgent ?? undefined })
+          }
+          msgs.push({ role: 'tool_call', content: '', name: tcName, tool_call_id: tcId, args, ts: new Date().toISOString(), agent_id: curAgent ?? undefined })
         }
-        msgs.push({ role: 'tool_call', content: '', name: tcName, tool_call_id: tcId, args, ts: new Date().toISOString(), relay: relayPhase, agent_id: curAgent ?? undefined })
       } else if (line.startsWith('R:')) {
         // tool_result: id|{json result}
         const rest = line.slice(2); const sep = rest.indexOf('|')
@@ -1399,7 +1438,13 @@ export const useConvStore = defineStore('conv', {
         // tool_result 的 agent_id = 对应 tool_call 的发起者
         const tc = msgs.find((m: RichMsg) => m.role === 'tool_call' && m.tool_call_id === tcId)
         const tcAgent = tc?.agent_id ?? curAgent ?? undefined
-        msgs.push({ role: 'tool_result', content: '', tool_call_id: tcId, result, ts: new Date().toISOString(), relay: relayPhase, agent_id: tcAgent })
+        const existedR = msgs.find((m: RichMsg) => m.role === 'tool_result' && m.tool_call_id === tcId)
+        if (existedR) {
+          existedR.result = result
+          existedR.agent_id = tcAgent
+        } else {
+          msgs.push({ role: 'tool_result', content: '', tool_call_id: tcId, result, ts: new Date().toISOString(), agent_id: tcAgent })
+        }
         // 文件被改动的工具执行完 → 广播事件，打开着的工作区面板立即刷新（不用等轮询间隔）
         if (tc?.name && MUTATING_FILE_TOOLS.has(_sanitizeToolName(tc.name))) {
           try { window.dispatchEvent(new CustomEvent('agentcluster:workspace-changed')) } catch { /* 非浏览器环境忽略 */ }
@@ -1436,7 +1481,7 @@ export const useConvStore = defineStore('conv', {
           const own = _resumableAssistantOf(msgs, curAgent)
           const hasOpen = !!own && !(own.content || '').trim()
           if (!hasOpen) {
-            msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), relay: relayPhase, agent_id: curAgent ?? undefined })
+            msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), agent_id: curAgent ?? undefined })
           }
         }
       } else if (line.startsWith('I:')) {
@@ -1473,6 +1518,13 @@ export const useConvStore = defineStore('conv', {
       } else if (line.startsWith('F:')) {
         // 最终完整文本（通常前端不需要，已经有流式拼接了）
         this._callTargetOutputted(cid)
+        // 本轮正文定稿 → 闭合当前发言者泡泡（再次被唤起/发言时必须新开，不续写旧泡泡）
+        const finalIdx = _lastStreamingAssistantIdx(msgs, curAgent)
+        if (finalIdx >= 0) {
+          const fin = msgs[finalIdx] as any
+          fin.streaming = false
+          if (typeof fin.startedAt === 'number' && typeof fin.endedAt !== 'number') fin.endedAt = Date.now()
+        }
         // 并行模式下：源头 speaker 输出最终文本后立即从 speakingAgents 移除，
         // 让节点不再高亮——即使后端还在等待接收方完成
         const originId = this._originSpeaker[cid]
@@ -1497,13 +1549,16 @@ export const useConvStore = defineStore('conv', {
           const oldIdx = _lastStreamingAssistantIdx(msgs, curAgent)
           if (oldIdx >= 0) {
             const old = msgs[oldIdx] as any
-            // 只清空的流式占位（R: 后开的"正在输入"，被切换打断即无意义，直接移除；
-            // 工具锚点是无 streaming 标记的 C: 行空 assistant，不受影响）。
-            // 有内容的流式消息继续保持 streaming——该 agent 再次发言时按归属续写，
-            // 汇成一条完整消息（对齐历史版本"每个 agent 一段正文"的视觉）。
+            // 发言权交出去 → 前一发言者的泡泡必须闭合：
+            // 空占位直接移除（R: 后开的"正在输入"无意义；工具锚点无 streaming 标记不受影响）；
+            // 有内容的结束流式并补结束时间，绝不保留 streaming 供下次续写——
+            // 否则该 agent 再次被唤起时的输出会粘连进旧泡泡（A 发消息给 B、B 回信再唤起 A 的场景）。
             if (!(old.content || '').trim() && !(old.reasoning || '').trim()) {
               old.streaming = false
               msgs.splice(oldIdx, 1)
+            } else {
+              old.streaming = false
+              if (typeof old.startedAt === 'number' && typeof old.endedAt !== 'number') old.endedAt = Date.now()
             }
           }
         }
@@ -1513,7 +1568,7 @@ export const useConvStore = defineStore('conv', {
           curAgent = id   // 同步更新局部变量，让后续 A2A:/T:/RN:/C: 行用正确的 agent_id
           regPart(id)
         }
-        this._relayPhase.add(cid)
+
         this._handoffActive.add(cid)
       } else if (line.startsWith('A2A:')) {
         // A2A 消息信封：结束「发送方自己的」流式消息 → 插入信封卡片（正文由后续 T: 懒创建）
@@ -1526,10 +1581,13 @@ export const useConvStore = defineStore('conv', {
         const fromIdx = _lastStreamingAssistantIdx(msgs, fromAid)
         if (fromIdx >= 0) {
           const fromMsg = msgs[fromIdx] as any
-          // 同 SPEAK:：只有空占位直接移除，有内容的流式消息保持（后续按归属续写）
+          // 同 SPEAK:：发送方泡泡闭合——空占位移除，有内容结束流式并补 endedAt（不保留续写）
           if (!(fromMsg.content || '').trim() && !(fromMsg.reasoning || '').trim()) {
             fromMsg.streaming = false
             msgs.splice(fromIdx, 1)
+          } else {
+            fromMsg.streaming = false
+            if (typeof fromMsg.startedAt === 'number' && typeof fromMsg.endedAt !== 'number') fromMsg.endedAt = Date.now()
           }
         }
         // 信封带双 agent_id：from.agent_id=发送方（画布源节点也应显示这条"我发出的"消息）
