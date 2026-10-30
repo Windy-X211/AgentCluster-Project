@@ -1,5 +1,6 @@
 import { marked } from 'marked'
 import { API_BASE } from './env'
+import { parseVizSegments, hasVizSegment } from '@/extensions/viz-parse'
 
 marked.setOptions({
   gfm: true,
@@ -229,7 +230,33 @@ export function renderMarkdown(text: string | undefined | null): string {
  * 产出的 HTML 仍通过 sanitizeHtml，保证安全。
  */
 export function renderChatMarkdown(text: string | undefined | null): string {
-  const html = renderMarkdown(text)
+  // —— viz 协议：若含 ```viz:type 代码块或裸 __viz__ JSON，分段渲染 ——
+  const src = (text || '')
+  if (hasVizSegment(src)) {
+    const segs = parseVizSegments(src)
+    let out = ''
+    for (const s of segs) {
+      if (s.kind === 'md') {
+        const html = renderMarkdown(s.text || '')
+        out += html ? _postChatAttachments(html) : ''
+      } else {
+        // viz 占位 div：data-viz-type + data-viz-enc(base64(Unicode-safe JSON)) + data-viz-valid
+        // 挂载层（RightPanel）扫描 .viz-slot 并动态挂载 VizBlock 组件
+        let enc = ''
+        let valid = '0'
+        if (s.data != null) {
+          try {
+            enc = btoa(unescape(encodeURIComponent(JSON.stringify(s.data))))
+            valid = '1'
+          } catch { /* 编码失败，保留 invalid */ }
+        }
+        out += `<div class="viz-slot" data-viz-type="${escAttrValue(s.type || '')}" data-viz-enc="${enc}" data-viz-valid="${valid}" data-viz-raw="${escAttrValue((s.raw || '').slice(0, 2000))}"></div>`
+      }
+    }
+    return out
+  }
+  // —— 普通消息：原逻辑 ——
+  const html = renderMarkdown(src)
   if (!html) return html
   return _postChatAttachments(html)
 }

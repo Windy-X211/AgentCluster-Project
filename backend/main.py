@@ -8,7 +8,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
 
 from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, ROOT
-from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds
+from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions
 
 from datetime import datetime
 
@@ -130,6 +130,12 @@ def _ensure_orchestrator():
 async def lifespan(app: FastAPI):
     init_store()
     _ensure_orchestrator()
+    # 首次启动自动安装核心功能拓展（visual_interaction 等）
+    try:
+        from api.extensions import auto_install_first_time
+        auto_install_first_time()
+    except Exception as e:
+        print(f"[main] 自动安装拓展失败（不阻断启动）：{e}")
     yield
 
 
@@ -223,6 +229,7 @@ ROUTES = [
     ("plugins_debug", plugins_debug.router),
     ("asr", asr.router),
     ("backgrounds", backgrounds.router),
+    ("extensions", extensions.router),
 ]
 for name, r in ROUTES:
     app.include_router(r, prefix=f"/api/{name}", tags=[name])
@@ -616,8 +623,17 @@ def fs_image(path: str = ""):
             raise HTTPException(403, f"path 超出允许范围：{path}")
         fp = p
     if not fp.is_file():
-        from fastapi import HTTPException
-        raise HTTPException(404, f"文件不存在：{path}")
+        # fallback: 如果原始 path 是相对路径，遍历所有工作区根目录搜索
+        # AI 常输出 "tyut_img/campus1.jpg" 这样的相对路径，文件实际在会话工作区下
+        if not _P(path).is_absolute():
+            for root in _collect_workdir_roots():
+                candidate = root / path
+                if candidate.is_file():
+                    fp = candidate
+                    break
+        if not fp.is_file():
+            from fastapi import HTTPException
+            raise HTTPException(404, f"文件不存在：{path}")
     mime = _IMG_EXT_MIME.get(fp.suffix.lower(), "")
     if not mime:
         from fastapi import HTTPException

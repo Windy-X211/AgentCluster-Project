@@ -293,5 +293,15 @@ export const api = {
   autostart: {
     get: () => req<{ enabled: boolean; command: string; supported: boolean }>('/autostart'),
     set: (enabled: boolean) => req('/autostart', { method: 'PUT', body: JSON.stringify({ enabled }) }),
+  },
+  extensions: {
+    list: () => req<{ market: any[]; installed: Record<string, any> }>('/extensions'),
+    active: () => req<{ extensions: Array<{ id: string; manifest: any; files: Record<string, string> }> }>('/extensions/active'),
+    install: (id: string) => req<any>('/extensions/install', { method: 'POST', body: JSON.stringify({ id }) }),
+    enable: (id: string) => req<any>(`/extensions/${encodeURIComponent(id)}/enable`, { method: 'POST' }),
+    disable: (id: string) => req<any>(`/extensions/${encodeURIComponent(id)}/disable`, { method: 'POST' }),
+    uninstall: (id: string) => req<any>(`/extensions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    file: (id: string, path: string) =>
+      req<{ ok: boolean; content: string }>(`/extensions/${encodeURIComponent(id)}/file?path=` + encodeURIComponent(path)),
   }
 }

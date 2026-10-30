@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, nextTick, render, createVNode } from 'vue'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
 import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
 import { renderChatMarkdown } from '@/utils/markdown'
@@ -8,6 +8,8 @@ import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
 import { api } from '@/api'
 import { API_BASE } from '@/utils/env'
 import FileViewer, { type ViewerFile } from './FileViewer.vue'
+import VizBlock from '@/extensions/VizBlock.vue'
+import { setExtAPIImpl } from '@/extensions/loader'
 
 /** 去掉消息首尾纯空行（保留中间换行）—— 用于修复气泡顶部空白；顺带剥离 <continue> 续跑标记 */
 function trimMsgContent(s: string | undefined): string {
@@ -2613,6 +2615,44 @@ function onChatAttachClick(e: MouseEvent) {
   }
 }
 
+// —— viz 拓展占位挂载：扫描消息区 .viz-slot，动态挂载 VizBlock 组件 ——
+const _vizMounts = new Map<HTMLElement, true>()
+function _decodeVizData(enc: string): any {
+  if (!enc) return null
+  try { return JSON.parse(decodeURIComponent(escape(atob(enc)))) } catch { return null }
+}
+function mountVizSlots() {
+  const root = msgBox.value
+  if (!root) return
+  // 1. 清理已脱离 DOM 的挂载
+  for (const el of _vizMounts.keys()) {
+    if (!el.isConnected) {
+      try { render(null, el) } catch { /* ignore */ }
+      _vizMounts.delete(el)
+    }
+  }
+  // 2. 挂载新的 .viz-slot（仅 valid=1）
+  const slots = root.querySelectorAll<HTMLElement>('.viz-slot[data-viz-valid="1"]:not([data-viz-mounted])')
+  slots.forEach(el => {
+    const type = el.getAttribute('data-viz-type') || ''
+    const data = _decodeVizData(el.getAttribute('data-viz-enc') || '')
+    const raw = el.getAttribute('data-viz-raw') || ''
+    if (!type) return
+    try {
+      const vnode = createVNode(VizBlock, { type, data, raw, extAPI: (window as any).__extAPI__ })
+      render(vnode, el)
+      el.setAttribute('data-viz-mounted', '1')
+      _vizMounts.set(el, true)
+    } catch (e) { console.error('[viz] 挂载失败:', e) }
+  })
+}
+function unmountAllVizSlots() {
+  for (const el of _vizMounts.keys()) {
+    try { render(null, el) } catch { /* ignore */ }
+  }
+  _vizMounts.clear()
+}
+
 onMounted(async () => {
   // 父级 Home 的 fetch 可能还没返回，这里先确保拉到列表，避免误判为空而重复新建
   if (!convs.list.length) await convs.fetch()
@@ -2620,7 +2660,19 @@ onMounted(async () => {
   if (!currentAgentId.value && agents.list.length) currentAgentId.value = agents.list[0].id
   if (!convs.list.length) await newConv()
   scheduleCtxRefresh()
+  // —— 注入 extAPI 给拓展渲染器 ——
+  setExtAPIImpl({
+    sendUserInput: (text: string) => { input.value = text; void send() },
+    insertInput: (text: string) => { input.value = text },
+    imageURL: (path: string) => `${API_BASE}/api/fs/image?path=${encodeURIComponent(path)}`,
+    openLightbox: (src: string) => openLightbox(src),
+    getSettings: () => settings.data,
+  })
 })
+// 消息列表变化 / 流式停止后扫描挂载 viz 占位
+watch(() => [renderItems.value.length, convs.streaming], () => {
+  nextTick(() => { mountVizSlots(); if (!convs.streaming) nextTick(mountVizSlots) })
+}, { flush: 'post' })
 // 从设置/能力管理等页面返回首页时，浏览器/KeepAlive 会把脱离文档流的可滚动元素
 // scrollTop 归零；这里保存 / 还原消息区与会话列表的滚动位置。
 // 滚动位置存在 layout store（仅内存），既能覆盖 KeepAlive 命中的情况，
@@ -2675,10 +2727,12 @@ onDeactivated(() => {
   window.removeEventListener('mouseup', onLbResizeEnd)
   window.removeEventListener('mousemove', onLbPanMove)
   window.removeEventListener('mouseup', onLbPanEnd)
+  unmountAllVizSlots()
 })
 onBeforeUnmount(() => {
   // 清理附件预览 URL
   for (const a of attachments.value) { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl) }
+  unmountAllVizSlots()
 })
 </script>
 

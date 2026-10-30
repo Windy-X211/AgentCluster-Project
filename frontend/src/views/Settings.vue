@@ -972,28 +972,39 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
   background: linear-gradient(135deg, #c47f8d, #ba71a2);
 }
 
-/* —— 文字大小滑块 —— */
+/* —— 文字大小滑块（小巧精致）—— */
 .font-scale-row { display: flex; align-items: center; gap: 10px; }
 .font-scale-edge { font-size: calc(12px * var(--font-scale)); opacity: .55; flex-shrink: 0; }
 .font-scale-slider {
   flex: 1; min-width: 0;
   -webkit-appearance: none; appearance: none;
-  height: 4px; border-radius: 2px;
+  height: 3px; border-radius: 2px;
   background: rgba(var(--surface-rgb), 0.12);
   outline: none; cursor: pointer;
+  padding: 4px 0;
+}
+.font-scale-slider::-webkit-slider-runnable-track {
+  height: 3px; border-radius: 2px;
+  background: rgba(var(--surface-rgb), 0.15);
+}
+.font-scale-slider::-moz-range-track {
+  height: 3px; border-radius: 2px; border: none;
+  background: rgba(var(--surface-rgb), 0.15);
 }
 .font-scale-slider::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none;
-  width: 16px; height: 16px; border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 2px 6px rgba(var(--accent-rgb), 0.4);
-  transition: transform .12s;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent-light, #9db4ff);
+  box-shadow: 0 1px 3px rgba(0,0,0,.35), 0 0 0 1px rgba(255,255,255,.15) inset;
+  margin-top: -3.5px;
+  transition: transform .1s, box-shadow .1s;
 }
-.font-scale-slider::-webkit-slider-thumb:hover { transform: scale(1.15); }
+.font-scale-slider::-webkit-slider-thumb:hover { transform: scale(1.2); }
+.font-scale-slider::-webkit-slider-thumb:active { transform: scale(1.05); }
 .font-scale-slider::-moz-range-thumb {
-  width: 16px; height: 16px; border-radius: 50%; border: none;
-  background: var(--accent); cursor: pointer;
-  box-shadow: 0 2px 6px rgba(var(--accent-rgb), 0.4);
+  width: 10px; height: 10px; border-radius: 50%; border: none;
+  background: var(--accent-light, #9db4ff); cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0,0,0,.35);
 }
 .font-scale-value {
   font-size: calc(12px * var(--font-scale)); font-weight: 600; min-width: 44px; text-align: right;

@@ -1,8 +1,7 @@
 import { defineStore } from 'pinia'
 
 const KEY = 'agentcluster.layout.v1'
-export const RIGHT_MIN = 240
-export const RIGHT_MAX = 820
+export const RIGHT_MIN = 180
 export const RIGHT_DEFAULT = 300
 export const FONT_SCALE_MIN = 0.85
 export const FONT_SCALE_MAX = 1.4
@@ -42,7 +41,7 @@ function writeStore(patch: Record<string, any>) {
 function readWidth(): number {
   const n = Number(readStore()?.rightWidth)
   if (!isFinite(n) || n <= 0) return RIGHT_DEFAULT
-  return Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, Math.round(n)))
+  return Math.max(RIGHT_MIN, Math.round(n))
 }
 
 function readFontScale(): number {
@@ -89,7 +88,7 @@ export const useLayoutStore = defineStore('layout', {
   }),
   actions: {
     setRightWidth(v: number) {
-      const n = Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, Math.round(v)))
+      const n = Math.max(RIGHT_MIN, Math.round(v))
       this.rightWidth = n
       writeStore({ rightWidth: n })
     },

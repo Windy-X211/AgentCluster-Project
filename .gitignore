@@ -3,6 +3,7 @@
 !/AppData/skills/
 !/AppData/backgrounds/
 !/AppData/agents/
+!/AppData/extensions/
 /AppData/agents/*
 !/AppData/agents/8.json
 !/AppData/agents/24.json

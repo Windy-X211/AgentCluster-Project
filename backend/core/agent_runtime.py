@@ -847,6 +847,15 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         )
     elif not tools:
         parts.append("\n## 能力\n你当前没有额外工具，直接基于角色知识与对话上下文回答即可。")
+    # —— 功能拓展注入：已启用拓展声明的 system_prompt_file 自动追加 ——
+    # （如可视化交互拓展启用时，所有智能体自动获得 viz 输出协议，用户无需手动指明）
+    try:
+        from api.extensions import collect_extension_system_prompts
+        _ext_sp = collect_extension_system_prompts()
+        for _e in _ext_sp:
+            parts.append(f"\n## 功能拓展协议 · {_e['name']}（系统自动注入）\n{_e['content']}")
+    except Exception as e:
+        print(f"[agent_runtime] WARN 拓展 system prompt 注入失败：{e}")
     if cluster_context:
         parts.append(f"\n【集群上下文】{cluster_context}")
     prompt = "\n".join(parts)
