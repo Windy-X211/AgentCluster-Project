@@ -1045,13 +1045,21 @@ function reasoningLevelLabel(v?: string): string {
 
 async function fetchReasoningCapabilities() {
   const a = currentAgent.value
-  if (!a || !a.interface_id || !a.model) {
+  if (!a || !a.interface_id) {
+    reasoningSupported.value = false
+    return
+  }
+  const mi = models.list.find((m: any) => m.id === a.interface_id)
+  const modelName = a.model || mi?.default_model || ''
+  if (!modelName) {
     reasoningSupported.value = false
     return
   }
   reasoningLoading.value = true
+  reasoningLevels.value = DEFAULT_REASONING_LEVELS
+  reasoningSupported.value = true
   try {
-    const res = await api.models.detectReasoning(a.interface_id, a.model)
+    const res = await api.models.detectReasoning(a.interface_id, modelName)
     if (res.status === 'confirmed' && res.options?.length) {
       reasoningLevels.value = [
         { value: 'off', label: 'Off', desc: '不启用推理' },
@@ -1148,7 +1156,7 @@ const visibleMsgs = computed(() => {
  *  - { type:'turn', start, end, side, children:[ {kind:'assistant',msg,idx,side} | {kind:'a2a',key,items,latest,side} ] }
  *    side='left'  = 下拉框选中智能体的输出（对话对象）
  *    side='right' = 其它发送方（其它智能体发给它的消息）
- *  同侧连续子块收进同一个固定大小"过程框"流式展示（详见过程窗口逻辑）。 */
+ *  同侧连续子块收进同一个自适应"过程框"流式展示（封顶260px，详见过程窗口逻辑）。 */
 const renderItems = computed(() => {
   const msgs = visibleMsgs.value
   const cur = currentAgentId.value
@@ -1359,9 +1367,9 @@ function toolDetailIsOpen(assistantIdx: number, tcId: string): boolean {
   return toolDetailOpen.value.get(assistantIdx) === tcId
 }
 
-// ============ 过程窗口（流式期间展开固定大小，停止后折叠为 "(>过程)"） ============
+// ============ 过程窗口（流式期间展开，高度随内容自适应、封顶 260px，停止后折叠为 "(>过程)"） ============
 // 设计：以"用户消息"为分界线，每两条用户消息之间的全部智能体输出（多条 assistant 消息、
-// 深度思考 / 流式正文 / 工具行 / 截图 / a2a 信封）按原顺序整合进【同一个】固定大小"过程框"
+// 深度思考 / 流式正文 / 工具行 / 截图 / a2a 信封）按原顺序整合进【同一个】自适应"过程框"
 // 流式展示；停止输出时，把本轮最后一条带正文的 assistant "提出来"作为正常气泡渲染，
 // 过程框自动折叠为紧贴智能体名称后的 "(>过程)" 文字（无边框、字号字体差异化），点击重新展开。
 const processOpen = ref(new Set<number>())   // 键 = turn.start
@@ -2162,7 +2170,7 @@ watch(() => convs.streaming, async (v) => {
   _wasStreamingForProc = v
 })
 
-// 切换对话记录时：滚动到底部，并默认选中当前会话最新一条回复的智能体
+// 切换对话记录时：滚动到底部，并默认选中运行中的智能体（优先）或最新一条回复的智能体
 watch(() => convs.current, async (id) => {
   if (id == null) return
   await nextTick()
@@ -2171,12 +2179,27 @@ watch(() => convs.current, async (id) => {
   scrollToBottom()
   const data = convs.currentData()
   const msgs = data?.messages || []
+  // 正在输出流式消息的智能体优先（串行接力下 B 的输出挂在 A 的运行流里，
+  // _runAgents 只登记链首 A——按它回填会错选等待中的 A 而非输出中的 B）
+  const streamingAgent = [...msgs].reverse().find(
+    (m: any) => m?.role === 'assistant' && m.streaming === true && m.agent_id != null
+  )?.agent_id ?? null
   const lastAssistant = [...msgs].reverse().find(
     (m: any) => m.role === 'assistant' && m.agent_id != null
   )
-  if (lastAssistant && lastAssistant.agent_id != null) {
-    currentAgentId.value = lastAssistant.agent_id
-    convs.selectedAgentId = lastAssistant.agent_id
+  const pick = streamingAgent ?? lastAssistant?.agent_id ?? null
+  if (pick != null) {
+    currentAgentId.value = pick
+    convs.selectedAgentId = pick
+  }
+  // 检测后端运行态（他端发起 / 重开窗口后本地未知）：接管恢复 + 选中运行中的智能体。
+  // 期间用户显式切换过智能体（下拉框 / 节点💬）或本地已见流式输出（串行接力中的
+  // 接收方）则不覆盖其选择——后端 running 只登记链首，接力中会错选等待中的发送方。
+  const prev = pick ?? currentAgentId.value
+  const running = await convs.refreshConv(id)
+  if (running.length && !streamingAgent && currentAgentId.value === prev && (prev == null || !running.includes(prev))) {
+    currentAgentId.value = running[0]
+    convs.selectedAgentId = running[0]
   }
 })
 
@@ -2184,8 +2207,8 @@ watch(() => convs.current, async (id) => {
 watch(() => convs.selectedAgentId, (id) => {
   if (id != null) currentAgentId.value = id
 })
-// 切换智能体（下拉框 / 画布💬直接对话）：切回时从后端同步该会话已落库内容，
-// 让界面先显示落库结果、后续流式增量继续渲染（会话正在流式时 refreshConv 内部会跳过）
+// 切换智能体（下拉框 / 画布💬直接对话）：切回时同步该会话——后端有运行则接管恢复
+// （停止按钮随运行状态切换），无运行则先显示落库结果（会话正在流式时 refreshConv 内部会跳过）
 watch(() => currentAgentId.value, (id) => {
   if (id == null) return
   const cid = convs.current
@@ -2334,7 +2357,7 @@ async function newConv() {
 }
 function selectConv(id: number) {
   if (selMode.value) { toggleSel(id); return }
-  convs.current = id
+  convs.selectConv(id)
 }
 function startRenameCanvas(id: number, name: string) { renameId.value = id; renameVal.value = name }
 // —— 画布列表右键菜单 ——
@@ -2855,7 +2878,7 @@ onBeforeUnmount(() => {
           <!-- ===== 一轮智能体输出（靠左）=====
                以"用户消息"为分界：本轮（两条用户消息之间）的全部智能体连续输出
                （多条 assistant 的思考/正文/工具行/截图 + a2a 信封）按原顺序整合进
-               【同一个】固定大小"过程框"流式展示；停止时把末条带正文的 assistant
+               【同一个】自适应"过程框"流式展示（封顶260px）；停止时把末条带正文的 assistant
                提出作为正常气泡，过程框折叠为名称后的 "(>过程)" -->
           <div v-else-if="it.type === 'turn'"
                class="msg assistant turn"
@@ -2889,7 +2912,7 @@ onBeforeUnmount(() => {
                 </div>
               </template>
 
-              <!-- 过程框：固定大小 + 内部滚动，整合本段全部智能体输出（顺序保持）；
+              <!-- 过程框：高度随内容自适应（封顶 260px）+ 内部滚动，整合本段全部智能体输出（顺序保持）；
                    展开时位于折叠钮下方、最终正文气泡上方 -->
               <div v-if="showProcessWindow(it)" class="process-window">
                 <div class="process-body"
@@ -3373,7 +3396,7 @@ onBeforeUnmount(() => {
   font-family: Consolas, monospace;
 }
 
-/* ============ 过程窗口：流式中展开的固定大小框，停止后折叠为 "(>过程)" 文字 ============ */
+/* ============ 过程窗口：流式中展开的自适应框（封顶260px），停止后折叠为 "(>过程)" 文字 ============ */
 /* 折叠钮：紧贴智能体名称，无边框、纯文字，字体/字号与名称差异化 */
 .proc-toggle {
   margin-left: 3px;
@@ -3404,14 +3427,14 @@ onBeforeUnmount(() => {
   color: rgba(var(--text-rgb), 0.5);
 }
 
-/* 过程框本体：固定高度 + 内部滚动，外观像一个小窗口 */
+/* 过程框本体：高度随内容自适应（封顶 260px 内部滚动），琥珀暖色 + 虚线与冷色气泡明显区分 */
 .process-window {
   margin-top: 5px;
-  height: 260px;
+  max-height: 260px;
   width: 100%;
-  background: rgba(var(--surface-rgb), 0.028);
-  border: 1px solid rgba(var(--surface-rgb), 0.08);
-  border-radius: 8px;
+  background: rgba(255, 184, 82, 0.09);
+  border: 1px dashed rgba(255, 184, 82, 0.45);
+  border-radius: 6px;
   overflow: hidden;
   display: flex;
   flex-direction: column;

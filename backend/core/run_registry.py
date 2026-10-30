@@ -41,6 +41,9 @@ class RunSession:
         # 本运行 spawn 的子任务（并行接力链的接收方等）→ 停止本运行时一并取消，
         # 避免只 cancel 父 task 但子 task 还在后台跑 LLM 造成泄漏。
         self.child_tasks: set[asyncio.Task] = set()
+        # child task → 接收方 agent_id：串行接力下 B 的运行是 A 的 child task（不占
+        # 独立 _RUNS 键），按 agent_id 精确停止时靠它路由到对应 child task
+        self.child_task_agents: dict[asyncio.Task, int] = {}
         self.started_at = time.time()
         self.ended_at: float | None = None
         self.cancelled = False
@@ -170,15 +173,25 @@ def stop(conv_id: int, agent_id: int | None = None) -> bool:
     - **指定 agent_id（精确停止）**：只取消父 pump task，**不**取消 child_tasks。
       并行 A2A 接力模式下接收方 spawn 出来的 child task 继续运行并独立输出完成，
       避免"停 A 把 spawn 的 B/C 也一起停了"的问题。
+      例外：该 agent_id 正是某个 child task 的接收方（串行接力 B 挂在 A 的运行下，
+      不占独立 _RUNS 键）→ 取消对应 child task，B 的事件流补 STOP 行。
     - **全停（agent_id=None）**：先取消所有 child_tasks 再取消父 task，整条链终止。
     """
     stopped = False
-    for s in _find(conv_id, agent_id):
+    for s in _find(conv_id):
         if agent_id is None:
             # 全停：先取消所有子任务再取消父 task
             for ct in list(s.child_tasks):
                 if not ct.done():
                     ct.cancel()
+                    stopped = True
+        else:
+            # 精确停止：路由到接收方为该 agent 的 child task（串行接力链）
+            for ct, aid in list(s.child_task_agents.items()):
+                if aid == agent_id and not ct.done():
+                    ct.cancel()
+                    stopped = True
+    for s in _find(conv_id, agent_id):
         if s.running:
             s.task.cancel()
             stopped = True

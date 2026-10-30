@@ -176,8 +176,39 @@ async function saveLaunchMode(mode: 'client' | 'web') {
   }
 }
 
+// 开机自启动
+const autostartEnabled = ref(false)
+const autostartSupported = ref(true)
+const autostartSaving = ref(false)
+const autostartCmd = ref('')
+
+async function loadAutostart() {
+  try {
+    const r = await api.autostart.get()
+    autostartEnabled.value = !!r.enabled
+    autostartSupported.value = r.supported !== false
+    autostartCmd.value = r.command || ''
+  } catch { /* 静默 */ }
+}
+
+async function toggleAutostart() {
+  if (!autostartSupported.value) return
+  autostartSaving.value = true
+  const next = !autostartEnabled.value
+  try {
+    const r = await api.autostart.set(next)
+    autostartEnabled.value = !!r.enabled
+    autostartCmd.value = r.command || ''
+    showToast(next ? '已开启开机自启动' : '已关闭开机自启动')
+  } catch (e: any) {
+    showToast('设置失败：' + (e?.message || e), 'err')
+  } finally {
+    autostartSaving.value = false
+  }
+}
+
 onMounted(async () => {
-  await Promise.all([models.fetch(), settings.fetch(), loadLaunchMode()])
+  await Promise.all([models.fetch(), settings.fetch(), loadLaunchMode(), loadAutostart()])
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
@@ -592,6 +623,33 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
             桌面客户端：启动后自动打开桌面应用窗口（完整功能）
             <br />
             浏览器网页：启动后端服务后自动打开浏览器 http://localhost:5173
+          </div>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">开机自启动</span>
+          </div>
+          <div class="asr-toggle">
+            <button class="asr-switch" :class="{ on: autostartEnabled, disabled: !autostartSupported }"
+                    :disabled="!autostartSupported || autostartSaving"
+                    @click="toggleAutostart">
+              <span class="asr-switch-knob"></span>
+            </button>
+            <div class="sound-desc">
+              <div class="sound-main">
+                <span v-if="!autostartSupported">当前系统不支持</span>
+                <span v-else-if="autostartSaving">保存中…</span>
+                <span v-else-if="autostartEnabled">已开启</span>
+                <span v-else>已关闭</span>
+              </div>
+              <div class="sound-sub" v-if="autostartSupported">
+                {{ autostartEnabled ? '电脑开机后自动启动智能体集群（后台静默）' : '电脑开机时不会自动启动' }}
+              </div>
+              <div class="sound-sub" v-else>
+                仅支持 Windows 系统
+              </div>
+            </div>
           </div>
         </div>
       </div>

@@ -625,7 +625,7 @@ async function doChat(node: any) {
       agent_ids: Array.from(new Set([...(conv.agent_ids || []), node.agent_id])),
     })
   }
-  convs.current = conv!.id
+  convs.selectConv(conv!.id)
   // 自动和它对话：选中该智能体 + 聚焦输入框
   // 等 RightPanel 的 convs.current async watcher 跑完（它会用「最新回复的智能体」覆盖 selectedAgentId），
   // 再写入我们指定的 agent_id，避免被那个默认选中逻辑冲掉。
@@ -1220,7 +1220,8 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div class="toolbar-right">
           <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
                   @click.stop="toggleRun">
-            {{ runningOnThisCanvas ? '⏹' : '▶' }}
+            <span v-if="runningOnThisCanvas" class="stop-icon" aria-hidden="true"></span>
+            <template v-else>▶</template>
           </button>
           <button class="btn ghost em-collapsed" @click.stop="toggleExecMode" :disabled="runningOnThisCanvas"
                   :title="runningOnThisCanvas ? '运行中：执行模式已锁定' : (canvas?.execution_mode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行')">
@@ -1246,7 +1247,8 @@ defineExpose({ viewportRef, computeNodeBbox })
           <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
                   @click.stop="toggleRun"
                   :title="runningOnThisCanvas ? '停止：中止定时触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时）运行集群'">
-            {{ runningOnThisCanvas ? '⏹ 停止' : '▶ 运行' }}
+            <template v-if="runningOnThisCanvas"><span class="stop-icon" aria-hidden="true"></span>停止</template>
+            <template v-else>▶ 运行</template>
           </button>
           <div class="exec-mode-toggle" @click.stop :class="{ disabled: runningOnThisCanvas }"
                :title="runningOnThisCanvas ? '运行中：执行模式已锁定' : (canvas?.execution_mode === 'parallel' ? '并行：发送后继续运行' : '串行：阻塞等待对方回信')">
@@ -1713,8 +1715,39 @@ marker#arrow path { fill: var(--accent); }
 .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 
 /* 运行/停止 + 触发 */
-.run-btn.stop { background: rgba(255,80,80,0.15); border-color: rgba(255,80,80,0.4); color: #ff9090; }
-.run-btn.stop:hover { background: rgba(255,80,80,0.25); }
+.run-btn.stop {
+  position: relative; z-index: 1;
+  background: linear-gradient(135deg, rgba(255,90,110,0.55), rgba(255,60,80,0.55));
+  border-color: rgba(255,140,150,0.7);
+  color: rgb(var(--text-rgb));
+  animation: stopBtnPulse 1.4s ease-in-out infinite;
+}
+.run-btn.stop:hover {
+  background: linear-gradient(135deg, rgba(255,90,110,0.65), rgba(255,60,80,0.65));
+  transform: translateY(-1px) scale(1.03);
+  box-shadow: 0 4px 18px rgba(255,80,100,0.45);
+}
+.run-btn.stop .stop-icon {
+  position: relative; display: inline-block; width: 14px; height: 14px; border-radius: 3px;
+  background: #fff; margin-right: 7px; vertical-align: middle; flex-shrink: 0;
+  box-shadow: 0 0 8px rgba(var(--surface-rgb), 0.55);
+  animation: stopIconPulse 1.4s ease-in-out infinite;
+}
+.run-btn.stop .stop-icon::before,
+.run-btn.stop .stop-icon::after {
+  content: ''; position: absolute; inset: -6px; border-radius: 50%;
+  border: 1.5px dashed rgba(var(--surface-rgb), 0.65);
+  animation: stopRingSpin 3s linear infinite;
+}
+.run-btn.stop .stop-icon::after {
+  inset: -10px; border-style: dotted;
+  border-color: rgba(var(--surface-rgb), 0.35);
+  animation: stopRingSpin 6s linear infinite reverse;
+}
+.canvas-toolbar.collapsed .run-btn.stop .stop-icon { margin-right: 0; }
+@keyframes stopBtnPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(255,80,100,0.5); } 50% { box-shadow: 0 0 0 6px rgba(255,80,100,0); } }
+@keyframes stopIconPulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(0.75); opacity: 0.85; } }
+@keyframes stopRingSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .run-btn:not(.stop) { background: rgba(100,220,160,0.12); border-color: rgba(100,220,160,0.35); color: var(--success-light); }
 .run-btn:not(.stop):hover { background: rgba(100,220,160,0.22); }
 /* 串行/并行切换 */

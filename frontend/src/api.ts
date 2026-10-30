@@ -287,5 +287,9 @@ export const api = {
   launchMode: {
     get: () => req<{ mode: 'client' | 'web' }>('/launch_mode'),
     set: (mode: 'client' | 'web') => req('/launch_mode', { method: 'PUT', body: JSON.stringify({ mode }) }),
+  },
+  autostart: {
+    get: () => req<{ enabled: boolean; command: string; supported: boolean }>('/autostart'),
+    set: (enabled: boolean) => req('/autostart', { method: 'PUT', body: JSON.stringify({ enabled }) }),
   }
 }

@@ -1,5 +1,6 @@
 """智能体集群 - FastAPI 入口"""
 import os
+import asyncio
 import zlib
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -137,9 +138,15 @@ class JsonGzipMiddleware:
 
     流式接口（text/plain 的对话流 / text/event-stream）完全不经过压缩，
     避免对聊天流式输出产生任何影响。
+
+    ⚠️ 关键优化：
+    - minimum_size 提高到 128KB：本地 loopback 网络带宽无限，小响应压缩/解压
+      的 CPU 开销远大于传输时间，反而增加延迟（之前 agents 52KB 压缩花 400ms+）
+    - 用 asyncio.to_thread 把 CPU 密集的 zlib.compress 放到线程池，不阻塞 event loop
+      （之前同步压缩 24MB 大响应直接卡死整个服务 1.3 秒）
     """
 
-    def __init__(self, app, minimum_size: int = 2048):
+    def __init__(self, app, minimum_size: int = 131072):
         self.app = app
         self.minimum_size = minimum_size
 
@@ -169,15 +176,21 @@ class JsonGzipMiddleware:
                     return
                 body = message.get("body") or b""
                 more = bool(message.get("more_body"))
+                # 小响应不值得压缩：本地网络传输 ~0ms，压缩/解压 CPU 开销更大
                 if not state["started"] and not more and len(body) < self.minimum_size:
-                    # 小响应不值得压缩，直接原样发出
                     state["started"] = True
                     await send(state["initial"])
                     await send(message)
                     return
-                comp = state["compressor"] or zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
-                state["compressor"] = comp
-                out = comp.compress(body) + (comp.flush(zlib.Z_SYNC_FLUSH) if more else comp.flush())
+                if state["compressor"] is None:
+                    state["compressor"] = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+                comp = state["compressor"]
+                # 把 CPU 密集的 zlib 操作放到线程池，不阻塞 event loop
+                def _do_compress():
+                    out = comp.compress(body)
+                    out += comp.flush(zlib.Z_SYNC_FLUSH) if more else comp.flush()
+                    return out
+                out = await asyncio.to_thread(_do_compress)
                 if not state["started"]:
                     state["started"] = True
                     mh = MutableHeaders(raw=list(state["initial"]["headers"]))
@@ -218,6 +231,108 @@ for name, r in ROUTES:
 @app.get("/api/health")
 def health():
     return {"ok": True, "version": "0.2.0"}
+
+
+# ==============================================================
+# 开机自启动（Windows 注册表 HKCU Run 键）
+# ==============================================================
+_AUTOSTART_KEY_NAME = "AgentCluster"
+
+
+def _project_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _build_autostart_cmd() -> str | None:
+    """拼出自启动命令字符串（pythonw.exe launcher.py 的绝对路径形式）。找不到则返回 None。"""
+    root = _project_root()
+    launcher = os.path.join(root, "launcher.py")
+    if not os.path.exists(launcher):
+        return None
+    # 优先用 pythonw.exe（无控制台），找不到再兜底 python.exe
+    import shutil as _shutil
+    pythonw = _shutil.which("pythonw")
+    if not pythonw:
+        # 尝试常见路径
+        for p in [
+            r"C:\Users\qiqi\AppData\Local\Programs\Python\Python314\pythonw.exe",
+            r"F:\anaconda3\pythonw.exe",
+        ]:
+            if os.path.exists(p):
+                pythonw = p
+                break
+    if not pythonw:
+        pythonw = _shutil.which("python") or "python"
+    # 用绝对路径，整个命令用引号包起来（注册表 Run 值里有空格时必须加引号）
+    return f'"{pythonw}" "{launcher}"'
+
+
+def _get_autostart_state() -> tuple[bool, str]:
+    """返回 (是否启用, 当前命令字符串)。非 Windows 平台始终返回 (False, '')。"""
+    if os.name != "nt":
+        return False, ""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_READ,
+        )
+        try:
+            val, _ = winreg.QueryValueEx(key, _AUTOSTART_KEY_NAME)
+            winreg.CloseKey(key)
+            return True, val
+        except FileNotFoundError:
+            winreg.CloseKey(key)
+            return False, ""
+    except Exception:
+        return False, ""
+
+
+def _set_autostart(enable: bool) -> tuple[bool, str]:
+    """启用或禁用自启动。返回 (实际状态, 命令字符串)。"""
+    if os.name != "nt":
+        return False, ""
+    import winreg
+    run_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    if enable:
+        cmd = _build_autostart_cmd()
+        if not cmd:
+            raise RuntimeError("找不到 launcher.py，无法设置自启动")
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, run_path)
+        winreg.SetValueEx(key, _AUTOSTART_KEY_NAME, 0, winreg.REG_SZ, cmd)
+        winreg.CloseKey(key)
+        return True, cmd
+    else:
+        # 先确保键存在再删值
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_path, 0, winreg.KEY_SET_VALUE)
+            try:
+                winreg.DeleteValue(key, _AUTOSTART_KEY_NAME)
+            except FileNotFoundError:
+                pass
+            winreg.CloseKey(key)
+        except FileNotFoundError:
+            pass  # 连 Run 键都不存在 → 视为已关闭
+        return False, ""
+
+
+@app.get("/api/autostart")
+def get_autostart():
+    enabled, cmd = _get_autostart_state()
+    return {"enabled": enabled, "command": cmd, "supported": os.name == "nt"}
+
+
+@app.put("/api/autostart")
+def set_autostart(body: dict):
+    enable = bool(body.get("enabled"))
+    try:
+        enabled, cmd = _set_autostart(enable)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"设置自启动失败：{e}")
+    return {"enabled": enabled, "command": cmd, "supported": os.name == "nt"}
 
 
 # ---- 启动模式（客户端 / 网页端）----

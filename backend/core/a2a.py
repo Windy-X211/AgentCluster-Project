@@ -85,9 +85,10 @@ def render_envelope(env: dict) -> str:
                          f"{p.get('content')}")
     if kind == "message":
         lines.append(
-            "这是与你多轮交流的消息（kind=message，不是成果移交）。请以你的角色处理并回应：\n"
-            "· 回复发件人 → cluster.send_message(to_agent=发件人名称, message=你的回复)，回信将直接送达发件人；\n"
-            "· 需要把任务转交/咨询其他成员 → cluster.send_message(to_agent=目标成员名称, message=任务或问题)，系统会等待其处理后回信；\n"
+            "这是其他智能体发给你的协作消息（kind=message，不是成果移交）。请以你的角色判断如何处理：\n"
+            "· ⚠️ 不一定要回信确认：如果消息只是告知、抄送或无需你回应的内容，直接忽略即可，不必调用 cluster.send_message 回复；\n"
+            "· 需要回应时（对方明确提问、请求协作、或确实需要你参与）→ cluster.send_message(to_agent=发件人名称, message=你的回复)，回信将直接送达发件人；\n"
+            "· 需要把任务转交/咨询其他成员 → cluster.send_message(to_agent=目标成员名称, message=任务或问题)；\n"
             "· 完成后输出你的总结正文（用户可见）。成果移交协议已暂时停用，勿调用 cluster.handoff。"
         )
     else:

@@ -628,15 +628,16 @@ def _release_all_for_owner(owner_tag: str) -> None:
 
 
 # ===== 后台 receiver 任务登记（防"前端已结束、后台继续跑"的孤儿任务泄漏）=====
-# 并行模式下用 asyncio.create_task 启动的接收方回复，只有在正常流程末尾被 await；
-# 一旦客户端断连/点停止/生成器抛异常，局部 parallel_tasks 列表丢失，这些 fire-and-forget
-# 任务会继续跑 LLM/工具/落库甚至递归 spawn。把它们登记到 turn["_child_tasks"] 共享集合
+# 用 asyncio.create_task 启动的接收方回复是 fire-and-forget 的；
+# 一旦客户端断连/点停止/生成器抛异常，局部引用丢失，这些任务会继续跑 LLM/工具/落库
+# 甚至递归 spawn。把它们登记到 turn["_child_tasks"] 共享集合
 # （child_turn = dict(turn) 是浅拷贝，集合对象全程共享），根 agent_reply 退出时统一取消。
 
 
-def _register_child_task(turn: dict | None, task: asyncio.Task, run_session=None) -> None:
+def _register_child_task(turn: dict | None, task: asyncio.Task, run_session=None, agent_id: int | None = None) -> None:
     """把一个后台 receiver 任务登记到 turn 共享集合（便于根调用退出时统一取消），
-    同时如果传入了 RunSession，也登记到 session.child_tasks。
+    同时如果传入了 RunSession，也登记到 session.child_tasks + child_task_agents
+    （task → 接收方 agent_id，run_registry.stop 按 agent 精确停止 child 时路由用）。
 
     done callback 里额外检查：session.task + 所有 child_tasks 是否都完成。
     用于精确停止后 pump 已退出但 child_tasks 还在跑的场景——
@@ -647,11 +648,14 @@ def _register_child_task(turn: dict | None, task: asyncio.Task, run_session=None
     pool.add(task)
     if run_session is not None:
         run_session.child_tasks.add(task)
+        if agent_id is not None:
+            run_session.child_task_agents[task] = agent_id
 
     def _on_done(_t: asyncio.Task) -> None:
         pool.discard(_t)
         if run_session is not None:
             run_session.child_tasks.discard(_t)
+            run_session.child_task_agents.pop(_t, None)
             # 精确停止后 pump 已退出，等所有 child_tasks 都 done 时才收尾
             try:
                 run_registry._on_session_children_done(run_session)
@@ -1187,10 +1191,10 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
         if exec_mode_for_prompt != "parallel":
             parts.append(
                 "【执行模式：串行】单线接力，一次只与一个成员沟通：\n"
-                "- 你主动给下游成员发 cluster.send_message → 阻塞等待对方运行完成，回信内容会作为**工具执行结果**返回给你；\n"
-                "- 对方也可能把任务继续转交其他成员（形成 A→B→C 传递链），整条链完成后回信逐级返回；\n"
-                "- 你若是被其他成员的消息唤起（对方正在等待你）→ 用 cluster.send_message(to_agent=对方, message=回复) 回复时，回信会**直接送达**对方，不会再次唤起对方运行；\n"
-                "- 每轮只能给一个成员发消息，如需联系多人请在收到回信后再发下一人。"
+                "- 你调用 cluster.send_message 给下游成员 → 消息立即发送成功，**你本轮随即停止运行**（发送即停），由对方接手处理；不会阻塞等待对方回信；\n"
+                "- 对方若需继续转交其他成员（形成 A→B→C 传递链），由接力机制逐级推进；\n"
+                "- 你若是被其他成员的消息唤起 → 直接处理其诉求；需要回复对方时同样用 cluster.send_message(to_agent=对方, message=...)；\n"
+                "- 每轮只能给一个成员发消息；需要联系多人时，等对方回信唤起你后再发下一位。"
             )
         else:
             parts.append(
@@ -1248,127 +1252,6 @@ def _build_cluster_context(canvas: dict, agent: dict) -> tuple[str, dict]:
     return "\n".join(p for p in parts if p), speaker_names
 
 
-def _serial_reply_upstream(
-    conversation_id: int, sender: dict, target: dict, message: str,
-    turn: dict, conv: dict,
-) -> tuple[list[str], dict]:
-    """串行模式：回复上游（唤起自己的成员）→ 直接回信，不递归唤起对方。
-
-    上游正阻塞在 cluster.send_message 的工具执行上等待回信，这里不再让上游跑一轮 LLM：
-    1. 构造 reply 信封落库并产出 A2A 行（前端显示 回信人→上游 的信封卡片）；
-    2. 把回信 call 记入 turn["calls"]，上游 _serial_send_message_and_wait
-       从中提取显式回信，作为 tool result 返回给上游的 LLM；
-    3. 信封立即标记 completed（无需等待接收方运行）。
-    """
-    reply_env = build_call_envelope(conversation_id, sender, target, {
-        "message": message, "reply_to": turn.get("reply_to_msg_id"),
-    })
-    fresh = run_registry.live_conv(conversation_id) or conv
-    fresh.setdefault("messages", []).append({
-        "role": "a2a", "envelope": reply_env, "ts": datetime.utcnow().isoformat(),
-    })
-    upsert("conversations", fresh)
-    mark_envelope_done(conversation_id, reply_env.get("message_id"))
-    turn.setdefault("calls", []).append({
-        "from_id": sender.get("id"),
-        "to_agent_id": target.get("id"),
-        "message": message,
-        "reply_to": turn.get("reply_to_msg_id"),
-        "via": "serial_reply",
-    })
-    # 计入消息熔断预算（与 collect_call_targets 的 pair/总量口径一致，防 A↔B 往返死循环）
-    pair_counts = turn.setdefault("_pair_call_counts", {})
-    pair_key = (sender.get("id"), target.get("id"))
-    pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
-    turn["call_count"] = turn.get("call_count", 0) + 1
-    lines = [f"A2A:{json.dumps(reply_env, ensure_ascii=False)}\n"]
-    result = {
-        "ok": True,
-        "to": target.get("name"),
-        "to_agent_id": target.get("id"),
-        "reply": message,
-        "note": "回信已直接送达对方（对方正在等待你的处理结果）；请勿重复发送，继续后续工作或输出总结即可",
-    }
-    return lines, result
-
-
-async def _serial_send_message_and_wait(
-    conversation_id: int, sender: dict, target: dict, message: str,
-    turn: dict, canvas: dict, conv: dict, result: dict | None = None,
-):
-    """串行模式专用 send_message — 实时 yield 下游 B 的每一行（与并行模式流式体验一致），
-    同时在 B 完全结束后通过 `result` 字典回传结构化的回信信息。
-
-    改造前是先收集全部行再一次性返回 → B 的画布泡泡要等 B 完成才突然全显示；
-    改造后是 async generator，每收到一行就 yield 给前端 → B 的泡泡逐 token 流式更新，
-    与并行模式（queue + drain）体验完全一致。
-    """
-    env = build_call_envelope(conversation_id, sender, target, {"message": message})
-    # 落库 A2A 信封（新建消息避免覆盖）
-    fresh = run_registry.live_conv(conversation_id) or conv
-    fresh.setdefault("messages", []).append({
-        "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
-    })
-    upsert("conversations", fresh)
-
-    # 先 yield A2A: 信封行（让前端 RightPanel 显示信封卡片，与并行模式顺序一致）
-    yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
-
-    # 把 env 放进 result，让调用方在异常时也能回传
-    if result is not None:
-        result["_env"] = env
-
-    # 构造 B 的 child_turn（浅拷贝，让 B 的 turn 修改不污染 A）
-    child_turn = dict(turn)
-    child_turn["reply_to_msg_id"] = env.get("message_id")
-    child_turn["reply_to_from"] = sender.get("id")
-    # 给 B 一个独立的 calls 队列（B 的 send_message 回信会进这里）
-    child_turn["calls"] = []
-
-    b_final_text = ""
-    try:
-        async for line in agent_reply(
-            conversation_id, target, render_envelope(env),
-            mode="linked", canvas=canvas, turn=child_turn,
-        ):
-            if line.strip() == "DONE":
-                continue
-            if line.startswith("F:"):
-                b_final_text = line[2:].rstrip("\n")
-            yield line
-    except Exception as e:
-        if result is not None:
-            result.clear()
-            result["error"] = f"下游智能体 {target.get('name', '?')} 执行异常：{e}"
-            result.setdefault("_env", env)
-        else:
-            # 防御性：result 未提供时至少 yield 错误行让前端知道
-            yield f"RN:（串行接收方 {target.get('name', '?')} 异常：{e}）\n"
-        return
-    mark_envelope_done(conversation_id, env.get("message_id"))
-
-    # 从 B 的 child_turn.calls 中提取 B 给 sender 的 send_message 显式回信
-    # （串行模式下 B 走 _serial_reply_upstream 直接回信路径时会写入；取最后一条=最终回复）
-    b_reply_msg = ""
-    for call in child_turn.get("calls", []):
-        if call.get("from_id") == target.get("id") and call.get("to_agent_id") == sender.get("id"):
-            b_reply_msg = call.get("message", "")
-
-    # 如果 B 没有显式 send_message 回信，取 B 的 final_text 作为回信
-    reply_content = b_reply_msg if b_reply_msg else b_final_text
-
-    if result is not None:
-        result.clear()
-        result.update({
-            "_env": env,
-            "ok": True,
-            "to": target.get("name"),
-            "to_agent_id": target.get("id"),
-            "reply": reply_content,
-            "b_final_text": b_final_text,
-            "b_explicit_reply": bool(b_reply_msg),
-            "note": "已收到对方回信",
-        })
 
 
 async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: str = "independent", canvas: dict | None = None, turn: dict | None = None, workdir: str | None = None, run_session=None):
@@ -1545,96 +1428,48 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # 内存 messages，不写入 conv）；进入慢通道时用它把提示动态剔除。
     user_msg_ref = messages[-1]
 
-    # 用户消息由前端 send() 落库（前端以此为运行基底快照，见 frontend/src/stores/conversation.ts send()），
-    # 后端不再重复落库，避免同一条用户消息双份（前端 ts 带 Z / 后端 ts 不带 Z）在
-    # 运行中切换智能体 / 刷新时被 fetch 渲染成两条。
-    # 例外：接力段的 A2A 输入是协议文本，前端不落库（仅过滤不渲染）→ 仍需后端落库以保留历史。
+    # 用户消息由 send 端点落库（conversations.py：start 前 append + upsert，运行基底快照即含用户消息），
+    # agent_reply 不再落链首用户消息，避免双份。
+    # 例外：接力段的 A2A 输入是协议文本，send 端点不经手 → 仍需这里落库以保留历史。
     if is_relay:
         conv.setdefault("messages", []).append({
             "role": "user", "content": user_input, "ts": datetime.utcnow().isoformat(),
             "to_agent_id": agent.get("id"), "a2a_input": True,
         })
-
-    # —— 节流落库：流式期间每 500ms 把当前 conv 快照写盘，进程硬退出时最多丢半秒数据 ——
-    _LAST_FLUSH = {"t": 0.0}
-    FLUSH_INTERVAL = 0.5
-
-    def _maybe_flush(delta_msg: dict | None = None) -> None:
-        """把当前 conv 落盘；delta_msg 是刚收到的一条（可选），避免额外 list 拼接。"""
-        # 节流：距上次 flush 不足 FLUSH_INTERVAL 且没有强制，就跳过
-        now = time.monotonic()
-        if (now - _LAST_FLUSH["t"]) < FLUSH_INTERVAL and delta_msg is None:
-            return
-        try:
-            upsert("conversations", conv)
-        except Exception as _e:
-            print(f"[runtime] WARN 节流 flush 失败: {_e}")
-        _LAST_FLUSH["t"] = now
-
-    # 立即写一次（用户消息刚入库），让中途 crash 至少保留用户输入
-    _maybe_flush()
+        upsert("conversations", conv)
 
     final_text_parts = []
     tool_history = []  # 本轮执行的工具列表（用于入库 assistant message 的 tool_calls 字段）
-    parallel_tasks = []  # 并行模式：并发接收方任务 [asyncio_task]
+
     max_tool_rounds = _max_tool_rounds(agent)
     assistant_reasoning = ""  # 让循环外可访问
     _last_assistant_text = ""  # 让循环外可访问
 
-    # ===== 并行模式实时输出桥接 =====
-    # 接收方 asyncio task 边运行边把输出行 push 到这个 Queue，
-    # 主生成器在 chat 流式循环/每轮 tool 执行后 drain 并 yield——
-    # 这样接收方的流式输出（T:/RN:/SPEAK:）不会被 _drain_agent_reply 缓存到 task 完成后才一次性吐出。
-    _recv_queue: asyncio.Queue = asyncio.Queue()
-    _recv_done_count = 0  # 已完成的接收方数量（标记 "__DONE__" 时递增）
-    _recv_expected_count = 0  # 预期启动的接收方总数
-
+    # ===== 接收方独立运行桥接 =====
+    # 接收方 asyncio task 边运行边把输出行直接 push 到父 session 的事件缓冲，
+    # 前端实时看到接收方输出（即使父 pump 已结束也不丢失）。
     async def _push_agent_to_queue(cid, tgt, inp_text, m, c, child_turn):
-        """接收方 agent_reply 包装：每行 put 到 _recv_queue（带 agent_id），
-        同时直接 push 到父 session 的事件缓冲（让前端能直接看到并行接收方的输出，
-        即使父 pump 被精确停止后也不丢失），完成后 put __DONE__ 标记。
-
-        注意：过滤掉嵌套 agent_reply 的 DONE 行——它是内部结束标记，不应传给前端清状态；
-        前端的 DONE 只应由顶层 agent_reply 在整个 SSE 流结束时 yield 一次。"""
+        """接收方 agent_reply 包装：把接收方每一行直接 push 到父 session 事件缓冲。
+        过滤嵌套 agent_reply 的 DONE 行——它是内部结束标记，前端 DONE 只由顶层流 yield 一次。
+        被 run_registry.stop 按 agent 精确取消时补 STOP 行：前端据此闭合接收方
+        流式消息（+[已停止] 标记），停止按钮立即恢复「发送」。"""
         parent_session = child_turn.get("_run_session") if child_turn else None
         try:
             async for line in agent_reply(cid, tgt, inp_text, m, c, child_turn):
                 if line.strip() == "DONE":
                     continue
-                await _recv_queue.put((tgt.get("id"), line))
-                # 同时直接 push 到父 session 的事件缓冲
-                # （并行接收方继续输出，前端能独立订阅到它们的行）
                 if parent_session is not None:
                     parent_session.push(line)
+        except asyncio.CancelledError:
+            # 精确停止该接收方（POST /stop {agent_id}）→ 补 STOP 收尾（不 re-raise，
+            # child task 以正常完成结算，_on_session_children_done 照常触发补 DONE）
+            if parent_session is not None:
+                parent_session.push("STOP\n")
         except Exception as e:
-            err_line = f"RN:（并行接收方 {tgt.get('name', '?')} 异常：{e}）\n"
-            await _recv_queue.put((tgt.get("id"), err_line))
+            err_line = f"RN:（接收方 {tgt.get('name', '?')} 异常：{e}）\n"
             if parent_session is not None:
                 parent_session.push(err_line)
-        await _recv_queue.put((None, "__DONE__"))
 
-    def _drain_recv_lines(sender_id: int | None = None):
-        """非阻塞 drain 接收方队列：返回 [(line, need_speak_switch), ...]
-        自动处理 SPEAK: 切换——当 drain 到不同 agent_id 的输出前，先加一条 SPEAK:X。
-        drain 结束后若 sender_id 有效，加一条 SPEAK 切回发送方。"""
-        out: list[tuple[str, bool]] = []  # (content, is_speak)
-        last_aid = None
-        nonlocal _recv_done_count
-        try:
-            while True:
-                aid, line = _recv_queue.get_nowait()
-                if line == "__DONE__":
-                    _recv_done_count += 1
-                    continue
-                if aid != last_aid:
-                    out.append((f"SPEAK:{aid}\n", True))
-                    last_aid = aid
-                out.append((line, False))
-        except asyncio.QueueEmpty:
-            pass
-        if sender_id is not None and last_aid is not None and last_aid != sender_id:
-            out.append((f"SPEAK:{sender_id}\n", True))
-        return out
 
     # ===== 分层自适应路由：默认快通道 =====
     # 非 linked 模式一律从快通道开始（把 <continue> 续跑提示动态附加到当前用户消息）；
@@ -1864,11 +1699,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         _garbage_aborted = False # 是否因流式垃圾中止本轮
         try:
             async for kind, payload in _gen:
-                # 每收到一个模型 token 前，先 drain 接收方可能已输出的行——
-                # 让并行接收方的流式输出在发送方继续运行时就能实时到达前端
-                if _recv_expected_count > 0:
-                    for line, _ in _drain_recv_lines(agent.get("id")):
-                        yield line
+
                 if kind == "text":
                     _delta = round_text_scan.feed(payload)
                     if _delta:
@@ -2079,7 +1910,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # （本轮刚追加，本轮 LLM 还没看过）；< 此值的是之前轮次的，替换为占位。
             _tool_round_start = len(messages)
             exec_mode = turn.get("_locked_exec_mode", "serial")
-            _serial_send_handled = False  # 串行模式下标记已处理过 send_message（防止一轮多条）
+            _send_handled = False  # 串行：一轮只允许给一个目标发送（并行不限，可多目标）
             for tc in assistant_tool_calls:
                 if _serial_sent and not _serial_round_sent:
                     # 收尾轮（上一轮已移交下游）：忽略任何工具调用，只输出结束语
@@ -2090,17 +1921,17 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 except Exception:
                     args = {}
 
-                # —— 串行模式：cluster.send_message「发送即停」——
-                # 语义：发送方发消息给接收方后立即返回成功并停止运行，接收方在接力阶段
-                #       被 spawn 独立运行（与画布 execution_mode=serial 的原始定义
-                #       「发送消息后停止运行，接收方开始运行」一致）。不再阻塞等待回信。
+                # —— cluster.send_message（串/并行共用同一套发送逻辑）——
+                # 串行：发送后"发送即停"——立即返回成功，下一轮收尾(tool_choice=none)输出结束语。
+                # 并行：发送后不停止模型迭代（继续循环，可继续调工具/输出）。
+                # 串/并行一致：接收方均在本轮结束后由接力阶段 spawn 独立运行。
                 _is_send_msg = fn["name"] == "cluster.send_message"
-                if _is_send_msg and mode == "linked" and canvas and exec_mode != "parallel":
-                    if _serial_send_handled:
-                        # 串行模式一轮只能给一个目标发消息
-                        result = {"error": "串行模式下每轮只能给一个目标发消息；已移交给第一个成员并停止运行。"}
+                if _is_send_msg and mode == "linked" and canvas:
+                    # 串行：一轮只允许给一个目标发送（发送即停）；并行：允许一轮多次 → 同时发给多个智能体
+                    if exec_mode != "parallel" and _send_handled:
+                        result = {"error": "串行模式下每轮只能给一个目标发送消息。"}
                     else:
-                        _serial_send_handled = True
+                        _send_handled = True
                         # 复用 a2a 的目标解析与方向性校验
                         target, err = _resolve_target(turn, args.get("to_agent"))
                         if err:
@@ -2131,30 +1962,42 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                                         f"请先在画布上从你的节点拖一条连线指向对方"
                                     )}
                             else:
-                                # 排队：本轮结束（停止运行）后由接力阶段 spawn 接收方独立运行
+                                # 排队：串/并行均由接力阶段 spawn 接收方独立运行
                                 turn.setdefault("skip_auto_ids", set()).add(from_id)
                                 turn.setdefault("calls", []).append({
                                     "from_id": from_id,
                                     "to_agent_id": to_id,
                                     "message": args.get("message", ""),
                                     "reply_to": turn.get("reply_to_msg_id"),
-                                    "via": "serial_send",
+                                    "via": ("parallel_send" if exec_mode == "parallel" else "serial_send"),
                                 })
-                                # 串行"发送即停"：已把消息移交下游 → 标记；
-                                # 下一轮 tool_choice=none，让模型读工具结果后输出一句结束语，随后结束运行。
-                                _serial_sent = True
-                                _serial_round_sent = True
-                                result = {
-                                    "ok": True,
-                                    "to": target.get("name"),
-                                    "to_agent_id": to_id,
-                                    "note": (
-                                        f"消息发送成功：已移交给「{target.get('name')}」，"
-                                        f"你已停止运行，由对方接手处理。请勿重复发送。"
-                                    ),
-                                }
+                                if exec_mode == "parallel":
+                                    # 并行：发送后不停止迭代（继续循环）→ 返回"可继续"文案
+                                    result = {
+                                        "ok": True,
+                                        "to": target.get("name"),
+                                        "to_agent_id": to_id,
+                                        "note": (
+                                            f"消息发送成功：已发送给「{target.get('name')}」，"
+                                            f"你可以继续当前任务。"
+                                        ),
+                                    }
+                                else:
+                                    # 串行"发送即停"：已移交下游 → 标记；下一轮 tool_choice=none
+                                    # 让模型读工具结果后输出一句结束语，随后结束运行。
+                                    _serial_sent = True
+                                    _serial_round_sent = True
+                                    result = {
+                                        "ok": True,
+                                        "to": target.get("name"),
+                                        "to_agent_id": to_id,
+                                        "note": (
+                                            f"消息发送成功：已移交给「{target.get('name')}」，"
+                                            f"你已停止运行，由对方接手处理。请勿重复发送。"
+                                        ),
+                                    }
                 else:
-                    # 并行模式 / 非 send_message → 走普通同步执行路径
+                    # 非 send_message（串/并行一致）→ 走普通同步执行路径
                     result = await asyncio.to_thread(_execute_tool, fn["name"], args,
                                           conv_id=conversation_id,
                                           tool_call_id=tc["id"],
@@ -2180,12 +2023,6 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     yield f"I:{tc['id']}|{json.dumps(img_refs, ensure_ascii=False)}\n"
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
 
-            # 每次工具执行后都尝试 drain 接收方队列——
-            # 工具执行的 await 期间 event loop 会让接收方 task 运行，输出到 Queue，
-            # 在 continue 下一轮 / break 出 tool loop 前把这些输出 flush 给前端
-            if _recv_expected_count > 0:
-                for line, _ in _drain_recv_lines(agent.get("id")):
-                    yield line
 
             # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
             # 否则模型每轮工具之间"过渡解说文字"都会触发一次验证器（上一条工具常有
@@ -2193,40 +2030,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # 导致"强制采纳"把整个运行提前掐死在任务中途。
             verify_retry_count = 0
 
-            # —— 并行模式：cluster.send_message 后立即启动接收方（不等接力阶段）——
-            # 串行模式下 send_message 已在上面阻塞等待并返回 tool result。
-            # collect_call_targets 会同时从 turn["calls"] 中移除已处理消息，
-            # 接力阶段（L2239）的 collect_call_targets 只会看到自动回复追加的消息。
-            if mode == "linked" and canvas and exec_mode == "parallel":
-                call_targets = collect_call_targets(turn, agent)
-                if call_targets:
-                    for target, d in call_targets:
-                        env = build_call_envelope(conversation_id, agent, target, d)
-                        fresh = run_registry.live_conv(conversation_id) or conv
-                        fresh.setdefault("messages", []).append({
-                            "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
-                        })
-                        upsert("conversations", fresh)
-                        yield f"SPEAK:{target.get('id')}\n"
-                        yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
-                        child_turn = dict(turn)
-                        child_turn["reply_to_msg_id"] = env.get("message_id")
-                        child_turn["reply_to_from"] = agent.get("id")
-                        task = asyncio.create_task(_push_agent_to_queue(
-                            conversation_id, target, render_envelope(env),
-                            "linked", canvas, child_turn,
-                        ))
-                        _register_child_task(turn, task, turn.get("_run_session"))
-                        parallel_tasks.append((task, env))
-                        _recv_expected_count += 1
-                    # drain 接收方已输出的行（非阻塞，有就立即 yield）
-                    for line, _ in _drain_recv_lines(agent.get("id")):
-                        yield line
-                    yield f"RN:（并行模式：已立即启动 {len(call_targets)} 个接收方，继续运行）\n"
-
-            # 串行"发送即停"：本轮已把消息移交下游 → 继续下一轮（收尾轮，tool_choice=none），
-            # 由模型读取工具结果后自然输出结束语，随后本运行结束（接力阶段 spawn 接收方）。
-            continue  # 继续下一轮（并行模式继续 tool loop；串行发送后进入收尾轮）
+            # 串/并行统一：本轮发送的消息由接力阶段 spawn 接收方独立运行。
+            # 串行发送即停 → 进入收尾轮（tool_choice=none）输出结束语后结束本轮；
+            # 并行发送后不停止迭代，继续 tool loop。
+            continue
 
         # —— 无 tool_calls → 模型声称完成，进入独立验证 ——
         # 情况 A：没调用过任何工具 → 纯知识回答，直接采纳（与快通道类似）
@@ -2240,9 +2047,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         workflow_mode = _wf_mode or agent.get("workflow_mode", "none")
         if workflow_mode not in ("spec", "goal"):
             # 非工作流模式：直接采纳模型的完成声明。
-            # 并行模式下，即使已启动了接收方任务，发送方也可以自由结束——
-            # 接收方会在后台继续运行并通过 Queue 把输出展示给用户；
-            # 发送方无需强迫自己继续做工具调用。
+            # 即使已 spawn 了接收方任务，发送方也可以自由结束——
+            # 接收方会在后台继续运行并经事件缓冲把输出展示给用户。
             final_text_parts.append(assistant_text)
             break
 
@@ -2331,8 +2137,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         break  # 兜底：正常情况下上面已经 break/continue 了
 
     # —— 先存最终 assistant 文字 + 发 F: 给前端 ——
-    # 提前到并行等待之前：让前端立即知道发送方已完成自己的工作（去掉节点高亮），
-    # 即使后端还在等待接收方完成。
+    # 让前端立即知道发送方已完成自己的工作（去掉节点高亮），
+    # 即使后端还有独立运行的接收方任务未结束。
     final_text = strip_continue("".join(final_text_parts))
     # 去掉首尾连续空行，保留中间换行
     final_text = final_text.strip("\n")
@@ -2346,7 +2152,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # 先把 final_entry 加到内存 conv，统一合并
     conv["messages"].append(final_entry)
 
-    # reload → 合并 → upsert：tool loop 中提前启动的并发接收方可能已写入 store，
+    # reload → 合并 → upsert：接力阶段 spawn 的独立接收方可能已写入 store，
     # 需要以 store 为基底（含接收方消息），再把内存中累积但未落库的新消息（tool entries + final_entry）
     # 追加进去，避免覆盖接收方写入或丢失本轮产出
     # live_conv 下 conv 即共享对象（已含并发写入），无需再合并，避免自我追加重复
@@ -2359,92 +2165,35 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # 接力前先落库当前智能体产出，避免下游脏写覆盖
     upsert("conversations", fresh_conv)
 
-    # —— 并行模式：等待所有并发接收方完成，持续 drain Queue 实时输出 ——
-    # 用 drain-while-waiting 替代裸 await task：在等待期间持续 drain Queue，
-    # 确保接收方的流式输出不会因为生成器卡在 await 上而延迟到达前端。
-    if parallel_tasks:
-        _envs = {task: env for task, env in parallel_tasks}
-        _pending = list(_envs.keys())
-        _done: list[asyncio.Task] = []
-        while _pending or _recv_done_count < len(parallel_tasks):
-            if not _pending:
-                # 所有 task 已完成，但 Queue 里可能还有未 drain 的行
-                break
-            done, _pending = await asyncio.wait(_pending, timeout=0.1)
-            # 每次 wait 后都 drain queue —— event loop 切换后接收方可能输出了新行
-            for line, _ in _drain_recv_lines(agent.get("id")):
-                yield line
-            for t in done:
-                _done.append(t)
-                env = _envs[t]
-                try:
-                    t.result()  # 重新 raise 异常（try/except 块外不会被吞）
-                except Exception as e:
-                    yield f"RN:（并行任务异常：{e}）\n"
-                mark_envelope_done(conversation_id, env.get("message_id"))
-        # 最终 drain：确保 Queue 清空
-        for line, _ in _drain_recv_lines(agent.get("id")):
-            yield line
 
-    # ===== 消息接力：cluster.send_message / 自动回复 在任意 relay 层级都处理
+    # ===== 消息接力：cluster.send_message 在任意 relay 层级都处理
     #     （受 MAX_CALL 预算 + A2A_MAX_RELAY_DEPTH 双重约束防爆炸）；
     #      成果接力（handoff）仅链首（relay_depth==0）触发防环 =====
     if mode == "linked" and canvas and turn.get("relay_depth", 0) <= A2A_MAX_RELAY_DEPTH:
-        exec_mode = turn.get("_locked_exec_mode", "serial")
-
-        # 1) cluster.send_message 排队的消息（允许往返多轮）
-        # 串行模式：send_message 已在 tool 层"发送即停"排队（via=serial_send），
-        #           本轮由此处 spawn 接收方独立运行——发送方不等待，立即结束运行。
-        # 并行模式：手动 cluster.send_message 已在 tool loop 末尾被提前消费并启动接收方。
-        if exec_mode in ("parallel", "serial"):
-            call_targets = collect_call_targets(turn, agent)
-            if call_targets:
-                # 统一处理：多目标和单目标都先 spawn 接收方
-                _jb_tasks = []  # [(task, env)] —— 仅并行模式用于 drain-while-waiting
-                for target, d in call_targets:
-                    env = build_call_envelope(conversation_id, agent, target, d)
-                    fresh = run_registry.live_conv(conversation_id) or conv
-                    fresh.setdefault("messages", []).append({
-                        "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
-                    })
-                    upsert("conversations", fresh)
-                    yield f"SPEAK:{target.get('id')}\n"
-                    yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
-                    child_turn = dict(turn)
-                    child_turn["reply_to_msg_id"] = env.get("message_id")
-                    child_turn["reply_to_from"] = agent.get("id")
-                    task = asyncio.create_task(_push_agent_to_queue(
-                        conversation_id, target, render_envelope(env),
-                        "linked", canvas, child_turn,
-                    ))
-                    _register_child_task(turn, task, turn.get("_run_session"))
-                    if exec_mode == "parallel":
-                        _jb_tasks.append((task, env))
-                        _recv_expected_count += 1
-                    else:
-                        # 串行"发送即停"：接收方独立运行，发送方不等待、立即结束。
-                        # 标记 keepalive，避免根 finally 取消这些仍需继续运行的下游任务。
-                        turn["_keep_children_alive"] = True
-                if exec_mode == "parallel":
-                    # drain-while-waiting：接力阶段发送方已结束，等待期间持续 drain Queue
-                    _envs = {t: env for t, env in _jb_tasks}
-                    _pending = list(_envs.keys())
-                    while _pending:
-                        done, _pending = await asyncio.wait(_pending, timeout=0.1)
-                        for line, _ in _drain_recv_lines(agent.get("id")):
-                            yield line
-                        for t in done:
-                            env = _envs[t]
-                            try:
-                                t.result()
-                            except Exception as e:
-                                yield f"RN:（接力并行任务异常：{e}）\n"
-                            mark_envelope_done(conversation_id, env.get("message_id"))
-                    # 最终 drain
-                    for line, _ in _drain_recv_lines(agent.get("id")):
-                        yield line
-                # 串行：不 drain、不等待，接收方输出经 _push_agent_to_queue 直接写入
-                #       parent_session 事件缓冲，前端实时可见；本运行到此结束。
+        # 1) cluster.send_message 排队的消息（串/并行同一套处理）：
+        #    本轮结束在此 spawn 接收方独立运行——发送方不等待，接收方输出经
+        #    _push_agent_to_queue 直接写入 parent_session 事件缓冲（前端实时可见）。
+        call_targets = collect_call_targets(turn, agent)
+        if call_targets:
+            for target, d in call_targets:
+                env = build_call_envelope(conversation_id, agent, target, d)
+                fresh = run_registry.live_conv(conversation_id) or conv
+                fresh.setdefault("messages", []).append({
+                    "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
+                })
+                upsert("conversations", fresh)
+                yield f"SPEAK:{target.get('id')}\n"
+                yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
+                child_turn = dict(turn)
+                child_turn["reply_to_msg_id"] = env.get("message_id")
+                child_turn["reply_to_from"] = agent.get("id")
+                task = asyncio.create_task(_push_agent_to_queue(
+                    conversation_id, target, render_envelope(env),
+                    "linked", canvas, child_turn,
+                ))
+                _register_child_task(turn, task, turn.get("_run_session"), target.get("id"))
+                # 接收方独立运行，发送方不等待；标记 keepalive 避免根 finally 取消下游
+                turn["_keep_children_alive"] = True
 
         # 2) 成果接力（A2A_HANDOFF_ENABLED=False 时 collect_relay_targets 返回空）
         for target, h in collect_relay_targets(turn, canvas, agent):

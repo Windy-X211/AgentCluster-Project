@@ -18,7 +18,7 @@
 const _fs = require('fs')
 const _path = require('path')
 const _LOG = _path.join(__dirname, '..', '..', 'electron-main.log')
-function _log(m) { try { _fs.appendFileSync(_LOG, '[' + new Date().toISOString() + '] ' + m + '\n') } catch {} }
+function _log(m) { try { _fs.appendFileSync(_LOG, '[' + new Date().toISOString() + '] ' + m + '\n') } catch { } }
 _log('=== Electron main.cjs starting ===')
 process.on('uncaughtException', (e) => { _log('UNCAUGHT: ' + e.message); _log(e.stack || '') })
 process.on('unhandledRejection', (e) => { _log('REJECTION: ' + (e?.message || e)) })
@@ -68,7 +68,7 @@ function _killPortIfBusy(port) {
       _log(`端口 ${port} 被 PID=${pid} 占用，执行 taskkill`)
       try {
         require('child_process').execSync(`taskkill /F /PID ${pid}`, { encoding: 'utf8', timeout: 3000 })
-      } catch {}
+      } catch { }
     }
     // 等端口释放
     for (let i = 0; i < 10; i++) {
@@ -161,7 +161,7 @@ function startBackend() {
           console.log(`[Electron] 后端就绪 (PID=${backendProc?.pid})`)
           resolve()
         }
-      } catch {}
+      } catch { }
       if (waited > 25) {
         clearInterval(interval)
         console.warn('[Electron] 后端启动超时')
@@ -177,10 +177,10 @@ function stopBackend() {
     backendProc.kill('SIGTERM')
     setTimeout(() => {
       if (backendProc && !backendProc.killed) {
-        try { backendProc.kill('SIGKILL') } catch {}
+        try { backendProc.kill('SIGKILL') } catch { }
       }
     }, 3000)
-  } catch {}
+  } catch { }
   backendProc = null
 }
 
@@ -226,7 +226,7 @@ function startDistServer() {
 
     distServerProc = require('child_process').spawn(
       nodeBin, [serveScript, distDir, String(DIST_PORT)],
-      { 
+      {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,  // ← 隐藏 Node.js 黑窗口
         shell: false,
@@ -251,7 +251,7 @@ function startDistServer() {
           _log(`✅ Dist server 就绪 (PID=${distServerProc?.pid}, port=${DIST_PORT})`)
           resolve()
         }
-      } catch {}
+      } catch { }
       if (waited > 10) {
         clearInterval(interval)
         reject(new Error('dist server timeout'))
@@ -262,7 +262,7 @@ function startDistServer() {
 
 function stopDistServer() {
   if (!distServerProc) return
-  try { distServerProc.kill('SIGTERM') } catch {}
+  try { distServerProc.kill('SIGTERM') } catch { }
   distServerProc = null
 }
 
@@ -290,7 +290,7 @@ function createSplash() {
           iconDataUrl = img.resize({ width: 144, height: 144 }).toDataURL()
           break
         }
-      } catch {}
+      } catch { }
     }
   }
 
@@ -406,7 +406,7 @@ async function waitFrontendReady(url, timeoutMs = 60000) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(1500) })
       if (res.ok) return true
-    } catch {}
+    } catch { }
     await new Promise(r => setTimeout(r, 800))
   }
   console.warn(`[Electron] 前端 ${url} 等待超时`)
@@ -458,6 +458,19 @@ async function createMainWindow() {
 
   mainWindow.loadURL(startURL)
 
+  // frameless 无菜单栏 → 手动接管刷新/DevTools 快捷键（dev 迭代与排障必需）
+  mainWindow.webContents.on('before-input-event', (_e, input) => {
+    if (input.type !== 'keyDown') return
+    const key = (input.key || '').toLowerCase()
+    if (key === 'r' && (input.control || input.meta)) {
+      mainWindow.webContents.reloadIgnoringCache()
+    } else if (key === 'f5') {
+      mainWindow.webContents.reloadIgnoringCache()
+    } else if (key === 'f12' && IS_DEV) {
+      mainWindow.webContents.toggleDevTools()
+    }
+  })
+
   // ---- 诊断日志（白屏时救命用）----
   mainWindow.webContents.on('did-fail-load', (_e, errCode, errDesc, url) => {
     _log('❌ 主窗口加载失败: ' + errCode + ' ' + errDesc + ' url=' + url)
@@ -484,7 +497,7 @@ async function createMainWindow() {
     closeSplash()
     mainWindow.show()
   }
-  
+
   mainWindow.once('ready-to-show', () => {
     _log('✅ ready-to-show (等 Vue app:ready...)')
     // ready-to-show 只标记，不立即 show
@@ -534,75 +547,91 @@ function _buildTrayMenuTemplate(statusText) {
       { label: `Web 模式 · ${statusText}`, enabled: false },
       { type: 'separator' },
       { label: '🌐 打开浏览器', default: true, click: () => shell.openExternal(`http://localhost:5173`) },
-      { label: '🔄 重启全部', click: async () => {
+      {
+        label: '🔄 重启全部', click: async () => {
           _dialogSync('重启提示', '请直接关闭 start.bat 窗口后重新运行')
-      }},
+        }
+      },
       { type: 'separator' },
       { label: '⚙ 打开设置', click: () => shell.openExternal(`http://localhost:5173/#/settings`) },
       { type: 'separator' },
-      { label: '❌ 退出并停止服务', click: () => {
+      {
+        label: '❌ 退出并停止服务', click: () => {
           _killWebProcesses()
           app.quit()
-      }},
+        }
+      },
     ]
   }
   return [
     { label: `状态: ${statusText}`, enabled: false },
     { type: 'separator' },
-    { label: '🚀 启动服务', click: () => {
-      // Electron 下默认就是启动了（app.whenReady 已经自动拉了后端+窗口），
-      // 如果用户手动关了窗口，这里重新打开
-      if (!mainWindow || !mainWindow.isVisible()) {
-        if (!mainWindow) { createMainWindow().catch(() => {}); return }
-        mainWindow.show(); mainWindow.focus()
+    {
+      label: '🚀 启动服务', click: () => {
+        // Electron 下默认就是启动了（app.whenReady 已经自动拉了后端+窗口），
+        // 如果用户手动关了窗口，这里重新打开
+        if (!mainWindow || !mainWindow.isVisible()) {
+          if (!mainWindow) { createMainWindow().catch(() => { }); return }
+          mainWindow.show(); mainWindow.focus()
+        }
       }
-    }},
-    { label: '🔄 重启全部', click: async () => {
-      splashStep('正在重启服务...', 10); createSplash()
-      stopBackend()
-      splashStep('正在重启后端...', 35)
-      await startBackend().catch(() => {})
-      splashStep('正在准备界面...', 80)
-      if (!mainWindow || !mainWindow.isVisible()) {
-        if (!mainWindow) await createMainWindow().catch(() => {})
-        else { mainWindow.show(); mainWindow.focus() }
+    },
+    {
+      label: '🔄 重启全部', click: async () => {
+        splashStep('正在重启服务...', 10); createSplash()
+        stopBackend()
+        splashStep('正在重启后端...', 35)
+        await startBackend().catch(() => { })
+        splashStep('正在准备界面...', 80)
+        if (!mainWindow || !mainWindow.isVisible()) {
+          if (!mainWindow) await createMainWindow().catch(() => { })
+          else { mainWindow.show(); mainWindow.focus() }
+        }
+        splashStep('DONE')
+        setTimeout(closeSplash, 800)
       }
-      splashStep('DONE')
-      setTimeout(closeSplash, 800)
-    }},
-    { label: '⏹ 停止全部服务', click: () => {
-      stopBackend()
-      if (mainWindow) { mainWindow.close() }
-      _updateTrayStatus('⏹ 已停止')
-    }},
+    },
+    {
+      label: '⏹ 停止全部服务', click: () => {
+        stopBackend()
+        if (mainWindow) { mainWindow.close() }
+        _updateTrayStatus('⏹ 已停止')
+      }
+    },
     { type: 'separator' },
-    { label: '🌐 打开界面', default: true, click: async () => {
-      if (!mainWindow) { await createMainWindow().catch(() => {}) }
-      else if (!mainWindow.isVisible()) { mainWindow.show() }
-      mainWindow?.focus()
-    }},
+    {
+      label: '🌐 打开界面', default: true, click: async () => {
+        if (!mainWindow) { await createMainWindow().catch(() => { }) }
+        else if (!mainWindow.isVisible()) { mainWindow.show() }
+        mainWindow?.focus()
+      }
+    },
     { label: '🌐 用浏览器打开', click: () => shell.openExternal(IS_DEV ? DEV_URL : DEV_URL) },
-    { label: '⚙ 后端健康检查', click: async () => {
-      try {
-        const res = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`, { signal: AbortSignal.timeout(1500) })
-        shell.openExternal(`http://127.0.0.1:${BACKEND_PORT}/api/health`)
-      } catch {
-        _dialogSync('后端未运行', '后端服务未启动，请先点"🚀 启动服务"')
+    {
+      label: '⚙ 后端健康检查', click: async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`, { signal: AbortSignal.timeout(1500) })
+          shell.openExternal(`http://127.0.0.1:${BACKEND_PORT}/api/health`)
+        } catch {
+          _dialogSync('后端未运行', '后端服务未启动，请先点"🚀 启动服务"')
+        }
       }
-    }},
+    },
     { type: 'separator' },
-    { label: '❌ 退出程序', click: () => {
-      stopBackend()
-      app.quit()
-    }},
+    {
+      label: '❌ 退出程序', click: () => {
+        stopBackend()
+        app.quit()
+      }
+    },
   ]
 }
 
 function _updateTrayStatus(newStatus) {
   if (!tray || newStatus === _trayStatus) return
   _trayStatus = newStatus
-  tray.setToolTip(`AgentCluster  ${newStatus}`)
-  try { tray.setContextMenu(Menu.buildFromTemplate(_buildTrayMenuTemplate(newStatus))) } catch {}
+  tray.setToolTip(`AgentCluster  ${newStatus}\n双击打开界面 · 右键管理程序`)
+  try { tray.setContextMenu(Menu.buildFromTemplate(_buildTrayMenuTemplate(newStatus))) } catch { }
 }
 
 // Web 模式退出时：杀掉 start.bat 启动的 python + node（按端口匹配）
@@ -615,18 +644,18 @@ function _killWebProcesses() {
         const m = out.trim().split(/\s+/)
         const pid = parseInt(m[m.length - 1], 10)
         if (pid && pid !== process.pid) {
-          try { process.kill(pid, 'SIGTERM') } catch {}
-          try { execSync(`taskkill /F /PID ${pid}`, { encoding: 'utf8', stdio: 'pipe' }) } catch {}
+          try { process.kill(pid, 'SIGTERM') } catch { }
+          try { execSync(`taskkill /F /PID ${pid}`, { encoding: 'utf8', stdio: 'pipe' }) } catch { }
         }
-      } catch {}
+      } catch { }
     }
-  } catch {}
+  } catch { }
 }
 
 function _dialogSync(title, msg) {
   try {
     dialog.showMessageBoxSync({ message: `${title}\n\n${msg}`, type: 'info', title: 'AgentCluster' })
-  } catch {}
+  } catch { }
 }
 
 function createTray() {
@@ -655,24 +684,24 @@ function createTray() {
         const p = path.join(resources, f)
         if (fs.existsSync(p)) { img = nativeImage.createFromPath(p); break }
       }
-    } catch {}
+    } catch { }
   }
   if (!img || img.isEmpty()) {
     img = nativeImage.createEmpty()
   }
 
   tray = new Tray(img)
-  tray.setToolTip('AgentCluster  正在启动...')
+  tray.setToolTip('AgentCluster  正在启动...\n双击打开界面 · 右键管理程序')
   tray.setContextMenu(Menu.buildFromTemplate(_buildTrayMenuTemplate('⏹ 已停止')))
 
   // 左键 = 打开界面（default: true 的项）
   tray.on('click', async () => {
-    if (!mainWindow) { await createMainWindow().catch(() => {}) }
+    if (!mainWindow) { await createMainWindow().catch(() => { }) }
     else if (!mainWindow.isVisible()) { mainWindow.show() }
     mainWindow?.focus()
   })
   tray.on('double-click', async () => {
-    if (!mainWindow) { await createMainWindow().catch(() => {}) }
+    if (!mainWindow) { await createMainWindow().catch(() => { }) }
     else if (!mainWindow.isVisible()) { mainWindow.show() }
     mainWindow?.focus()
   })
@@ -683,7 +712,7 @@ function createTray() {
     let status
     if (h.backend && h.frontend) status = '✅ 运行中'
     else if (!h.backend && !h.frontend) status = '⏹ 已停止'
-    else status = `⚠️ 部分失败 (后端=${h.backend?'OK':'FAIL'}, 前端=${h.frontend?'OK':'FAIL'})`
+    else status = `⚠️ 部分失败 (后端=${h.backend ? 'OK' : 'FAIL'}, 前端=${h.frontend ? 'OK' : 'FAIL'})`
     _updateTrayStatus(status)
   }, 3000)
 }
@@ -775,7 +804,7 @@ app.whenReady().then(async () => {
       await startDistServer()
     } catch (err) {
       console.warn('[Electron] Dist server 启动失败:', err.message)
-      try { _dialogSync('前端构建缺失', err.message) } catch {}
+      try { _dialogSync('前端构建缺失', err.message) } catch { }
     }
   }
 

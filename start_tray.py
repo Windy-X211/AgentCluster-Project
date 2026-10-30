@@ -410,6 +410,11 @@ def make_image(running: bool = True) -> Image.Image:
     return img
 
 
+def _tooltip(status: str) -> str:
+    """拼装托盘悬浮提示：状态行 + 操作提示行（Windows 托盘原生支持多行）。"""
+    return f"AgentCluster  {status}\n双击打开界面 · 右键管理程序"
+
+
 def update_menu():
     """每 3 秒刷新：用实时健康检查回写 status_text，避免启动期 FAIL 文案永久残留。
 
@@ -422,7 +427,7 @@ def update_menu():
     global status_text
     # 启动/停止过渡态由 start_all/stop_all 设置，这里只在明确运行或停止后覆盖
     if status_text.startswith("正在启动") or status_text.startswith("正在停止"):
-        icon.title = f"AgentCluster  {status_text}"
+        icon.title = _tooltip(status_text)
         return
     h = check_health()
     if h["backend"] and h["frontend"]:
@@ -432,7 +437,7 @@ def update_menu():
     else:
         new_status = f"⚠️ 部分失败 (后端={'OK' if h['backend'] else 'FAIL'}, 前端={'OK' if h['frontend'] else 'FAIL'})"
 
-    icon.title = f"AgentCluster  {new_status}"
+    icon.title = _tooltip(new_status)
     if new_status != status_text:
         status_text = new_status
         try: icon.update_menu()
@@ -475,7 +480,7 @@ def on_exit(ic=None, item=None):
 
 def on_start_if_needed(icon=None, item=None):
     if is_running():
-        icon.title = "AgentCluster ✅ 已在运行"
+        icon.title = _tooltip("✅ 运行中")
     else:
         threading.Thread(target=start_all, daemon=True).start()
 
@@ -501,7 +506,7 @@ def run_tray():
         pystray.MenuItem("❌ 退出程序", on_exit),
     )
     icon = pystray.Icon("agentcluster", make_image(running=True), "AgentCluster", menu)
-    icon.title = f"AgentCluster  {status_text}"
+    icon.title = _tooltip(status_text)
 
     # 后台自动启动（包装异常）
     def safe_start():

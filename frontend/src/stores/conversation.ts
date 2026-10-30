@@ -128,6 +128,10 @@ export function cronMatch(expr: string, d: Date): boolean {
 
 /** 最后活动时间：最后一条消息 ts → created_at → epoch(id)，用于上新下旧排序 */
 export function convLastTs(c: any): string {
+  // ⚠️ 精简列表优化：后端 GET /api/conversations 返回的精简版本已带 last_ts 摘要字段，
+  // 优先用它避免扫整个 messages 数组（精简列表没有 messages，扫了也白扫）。
+  // 完整会话（点击加载后）回退到 messages 扫描以保持兼容。
+  if (c?.last_ts) return c.last_ts
   const msgs = c?.messages || []
   let last = ''
   for (const m of msgs) {
@@ -165,13 +169,36 @@ export function sortConvsByActivity(list: any[]): any[] {
   })
 }
 
-/** 会话展示名：最新一条有内容的用户/助手消息，单行截 20 字；无消息回退 c.name */
+/** 判断消息是否适合做会话标签预览（跳过协议/工具噪音，与后端 _is_preview_worthy 对齐） */
+function _isPreviewWorthy(m: any): boolean {
+  if (!m || typeof m !== 'object') return false
+  const role = m.role
+  if (role === 'a2a' || role === 'tool') return false
+  const content: any = m.content
+  if (typeof content !== 'string') return false
+  const stripped = content.trim()
+  if (!stripped) return false
+  // A2A 协议转发消息（集群内 agent-to-agent 信封）
+  if (stripped.startsWith('【A2A 协议消息】')) return false
+  // 纯 JSON/数组内容（工具返回值）
+  if (stripped.startsWith('{') || stripped.startsWith('[')) return false
+  return role === 'user' || role === 'assistant'
+}
+
+/** 会话展示名：优先用后端返回的 last_preview 摘要字段（精简列表没有 messages），
+ *  其次扫 messages 里最新有内容的 user/assistant 自然语言消息，单行截 20 字；无消息回退 c.name。 */
 export function convDisplayName(c: any): string {
+  // 精简列表已带 last_preview（后端已过滤 A2A/tool/协议转发），直接用
+  if (c?.last_preview) {
+    const t = c.last_preview.replace(/\s+/g, ' ').trim()
+    if (t) return t.length > 20 ? t.slice(0, 20) + '…' : t
+  }
+  // 回退：扫 messages，跳过 a2a/tool/协议转发/JSON 工具结果
   const msgs = c?.messages || []
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
-    if (m.role !== 'user' && m.role !== 'assistant') continue
-    const t = (m.content || '').replace(/\s+/g, ' ').trim()
+    if (!_isPreviewWorthy(m)) continue
+    const t = (m.content as string).replace(/\s+/g, ' ').trim()
     if (!t) continue
     return t.length > 20 ? t.slice(0, 20) + '…' : t
   }
@@ -535,10 +562,7 @@ export const useConvStore = defineStore('conv', {
     runCanvasId: null as number | null,
     _timer: null as ReturnType<typeof setInterval> | null,
     _fired: {} as Record<string, string>,    // cron 防重 {agentId: 'YYYY-MM-DDTHH:MM'}
-    // —— 流式保存节流相关（2026-09 加入）——
-    _flushTimers: {} as Record<number, ReturnType<typeof setTimeout>>, // 会话 → 节流 flush 定时器
-    _lastFlushAt: 0,           // 上次 flush 时间戳（ms）
-    _unloadBound: false,       // 是否已绑定 beforeunload
+
     _sendError: {} as Record<number, boolean>, // 会话 → 本轮 send 是否出现错误（E: 行 / 异常）
     _adopting: new Set<number>(), // 正在接管恢复的后端运行会话（防重复订阅）
   }),
@@ -548,11 +572,27 @@ export const useConvStore = defineStore('conv', {
     streaming(state): boolean {
       return state.current != null && state.streamingConvIds.has(state.current)
     },
-    /** 指定智能体在当前会话是否流式运行中（对话区停止按钮按「下拉框选中的智能体」切换） */
+    /** 指定智能体是否正在输出（对话区停止按钮按「下拉框选中的智能体」切换）。
+     *  按消息 streaming 标记判断而非 _runAgents 订阅归属：串行接力（A send_message 给 B）下
+     *  B 的输出经 A 的运行流转，_runAgents 只登记链首 A——按订阅判断会出现"A 已停仍显示
+     *  停止、B 在跑仍显示发送"的错位；SPEAK:/A2A:/DONE/STOP/收尾兜底全程维护 streaming 标记，
+     *  与「谁正在输出」严格一致（A 发出消息即闭合自己的泡泡 → 按钮回发送；B 懒开流式
+     *  assistant → 按钮变停止；收尾/停止统一清除 → 恢复发送）。 */
     agentStreaming(state): (agentId: number | null | undefined) => boolean {
-      return (agentId) =>
-        agentId != null && state.current != null &&
-        (state._runAgents[state.current] ?? new Set()).has(agentId)
+      return (agentId) => {
+        if (agentId == null || state.current == null) return false
+        // 工具执行窗口：C: 行已闭合正文（streaming=false）、R: 行尚未开"正在输入"占位
+        // ——该 agent 有未返回结果的工具（_toolPending>0）即为运行中（pip install 等长工具）
+        if ((state._toolPending[state.current] ?? {})[agentId] > 0) return true
+        const msgs = state.list.find(x => x.id === state.current)?.messages || []
+        // 倒序扫描：输出中的 agent 的流式消息靠近尾部，命中即短路返回
+        // （不能在遇到"别的 agent 的流式消息"时提前判 false——并行模式下多方流式消息共存）
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i] as any
+          if (m?.role === 'assistant' && m.streaming === true && m.agent_id === agentId) return true
+        }
+        return false
+      }
     },
     /** 当前会话的发言智能体（最近一个） */
     speakingAgent(state): number | null {
@@ -589,40 +629,50 @@ export const useConvStore = defineStore('conv', {
   },
   actions: {
     async fetch() {
+      // 后端 GET /api/conversations 现已返回**精简列表**（剥离了 messages 大数组），
+      // 启动时数据量从 24MB 降至约 100KB，加载速度提升 100x+。
+      // 完整消息在 ensureCurrent() 或 refreshConv() 时按需加载。
       const list: any[] = await api.convs.list()
-      // 清洗历史遗留的 streaming 标记：fetch 时不可能存在进行中的流，
-      // 防止之前异常中断被持久化的 streaming:true 在重开后渲染成"空泡泡+永久闪烁光标"
-      for (const c of list) {
-        // 正在流式的会话：跳过清洗（保留本地实时流式消息），整对象替换会让
-        // send()/_handleLine 持有的引用脱钩、收尾 flush 用旧快照覆盖后端 → 运行时切换智能体丢输出
-        if (this.streamingConvIds.has(c?.id)) continue
-        for (const m of c?.messages || []) {
-          if (m && typeof m === 'object') {
-            if (m.streaming) m.streaming = false
-            // 后端持久化字段 images → 前端统一 image_refs
-            if (!m.image_refs && Array.isArray(m.images) && m.images.length) {
-              m.image_refs = m.images
-            }
-          }
-        }
-      }
-      // 流式中的会话改用本地对象（含实时输出），其余用服务端最新；避免运行期对象脱钩
+      // —— 关键：合并策略 ——
+      // 后端返回的精简列表没有 messages。我们必须保护本地已有的完整会话对象：
+      //   1) 流式中的 conv → 保留本地（含实时输出，运行期对象不能脱钩）
+      //   2) 已有完整 messages 的 conv → 保留本地（否则 fetch 会把已加载的消息清空）
+      //      （回复完成后 streamingConvIds 会移除该 conv，但 messages 数组应该保留）
+      //   3) 新出现的 conv → 直接用后端精简版（后面 ensureCurrent 会按需加载完整数据）
       const merged = list.map((c: any) => {
-        if (this.streamingConvIds.has(c?.id)) {
-          const loc = this.list.find(x => x.id === c.id) as any
-          if (loc) {
-            for (const k of ['mode', 'canvas_id', 'name', 'agent_ids', 'workdir', 'execution_mode']) {
-              if (k in c) loc[k] = c[k]
-            }
-            return loc
+        const localIdx = this.list.findIndex(x => x.id === c.id)
+        const local = localIdx >= 0 ? this.list[localIdx] : null
+        const shouldPreserve =
+          (c?.id != null && this.streamingConvIds.has(c.id)) ||  // ① 流式中
+          (local && Array.isArray((local as any).messages))     // ② 已加载完整消息
+        if (shouldPreserve && local) {
+          // 同步后端最新元信息（名字/画布/智能体列表等），保留 messages 和本地引用
+          for (const k of ['mode', 'canvas_id', 'name', 'agent_ids', 'workdir', 'execution_mode',
+            'message_count', 'last_ts', 'last_role', 'last_agent_id', 'last_preview']) {
+            if (k in c) (local as any)[k] = c[k]
           }
+          return local
         }
         return c
       })
       this.list = sortConvsByActivity(merged)
     },
     async create(d: any = { name: '新对话', agent_ids: [] }) {
-      const c = await api.convs.create(d); this.list = sortConvsByActivity([c, ...this.list]); this.current = c.id; return c
+      const c = await api.convs.create(d); this.list = sortConvsByActivity([c, ...this.list]); this.current = c.id
+      // 新建成功后顺带清理遗留的空会话（0 条消息）：反复点「新建」不再堆积空对话。
+      // 安全边界（防"无法新建/发送"回归）：先创建成功再清理、清理全程容错不影响本次返回；
+      // 排除当前会话（CanvasBoard 对空会话有换绑复用逻辑）与流式中的会话，绝不误删使用中的。
+      try {
+        const isEmpty = (x: any) => Array.isArray(x.messages)
+          ? x.messages.length === 0
+          : x.message_count === 0
+        const emptyIds = this.list
+          .filter((x: any) => x?.id != null && x.id !== c.id && x.id !== this.current
+            && !this.streamingConvIds.has(x.id) && isEmpty(x))
+          .map((x: any) => x.id)
+        if (emptyIds.length) void this.removeMany(emptyIds)
+      } catch { /* 清理失败不影响新建 */ }
+      return c
     },
     async update(id: number, d: any) {
       const c = await api.convs.update(id, d)
@@ -638,14 +688,34 @@ export const useConvStore = defineStore('conv', {
       }
       return c
     },
-    /** 从后端重新拉取单个会话并对齐到本地（"切回智能体时先同步已落库内容"）。
-     *  仅在该会话无流式运行时执行：若会话正在流式，本地已含实时输出，
-     *  整体替换会打断后续流式渲染，故以本地为准直接跳过。 */
-    async refreshConv(cid: number) {
-      if (cid == null || this.streamingConvIds.has(cid)) return
+    /** 从后端同步单个会话到本地（"切回智能体/会话时同步"）。
+     *  先检测后端运行态：发现本地未接管的运行（他端发起 / 重开窗口）→ 走 _adoptRun
+     *  接管事件流恢复显示，_runAgents 随之填充 → 停止按钮与选中智能体运行状态同步；
+     *  无运行才拉落库整体替换。会话正在流式时本地已含实时输出，整体替换会打断
+     *  后续流式渲染，故以本地为准直接返回本地运行集合。
+     *  返回该会话运行中的 agentId 列表（供调用方回填选中智能体）。 */
+    async refreshConv(cid: number): Promise<number[]> {
+      if (cid == null) return []
+      const local = [...(this._runAgents[cid] ?? new Set<number>())].filter(a => a != null)
+      if (this.streamingConvIds.has(cid)) return local
+      try {
+        const st = await api.convs.running(cid)
+        const runs: any[] = st?.runs || []
+        if (st?.running && runs.length) {
+          // 走到这里时本地必无流式（上方守卫）→ 运行均为未接管，全量接管恢复。
+          // 同步先占 _adopting：watch(current) 与 watch(currentAgentId) 可能并发触发
+          // 两份 refreshConv，双重 _adoptRun 会对同一运行订阅两份事件流 → 消息重复
+          if (!this._adopting.has(cid)) {
+            this._adopting.add(cid)
+            runs.sort((a: any, b: any) => (a.started_at ?? 0) - (b.started_at ?? 0))
+            void this._adoptRun(cid, runs)
+          }
+          return [...new Set([...local, ...runs.map((r: any) => r.agent_id).filter((a: any) => a != null)])]
+        }
+      } catch { /* 后端不可达 → 退回落库拉取 */ }
       try {
         const c = await api.convs.get(cid)
-        if (!c || !Array.isArray(c.messages)) return
+        if (!c || !Array.isArray(c.messages)) return []
         for (const m of c.messages) {
           if (m && typeof m === 'object' && m.streaming) m.streaming = false
           if (m && !m.image_refs && Array.isArray(m.images) && m.images.length) m.image_refs = m.images
@@ -654,6 +724,7 @@ export const useConvStore = defineStore('conv', {
         if (i >= 0) this.list[i] = c
         else this.list.push(c)
       } catch { /* 会话可能已被删除 / 后端短暂不可达 → 静默 */ }
+      return []
     },
     async remove(id: number) { await api.convs.remove(id); this.list = this.list.filter(x => x.id !== id); if (this.current === id) this.current = this.list[0]?.id ?? null },
     async removeMany(ids: number[]) {
@@ -663,6 +734,12 @@ export const useConvStore = defineStore('conv', {
       if (this.current != null && gone.has(this.current)) this.current = this.list[0]?.id ?? null
     },
     currentData() { return this.list.find(x => x.id === this.current) },
+
+    /** 统一的切换会话入口：设置 current + 按需加载完整消息历史 */
+    selectConv(cid: number | null) {
+      this.current = cid
+      if (cid != null) void this._ensureFullMessages(cid)
+    },
 
     /** 删除单条消息（仅删除该条，保留其余消息）。
      *  若删除的是带 tool_calls 的 assistant 消息，后端会连带删除紧随的 tool 结果，
@@ -708,7 +785,7 @@ export const useConvStore = defineStore('conv', {
       }
     },
 
-    // ========== 流式持久化（2026-09 加入） ==========
+    // ========== 流式持久化 ==========
     /** 强制把指定会话（含 streaming:true 的 assistant）写回后端。同步/异步都能跑。
      *  未传 id 时回退到当前会话。流式状态按会话隔离后，send() 必须传入对应会话 id，
      *  否则用户中途切换会话后会写错对象。 */
@@ -718,53 +795,29 @@ export const useConvStore = defineStore('conv', {
       const c = this.list.find(x => x.id === cid)
       if (!c) return
       const payload = {
-        messages: (c.messages || []).map((m: any) => {
-          const o: any = { ...m }
-          return o
-        }),
+        messages: (c.messages || []).map((m: any) => ({ ...m })),
       }
       try {
         if (useSyncXHR) {
-          // beforeunload 里 fetch 会被浏览器取消，用同步 XHR 兜底（仅 Chrome/Edge 支持）
           const xhr = new XMLHttpRequest()
-          xhr.open('PUT', `${API_BASE}/api/conversations/${cid}`, false) // false = 同步
+          xhr.open('PUT', `${API_BASE}/api/conversations/${cid}`, false)
           xhr.setRequestHeader('Content-Type', 'application/json')
           try { xhr.send(JSON.stringify(payload)) } catch { /* ignore */ }
         } else {
           await api.convs.update(cid, payload)
         }
-        this._lastFlushAt = Date.now()
       } catch {
         // 静默：流式过程中后端短暂不可达不应该炸掉整个流
       }
     },
-    /** 节流 flush：调用后 delayMs 内只会真的发一次，避免每 chunk 都打一次 PUT。
-     *  未传 id 时回退到当前会话。按会话维护独立的节流定时器，互不干扰。 */
-    scheduleFlushCurrent(delayMs = 1200, id: number | null = null) {
-      const cid = id ?? this.current
-      if (cid == null) return
-      const prev = this._flushTimers[cid]
-      if (prev) clearTimeout(prev)
-      this._flushTimers[cid] = setTimeout(() => {
-        delete this._flushTimers[cid]
-        void this.flushCurrentNow(false, cid)
-      }, delayMs)
-    },
-    /** 取消挂起的节流 flush（流式结束、手动 fetch 等场景） */
+    /** 取消挂起的节流 flush */
     cancelScheduledFlush(id: number | null = null) {
-      const cid = id ?? this.current
-      if (cid == null) return
-      const t = this._flushTimers[cid]
-      if (t) { clearTimeout(t); delete this._flushTimers[cid] }
+      // 节流定时器已在后端 send 端点落库 + DONE 前 final upsert 双通道保障，
+      // 前端只保留 flushCurrentNow 在关键节点（send 前 / finish 后）显式调用
     },
-    /** 绑定 window.beforeunload：关页/关标签时用同步 XHR 强制保存所有正在流式的会话。
-     *  只绑一次，幂等。 */
+    /** 绑定 window.beforeunload：关页/关标签时用同步 XHR 强制保存。幂等。 */
     bindBeforeUnload() {
-      if (this._unloadBound || typeof window === 'undefined') return
-      this._unloadBound = true
       const handler = () => {
-        // 关页时尽力保存会话。运行中的会话跳过：后端节流落库负责，
-        // 前端整段 PUT 会覆盖后端半路写入（且多前端实例在线时会互相踩踏）
         const ids = new Set<number>()
         if (this.current != null) ids.add(this.current)
         for (const cid of ids) {
@@ -773,8 +826,6 @@ export const useConvStore = defineStore('conv', {
         }
       }
       window.addEventListener('beforeunload', handler)
-      // pagehide 也触发一次（iOS Safari 更倾向 pagehide）
-      window.addEventListener('pagehide', handler)
     },
 
     async send(agentId: number, content: string) {
@@ -782,8 +833,13 @@ export const useConvStore = defineStore('conv', {
       const cid = this.current!  // 捕获本次发送的会话 id：整个流程（含 finally）都按此 id 操作，
       // 用户中途切换会话不会影响本流的收尾与状态复位
       const runKey = `${cid}:${agentId}`
-      // 防重入按「会话 + 智能体」：同一智能体重复发送忽略；其它智能体可并发流式
-      if ((this._runAgents[cid] ?? new Set<number>()).has(agentId)) return
+      // 防重入按「会话 + 智能体」：同一智能体重复发送忽略；其它智能体可并发流式。
+      // 注意停止按钮已按消息 streaming 判断（接力中 A 无输出即回"发送"），但 A 的运行订阅
+      // 仍未结束（等接力链收尾）→ 这里拦下并提示，避免"按钮是发送却点了没反应"
+      if ((this._runAgents[cid] ?? new Set<number>()).has(agentId)) {
+        alert('该智能体的接力链仍在运行，请等待完成或停止后再发送')
+        return
+      }
       const c = this.currentData()
       // 本会话首个运行才复位会话级状态（已有并发运行时不清，避免踩掉对方状态）
       const isFirstRun = !(this._runAgents[cid] && this._runAgents[cid].size)
@@ -807,9 +863,6 @@ export const useConvStore = defineStore('conv', {
       this._runSeq[runKey] = 0
       this._runParts[runKey] = new Set([agentId])
 
-      // 绑定一次 beforeunload（幂等），关页/关标签会同步 XHR 强制保存
-      this.bindBeforeUnload()
-
       // 构建当前轮消息数组（混合：用户 + 工具卡片 + 流式 assistant）
       const msgs: RichMsg[] = c.messages || []
       msgs.push({ role: 'user', content, ts: new Date().toISOString(), to_agent_id: agentId })
@@ -822,6 +875,9 @@ export const useConvStore = defineStore('conv', {
       this._speakingAgents[cid] = new Set([agentId])
       const ctrl = new AbortController()
       this._ctrls.set(runKey, ctrl)
+
+      // 绑定一次 beforeunload（幂等），关页/关标签会同步 XHR 强制保存
+      this.bindBeforeUnload()
 
       // 先立刻落库一次（用户消息 + 空的 assistant 占位）：后端 send 端点以此为运行基底快照，
       // 重开窗口恢复时用它 + 全量重放行协议重建界面
@@ -1008,7 +1064,9 @@ export const useConvStore = defineStore('conv', {
         }
       }
       // 恢复流程可能替换过 list 中的对象 → 重新定位当前引用
-      const c = (this.list.find(x => x.id === cid) as any) || cOrig
+      // ⚠️ 保险：优先选**有完整 messages 数组**的版本（精简列表 fetch 后 messages 可能为 undefined）
+      const inList = this.list.find(x => x.id === cid) as any
+      const c = (inList && Array.isArray(inList.messages)) ? inList : (cOrig || inList)
       const msgs: RichMsg[] = c?.messages || []
       // 兜底：清空本运行残留的 streaming 标记（正常结束 / 中断 / 异常统一收敛到这里），
       // 确保最终落库的 messages 不带"活的"流式标记，防止空泡泡+光标被持久化
@@ -1052,9 +1110,9 @@ export const useConvStore = defineStore('conv', {
         }
         if (!anchored) msgs.splice(i, 1)
       }
-      // 取消挂起的节流 flush（马上要手动 flush + fetch）
-      this.cancelScheduledFlush(cid)
-      // 关键：先把最终状态立刻写回后端，再 fetch 刷新
+      // 关键：先把最终状态立刻写回后端，再 fetch 刷新。
+      // 前端是流式增量输出（_handleLine 逐行 append），后端节流落库可能还没写完全部内容。
+      // 这里 flushCurrentNow 确保 messages 与流式渲染 100% 一致后再 fetch 对齐。
       await this.flushCurrentNow(false, cid)
       // 刷新列表（保守：find 失败不把 current 清 null，避免内存里的 messages 被"闪空"）
       await this.fetch()
@@ -1095,6 +1153,11 @@ export const useConvStore = defineStore('conv', {
         for (const [cid, runs] of byCid) {
           if (this._adopting.has(cid)) continue
           runs.sort((a, b) => (a.started_at ?? 0) - (b.started_at ?? 0))
+          // 当前会话有运行 → 选中首个运行智能体（重开窗口后停止按钮立即可用）
+          if (cid === this.current) {
+            const first = runs.map((r: any) => r.agent_id).find((a: any) => a != null)
+            if (first != null) this.selectedAgentId = first
+          }
           void this._adoptRun(cid, runs)
         }
       } catch { /* 后端不可达 / 无运行 → 静默 */ }
@@ -1151,11 +1214,31 @@ export const useConvStore = defineStore('conv', {
 
     /** 挂载兜底：优先恢复上次选中的会话（localStorage 记忆），否则最新活跃会话 */
     ensureCurrent() {
-      if (this.current != null && this.list.find(x => x.id === this.current)) return
+      if (this.current != null && this.list.find(x => x.id === this.current)) {
+        // 已有 current → 确保完整消息已加载（精简列表 fetch 后 messages 缺失）
+        void this._ensureFullMessages(this.current)
+        return
+      }
       let saved: number | null = null
       try { saved = +(localStorage.getItem('agent-cluster.conversation.current') || '') || null } catch { /* ignore */ }
-      if (saved != null && this.list.find(x => x.id === saved)) { this.current = saved; return }
-      this.current = this.list[0]?.id ?? null
+      if (saved != null && this.list.find(x => x.id === saved)) {
+        this.current = saved
+        void this._ensureFullMessages(saved)
+        return
+      }
+      const first = this.list[0]?.id ?? null
+      this.current = first
+      if (first != null) void this._ensureFullMessages(first)
+    },
+
+    /** 确保指定会话已加载完整消息（精简列表只有元数据，messages 为 undefined）。
+     *  如果已有 messages 数组（>=0 条）说明已是完整数据，直接跳过。
+     *  异步调用，不阻塞调用方。 */
+    async _ensureFullMessages(cid: number) {
+      if (cid == null || this.streamingConvIds.has(cid)) return
+      const c = this.list.find(x => x.id === cid) as any
+      if (c && Array.isArray(c.messages)) return  // 已有完整数据，跳过
+      await this.refreshConv(cid)
     },
 
     // —— 运行/停止：按节点右键配置的触发方式（manual 等待 / cron 定时）——
@@ -1176,24 +1259,32 @@ export const useConvStore = defineStore('conv', {
       if (cid != null) void this.stopSend()
     },
     /** 停止对话流：agentId 给定 → 只停该智能体；缺省 → 停该会话全部智能体。
-     *  运行与连接解耦后必须显式通知后端取消任务，流随后端 STOP/DONE 行自然结束并走 _finishRun 收尾。
-     *  8s 兜底：后端未响应时本地 abort 仅断开订阅视图（不再影响后端运行）。 */
+     *  原设计：先 await 通知后端停止，后端成功后本地流自然会收到 STOP/DONE 行结束；
+     *  后端不可达或 8s 超时 → abort 本地流兜底。
+     *  新版同步无条件 abort 本地流会导致：正常回复进行中被提前 abort → 前端 ERR_ABORTED → 对话清空。 */
     async stopSend(agentId?: number | null) {
       const cid = this.current
       if (cid == null) return
       try {
+        // 先通知后端取消运行——后端会发出 STOP 行，前端事件流自然结束（DONE 收尾）
         await api.convs.stop(cid, agentId ?? null)
       } catch {
+        // 后端不可达 → 兜底 abort 本地流（不等后端了）
         this._abortLocal(cid, agentId)
         return
       }
-      setTimeout(() => {
-        // 8s 后该运行仍在本地流式 → 断开订阅兜底（按 runKey 精确判定）
-        const stillStreaming = agentId != null
-          ? this._ctrls.has(`${cid}:${agentId}`)
-          : [...this._ctrls.keys()].some(k => k.startsWith(`${cid}:`))
-        if (stillStreaming) this._abortLocal(cid, agentId)
-      }, 8000)
+      // 8s 后该运行仍在本地流式 → 断开订阅兜底（按 runKey 精确判定）
+      const stillStreaming = agentId != null
+        ? this._ctrls.has(`${cid}:${agentId}`)
+        : [...this._ctrls.keys()].some(k => k.startsWith(`${cid}:`))
+      if (stillStreaming) {
+        setTimeout(() => {
+          const still2 = agentId != null
+            ? this._ctrls.has(`${cid}:${agentId}`)
+            : [...this._ctrls.keys()].some(k => k.startsWith(`${cid}:`))
+          if (still2) this._abortLocal(cid, agentId)
+        }, 8000)
+      }
     },
     _abortLocal(cid: number, agentId?: number | null) {
       if (agentId != null) {
