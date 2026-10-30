@@ -2698,9 +2698,9 @@ COMMAND_GROUPS = [
     ("文件操作", [
         "file.read", "file.write", "file.delete", "file.replace",
         "file.patch", "file.structure", "file.search", "file.find",
+        "workspace.search",
     ]),
-    ("工作区检索", ["workspace.search"]),
-    ("智能搜索", ["agent.smart_search"]),
+    ("智能命令", ["agent.smart_search"]),
     ("命令运行", ["cmd.run", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
     ("集群编排", [
         "cluster.list_agents", "cluster.list_capabilities",

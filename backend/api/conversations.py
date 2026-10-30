@@ -230,6 +230,20 @@ def get_running(cid: int, include_base: bool = Query(False, description="附带 
     return {"running": True, "runs": running, "conv_id": cid}
 
 
+@router.get("/{cid}/context")
+def get_context_stats(cid: int, agent_id: int = Query(..., description="按该智能体视角估算（模型窗口 / system prompt 不同）")):
+    """当前智能体视角的上下文长度（估算 token）与压缩线进度（对话区指示器数据源）。"""
+    conv = run_registry.peek_live_conv(cid) or get_by("conversations", cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    agent = get_by("agents", agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    canvas = get_by("canvases", conv.get("canvas_id")) if conv.get("canvas_id") else None
+    from core.ctx_compress import context_stats
+    return context_stats(conv, agent, canvas)
+
+
 @router.get("/{cid}/events")
 async def stream_events(cid: int,
                         since: int = Query(0, description="从该序号之后重放（恢复场景固定 since=0 全量重放）"),

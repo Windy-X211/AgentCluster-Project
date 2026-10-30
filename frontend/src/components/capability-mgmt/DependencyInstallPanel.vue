@@ -232,15 +232,15 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
 </template>
 
 <style scoped>
-.dep-panel { display: flex; flex-direction: column; gap: 12px; height: 100%; }
+.dep-panel { display: flex; flex-direction: column; gap: 10px; height: 100%; }
 .dep-header {
   display: flex; align-items: center; gap: 12px; justify-content: space-between;
-  padding: 12px 16px; border-radius: 10px; flex-shrink: 0;
+  padding: 8px 12px; border-radius: 10px; flex-shrink: 0;
   background: rgba(var(--surface-rgb), 0.04); border: 1px solid rgba(var(--surface-rgb), 0.08);
 }
 .dep-summary { display: flex; gap: 8px; flex-wrap: wrap; }
 .ds-chip {
-  font-size: calc(12px * var(--font-scale)); padding: 3px 10px; border-radius: 999px;
+  font-size: calc(12px * var(--font-scale)); padding: 2px 9px; border-radius: 999px;
   background: rgba(var(--surface-rgb), 0.08); border: 1px solid rgba(var(--surface-rgb), 0.12);
 }
 .ds-chip.pip { background: rgba(80, 160, 255, 0.15); color: #8ab4ff; border-color: rgba(80, 160, 255, 0.3); }

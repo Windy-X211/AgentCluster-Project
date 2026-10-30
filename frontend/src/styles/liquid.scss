@@ -317,6 +317,14 @@ html.desktop-frameless .app-root {
   padding-top: 6px;
 }
 
+/* 桌面独立窗口：所有带 pywebview-drag-region 类的区域可拖动窗口
+   （Home 顶栏 brand/spacer、设置中心与能力管理页的 .top-drag 标题区）
+   纯浏览器下该属性被忽略，无副作用 */
+html.desktop-frameless .pywebview-drag-region {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
 .topbar {
   grid-area: topbar;
 }

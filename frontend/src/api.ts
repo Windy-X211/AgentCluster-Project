@@ -192,6 +192,8 @@ export const api = {
     remove: (id: number) => req(`/conversations/${id}`, { method: 'DELETE' }),
     runs: () => req<any>('/conversations/runs'),
     running: (id: number) => req<any>(`/conversations/${id}/running?include_base=1`),
+    // 当前智能体视角的上下文长度（估算 token）与压缩线进度
+    context: (id: number, agentId: number) => req<any>(`/conversations/${id}/context?agent_id=${agentId}`),
     // agentId 给定 → 只停该智能体；缺省 → 停该会话全部智能体
     stop: (id: number, agentId?: number | null) =>
       req(`/conversations/${id}/stop`, { method: 'POST', body: JSON.stringify(agentId != null ? { agent_id: agentId } : {}) }),

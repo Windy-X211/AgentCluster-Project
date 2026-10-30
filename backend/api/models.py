@@ -15,6 +15,35 @@ class IfaceIn(BaseModel):
     default_model: str = "gpt-4o-mini"
     models: list[str] = []
     description: str = ""
+    # 每个模型的上下文窗口（token）：{模型名: 窗口}，值支持 int 或 "128k"/"1m" 字符串
+    model_windows: dict = {}
+
+
+def _norm_windows(w: dict) -> dict[str, int]:
+    """窗口表规范化：容忍 128k/1m/2b 字符串值，剔除非法项。"""
+    out: dict[str, int] = {}
+    if not isinstance(w, dict):
+        return out
+    for k, v in w.items():
+        n = None
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)) and v > 0:
+            n = int(v)
+        elif isinstance(v, str):
+            s = v.strip().lower()
+            mult = 1
+            if s.endswith("k"): mult, s = 1_000, s[:-1]
+            elif s.endswith("m"): mult, s = 1_000_000, s[:-1]
+            elif s.endswith("b"): mult, s = 1_000_000_000, s[:-1]
+            try:
+                f = float(s)
+                n = int(f * mult) if f > 0 else None
+            except ValueError:
+                n = None
+        if n:
+            out[str(k)] = n
+    return out
 
 
 @router.get("")
@@ -25,6 +54,7 @@ def list_interfaces():
 @router.post("")
 def create_iface(i: IfaceIn):
     item = i.model_dump()
+    item["model_windows"] = _norm_windows(item.get("model_windows"))
     item["id"] = next_id("model_interfaces")
     return upsert("model_interfaces", item)
 
@@ -39,6 +69,7 @@ def update_iface(iid: int, i: IfaceIn):
     cur = get_by("model_interfaces", iid)
     if not cur: raise HTTPException(404, "not found")
     cur.update(i.model_dump())
+    cur["model_windows"] = _norm_windows(cur.get("model_windows"))
     cur["id"] = iid
     return upsert("model_interfaces", cur)
 

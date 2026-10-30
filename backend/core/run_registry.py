@@ -51,7 +51,16 @@ class RunSession:
 
     @property
     def running(self) -> bool:
-        return self.ended_at is None and self.task is not None and not self.task.done()
+        """运行中 = 父 pump 在跑，或串行"发送即停"后接力 child_tasks（接收方）还在跑。
+        后者：agent_reply spawn 接收方 child task 后即返回 → pump finally 提前 return
+        （不设 ended_at、等 _on_session_children_done 收尾），此时 task 已 done 但
+        接收方仍在输出——若判为非运行，刷新后 /runs 与 /running 均答"无运行"，
+        前端恢复链路（events 重放）整体断裂，表现为"模型还在跑但界面无运行态、内容不更新"。"""
+        if self.ended_at is not None:
+            return False
+        if self.task is not None and not self.task.done():
+            return True
+        return any(not ct.done() for ct in self.child_tasks)
 
     def push(self, line: str) -> None:
         """追加一个事件并广播给所有在线订阅者（事件循环内同步调用，天然原子）。"""

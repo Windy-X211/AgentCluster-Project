@@ -159,6 +159,11 @@ DEFAULT_SETTINGS = {
     "default_workdir": "",
     # 画布运行停止时的提示音开关（完成=愉悦/错误=急促）
     "sound_enabled": True,
+    # —— 历史上下文压缩：达到压缩线（模型窗口×百分比）时自动把较早历史压缩成摘要 ——
+    "context_compress_enabled": True,
+    "context_compress_threshold": 0.8,   # 压缩线 = 模型上下文窗口 × 该比例
+    "context_keep_recent": 20,           # 压缩时保留最近 N 条完整对话
+    "context_window_default": 128000,    # 模型未在接口里配置窗口时的默认窗口（token）
 }
 
 

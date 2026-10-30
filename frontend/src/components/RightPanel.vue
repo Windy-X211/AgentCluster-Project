@@ -31,6 +31,11 @@ const layout = useLayoutStore()
 // 其他智能体发给当前智能体的消息：是否显示、显示在左侧还是右侧
 const showOtherAgents = computed(() => settings.data.chat_show_other_agents !== false)
 const otherAgentsSide = computed<'left' | 'right'>(() => (settings.data.chat_other_agents_side === 'left' ? 'left' : 'right'))
+// 对话区消息头像大小（设置中心可配置，默认 24px）
+const chatAvatarSize = computed(() => {
+  const v = Number(settings.data.chat_avatar_size)
+  return Number.isFinite(v) && v >= 16 && v <= 48 ? v : 24
+})
 
 /** 消息是否处于"活动流式"状态：仅当全局确实在流（convs.streaming）且该消息标了 streaming
  *  才视为流式。避免历史遗留的 streaming:true（异常中断被持久化）渲染出永不消失的空泡泡+闪烁光标 */
@@ -1139,6 +1144,8 @@ const visibleMsgs = computed(() => {
   const fromOf = (m: any): number | null => m.from_agent_id ?? m.envelope?.from?.agent_id ?? null
   const toOf = (m: any): number | null => m.envelope?.to?.agent_id ?? null
   return all.filter((m: any) => {
+    // 历史压缩摘要卡片：会话级，不受智能体视角过滤
+    if (m.compressed_summary) return true
     if (m.role === 'user') return !isA2aInput(m) && (m.to_agent_id == null || m.to_agent_id === cur)
     if (m.role === 'a2a') {
       if (fromOf(m) === cur) return true                 // 当前智能体自己发出的
@@ -1170,6 +1177,7 @@ const renderItems = computed(() => {
   let i = 0
   while (i < msgs.length) {
     const m = msgs[i] as any
+    if (m.compressed_summary) { out.push({ type: 'ctx-summary', msg: m, idx: i }); i++; continue }
     if (m.role === 'user') { out.push({ type: 'user', msg: m, idx: i }); i++; continue }
     // 一轮智能体输出：从 user 消息之后开始，直到下一条 user 消息为止
     const start = i
@@ -1463,7 +1471,12 @@ function isTurnActive(seg: any): boolean {
   if (!seg || seg.type !== 'turn') return false
   if (seg.start < turnStartIdx()) return false   // 不是最后一轮
   if (!seg.children.length) return true          // 尚无正文的占位段（工具/等待期）
-  return seg.children.some((ch: any) => ch.kind === 'assistant' && isStreamingMsg(ch.msg))
+  if (seg.children.some((ch: any) => ch.kind === 'assistant' && isStreamingMsg(ch.msg))) return true
+  // 工具执行窗口：C: 已闭合正文（streaming=false）、R: 尚未开新流式占位——
+  // 段内工具仍在执行时保持活跃，否则过程框会在运行中途闪隐、工具行随之中途消失
+  return seg.children.some((ch: any) =>
+    ch.kind === 'assistant' && toolsOfAssistant(ch.idx).some((t: any) => t.role === 'tool_call' && toolIsRunning(t))
+  )
 }
 /** 该 assistant 是否被"提出来"作为最终正文气泡：仅在其所属轮彻底停止后、
  *  且是"该轮最后一条带正文的 assistant"时成立。流式未结束一律留在过程框里 */
@@ -2151,6 +2164,7 @@ watch(scrollKey, async () => {
 // 折叠后把最终正文气泡滚到第一行；用户上滑过则不打扰。
 let _wasStreamingForProc = false
 watch(() => convs.streaming, async (v) => {
+  if (!v) scheduleCtxRefresh()  // 流式结束（含触发过压缩的轮次）→ 刷新上下文指示
   if (_wasStreamingForProc && !v) {
     const s = new Set(processOpen.value)
     // 收敛「本轮」的全部左右侧段（side 切分后一轮可能拆成多段）
@@ -2173,6 +2187,7 @@ watch(() => convs.streaming, async (v) => {
 // 切换对话记录时：滚动到底部，并默认选中运行中的智能体（优先）或最新一条回复的智能体
 watch(() => convs.current, async (id) => {
   if (id == null) return
+  scheduleCtxRefresh()
   await nextTick()
   // 切换对话记录：回到最新一条，并恢复底部跟随
   stickBottom.value = true
@@ -2207,13 +2222,74 @@ watch(() => convs.current, async (id) => {
 watch(() => convs.selectedAgentId, (id) => {
   if (id != null) currentAgentId.value = id
 })
+
+// —— 上下文长度指示（发送按钮上方）：估算 token + 压缩线进度配色 ——
+// 数据来自 GET /conversations/{cid}/context（后端按当前智能体视角组装估算）；
+// 消息数 / 智能体 / 会话 / 流式结束都会触发节流刷新
+const ctxInfo = ref<any>(null)
+let _ctxTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleCtxRefresh() {
+  if (_ctxTimer) clearTimeout(_ctxTimer)
+  _ctxTimer = setTimeout(() => { void refreshCtx() }, 300)
+}
+async function refreshCtx() {
+  const cid = convs.current
+  const aid = currentAgentId.value
+  if (cid == null || aid == null) { ctxInfo.value = null; return }
+  try { ctxInfo.value = await api.convs.context(cid, aid) } catch { ctxInfo.value = null }
+}
+/** token 数格式化：不足 1k 显示原值；超出用 k/m/b 单位保留两位小数 */
+function fmtCtxTokens(n: number): string {
+  if (!Number.isFinite(n)) return ''
+  if (n < 1000) return String(Math.round(n))
+  const units: [string, number][] = [['b', 1e9], ['m', 1e6], ['k', 1e3]]
+  for (const [u, v] of units) if (n >= v) return (n / v).toFixed(2) + u
+  return String(Math.round(n))
+}
+const ctxBadgeText = computed(() => (ctxInfo.value?.tokens != null ? fmtCtxTokens(ctxInfo.value.tokens) : ''))
+/** 边框颜色分档：进度（当前 token ÷ 压缩线）绿 → 黄 → 橙 → 红 */
+const ctxLevel = computed(() => {
+  const i = ctxInfo.value
+  if (!i || !i.enabled || !i.limit) return 'off'
+  const p = i.progress ?? 0
+  if (p >= 0.9) return 'crit'
+  if (p >= 0.75) return 'warn2'
+  if (p >= 0.5) return 'warn'
+  return 'ok'
+})
+const ctxTitle = computed(() => {
+  const i = ctxInfo.value
+  if (!i) return ''
+  if (!i.enabled) return `上下文估算 ${fmtCtxTokens(i.tokens)} token（历史压缩已停用）`
+  return `上下文估算 ${fmtCtxTokens(i.tokens)} token / 压缩线 ${fmtCtxTokens(i.limit)}（窗口 ${fmtCtxTokens(i.window)} × ${Math.round((i.threshold ?? 0) * 100)}%）· 已达 ${Math.round((i.progress ?? 0) * 100)}%`
+})
+// —— 历史压缩摘要卡片：展开查看摘要全文 ——
+const expandedCtxSummary = ref(new Set<number>())
+function toggleCtxSummary(idx: number) {
+  const s = new Set(expandedCtxSummary.value)
+  if (s.has(idx)) s.delete(idx); else s.add(idx)
+  expandedCtxSummary.value = s
+}
+function ctxSummaryMeta(m: any): string {
+  const parts: string[] = []
+  if (m?.compressed_count) parts.push(`${m.compressed_count} 条历史消息`)
+  if (m?.ts) {
+    const d = new Date(m.ts)
+    if (!isNaN(d.getTime())) parts.push(`${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`)
+  }
+  return parts.join(' · ')
+}
+
 // 切换智能体（下拉框 / 画布💬直接对话）：切回时同步该会话——后端有运行则接管恢复
 // （停止按钮随运行状态切换），无运行则先显示落库结果（会话正在流式时 refreshConv 内部会跳过）
 watch(() => currentAgentId.value, (id) => {
   if (id == null) return
   const cid = convs.current
   if (cid != null) void convs.refreshConv(cid)
+  scheduleCtxRefresh()
 })
+// 消息数变化（流式追加 / 压缩落库 / 删除）→ 重新估算上下文
+watch(() => convs.currentData()?.messages?.length, () => scheduleCtxRefresh())
 watch(() => convs.focusChatAt, async (t) => {
   if (!t) return
   await nextTick()
@@ -2543,6 +2619,7 @@ onMounted(async () => {
   convs.ensureCurrent()
   if (!currentAgentId.value && agents.list.length) currentAgentId.value = agents.list[0].id
   if (!convs.list.length) await newConv()
+  scheduleCtxRefresh()
 })
 // 从设置/能力管理等页面返回首页时，浏览器/KeepAlive 会把脱离文档流的可滚动元素
 // scrollTop 归零；这里保存 / 还原消息区与会话列表的滚动位置。
@@ -2858,7 +2935,7 @@ onBeforeUnmount(() => {
       <Teleport to="body">
         <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
       </Teleport>
-      <div class="chat-box" ref="msgBox" @scroll.passive="onMessagesScroll">
+      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll">
         <div v-if="!conv" class="no-conv">请新建对话</div>
         <!-- ============ 消息列表 ============
              tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
@@ -2873,6 +2950,18 @@ onBeforeUnmount(() => {
             </div>
             <div class="bubble markdown user-bubble" v-html="msgBubbleHtml(it.msg)"></div>
 
+          </div>
+
+          <!-- ===== 历史压缩摘要卡片（会话级，居中）===== -->
+          <div v-else-if="it.type === 'ctx-summary'" class="ctx-summary-card">
+            <div class="ctx-summary-head" @click="toggleCtxSummary(it.idx)">
+              <span class="ctx-summary-ico">🗜</span>
+              <span class="ctx-summary-title">历史已压缩</span>
+              <span v-if="ctxSummaryMeta(it.msg)" class="ctx-summary-meta">{{ ctxSummaryMeta(it.msg) }}</span>
+              <span class="ctx-summary-chev">{{ expandedCtxSummary.has(it.idx) ? '▾' : '▸' }}</span>
+            </div>
+            <div v-if="expandedCtxSummary.has(it.idx)"
+                 class="ctx-summary-body markdown" v-html="renderChatMarkdown(it.msg.content || '')"></div>
           </div>
 
           <!-- ===== 一轮智能体输出（靠左）=====
@@ -3214,6 +3303,8 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="row2">
+          <!-- 上下文长度指示：紧贴发送按钮上方（绝对定位），外框颜色 = 达到压缩线的进度（绿→黄→橙→红） -->
+          <div v-if="ctxBadgeText" class="ctx-badge" :class="'lv-' + ctxLevel" :title="ctxTitle">{{ ctxBadgeText }}</div>
           <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true"></textarea>
           <button v-if="settings.asrAvailable && settings.asrEnabled" class="btn voice-btn" :class="{ recording: isRecording }" @click="toggleVoiceInput" :title="isRecording ? '停止同声传译' : '同声传译'" aria-label="语音输入">
             <span class="voice-icon">
@@ -3462,9 +3553,10 @@ onBeforeUnmount(() => {
 .head-row { display: flex; align-items: center; gap: 6px; }
 .avatar {
   position: relative; overflow: hidden;
-  width: 24px; height: 24px; border-radius: 7px;
+  width: var(--chat-avatar-size, 24px); height: var(--chat-avatar-size, 24px);
+  border-radius: calc(var(--chat-avatar-size, 24px) * 0.29);
   display: flex; align-items: center; justify-content: center;
-  font-size: calc(11px * var(--font-scale)); font-weight: 600; flex-shrink: 0; color: #fff;
+  font-size: calc(var(--chat-avatar-size, 24px) * 0.46 * var(--font-scale)); font-weight: 600; flex-shrink: 0; color: #fff;
   text-shadow: 0 1px 2px rgba(var(--shadow-rgb), 0.3);
   box-shadow: inset 0 1px 1px rgba(var(--surface-rgb), 0.45),
               inset 0 -3px 6px rgba(var(--shadow-rgb), 0.32),
@@ -3480,7 +3572,8 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 .avatar.user-avatar {
-  width: 24px; height: 24px; border-radius: 7px;
+  width: var(--chat-avatar-size, 24px); height: var(--chat-avatar-size, 24px);
+  border-radius: calc(var(--chat-avatar-size, 24px) * 0.29);
   background: linear-gradient(135deg, #f97316, #ec4899);
   overflow: hidden;
 }
@@ -3893,7 +3986,22 @@ onBeforeUnmount(() => {
   margin-left: auto; color: var(--accent); font-size: 14px; font-weight: 700;
 }
 
-.row2 { display: flex; gap: 6px; align-items: flex-end; }
+.row2 { display: flex; gap: 6px; align-items: flex-end; position: relative; }
+/* —— 上下文长度指示（紧贴发送按钮上方）：数值外围线条包围，颜色=压缩线进度 —— */
+.ctx-badge { position: absolute; right: 0; bottom: 43px; font-family: Consolas, monospace; font-size: calc(10.5px * var(--font-scale)); line-height: 1.45; padding: 0 8px; border-radius: 5px; border: 1.5px solid; letter-spacing: .3px; user-select: none; font-variant-numeric: tabular-nums; z-index: 2; }
+.ctx-badge.lv-ok { color: #4ade80; border-color: rgba(74, 222, 128, .6); background: rgba(74, 222, 128, .07); }
+.ctx-badge.lv-warn { color: #eab308; border-color: rgba(234, 179, 8, .6); background: rgba(234, 179, 8, .07); }
+.ctx-badge.lv-warn2 { color: #fb923c; border-color: rgba(251, 146, 60, .65); background: rgba(251, 146, 60, .08); }
+.ctx-badge.lv-crit { color: #f87171; border-color: rgba(248, 113, 113, .7); background: rgba(248, 113, 113, .1); animation: ctxBadgePulse 1.6s ease-in-out infinite; }
+.ctx-badge.lv-off { color: rgba(var(--text-rgb), .5); border-color: rgba(var(--surface-rgb), .25); }
+@keyframes ctxBadgePulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+/* —— 历史压缩摘要卡片（会话级，居中） —— */
+.ctx-summary-card { align-self: center; max-width: 86%; margin: 2px 0; border: 1px dashed rgba(var(--accent2-rgb), .4); border-radius: 10px; padding: 4px 12px; font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), .65); background: rgba(var(--accent2-rgb), .05); }
+.ctx-summary-head { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.ctx-summary-title { font-weight: 600; color: var(--purple-ink); }
+.ctx-summary-meta { opacity: .6; }
+.ctx-summary-chev { font-size: calc(10px * var(--font-scale)); opacity: .6; }
+.ctx-summary-body { margin-top: 6px; padding-top: 6px; border-top: 1px dashed rgba(var(--surface-rgb), .15); max-height: 220px; overflow-y: auto; font-size: calc(11.5px * var(--font-scale)); line-height: 1.6; }
 .voice-btn { flex-shrink: 0; width: 40px; height: 40px; padding: 0; min-width: 40px; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; border-radius: 8px; background: rgba(var(--surface-rgb), 0.08); border: 1px solid rgba(var(--surface-rgb), 0.12); color: var(--text); transition: all .2s; }
 .voice-btn:hover:not(:disabled) { background: rgba(var(--accent-rgb), 0.15); border-color: rgba(var(--accent-rgb), 0.3); }
 .voice-btn:disabled { opacity: .5; cursor: wait; }

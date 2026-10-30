@@ -1401,6 +1401,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     system_prompt_base = _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe)
     # 保存不带工作流 preamble 的核心 prompt（每轮刷新 preamble 时复用）
     _system_prompt_core = system_prompt_base
+    # —— 历史上下文压缩：达到压缩线（模型窗口×阈值）时，先把较早历史压成摘要再组装 ——
+    # 压缩改写共享 conv.messages（会话级生效）：旧消息 → 一条带 compressed_summary 标记的
+    # system 摘要，最近 N 条完整对话原样保留；任何异常都不阻断本轮对话
+    from core.ctx_compress import maybe_compress
+    await maybe_compress(conv, agent, interface, model, system_prompt_base)
     if _wf_mode in ("plan", "spec", "goal") and _wf:
         system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})

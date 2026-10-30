@@ -209,6 +209,7 @@ async function toggleAutostart() {
 
 onMounted(async () => {
   await Promise.all([models.fetch(), settings.fetch(), loadLaunchMode(), loadAutostart()])
+  syncCtxSettings()
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
@@ -266,22 +267,53 @@ async function browseStorage() {
 
 // —— 模型接口 ——
 function openNew() {
-  ifaceForm.value = { name: '', url: '', api_key: '', default_model: 'gpt-4o-mini', models_str: '', models: [], description: '' }
+  ifaceForm.value = { name: '', url: '', api_key: '', default_model: 'gpt-4o-mini', models_str: '', models: [], description: '', windows_str: '' }
   isEditing.value = false; showDialog.value = true
 }
 function edit(i: any) {
-  ifaceForm.value = { ...i, models_str: (i.models || []).join(',') }
+  ifaceForm.value = { ...i, models_str: (i.models || []).join(','), windows_str: Object.entries(i.model_windows || {}).map(([k, v]) => `${k}:${v}`).join(', ') }
   isEditing.value = true; showDialog.value = true
 }
 function closeDialog() { showDialog.value = false; ifaceForm.value = {} }
+/** 窗口值解析：128000 / 128k / 1m / 2b → token 数 */
+function parseWindowTokens(v: string): number {
+  const m = /^(\d+(?:\.\d+)?)\s*([kmb])?$/i.exec((v || '').trim())
+  if (!m) return 0
+  const mult: Record<string, number> = { k: 1e3, m: 1e6, b: 1e9 }
+  return Math.round(parseFloat(m[1]) * (mult[(m[2] || '').toLowerCase()] || 1))
+}
 async function saveIface() {
   ifaceForm.value.models = (ifaceForm.value.models_str || '').split(',').map((s: string) => s.trim()).filter(Boolean)
-  const { models_str, ...clean } = ifaceForm.value
+  const mw: Record<string, number> = {}
+  ;(ifaceForm.value.windows_str || '').split(',').map((s: string) => s.trim()).filter(Boolean).forEach((pair: string) => {
+    const idx = pair.lastIndexOf(':')
+    if (idx <= 0) return
+    const k = pair.slice(0, idx).trim()
+    const n = parseWindowTokens(pair.slice(idx + 1))
+    if (k && n > 0) mw[k] = n
+  })
+  const { models_str, windows_str, ...clean } = ifaceForm.value
+  clean.model_windows = mw
   if (isEditing.value) await models.update(ifaceForm.value.id, clean)
   else await models.create(clean)
   closeDialog(); await models.fetch()
 }
 async function setDefaultIface(id: number) { await settings.update({ default_model_interface: id }) }
+
+// —— 历史上下文压缩设置 ——
+const ctxThreshold = ref(0.8)
+const ctxKeepRecent = ref(20)
+const ctxDefaultWindow = ref(128000)
+function syncCtxSettings() {
+  const d = settings.data || {}
+  ctxThreshold.value = Number(d.context_compress_threshold) || 0.8
+  ctxKeepRecent.value = Number(d.context_keep_recent) || 20
+  ctxDefaultWindow.value = Number(d.context_window_default) || 128000
+}
+async function saveCtx(k: string, v: any) {
+  try { await settings.update({ [k]: v }) } catch { /* 保存失败静默，下次进入回读 */ }
+}
+const ctxCompressOn = computed(() => settings.data.context_compress_enabled !== false)
 
 // —— 外观设置 ——
 const avatarMode = computed({
@@ -298,6 +330,14 @@ const showOtherAgents = computed({
 const otherAgentsSide = computed({
   get() { return settings.data.chat_other_agents_side === 'left' ? 'left' : 'right' },
   set(v: string) { settings.update({ chat_other_agents_side: v }) }
+})
+// 对话区消息头像大小（px），默认 24
+const chatAvatarSize = computed({
+  get() {
+    const v = Number(settings.data.chat_avatar_size)
+    return Number.isFinite(v) && v >= 16 && v <= 48 ? v : 24
+  },
+  set(v: number) { settings.update({ chat_avatar_size: v }) }
 })
 
 function avatarPreviewGradient(name: string): string {
@@ -353,6 +393,34 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
           </tbody>
         </table>
         <div v-if="!models.list.length" class="empty">还没有接口，点击右上角"新建接口"</div>
+      </div>
+
+      <!-- 历史上下文压缩 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>🗜 历史上下文压缩</span>
+          <span class="hint">达到压缩线时自动把较早历史压缩成摘要</span>
+        </div>
+        <div class="cap-block">
+          <div class="asr-toggle">
+            <button class="asr-switch" :class="{ on: ctxCompressOn }" @click="saveCtx('context_compress_enabled', !ctxCompressOn)">
+              <span class="asr-switch-knob"></span>
+            </button>
+            <div class="sound-desc">
+              <div class="sound-main">{{ ctxCompressOn ? '已启用' : '已关闭' }}</div>
+              <div class="sound-sub">{{ ctxCompressOn ? '发送消息时检测：上下文达到压缩线 → 较早历史压缩成摘要，最近对话原样保留' : '不做任何压缩，历史全量进入模型上下文' }}</div>
+            </div>
+          </div>
+          <div class="ctx-cfg-grid">
+            <label>压缩线（窗口百分比）<input class="input" type="number" min="0.3" max="0.95" step="0.05" v-model.number="ctxThreshold" @change="saveCtx('context_compress_threshold', ctxThreshold)" /></label>
+            <label>保留最近对话（条）<input class="input" type="number" min="4" step="1" v-model.number="ctxKeepRecent" @change="saveCtx('context_keep_recent', ctxKeepRecent)" /></label>
+            <label>默认上下文窗口（token）<input class="input" type="number" min="8000" step="1000" v-model.number="ctxDefaultWindow" @change="saveCtx('context_window_default', ctxDefaultWindow)" /></label>
+          </div>
+          <div class="hint-empty" style="margin-top: 8px">
+            各模型的窗口在上方接口编辑中按「模型:token」配置（支持 128k / 1m 写法）；未配置的模型使用此默认窗口。
+            对话区发送按钮上方的数值边框颜色表示达到压缩线的进度（绿 → 黄 → 橙 → 红）。
+          </div>
+        </div>
       </div>
 
       <!-- 外观设置 -->
@@ -439,8 +507,17 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
               <span class="radio-text">显示在右侧</span>
             </label>
           </div>
+          <div class="font-scale-row" style="margin-top: 10px">
+            <span class="font-scale-edge">小</span>
+            <input class="font-scale-slider" type="range" min="16" max="48" step="2"
+                   :value="chatAvatarSize"
+                   @input="chatAvatarSize = Number(($event.target as HTMLInputElement).value)" />
+            <span class="font-scale-edge">大</span>
+            <span class="font-scale-value">{{ chatAvatarSize }}px</span>
+            <button class="btn sm ghost" :disabled="chatAvatarSize === 24" @click="chatAvatarSize = 24">默认</button>
+          </div>
           <div class="hint-empty" style="margin-top: 8px">
-            控制当前智能体视角下，其他智能体发给它的消息是否显示、以及显示在左侧还是右侧
+            控制当前智能体视角下，其他智能体发给它的消息是否显示、以及显示在左侧还是右侧；头像大小调整对话区消息旁的用户与智能体头像
           </div>
         </div>
 
@@ -736,6 +813,7 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
           <label class="full">API Key<input class="input" v-model="ifaceForm.api_key" type="password" /></label>
           <label>默认模型<input class="input" v-model="ifaceForm.default_model" placeholder="gpt-4o-mini" /></label>
           <label class="full">可用模型（逗号分隔，如 gpt-4o,gpt-4o-mini,o1）<input class="input" v-model="ifaceForm.models_str" /></label>
+          <label class="full">上下文窗口（格式 模型:token，逗号分隔，如 gpt-4o:128k, glm-4.5:200k；未配置的模型用全局默认窗口）<input class="input" v-model="ifaceForm.windows_str" placeholder="gpt-4o:128k, o1:200k" /></label>
           <label class="full">描述<input class="input" v-model="ifaceForm.description" /></label>
         </div>
         <div class="actions">
@@ -755,11 +833,21 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
 </template>
 
 <style scoped>
-.settings-root { padding: 16px; height: calc(100vh - var(--titlebar-h)); overflow-y: auto; }
-.top { padding: 12px 20px; margin: 0 auto 16px; max-width: 1100px; display: flex; align-items: center; gap: 16px; h2 { font-size: calc(18px * var(--font-scale)); } }
+.settings-root {
+  padding: 16px; height: calc(100vh - var(--titlebar-h));
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+}
+/* 顶栏与下方面板区完全同宽同缘对齐（1100px 居中）：按钮和文字贴左，
+   顶栏内右侧空白（.top-drag flex:1）留作拖拽区 */
+.top {
+  padding: 12px 20px; margin: 0 auto 16px; max-width: 1100px; width: 100%;
+  display: flex; align-items: center; gap: 16px; flex-shrink: 0;
+  h2 { font-size: calc(18px * var(--font-scale)); }
+}
 /* 标题 + 空白拖动区：flex:1 占满剩余空间，撑满高度才能接收鼠标事件 */
 .top-drag { flex: 1; align-self: stretch; display: flex; align-items: center; user-select: none; }
-.panels { display: grid; gap: 16px; max-width: 1100px; margin: 0 auto; }
+/* 顶栏固定常驻，面板区内部滚动（面板还原 1100px 居中窄条） */
+.panels { display: grid; gap: 16px; max-width: 1100px; width: 100%; margin: 0 auto; flex: 1; min-height: 0; min-width: 0; overflow-y: auto; }
 .panel { padding: 18px; }
 .panel-title { font-size: calc(15px * var(--font-scale)); font-weight: 600; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
 .panel-title .hint { font-size: calc(11px * var(--font-scale)); font-weight: normal; opacity: .5; }
@@ -1001,6 +1089,7 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
 .modal { width: 520px; padding: 20px; }
 .modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; margin-bottom: 14px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; label { display: flex; flex-direction: column; gap: 4px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); &.full { grid-column: 1 / -1; } } }
+.ctx-cfg-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 12px; label { display: flex; flex-direction: column; gap: 4px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); } .input { width: 100%; } }
 .actions-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
 /* —— 能力参数预设 —— */

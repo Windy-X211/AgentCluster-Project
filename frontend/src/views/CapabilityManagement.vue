@@ -51,11 +51,11 @@ const activeTabDesc = () => tabs.find(t => t.key === activeTab.value)?.desc || '
 
 <style scoped>
 .cm-root {
-  padding: 16px; height: calc(100vh - var(--titlebar-h));
+  padding: 10px 16px 16px; height: calc(100vh - var(--titlebar-h));
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .top {
-  padding: 12px 20px; margin-bottom: 12px;
+  padding: 8px 16px; margin-bottom: 10px;
   display: flex; align-items: center; gap: 16px; flex-shrink: 0;
   h2 { font-size: calc(18px * var(--font-scale)); }
 }
@@ -64,13 +64,13 @@ const activeTabDesc = () => tabs.find(t => t.key === activeTab.value)?.desc || '
 
 /* —— tabs —— */
 .tabs {
-  display: flex; gap: 4px; padding: 6px; margin-bottom: 12px;
+  display: flex; gap: 4px; padding: 4px; margin-bottom: 10px;
   border-radius: 10px; flex-shrink: 0;
   overflow-x: auto;
 }
 .tab-btn {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 8px 14px; border-radius: 7px; border: none; background: transparent;
+  padding: 6px 12px; border-radius: 7px; border: none; background: transparent;
   font-size: calc(13px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7);
   cursor: pointer; transition: all .15s; white-space: nowrap;
   border: 1px solid transparent;

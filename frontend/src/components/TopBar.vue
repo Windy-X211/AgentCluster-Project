@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted } from 'vue'
 import { RouterLink } from 'vue-router'
 import { isDesktop, windowAPI } from '@/utils/env'
 import { useSnap } from '@/composables/useSnap'
@@ -7,7 +7,7 @@ import { useSnap } from '@/composables/useSnap'
 const isMax = ref(false)
 
 onMounted(() => {
-  if (isDesktop) document.documentElement.classList.add('desktop-frameless')
+  // desktop-frameless 类已移至 main.ts 应用入口添加（TopBar 仅在 Home 挂载，刷新进其他路由会缺失）
   // 同步初始最大化状态
   windowAPI.isMaximized?.().then((v: boolean | null) => { if (typeof v === 'boolean') isMax.value = v }).catch(() => {})
   // Electron 最大化状态事件
@@ -22,9 +22,6 @@ onMounted(() => {
     brand && attachDragRegion(brand)
     spacer && attachDragRegion(spacer)
   }
-})
-onBeforeUnmount(() => {
-  document.documentElement.classList.remove('desktop-frameless')
 })
 async function minimize() { try { await windowAPI.minimize() } catch {} }
 async function toggleMax() {
