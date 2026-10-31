@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8">
+    <title>精灵悬浮球</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: transparent;
+            overflow: hidden;
+            user-select: none;
+            font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+        }
+
+        .stage {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            padding-bottom: 14px;
+        }
+
+        /* ============ 精灵本体 ============ */
+        .fairy {
+            position: relative;
+            width: 92px;
+            height: 92px;
+            cursor: pointer;
+            animation: floaty 3.2s ease-in-out infinite;
+            transition: filter .4s;
+            z-index: 2;
+        }
+
+        /* 身体 */
+        .fairy .body {
+            position: absolute;
+            inset: 0;
+            border-radius: 46% 46% 50% 50%;
+            background:
+                radial-gradient(circle at 34% 28%, rgba(255, 255, 255, .55), transparent 42%),
+                radial-gradient(circle at 68% 74%, rgba(124, 88, 222, .45), transparent 52%),
+                linear-gradient(160deg, #7aa6ff 0%, #5b8cff 42%, #a78bfa 100%);
+            box-shadow:
+                inset -4px -8px 14px rgba(30, 20, 90, .28),
+                inset 3px 5px 10px rgba(255, 255, 255, .30),
+                0 6px 18px rgba(91, 140, 255, .35);
+            animation: breathe 3.6s ease-in-out infinite;
+        }
+
+        /* 呆毛天线 */
+        .fairy .ahoge {
+            position: absolute;
+            top: -13px;
+            left: 50%;
+            width: 4px;
+            height: 16px;
+            margin-left: -2px;
+            background: linear-gradient(#a78bfa, #5b8cff);
+            border-radius: 3px;
+            transform-origin: bottom center;
+            animation: sway 2.6s ease-in-out infinite;
+        }
+
+        .fairy .ahoge::after {
+            content: '';
+            position: absolute;
+            top: -7px;
+            left: 50%;
+            width: 10px;
+            height: 10px;
+            margin-left: -5px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 35% 35%, #fff, #b9a5ff 55%, #7c5ade);
+            box-shadow: 0 0 10px 2px rgba(167, 139, 250, .75);
+        }
+
+        /* 眼睛 */
+        .fairy .eyes {
+            position: absolute;
+            top: 34px;
+            left: 0;
+            right: 0;
+            display: flex;
+            justify-content: center;
+            gap: 18px;
+        }
+
+        .fairy .eye {
+            width: 15px;
+            height: 18px;
+            background: #fff;
+            border-radius: 50%;
+            position: relative;
+            animation: blink 4.4s infinite;
+            box-shadow: inset 0 -1px 2px rgba(60, 60, 110, .2);
+        }
+
+        .fairy .eye::after {
+            content: '';
+            position: absolute;
+            left: 4px;
+            top: 6px;
+            width: 7px;
+            height: 8px;
+            border-radius: 50%;
+            background: #221c3a;
+        }
+
+        .fairy .eye::before {
+            content: '';
+            position: absolute;
+            left: 6px;
+            top: 7px;
+            width: 3px;
+            height: 3px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, .95);
+            z-index: 1;
+        }
+
+        /* 腮红 + 嘴 */
+        .fairy .cheek {
+            position: absolute;
+            top: 55px;
+            width: 11px;
+            height: 6px;
+            border-radius: 50%;
+            background: rgba(255, 120, 150, .5);
+            filter: blur(1px);
+        }
+
+        .fairy .cheek.l {
+            left: 14px;
+        }
+
+        .fairy .cheek.r {
+            right: 14px;
+        }
+
+        .fairy .mouth {
+            position: absolute;
+            top: 56px;
+            left: 50%;
+            width: 12px;
+            height: 6px;
+            margin-left: -6px;
+            border-radius: 0 0 12px 12px;
+            background: #3a2f57;
+            transition: all .25s;
+        }
+
+        /* 影子 */
+        .fairy .shadow {
+            position: absolute;
+            bottom: -9px;
+            left: 50%;
+            width: 62px;
+            height: 12px;
+            margin-left: -31px;
+            border-radius: 50%;
+            background: rgba(20, 26, 48, .35);
+            filter: blur(3px);
+            animation: shadowPulse 3.2s ease-in-out infinite;
+        }
+
+        /* ============ 状态 ============ */
+        /* 运行中：欢快跳动 + 发光 */
+        .fairy.running {
+            animation: bounce .62s cubic-bezier(.5, 0, .5, 1) infinite;
+        }
+
+        .fairy.running .body {
+            background:
+                radial-gradient(circle at 34% 28%, rgba(255, 255, 255, .65), transparent 40%),
+                radial-gradient(circle at 68% 74%, rgba(124, 88, 222, .5), transparent 52%),
+                linear-gradient(160deg, #8fd4ff 0%, #5b8cff 40%, #c9a5ff 100%);
+            box-shadow:
+                inset -4px -8px 14px rgba(30, 20, 90, .28),
+                inset 3px 5px 10px rgba(255, 255, 255, .35),
+                0 0 18px 4px rgba(110, 160, 255, .65),
+                0 0 40px 10px rgba(167, 139, 250, .4);
+            animation: breathe 1.6s ease-in-out infinite;
+        }
+
+        .fairy.running .mouth {
+            width: 16px;
+            height: 10px;
+            margin-left: -8px;
+            border-radius: 0 0 16px 16px;
+            background: #5a2f57;
+        }
+
+        .fairy.running .ahoge {
+            animation: sway .5s ease-in-out infinite;
+        }
+
+        .fairy.running .shadow {
+            animation: shadowBounce .62s cubic-bezier(.5, 0, .5, 1) infinite;
+        }
+
+        /* 异常：变灰委屈 */
+        .fairy.error {
+            filter: grayscale(.9) brightness(.82);
+            animation: floaty 4.5s ease-in-out infinite;
+        }
+
+        .fairy.error .body {
+            animation: none;
+        }
+
+        .fairy.error .eye {
+            animation: blink 7s infinite;
+        }
+
+        .fairy.error .mouth {
+            border-radius: 12px 12px 0 0;
+            height: 4px;
+            top: 59px;
+        }
+
+        .fairy.dragging {
+            opacity: .82;
+        }
+
+        /* 运行徽标 */
+        .badge {
+            position: absolute;
+            top: 8px;
+            left: 50%;
+            transform: translateX(-50%) translateY(-4px);
+            display: none;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 9px;
+            border-radius: 999px;
+            background: #0f1626;
+            border: 1px solid rgba(91, 140, 255, .4);
+            color: #cfe0ff;
+            font-size: 11px;
+            white-space: nowrap;
+            opacity: 0;
+            transition: opacity .3s, transform .3s;
+            z-index: 3;
+        }
+
+        .badge .dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #6ef0a8;
+            box-shadow: 0 0 6px #6ef0a8;
+            animation: dotPulse 1.2s ease-in-out infinite;
+        }
+
+        .badge.show {
+            display: flex;
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        /* 点击开心动画 */
+        .spark {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            font-size: 15px;
+            opacity: 0;
+            pointer-events: none;
+            z-index: 4;
+        }
+
+        .spark.go {
+            animation: sparkle .8s ease-out;
+        }
+
+        /* ============ 右键菜单 ============ */
+        /* 透明窗口注意：禁用 backdrop-filter（采样不到窗口外内容，会渲染成灰色半透明块）
+           与半透明背景 / 大范围模糊投影（桌面内容透色+灰晕），一律用实色 */
+        .menu {
+            position: absolute;
+            display: none;
+            min-width: 158px;
+            padding: 5px;
+            border-radius: 12px;
+            background: #0f1626;
+            border: 1px solid rgba(120, 150, 220, .25);
+            z-index: 10;
+        }
+
+        .menu.open {
+            display: block;
+            animation: menuIn .16s ease-out;
+        }
+
+        .menu .mi {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            color: #d7e2f7;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .menu .mi:hover {
+            background: rgba(91, 140, 255, .18);
+            color: #fff;
+        }
+
+        .menu .mi .ic {
+            width: 18px;
+            text-align: center;
+            font-size: 14px;
+        }
+
+        .menu .tip {
+            padding: 6px 10px 3px;
+            color: #7d8cad;
+            font-size: 11px;
+        }
+
+        @keyframes floaty {
+
+            0%,
+            100% {
+                transform: translateY(0);
+            }
+
+            50% {
+                transform: translateY(-5px);
+            }
+        }
+
+        @keyframes breathe {
+
+            0%,
+            100% {
+                transform: scale(1);
+            }
+
+            50% {
+                transform: scale(1.035);
+            }
+        }
+
+        @keyframes sway {
+
+            0%,
+            100% {
+                transform: rotate(-9deg);
+            }
+
+            50% {
+                transform: rotate(9deg);
+            }
+        }
+
+        @keyframes blink {
+
+            0%,
+            94%,
+            100% {
+                transform: scaleY(1);
+            }
+
+            96%,
+            98% {
+                transform: scaleY(.08);
+            }
+        }
+
+        @keyframes bounce {
+
+            0%,
+            100% {
+                transform: translateY(0) scale(1, 1);
+            }
+
+            22% {
+                transform: translateY(-16px) scale(.96, 1.05);
+            }
+
+            42% {
+                transform: translateY(0) scale(1.06, .93);
+            }
+
+            58% {
+                transform: translateY(-7px) scale(.99, 1.02);
+            }
+
+            74% {
+                transform: translateY(0) scale(1.03, .97);
+            }
+        }
+
+        @keyframes shadowPulse {
+
+            0%,
+            100% {
+                transform: scaleX(1);
+                opacity: .8;
+            }
+
+            50% {
+                transform: scaleX(.86);
+                opacity: .55;
+            }
+        }
+
+        @keyframes shadowBounce {
+
+            0%,
+            100% {
+                transform: scaleX(1);
+                opacity: .8;
+            }
+
+            22% {
+                transform: scaleX(.66);
+                opacity: .4;
+            }
+
+            42% {
+                transform: scaleX(1.12);
+                opacity: .85;
+            }
+
+            58% {
+                transform: scaleX(.86);
+                opacity: .6;
+            }
+        }
+
+        @keyframes dotPulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: .35;
+            }
+        }
+
+        @keyframes menuIn {
+            from {
+                opacity: 0;
+                transform: translateY(-4px) scale(.98);
+            }
+
+            to {
+                opacity: 1;
+                transform: none;
+            }
+        }
+
+        @keyframes sparkle {
+            0% {
+                opacity: 0;
+                transform: translate(-50%, 0) scale(.5);
+            }
+
+            25% {
+                opacity: 1;
+            }
+
+            100% {
+                opacity: 0;
+                transform: translate(-50%, -34px) scale(1.25);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="stage" id="stage">
+        <div class="badge" id="badge"><span class="dot"></span><span id="badgeText"></span></div>
+        <div class="fairy" id="fairy" title="智能体集群 · 点击打开">
+            <div class="ahoge"></div>
+            <div class="body"></div>
+            <div class="eyes">
+                <div class="eye"></div>
+                <div class="eye"></div>
+            </div>
+            <div class="cheek l"></div>
+            <div class="cheek r"></div>
+            <div class="mouth"></div>
+            <div class="shadow"></div>
+            <div class="spark" id="spark">✨</div>
+        </div>
+        <div class="menu" id="menu">
+            <div class="mi" data-act="screenshot"><span class="ic">✂️</span>截图提问<span class="tip"
+                    style="padding:0"></span></div>
+            <div class="mi" data-act="quickchat"><span class="ic">💬</span>临时对话</div>
+            <div class="mi" data-act="settings"><span class="ic">⚙️</span>打开设置</div>
+        </div>
+    </div>
+    <script>
+        (function () {
+            const fairy = document.getElementById('fairy')
+            const badge = document.getElementById('badge')
+            const badgeText = document.getElementById('badgeText')
+            const spark = document.getElementById('spark')
+            const menu = document.getElementById('menu')
+            const ea = window.electronAPI || {}
+            const fairyAPI = ea.fairy || {}
+            const API = (ea.apiBase || '') + '/api/ext/fairy_ball'
+
+            // —— 菜单状态（不穿透：窗口整个区域都接收鼠标，无需 setIgnoreMouseEvents）——
+            let menuOpen = false
+
+            // —— 拖动 vs 点击（位移 > 4px 判定为拖动窗口）——
+            let press = null
+            fairy.addEventListener('mousedown', (e) => {
+                if (e.button !== 0) return
+                closeMenu()
+                press = { sx: e.screenX, sy: e.screenY, wx: null, wy: null, moved: false }
+                Promise.resolve(fairyAPI.winPos ? fairyAPI.winPos() : null).then((p) => {
+                    if (press && !press.moved && p) { press.wx = p.x; press.wy = p.y }
+                })
+            })
+            window.addEventListener('mousemove', (e) => {
+                if (!press) return
+                const dx = e.screenX - press.sx, dy = e.screenY - press.sy
+                if (!press.moved && Math.abs(dx) + Math.abs(dy) > 4) {
+                    press.moved = true
+                    fairy.classList.add('dragging')
+                }
+                if (press.moved && press.wx != null) {
+                    fairyAPI.moveTo && fairyAPI.moveTo(press.wx + dx, press.wy + dy)
+                }
+            })
+            window.addEventListener('mouseup', () => {
+                if (!press) return
+                const wasDrag = press.moved
+                press = null
+                fairy.classList.remove('dragging')
+                if (wasDrag) { return }
+                // 点击 → 惊喜动画 + 打开主窗口
+                spark.classList.remove('go'); void spark.offsetWidth; spark.classList.add('go')
+                fairyAPI.openMain && fairyAPI.openMain()
+            })
+
+            // —— 右键菜单：窗口内任意位置右键都弹（精灵本体 + 周围区域）——
+            document.addEventListener('contextmenu', (e) => {
+                e.preventDefault()
+                openMenu(e.clientX, e.clientY)
+            })
+            function openMenu(x, y) {
+                menuOpen = true
+                const vw = window.innerWidth, vh = window.innerHeight
+                menu.classList.add('open')
+                const mw = menu.offsetWidth, mh = menu.offsetHeight
+                // 球靠屏幕右缘 → 菜单朝左弹；靠下缘 → 菜单往上弹
+                let mx = (x || vw / 2) + 10, my = (y || vh / 2) - 10
+                if (mx + mw > vw - 4) mx = vw - mw - 4
+                if (my + mh > vh - 4) my = vh - mh - 4
+                if (my < 4) my = 4
+                menu.style.left = mx + 'px'; menu.style.top = my + 'px'
+            }
+            function closeMenu() {
+                if (!menuOpen) return
+                menuOpen = false
+                menu.classList.remove('open')
+            }
+            menu.addEventListener('mousedown', (e) => e.stopPropagation())
+            menu.addEventListener('contextmenu', (e) => {
+                e.preventDefault()
+                e.stopPropagation()   // 菜单自身上右键不重开
+            })
+            menu.addEventListener('click', (e) => {
+                const mi = e.target.closest('.mi')
+                if (!mi) return
+                const act = mi.getAttribute('data-act')
+                closeMenu()
+                fairyAPI.action && fairyAPI.action(act)
+            })
+            // 菜单外点击 / ESC / 窗口失焦（点其他应用或主窗口）→ 关闭菜单
+            document.addEventListener('mousedown', (e) => {
+                if (menuOpen && !menu.contains(e.target) && !fairy.contains(e.target)) closeMenu()
+            })
+            document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu() })
+            window.addEventListener('blur', closeMenu)
+
+            // —— 状态轮询：idle / running / error ——
+            let curStatus = 'idle'
+            async function poll() {
+                try {
+                    const res = await fetch(API + '/state', { signal: AbortSignal.timeout(2500) })
+                    if (!res.ok) throw new Error('http ' + res.status)
+                    const data = await res.json()
+                    setStatus(data.status || 'idle', data.running || [])
+                } catch (e) {
+                    setStatus('error', [])
+                }
+            }
+            function setStatus(st, running) {
+                if (st !== curStatus) {
+                    fairy.classList.remove('running', 'error')
+                    if (st === 'running') fairy.classList.add('running')
+                    if (st === 'error') fairy.classList.add('error')
+                    curStatus = st
+                }
+                if (st === 'running' && running.length) {
+                    const names = running.map((r) => r.agent_name || ('#' + r.agent_id)).join('、')
+                    badgeText.textContent = running.length > 1 ? (running.length + ' 个智能体运行中') : (names + ' 运行中')
+                    badge.classList.add('show')
+                    fairy.title = '智能体集群 · 运行中：' + names
+                } else {
+                    badge.classList.remove('show')
+                    fairy.title = st === 'error' ? '智能体集群 · 后端连接异常' : '智能体集群 · 点击打开'
+                }
+            }
+            poll()
+            setInterval(poll, 3000)
+        })()
+    </script>
+</body>
+
+</html>

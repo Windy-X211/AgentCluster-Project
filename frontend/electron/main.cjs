@@ -23,9 +23,10 @@ _log('=== Electron main.cjs starting ===')
 process.on('uncaughtException', (e) => { _log('UNCAUGHT: ' + e.message); _log(e.stack || '') })
 process.on('unhandledRejection', (e) => { _log('REJECTION: ' + (e?.message || e)) })
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, shell, screen, dialog } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, shell, screen, dialog, desktopCapturer } = require('electron')
 const path = require('path')
 const fs = require('fs')
+const os = require('os')
 const { spawn } = require('child_process')
 
 _log('app.isPackaged=' + app.isPackaged + ' argv=' + JSON.stringify(process.argv.slice(2)))
@@ -302,6 +303,7 @@ function createSplash() {
     skipTaskbar: true,
     resizable: false,
     show: false,
+    hasShadow: false,   // 透明窗口禁用系统阴影（DWM 阴影在透明窗上呈灰底）
     webPreferences: {
       preload: PRELOAD,
       contextIsolation: true,
@@ -317,7 +319,7 @@ function createSplash() {
   const splashHtml = `<!doctype html><html><head><meta charset="utf-8"><style>
 html,body{margin:0;padding:0;background:transparent;width:100%;height:100%;overflow:hidden}
 body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:#eaf1ff;user-select:none}
-.card{position:absolute;inset:4px;border-radius:26px;background:#0f1626;border:1px solid #243450;box-shadow:0 20px 60px rgba(0,0,0,0.5),0 0 80px rgba(91,140,255,0.1);overflow:hidden}
+ .card{position:absolute;inset:4px;border-radius:26px;background:#0f1626;border:1px solid #243450;overflow:hidden}
 .glow-top{position:absolute;left:40px;right:40px;top:34px;height:46px;background:linear-gradient(180deg,rgba(91,140,255,0.22),transparent);border-radius:8px}
 .close-x{position:absolute;right:18px;top:10px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:18px;color:#94a8cf;cursor:pointer;border-radius:8px;transition:background 0.15s}
 .close-x:hover{background:rgba(255,100,100,0.15);color:#ff9a9a}
@@ -717,6 +719,236 @@ function createTray() {
   }, 3000)
 }
 
+// ---------- 精灵悬浮球拓展（fairy_ball） ----------
+// 球窗 / 区域截图选区窗 / 临时对话小窗的宿主壳。
+// 页面 HTML 全部由拓展后端下发（/api/ext/fairy_ball/page|snip|quickchat），
+// 改球外观无需重建前端 dist；本文件只提供窗口与截图能力。
+
+const FAIRY_ID = 'fairy_ball'
+const FAIRY_BASE = `http://127.0.0.1:${BACKEND_PORT}/api/ext/${FAIRY_ID}`
+let fairyWin = null        // 悬浮球窗口
+let quickWin = null        // 临时对话小窗
+let snipWin = null         // 区域截图选区窗（全屏）
+let fairyPollTimer = null
+let _snipFullImg = null    // 选区期间的全屏 nativeImage（物理分辨率）
+let _snipScale = 1         // 主屏 DPI 缩放（CSS 逻辑坐标 → 物理像素）
+
+function _fairyWebPrefs() {
+  return { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: false }
+}
+
+function createFairyWin() {
+  if (fairyWin && !fairyWin.isDestroyed()) return fairyWin
+  const wa = screen.getPrimaryDisplay().workAreaSize
+  fairyWin = new BrowserWindow({
+    width: 180, height: 170,
+    x: wa.width - 205, y: wa.height - 200,
+    frame: false, transparent: true, alwaysOnTop: true,
+    skipTaskbar: true, resizable: false, hasShadow: false,
+    show: false,
+    webPreferences: _fairyWebPrefs(),
+  })
+  fairyWin.setAlwaysOnTop(true, 'screen-saver')
+  fairyWin.loadURL(`${FAIRY_BASE}/page`)
+  fairyWin.once('ready-to-show', () => fairyWin.show())
+  fairyWin.webContents.on('did-fail-load', (_e, code) => {
+    // 后端未就绪 / 拓展刚停用 → 关闭，等下一轮轮询重试
+    _log(`[fairy] 球页面加载失败 code=${code}，稍后重试`)
+    try { fairyWin.close() } catch { }
+    fairyWin = null
+  })
+  fairyWin.on('closed', () => { fairyWin = null })
+  return fairyWin
+}
+
+async function showMainWindow(route) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    await createMainWindow()
+  }
+  if (!mainWindow) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+  if (route) {
+    // hash 路由跳转（避免整页刷新）
+    mainWindow.webContents.executeJavaScript(`location.hash = ${JSON.stringify(route)}; true`).catch(() => { })
+  }
+}
+
+function openQuickChat(shotPath) {
+  if (quickWin && !quickWin.isDestroyed()) {
+    quickWin.show()
+    quickWin.focus()
+    if (shotPath) sendQuickShot(shotPath)
+    return
+  }
+  quickWin = new BrowserWindow({
+    width: 480, height: 740, minWidth: 400, minHeight: 560,
+    frame: false, backgroundColor: '#0a0e1a',
+    resizable: true, skipTaskbar: false,
+    show: false,
+    webPreferences: _fairyWebPrefs(),
+  })
+  // 复用主窗口前端应用（#/quickchat 视图 = RightPanel 精简壳）：
+  // markdown / viz 思维导图 / 思考折叠 / 附件等渲染能力与主窗完全一致，无需重复实现
+  const base = IS_DEV ? DEV_URL : PROD_URL
+  quickWin.loadURL(base + '/#/quickchat')
+  quickWin.once('ready-to-show', () => quickWin.show())
+  if (shotPath) {
+    // 等 Vue 挂载完成（RightPanel 的 quick:shot 监听就绪）再发截图路径
+    quickWin.webContents.once('did-finish-load', () => {
+      setTimeout(() => { if (quickWin && !quickWin.isDestroyed()) sendQuickShot(shotPath) }, 400)
+    })
+  }
+  quickWin.on('closed', () => { quickWin = null })
+}
+
+function sendQuickShot(shotPath) {
+  if (quickWin && !quickWin.isDestroyed()) {
+    quickWin.webContents.send('quick:shot', { path: shotPath })
+  }
+}
+
+// —— 区域截图：隐藏球 → desktopCapturer 全屏截 → 选区窗框选 → 裁剪保存 → 分发去向 ——
+async function startSnip() {
+  // 球置顶会入镜 → 先藏（结束后恢复）
+  let fairyHidden = false
+  if (fairyWin && !fairyWin.isDestroyed() && fairyWin.isVisible()) {
+    fairyWin.hide()
+    fairyHidden = true
+    await new Promise(r => setTimeout(r, 160))
+  }
+  try {
+    const primary = screen.getPrimaryDisplay()
+    const { width, height } = primary.size
+    const scaleFactor = primary.scaleFactor || 1
+    const thumbW = Math.max(1, Math.round(width * scaleFactor))
+    const thumbH = Math.max(1, Math.round(height * scaleFactor))
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: thumbW, height: thumbH },
+    })
+    const src = sources.find(s => String(s.display_id) === String(primary.id)) || sources[0]
+    if (!src || src.thumbnail.isEmpty()) throw new Error('未获取到屏幕内容')
+    _snipFullImg = src.thumbnail
+    _snipScale = scaleFactor
+    snipWin = new BrowserWindow({
+      x: primary.bounds.x, y: primary.bounds.y, width, height,
+      frame: false, transparent: true, alwaysOnTop: true,
+      skipTaskbar: true, resizable: false, fullscreenable: false,
+      show: false,
+      webPreferences: _fairyWebPrefs(),
+    })
+    snipWin.setAlwaysOnTop(true, 'screen-saver')
+    snipWin.loadURL(`${FAIRY_BASE}/snip`)
+    snipWin.once('ready-to-show', () => {
+      snipWin.show()
+      snipWin.focus()
+      snipWin.webContents.send('snip:image', _snipFullImg.toDataURL())
+    })
+    snipWin.on('closed', () => { snipWin = null })
+  } catch (err) {
+    _log('[fairy] 截图启动失败：' + (err?.message || err))
+    _dialogSync('截图失败', String(err?.message || err))
+    closeSnipWin()
+    if (fairyHidden && fairyWin && !fairyWin.isDestroyed()) fairyWin.show()
+  }
+}
+
+function closeSnipWin() {
+  if (snipWin && !snipWin.isDestroyed()) snipWin.close()
+  snipWin = null
+  _snipFullImg = null
+}
+
+async function onSnipChoose(data) {
+  const target = data?.target
+  const restoreFairy = () => { if (fairyWin && !fairyWin.isDestroyed() && !fairyWin.isVisible()) fairyWin.show() }
+  if (!target || target === 'cancel') { closeSnipWin(); restoreFairy(); return }
+  const rect = data?.rect
+  if (!rect || !_snipFullImg) { closeSnipWin(); restoreFairy(); return }
+  try {
+    // CSS 逻辑坐标 → 物理像素（DPI 缩放）
+    const sf = _snipScale
+    const cropped = _snipFullImg.crop({
+      x: Math.max(0, Math.round(rect.x * sf)),
+      y: Math.max(0, Math.round(rect.y * sf)),
+      width: Math.max(1, Math.round(rect.w * sf)),
+      height: Math.max(1, Math.round(rect.h * sf)),
+    })
+    // 保存到 /api/fs/image 白名单内的临时截图目录
+    const shotDir = path.join(os.homedir(), 'AppData', 'Local', 'Temp', 'agentcluster_screenshots')
+    fs.mkdirSync(shotDir, { recursive: true })
+    const shotPath = path.join(shotDir, `fairy_${Date.now()}.png`)
+    fs.writeFileSync(shotPath, cropped.toPNG())
+    closeSnipWin()
+    if (target === 'main') {
+      // 先回首页（RightPanel 挂载/KeepAlive 恢复）再发截图事件，避免停在设置页收不到
+      await showMainWindow('#/')
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('fairy:shot', { path: shotPath })
+        }
+      }, 500)
+    } else if (target === 'quick') {
+      openQuickChat(shotPath)
+    }
+  } catch (err) {
+    _log('[fairy] 截图裁剪失败：' + (err?.message || err))
+    closeSnipWin()
+  } finally {
+    restoreFairy()
+  }
+}
+
+// —— 拓展启停感知：轮询 /enabled 决定球窗开关 ——
+function startFairyPolling() {
+  if (fairyPollTimer) return
+  fairyPollTimer = setInterval(async () => {
+    let enabled = false
+    try {
+      const res = await fetch(`${FAIRY_BASE}/enabled`, { signal: AbortSignal.timeout(2000) })
+      if (res.ok) enabled = !!(await res.json()).enabled
+    } catch { }
+    try {
+      if (enabled) {
+        if (!fairyWin || fairyWin.isDestroyed()) createFairyWin()
+      } else if (fairyWin && !fairyWin.isDestroyed()) {
+        fairyWin.close()
+        fairyWin = null
+      }
+    } catch (e) {
+      _log('[fairy] 球窗管理异常：' + e.message)
+    }
+  }, 4000)
+}
+
+function registerFairyIPC() {
+  ipcMain.handle('fairy:openMain', (_e, route) => { showMainWindow(route).catch(() => { }) })
+  ipcMain.handle('fairy:action', (_e, name) => {
+    if (name === 'screenshot') {
+      startSnip().catch(e => _log('[fairy] startSnip: ' + e.message))
+    } else if (name === 'quickchat') {
+      openQuickChat()
+    } else if (name === 'settings') {
+      showMainWindow('#/settings').catch(() => { })
+    }
+  })
+
+  ipcMain.handle('fairy:winPos', (e) => {
+    const w = BrowserWindow.fromWebContents(e.sender)
+    if (!w) return null
+    const p = w.getPosition()
+    return { x: p[0], y: p[1] }
+  })
+  ipcMain.handle('fairy:moveTo', (e, x, y) => {
+    const w = BrowserWindow.fromWebContents(e.sender)
+    if (w) w.setPosition(Math.round(x), Math.round(y))
+  })
+  ipcMain.handle('fairy:closeWin', (e) => { BrowserWindow.fromWebContents(e.sender)?.close() })
+  ipcMain.handle('snip:choose', (_e, data) => { onSnipChoose(data) })
+}
+
 // ---------- IPC：窗口控制 ----------
 
 function registerIPC() {
@@ -823,6 +1055,9 @@ app.whenReady().then(async () => {
     await createMainWindow()
     createTray()
     registerIPC()
+    // 精灵悬浮球拓展（fairy_ball）：IPC 注册 + 轮询拓展启用状态决定球窗开关
+    registerFairyIPC()
+    startFairyPolling()
     splashStep('DONE')
     setTimeout(closeSplash, 800)
   } catch (err) {

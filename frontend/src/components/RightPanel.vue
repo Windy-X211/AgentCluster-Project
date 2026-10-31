@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, nextTick, render, createVNode } from 'vue'
+import { useRoute } from 'vue-router'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
 import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
 import { renderChatMarkdown } from '@/utils/markdown'
@@ -487,8 +488,27 @@ async function onChatDrop(e: DragEvent) {
 const renameId = ref<number | null>(null)
 const renameVal = ref('')
 const convsCollapsed = ref(true) // 对话记录列表默认折叠（展开时浮层覆盖画布）
+// 对话记录浮层只属于主界面：KeepAlive 停用 Home 时 Teleport 到 body 的内容不会随页面隐藏，
+// 会残留在设置等路由页上（Vue 已知行为），因此仅在路由位于主界面时渲染浮层；返回主界面自动恢复
+const route = useRoute()
+const isHomeRoute = computed(() => route.path === '/')
 const canvasesCollapsed = ref(true) // 画布列表默认折叠
 const convDesc = ref(true) // 对话记录排序：true = 新在上，false = 新在下
+
+// —— 对话记录分类方式：无分类 / 按集群（画布）/ 按工作区（会话级 workdir）；localStorage 记忆上次选择 ——
+type ConvGroupMode = 'none' | 'cluster' | 'workspace'
+function readConvGroupMode(): ConvGroupMode {
+  try {
+    const v = localStorage.getItem('agent-cluster.conversation.groupMode')
+    if (v === 'cluster' || v === 'workspace' || v === 'none') return v
+  } catch { /* ignore */ }
+  return 'none'
+}
+const groupMode = ref<ConvGroupMode>(readConvGroupMode())
+watch(groupMode, v => { try { localStorage.setItem('agent-cluster.conversation.groupMode', v) } catch { /* ignore */ } })
+// 分组折叠状态：null = 未交互（全部展开）；点击组头后进入手风琴模式（展开一组时其他组折叠）
+const expandedGroupKeys = ref<Set<string> | null>(null)
+watch(groupMode, () => { expandedGroupKeys.value = null }) // 切换分类方式 → 重置为全部展开
 
 // 图片浮窗：滚轮缩放（以鼠标为锚） + 鼠标拖拽平移 + 8 方向 resize
 // —— 解耦架构：窗口尺寸 ≠ 图片缩放 ≠ 图片平移 ——
@@ -1121,6 +1141,115 @@ const seqMap = computed(() => {
   return m
 })
 
+// —— 对话记录分组（按集群=画布 / 按工作区=会话级 workdir）——
+interface ConvGroup {
+  key: string              // 'c{id}' | 'w{workdir}' | '__none__'
+  kind: 'cluster' | 'workspace' | 'unbound'
+  title: string            // 组标题：画布名 / 工作区文件夹名 / 未绑定文案
+  hint: string             // tooltip（完整 workdir 等）
+  canvasId: number | null
+  workdir: string | null
+  canCreate: boolean       // 已删画布的组不可新建（避免创建指向已删画布的会话）
+  convs: any[]
+}
+const UNBOUND_TITLE = '未绑定集群'
+const NOWD_TITLE = '无工作区'
+/** 工作区路径 → 文件夹名（分组标题 / 会话条目标注用） */
+function wdBasename(p: string): string {
+  const s = (p || '').replace(/[\\/]+$/, '')
+  const i = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'))
+  return i >= 0 ? s.slice(i + 1) : s
+}
+/**
+ * 分组视图：groupMode === 'none' 返回 null（走平铺分支）。
+ * 组排序：有对话的组按组内最新会话活跃度降序（sortedConvs 首次出现顺序）
+ * → 空组排后（cluster 按 canvases.list 顺序、workspace 按名称字母序）
+ * → 「未绑定集群」/「无工作区」组固定最后。
+ */
+const convGroups = computed<ConvGroup[] | null>(() => {
+  if (groupMode.value === 'none') return null
+  const sorted = sortedConvs.value
+  const ordered: ConvGroup[] = []
+  const byKey = new Map<string, ConvGroup>()
+  const ensure = (g: ConvGroup): ConvGroup => {
+    let e = byKey.get(g.key)
+    if (!e) { e = g; byKey.set(g.key, e); ordered.push(e) }
+    return e
+  }
+  if (groupMode.value === 'cluster') {
+    for (const c of sorted) {
+      const cid = (c as any).canvas_id ?? null
+      if (cid == null) {
+        ensure({ key: '__none__', kind: 'unbound', title: UNBOUND_TITLE, hint: UNBOUND_TITLE, canvasId: null, workdir: null, canCreate: true, convs: [] }).convs.push(c)
+        continue
+      }
+      const cv = canvases.list.find((x: any) => x.id === cid)
+      const title = cv?.name || `已删画布 #${cid}`
+      ensure({ key: `c${cid}`, kind: 'cluster', title, hint: title, canvasId: cid, workdir: null, canCreate: !!cv, convs: [] }).convs.push(c)
+    }
+    // 空画布分组（还没有任何对话的集群也显示，供直接新建）
+    const clusterGroups = ordered.filter(g => g.kind === 'cluster')
+    const emptyGroups: ConvGroup[] = []
+    for (const cv of canvases.list as any[]) {
+      if (byKey.has(`c${cv.id}`)) continue
+      emptyGroups.push({ key: `c${cv.id}`, kind: 'cluster', title: cv.name || `画布 #${cv.id}`, hint: cv.name || '', canvasId: cv.id, workdir: null, canCreate: true, convs: [] })
+    }
+    const unbound = byKey.get('__none__')
+    return [...clusterGroups, ...emptyGroups, ...(unbound ? [unbound] : [])]
+  }
+  // workspace
+  for (const c of sorted) {
+    const wd = ((c as any).workdir || '').trim()
+    if (!wd) {
+      ensure({ key: '__none__', kind: 'unbound', title: NOWD_TITLE, hint: NOWD_TITLE, canvasId: null, workdir: null, canCreate: true, convs: [] }).convs.push(c)
+      continue
+    }
+    ensure({ key: `w${wd}`, kind: 'workspace', title: wdBasename(wd) || wd, hint: wd, canvasId: null, workdir: wd, canCreate: true, convs: [] }).convs.push(c)
+  }
+  const wsGroups = ordered.filter(g => g.kind === 'workspace')
+  const emptyGroups: ConvGroup[] = []
+  const seenWd = new Set(wsGroups.map(g => g.workdir))
+  for (const cv of canvases.list as any[]) {
+    const wd = ((cv as any).workdir || '').trim()
+    if (!wd || seenWd.has(wd)) continue
+    seenWd.add(wd)
+    emptyGroups.push({ key: `w${wd}`, kind: 'workspace', title: wdBasename(wd) || wd, hint: wd, canvasId: null, workdir: wd, canCreate: true, convs: [] })
+  }
+  emptyGroups.sort((a, b) => (a.title || '').localeCompare(b.title || ''))
+  const unbound = byKey.get('__none__')
+  return [...wsGroups, ...emptyGroups, ...(unbound ? [unbound] : [])]
+})
+/** 分组模式下会话条目的归属标注：按集群 → 工作区文件夹名；按工作区 → 画布名 */
+function convGroupTag(c: any): string {
+  if (groupMode.value === 'cluster') {
+    const wd = (c.workdir || '').trim()
+    return wd ? (wdBasename(wd) || wd) : NOWD_TITLE
+  }
+  if (groupMode.value === 'workspace') {
+    const cid = c.canvas_id ?? null
+    if (cid == null) return UNBOUND_TITLE
+    return canvases.list.find((x: any) => x.id === cid)?.name || `已删画布 #${cid}`
+  }
+  return ''
+}
+/** 组是否展开：null = 未交互（全部展开），否则按手风琴集合判断 */
+function isGroupExpanded(key: string): boolean {
+  return expandedGroupKeys.value == null || expandedGroupKeys.value.has(key)
+}
+/** 点击组头折叠/展开：折叠 → 其余组不变；展开 → 其他展开组全部折叠（手风琴） */
+function toggleGroupExpand(key: string) {
+  const cur = expandedGroupKeys.value
+  if (cur == null) {
+    // 从「全部展开」首次交互：仅折叠被点的组，其余保持展开
+    const s = new Set<string>()
+    for (const g of convGroups.value || []) if (g.key !== key) s.add(g.key)
+    expandedGroupKeys.value = s
+    return
+  }
+  if (cur.has(key)) cur.delete(key)
+  else expandedGroupKeys.value = new Set([key])
+}
+
 /** 从 a2a 信封的 parts 中拼接出纯文字（text 类型 part 用 \n\n 连接） */
 function extractEnvelopeText(envelope: any): string {
   if (!envelope?.parts) return ''
@@ -1186,7 +1315,7 @@ const renderItems = computed(() => {
     const children: any[] = []
     while (i < msgs.length && (msgs[i] as any).role !== 'user') {
       const m2 = msgs[i] as any
-      if (m2.role === 'tool_call' || m2.role === 'tool_result') { i++; continue }
+      if (m2.role === 'tool_call' || m2.role === 'tool_result' || m2.role === 'tool') { i++; continue }
       if (m2.role === 'a2a') {
         // 只渲染"发给当前智能体"的信封（from !== cur）；自己发出的不渲染信封卡片。
         // 显示在左/右侧由 sideOf（设置项）决定，与"是否渲染"无关。
@@ -2425,13 +2554,37 @@ async function newConv() {
   // 统一「新建」：一个会话记录一个画布的用户与智能体消息；
   // 带上当前设置的工作区与串并行模式（画布打开时以画布当前设置为准）
   const cur = convs.currentData() as any
+  // 未选中智能体时兜底选中设置里的默认智能体（已选中则沿用，不覆盖用户选择；
+  // 智能体已删除时跳过兜底）——主窗口与小窗共用本入口，行为一致
+  let agentId = currentAgentId.value
+  if (agentId == null) {
+    const d = Number(settings.data?.default_agent_id)
+    if (Number.isFinite(d) && d > 0 && agents.list.some((a: any) => a.id === d)) {
+      agentId = d
+      currentAgentId.value = d
+    }
+  }
   await convs.create({
     name: '新对话',
-    agent_ids: currentAgentId.value ? [currentAgentId.value] : [],
+    agent_ids: agentId ? [agentId] : [],
     canvas_id: canvas.value?.id ?? null,
     workdir: canvas.value?.workdir ?? cur?.workdir ?? null,
     execution_mode: canvas.value?.execution_mode ?? cur?.execution_mode ?? null,
   })
+}
+/** 分组头「＋」：在对应集群（画布）/工作区上下文中新建对话（立即创建）。
+ *  集群组新建 → 工作区默认为空，并自动打开对应集群画布；工作区组新建 → 集群默认为空；均不预设智能体。
+ *  创建后展开该组（手风琴模式下其余组折叠），确保新对话立即可见。 */
+async function newConvInGroup(g: ConvGroup) {
+  if (g.kind === 'cluster' && g.canvasId != null) {
+    await convs.create({ name: '新对话', agent_ids: [], canvas_id: g.canvasId, workdir: null, execution_mode: null })
+    selectCanvas(g.canvasId) // 自动打开对应集群画布（新会话 workdir 为空 → 运行时回退画布工作区，不覆盖画布设置）
+  } else if (g.kind === 'workspace' && g.workdir) {
+    await convs.create({ name: '新对话', agent_ids: [], canvas_id: null, workdir: g.workdir, execution_mode: null })
+  } else {
+    await convs.create({ name: '新对话', agent_ids: [], canvas_id: null, workdir: null, execution_mode: null })
+  }
+  if (expandedGroupKeys.value != null) expandedGroupKeys.value = new Set([g.key])
 }
 function selectConv(id: number) {
   if (selMode.value) { toggleSel(id); return }
@@ -2653,6 +2806,55 @@ function unmountAllVizSlots() {
   _vizMounts.clear()
 }
 
+// —— 精灵球截图提问：Electron 发来截图路径 → 预填附件 ——
+// fairy:shot（主窗去向）：新建「⚡ 截图提问」会话 + 预填
+// quick:shot（小窗去向）：小窗临时会话由 QuickChatView 管理，这里仅预填
+// 截图以 ready 附件进 attachments 预览条（输入框上方直接显示缩略图卡片），
+// 发送时由 attachmentsToText() 拼回 `![截图](/api/fs/image?path=…)` markdown——
+// 气泡端 markdown.ts 的 chat-img-wrap 后处理再渲染成可点击缩略图，全链路一致。
+// 模块级防重绑：KeepAlive 失活时 ipcRenderer 监听仍存活，重复挂载不能重复绑定
+let _fairyShotBound = false
+function bindFairyShot() {
+  if (_fairyShotBound) return
+  const ea = (window as any).electronAPI
+  if (!ea?.on) return
+  _fairyShotBound = true
+  const addShotAttachment = (path: string) => {
+    if (!path) return
+    // 同一张截图不重复堆叠（重复收到同路径事件时忽略）
+    if (attachments.value.some(a => a.path === path)) return
+    const name = path.split(/[\\/]/).pop() || '截图.png'
+    const att: ChatAttachment = {
+      id: crypto.randomUUID(),
+      name,
+      path,
+      size: 0,
+      content_type: 'image/png',
+      ext: name.split('.').pop()?.toLowerCase() || 'png',
+      previewUrl: `${API_BASE}/api/fs/image?path=${encodeURIComponent(path)}`,
+      status: 'ready',
+    }
+    attachments.value.push(att)
+    // 文件大小异步补上（卡片 meta 区显示）；HEAD 失败保持 0 → 显示为 '0 B' 也可接受
+    fetch(att.previewUrl as string, { method: 'HEAD' })
+      .then(r => {
+        const len = +(r.headers.get('content-length') || 0)
+        if (len > 0) att.size = len
+      })
+      .catch(() => { /* ignore */ })
+    stickBottom.value = true
+    taRef.value?.focus()
+  }
+  ea.on('fairy:shot', async ({ path }: { path: string }) => {
+    if (!path) return
+    try {
+      await convs.create({ name: '⚡ 截图提问', agent_ids: [] })
+      addShotAttachment(path)
+    } catch (e) { console.error('[fairy] 截图提问预填失败:', e) }
+  })
+  ea.on('quick:shot', ({ path }: { path: string }) => { addShotAttachment(path) })
+}
+
 onMounted(async () => {
   // 父级 Home 的 fetch 可能还没返回，这里先确保拉到列表，避免误判为空而重复新建
   if (!convs.list.length) await convs.fetch()
@@ -2664,10 +2866,19 @@ onMounted(async () => {
   setExtAPIImpl({
     sendUserInput: (text: string) => { input.value = text; void send() },
     insertInput: (text: string) => { input.value = text },
-    imageURL: (path: string) => `${API_BASE}/api/fs/image?path=${encodeURIComponent(path)}`,
+    // 模型常给工作区内相对路径（如 tyut_img/campus1.jpg）→ 先拼当前会话/画布工作区，再走 /api/fs/image
+    imageURL: (path: string) => {
+      if (path && !/^(https?:|data:|blob:|file:|\/|[A-Za-z]:[\\/])/i.test(path)) {
+        const wd = ((convs.currentData() as any)?.workdir || '').replace(/[\\/]+$/, '')
+        if (wd) path = `${wd}/${path.replace(/^[\\/]+/, '')}`
+      }
+      return `${API_BASE}/api/fs/image?path=${encodeURIComponent(path)}`
+    },
     openLightbox: (src: string) => openLightbox(src),
     getSettings: () => settings.data,
   })
+  // —— 精灵球截图提问监听（主窗去向）——
+  bindFairyShot()
 })
 // 消息列表变化 / 流式停止后扫描挂载 viz 占位
 watch(() => [renderItems.value.length, convs.streaming], () => {
@@ -2810,7 +3021,7 @@ onBeforeUnmount(() => {
       </div>
       <!-- 对话列表：固定定位的浮层，覆盖在画布区域，不压缩对话区高度 -->
       <Teleport to="body">
-        <div v-if="!convsCollapsed" class="conv-float glass" :style="convFloatStyle" @click.stop>
+        <div v-if="isHomeRoute && !convsCollapsed" class="conv-float glass" :style="convFloatStyle" @click.stop>
           <div class="conv-float-head">
             <span class="conv-title-text">对话记录</span>
             <span class="conv-count">{{ convs.list.length }}</span>
@@ -2822,6 +3033,14 @@ onBeforeUnmount(() => {
             <span class="flex-spacer"></span>
             <button class="collapse-btn" type="button" @click.stop="convsCollapsed = true" title="折叠">✕</button>
           </div>
+          <!-- 分类栏：无分类 / 按集群（画布）/ 按工作区；选择自动记忆 -->
+          <div class="conv-group-bar">
+            <select class="input conv-group-select" v-model="groupMode" title="对话分类方式（自动记住上次选择）">
+              <option value="none">无分类</option>
+              <option value="cluster">按集群</option>
+              <option value="workspace">按工作区</option>
+            </select>
+          </div>
           <!-- 多选操作条（仅选择模式出现） -->
           <div class="sel-bar" v-if="selMode" @click.stop>
             <span class="sel-count">已选 {{ selectedIds.length }}</span>
@@ -2831,19 +3050,54 @@ onBeforeUnmount(() => {
           </div>
           <div class="conv-list-wrap" ref="convListEl" @scroll.passive="onConvListScroll">
             <div class="conv-list">
-              <div v-for="c in sortedConvs" :key="c.id"
-                   :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id) }]"
-                   @click="selectConv(c.id)"
-                   @contextmenu="onConvContext($event, c.id)">
-                <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
-                <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
-                <span class="conv-body">
-                  <span class="conv-name">{{ convDisplayName(c) }}</span>
-                  <span class="conv-time">{{ convTimeLabel(c) }}</span>
-                </span>
-                <span class="del" @click.stop="convs.remove(c.id)">×</span>
-              </div>
-              <div v-if="!sortedConvs.length" class="empty">暂无对话，点「＋」新建</div>
+              <!-- 无分类：平铺 -->
+              <template v-if="groupMode === 'none'">
+                <div v-for="c in sortedConvs" :key="c.id"
+                     :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id) }]"
+                     @click="selectConv(c.id)"
+                     @contextmenu="onConvContext($event, c.id)">
+                  <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
+                  <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
+                  <span class="conv-body">
+                    <span class="conv-name">{{ convDisplayName(c) }}</span>
+                    <span class="conv-time">{{ convTimeLabel(c) }}</span>
+                  </span>
+                  <span class="del" @click.stop="convs.remove(c.id)">×</span>
+                </div>
+                <div v-if="!sortedConvs.length" class="empty">暂无对话，点「＋」新建</div>
+              </template>
+              <!-- 分组：按集群（画布名）/ 按工作区（文件夹名）；条目标注 工作区名 / 画布名；组头点击折叠/展开（手风琴） -->
+              <template v-else>
+                <div v-for="g in convGroups" :key="g.key" class="conv-group">
+                  <div class="conv-group-head" :title="(g.hint || g.title) + (isGroupExpanded(g.key) ? '（点击折叠）' : '（点击展开）')"
+                       @click="toggleGroupExpand(g.key)">
+                    <span class="conv-group-caret">{{ isGroupExpanded(g.key) ? '▾' : '▸' }}</span>
+                    <span class="conv-group-title">{{ g.title }}</span>
+                    <span class="conv-group-count">{{ g.convs.length }}</span>
+                    <span class="flex-spacer"></span>
+                    <button v-if="g.canCreate" class="conv-group-add" type="button"
+                            @click.stop="newConvInGroup(g)" :title="`在「${g.title}」新建对话`">＋</button>
+                  </div>
+                  <template v-if="isGroupExpanded(g.key)">
+                    <div v-for="c in g.convs" :key="c.id"
+                         :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id) }]"
+                         @click="selectConv(c.id)"
+                         @contextmenu="onConvContext($event, c.id)">
+                      <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
+                      <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
+                      <span class="conv-body">
+                        <span class="conv-name">{{ convDisplayName(c) }}</span>
+                        <span class="conv-meta">
+                          <span class="conv-tag">{{ convGroupTag(c) }}</span>
+                          <span class="conv-time">{{ convTimeLabel(c) }}</span>
+                        </span>
+                      </span>
+                      <span class="del" @click.stop="convs.remove(c.id)">×</span>
+                    </div>
+                  </template>
+                </div>
+                <div v-if="!convGroups?.length" class="empty">暂无对话</div>
+              </template>
             </div>
           </div>
         </div>
@@ -3434,6 +3688,23 @@ onBeforeUnmount(() => {
 /* 排序方向切换按钮：↓ 新在上（倒序）／↑ 旧在上（顺序） */
 .sort-btn { flex-shrink: 0; width: 22px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 6px; color: var(--accent); font-size: calc(12px * var(--font-scale)); cursor: pointer; line-height: 1; }
 .sort-btn:hover { background: rgba(var(--accent-rgb), 0.18); color: #dce8ff; }
+/* 分类栏：分类方式下拉框（无分类 / 按集群 / 按工作区），复用全局 select.input 深色主题 */
+.conv-group-bar { flex-shrink: 0; padding: 2px 8px 6px; }
+.conv-group-select { height: 24px; padding: 0 22px 0 8px; border-radius: 6px; font-size: calc(11px * var(--font-scale)); }
+/* 分组头：组名（画布名/工作区文件夹名）+ 数量 + 组内新建；点击折叠/展开（手风琴） */
+.conv-group { margin-bottom: 3px; }
+.conv-group-head { display: flex; align-items: center; gap: 6px; padding: 5px 10px 3px; min-width: 0; cursor: pointer; user-select: none; border-radius: 6px; }
+.conv-group-head:hover { background: rgba(var(--surface-rgb), 0.05); }
+.conv-group-caret { flex-shrink: 0; width: 10px; text-align: center; font-size: calc(9px * var(--font-scale)); color: rgba(var(--text-rgb), 0.5); }
+.conv-group-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: calc(11px * var(--font-scale)); font-weight: 600; color: rgba(var(--text-rgb), 0.7); }
+.conv-group-head:hover .conv-group-title { color: rgb(var(--text-rgb)); }
+.conv-group-count { flex-shrink: 0; font-family: Consolas, monospace; font-size: calc(10px * var(--font-scale)); opacity: .5; }
+.conv-group-add { flex-shrink: 0; width: 18px; height: 18px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 5px; color: var(--accent); font-size: calc(12px * var(--font-scale)); cursor: pointer; line-height: 1; }
+.conv-group-add:hover { background: rgba(var(--accent-rgb), 0.18); color: #dce8ff; }
+/* 分组模式下会话条目的归属标注（按集群 → 工作区名；按工作区 → 画布名） */
+.conv-item .conv-meta { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.conv-item .conv-tag { min-width: 0; flex: 0 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: calc(10px * var(--font-scale)); color: var(--accent); opacity: .7; }
+.conv-item .conv-meta .conv-time { flex-shrink: 0; }
 .conv-count {
   font-size: calc(11px * var(--font-scale));
   font-family: Consolas, monospace;

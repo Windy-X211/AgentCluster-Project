@@ -4,5 +4,11 @@
     "installed_at": "2026-10-30T12:03:55.504721",
     "version": "1.2.0",
     "source": "builtin"
+  },
+  "fairy_ball": {
+    "enabled": true,
+    "installed_at": "2026-10-31T02:07:06.423744",
+    "version": "1.0.0",
+    "source": "builtin"
   }
 }

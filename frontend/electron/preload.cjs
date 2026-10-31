@@ -45,9 +45,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
   api: {
     health: () => ipcRenderer.invoke('api:health'),
   },
-  // 事件监听（主窗口最大化状态同步）
+  // 精灵悬浮球拓展（fairy_ball）：球窗/小对话窗/选区窗共用的桥
+  fairy: {
+    /** 打开主窗口（route 可选，如 '#/settings'） */
+    openMain: (route) => ipcRenderer.invoke('fairy:openMain', route),
+    /** 菜单动作：screenshot | quickchat | settings */
+    action: (name, payload) => ipcRenderer.invoke('fairy:action', name, payload),
+
+    /** 当前窗口位置（拖动计算用） */
+    winPos: () => ipcRenderer.invoke('fairy:winPos'),
+    /** 移动当前窗口到屏幕坐标 */
+    moveTo: (x, y) => ipcRenderer.invoke('fairy:moveTo', x, y),
+    /** 关闭当前窗口（frameless 自绘关闭按钮用） */
+    closeWin: () => ipcRenderer.invoke('fairy:closeWin'),
+  },
+  // 区域截图选区窗桥
+  snip: {
+    /** 主进程把全屏截图 dataURL 发来（选区窗就绪后） */
+    onImage: (callback) => {
+      ipcRenderer.on('snip:image', (_e, dataUrl) => callback(dataUrl))
+    },
+    /** 选区完成/取消：{target:'main'|'quick'|'cancel', rect:{x,y,w,h}} */
+    choose: (data) => ipcRenderer.invoke('snip:choose', data),
+  },
+  // 事件监听（主窗口最大化状态同步 / 精灵球截图提问 / 小窗补充截图）
   on: (channel, callback) => {
-    const validChannels = ['win:maximized']
+    const validChannels = ['win:maximized', 'fairy:shot', 'quick:shot']
     if (validChannels.includes(channel)) {
       ipcRenderer.on(channel, (_e, ...args) => callback(...args))
     }

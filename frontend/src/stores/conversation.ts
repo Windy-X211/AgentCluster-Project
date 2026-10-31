@@ -520,6 +520,92 @@ export interface ToolCallPhase {
   streamingArgs?: string   // 参数流式中：累计到当前的原始 JSON 字符串片段
 }
 
+// ============ 落库历史水合：后端落库格式 → 渲染格式（tool_call/tool_result） ============
+// 落库单通道化后，后端按 OpenAI 契约写消息：
+//   · 每轮 assistant 带 tool_calls（OpenAI 格式 [{id,type,function:{name,arguments}}]，仅中间轮）；
+//   · 工具结果为紧随的 role='tool' 消息（{tool_call_id, content, images?}）；
+//   · 运行收尾时最终 assistant 聚合 tool_history=[{name,args,result}]（覆盖全部轮次）。
+// 而聊天区/画布的工具行渲染只认 tool_call/tool_result 角色（流式时由 C:/R: 行现场合成），
+// 会话重开/切换后从后端拉到的落库数组若不水合，工具行就消失（只剩正文没有过程）。
+// 水合规则（按 user 消息分段）：
+//   · role='tool' 的原始结果消息不直接渲染（结果已聚合进 tool_history）→ 移除；
+//   · 段内存在带 tool_history 的 assistant（最终回复）→ 以 tool_history 为准合成
+//     tool_call/tool_result 对挂在它后面（与流式"锚点 assistant + 工具行"同构），
+//     tool_call_id / image_refs 按落库顺序从段内 role='tool' 消息回填；
+//   · 段内没有 tool_history（运行中断只有中间轮）→ 按 assistant.tool_calls 精确 id 配对合成；
+//   · 每条输出消息打 _rawIdx（原始落库索引），deleteMessage/undo 等按索引操作后端数组的接口用它换算。
+// 幂等：已含 tool_call 的数组视为已水合，原样返回。
+function _stampRaw(m: any, rawIdx: number): any {
+  if (m && typeof m === 'object') m._rawIdx = rawIdx
+  return m
+}
+
+/** 段内合成一对 tool_call/tool_result 并推入 out（agent_id 归属所属 assistant） */
+function _pushSynthPair(out: any[], tcId: string, name: string, args: any, result: any,
+                        images: any[] | null, agentId: number | undefined, ts: string | undefined) {
+  out.push({ role: 'tool_call', content: '', name, tool_call_id: tcId, args: args || {}, ts, agent_id: agentId ?? undefined })
+  const rMsg: any = { role: 'tool_result', content: '', tool_call_id: tcId, result: result ?? {}, ts, agent_id: agentId ?? undefined }
+  if (Array.isArray(images) && images.length) rMsg.image_refs = images
+  out.push(rMsg)
+}
+
+export function hydrateHistoryMsgs(raw: any[]): any[] {
+  if (!Array.isArray(raw) || !raw.length) return raw
+  if (raw.some(m => m && m.role === 'tool_call')) return raw
+  const out: any[] = []
+  const n = raw.length
+  let i = 0
+  while (i < n) {
+    if (raw[i]?.role === 'user') { out.push(_stampRaw(raw[i], i)); i++; continue }
+    // 本段 [i, e)：直到下一条 user（含 a2a / assistant / tool 等全部非 user 消息）
+    let e = i
+    while (e < n && raw[e]?.role !== 'user') e++
+    // 段内原始 tool 结果池（按落库顺序；tool_history 与其一一对应，用于回填 id 与图片）
+    const pool: { m: any; used: boolean }[] = []
+    let hasFinal = false
+    for (let k = i; k < e; k++) {
+      const m = raw[k]
+      if (m?.role === 'tool') pool.push({ m, used: false })
+      if (m?.role === 'assistant' && Array.isArray(m.tool_history) && m.tool_history.length) hasFinal = true
+    }
+    let nextTool = 0
+    const takeTool = () => (nextTool < pool.length ? pool[nextTool++] : null)
+    for (let k = i; k < e; k++) {
+      const m = raw[k]
+      if (!m || m.role === 'tool') continue
+      out.push(_stampRaw(m, k))
+      if (m.role !== 'assistant') continue
+      // 最终 assistant：tool_history 全量聚合（优先，避免与中间轮重复）
+      if (Array.isArray(m.tool_history) && m.tool_history.length) {
+        for (const h of m.tool_history) {
+          const t = takeTool()
+          _pushSynthPair(out,
+            t?.m?.tool_call_id || `hist-${k}-${nextTool}`,
+            h?.name || '?', h?.args || {}, h?.result ?? {},
+            t?.m?.images || null, m.agent_id, m.ts)
+        }
+      } else if (!hasFinal && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        // 无最终回复的段（运行中断）：按中间轮 OpenAI tool_calls 精确 id 配对
+        for (const tc of m.tool_calls) {
+          const tcId = tc?.id || `hist-${k}-${nextTool}`
+          let args: any = {}
+          const argRaw = tc?.function?.arguments
+          if (typeof argRaw === 'string') { try { args = JSON.parse(argRaw) } catch { args = { _raw: argRaw } } }
+          else if (argRaw && typeof argRaw === 'object') args = argRaw
+          const t = pool.find(x => !x.used && x.m?.tool_call_id === tcId)
+          if (t) { t.used = true; nextTool = Math.max(nextTool, pool.indexOf(t) + 1) }
+          let result: any = {}
+          const rc = t?.m?.content
+          if (rc != null) { try { result = JSON.parse(rc) } catch { result = { _raw: rc } } }
+          _pushSynthPair(out, tcId, tc?.function?.name || '?', args, result, t?.m?.images || null, m.agent_id, m.ts)
+        }
+      }
+    }
+    i = e
+  }
+  return out
+}
+
 export const useConvStore = defineStore('conv', {
   state: () => ({
     list: [] as any[],
@@ -720,6 +806,7 @@ export const useConvStore = defineStore('conv', {
           if (m && typeof m === 'object' && m.streaming) m.streaming = false
           if (m && !m.image_refs && Array.isArray(m.images) && m.images.length) m.image_refs = m.images
         }
+        c.messages = hydrateHistoryMsgs(c.messages)
         const i = this.list.findIndex(x => x.id === cid)
         if (i >= 0) this.list[i] = c
         else this.list.push(c)
@@ -748,8 +835,10 @@ export const useConvStore = defineStore('conv', {
     async deleteMessage(target: any): Promise<{ ok: boolean; msg?: string; removed?: number }> {
       const c = this.currentData()
       if (!c) return { ok: false, msg: '无当前会话' }
-      const rawIdx = (c.messages || []).indexOf(target)
-      if (rawIdx < 0) return { ok: false, msg: '找不到消息' }
+      // 水合后本地数组与后端落库数组索引不同（原始 tool 消息被移除、工具对被插入），
+      // 优先用 _rawIdx（水合时打的原始落库索引）换算
+      const rawIdx = (target as any)?._rawIdx ?? (c.messages || []).indexOf(target)
+      if (rawIdx < 0 || rawIdx == null) return { ok: false, msg: '找不到消息' }
       try {
         const r = await api.convs.deleteMessage(c.id, rawIdx)
         await this.fetch()
@@ -769,8 +858,9 @@ export const useConvStore = defineStore('conv', {
     async undoFromUserMessage(target: any): Promise<{ ok: boolean; msg?: string; restoredOps?: number }> {
       const c = this.currentData()
       if (!c) return { ok: false, msg: '无当前会话' }
-      const rawIdx = (c.messages || []).indexOf(target)
-      if (rawIdx < 0) return { ok: false, msg: '找不到消息' }
+      // 同 deleteMessage：水合后优先用 _rawIdx 换算原始落库索引
+      const rawIdx = (target as any)?._rawIdx ?? (c.messages || []).indexOf(target)
+      if (rawIdx < 0 || rawIdx == null) return { ok: false, msg: '找不到消息' }
       if (target.role !== 'user') return { ok: false, msg: '仅可对用户消息执行撤销' }
       try {
         const r = await api.convs.undoFrom(c.id, rawIdx)
@@ -1007,6 +1097,7 @@ export const useConvStore = defineStore('conv', {
             if (m && typeof m === 'object' && m.streaming) m.streaming = false
             if (m && !m.image_refs && Array.isArray(m.images) && m.images.length) m.image_refs = m.images
           }
+          c.messages = hydrateHistoryMsgs(c.messages)
         }
         const i = this.list.findIndex(x => x.id === cid)
         if (i >= 0 && c) this.list[i] = c
@@ -1171,7 +1262,7 @@ export const useConvStore = defineStore('conv', {
         // 基底重置一次：取最早开始运行的 send 时刻快照（公共前缀），其余运行从 0 补播
         const c = this.list.find(x => x.id === cid) as any
         if (c && runs[0]?.base_conv) {
-          c.messages = JSON.parse(JSON.stringify(runs[0].base_conv.messages || []))
+          c.messages = hydrateHistoryMsgs(JSON.parse(JSON.stringify(runs[0].base_conv.messages || [])))
         }
         this._sendError[cid] = false
         await Promise.all(runs.map(async (run) => {

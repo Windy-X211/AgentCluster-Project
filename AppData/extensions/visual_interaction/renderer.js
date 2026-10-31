@@ -82,7 +82,7 @@
 
 /* flowchart */
 .viz-flow { overflow-x: auto; overflow-y: hidden; padding: 4px; border: 1px solid rgba(255,255,255,.08); border-radius: 8px; }
-.viz-flow svg { display: block; height: auto; max-width: 100%; min-width: 100%; }
+.viz-flow svg { display: block; }
 .viz-flow .viz-err { color: #ff8080; font-size: 12px; }
 .viz-flow-bar { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(0,0,0,.25); border-bottom: 1px solid rgba(255,255,255,.06); font-size: 12px; }
 .viz-flow-title { opacity: .8; }
@@ -93,7 +93,9 @@
 .viz-flow-btn-primary:hover { filter: brightness(1.08); }
 .viz-flow-btn-close { background: transparent; border-color: rgba(255,255,255,.3); color: #fff; }
 .viz-flow-canvas { padding: 0; overflow: hidden; position: relative; max-height: 400px; min-height: 180px; }
-.viz-flow-canvas svg { transition: none; position: absolute; top: 0; left: 0; }
+/* 画布内 SVG 必须保持在文档流内（禁止 position:absolute）：
+   若脱流，零宽 shrink-to-fit 的 .viz-viewport 会把 svg 的百分比宽度钳成 0×0，
+   缩略图整片空白（全屏画布类名不同 .viz-flow-full-canvas 故不受影响）。 */
 .viz-pan-layer { position: absolute; inset: 0; }
 .viz-viewport { position: absolute; top: 0; left: 0; }
 .viz-flow-full { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,.92); display: flex; flex-direction: column; }
@@ -649,6 +651,10 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             const panning = ref(false);   // 画布平移模式
             const panStart = reactive({ mx: 0, my: 0, px: 0, py: 0 });
             const layout = computeLayout(props.data || {});
+            // 缩略图画布高度：子元素全是绝对定位不撑高容器，若固定 min-height 180px，
+            // 大图会被压进 180px 窗口、fit 出极小 zoom，节点小到看不见（缩略图"空白"）。
+            // 让画布高度跟随内容（180 ~ 400px），大图有足够的可视空间。
+            const canvasH = Math.min(Math.max(Math.ceil(layout.svgH), 180), 400);
             const pos = reactive({});
             Object.keys(layout.pos).forEach(k => { pos[k] = { ...layout.pos[k] }; });
 
@@ -657,25 +663,28 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             const _canvasRef = ref(null);       // 主画布（viz-flow-canvas）
             const _fullCanvasRef = ref(null);   // 全屏画布（打开后才有）
             let _ro = null;                     // ResizeObserver
+            let _fitTimer = null;               // fit 兜底重试定时器
             function getMyCanvas() {
                 if (full.value) return _fullCanvasRef.value;
                 return _canvasRef.value;
             }
             function fitToContainer() {
                 const canvas = getMyCanvas();
-                if (!canvas) return;
+                if (!canvas) return false;
                 const rect = canvas.getBoundingClientRect();
-                if (rect.width < 1 || rect.height < 1) return;
+                if (rect.width < 1 || rect.height < 1) return false;
                 const padH = 16, padV = 16;
                 const availW = rect.width - padH * 2;
                 const availH = rect.height - padV * 2;
                 const s = layout.svgW, t = layout.svgH;
-                if (s <= 0 || t <= 0) return;
-                // 集群画布同款中心公式
-                const z = Math.min(availW / s, availH / t);
+                if (s <= 0 || t <= 0) return false;
+                // 集群画布同款中心公式；zoom 设下限（与 ZOOM_MIN 一致），
+                // 超大图不再无限缩小到不可见，超出部分可拖拽平移查看
+                const z = Math.max(ZOOM_MIN, Math.min(availW / s, availH / t));
                 zoom.value = +z.toFixed(3);
                 panX.value = +((availW - s * z) / 2 + padH).toFixed(2);
                 panY.value = +((availH - t * z) / 2 + padV).toFixed(2);
+                return true;
             }
             function getCanvasEl() { return getMyCanvas(); }
             function clientToCanvas(ev) {
@@ -685,11 +694,17 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 return { x: ev.clientX - r.left, y: ev.clientY - r.top };
             }
             function _scheduleFit() {
-                // 多帧重试，确保 DOM 尺寸就绪
+                // 多帧重试，确保 DOM 尺寸就绪；容器尚未完成布局（rect 无效）时定时兜底重试，
+                // 避免 fit 静默失败后缩略图永远停在空白/错位状态
+                if (_fitTimer) { clearInterval(_fitTimer); _fitTimer = null; }
                 requestAnimationFrame(() => {
                     fitToContainer();
                     requestAnimationFrame(() => fitToContainer());
                 });
+                let tries = 0;
+                _fitTimer = setInterval(() => {
+                    if (fitToContainer() || ++tries >= 10) { clearInterval(_fitTimer); _fitTimer = null; }
+                }, 120);
             }
             onMounted(() => {
                 _scheduleFit();
@@ -778,6 +793,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 window.removeEventListener('mousemove', onMouseMove);
                 window.removeEventListener('mouseup', onMouseUp);
                 if (_ro) { _ro.disconnect(); _ro = null; }
+                if (_fitTimer) { clearInterval(_fitTimer); _fitTimer = null; }
             });
 
             // —— 重置位置 ——
@@ -798,10 +814,11 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
 
             // —— 工具栏按钮缩放（以画布中心为定点）——
             function toolbarZoom(delta) {
+                // doZoomAt 锚点是画布局部坐标（非 client 坐标），以画布中心为定点
                 const canvas = getCanvasEl();
-                if (!canvas) return doZoomAt(window.innerWidth / 2, window.innerHeight / 2, delta);
+                if (!canvas) return doZoomAt(0, 0, delta);
                 const rect = canvas.getBoundingClientRect();
-                doZoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, delta);
+                doZoomAt(rect.width / 2, rect.height / 2, delta);
             }
 
             // —— 渲染 ——
@@ -825,7 +842,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     h('div', {
                         ref: _canvasRef,
                         class: 'viz-flow-canvas',
-                        style: { cursor },
+                        style: { cursor, height: canvasH + 'px' },
                         onWheel: onCanvasWheel,
                         onMousedown: onCanvasMouseDown
                     }, [
@@ -974,23 +991,26 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             const _canvasRef = ref(null);
             const _fullCanvasRef = ref(null);
             let _ro = null;
+            let _fitTimer = null;   // fit 兜底重试定时器
             function getMyCanvas() {
                 if (full.value) return _fullCanvasRef.value;
                 return _canvasRef.value;
             }
             function fitToContainer() {
                 const canvas = getMyCanvas();
-                if (!canvas) return;
+                if (!canvas) return false;
                 const rect = canvas.getBoundingClientRect();
-                if (rect.width < 1 || rect.height < 1) return;
+                if (rect.width < 1 || rect.height < 1) return false;
                 const padH = 16, padV = 16;
                 const availW = rect.width - padH * 2;
                 const availH = rect.height - padV * 2;
-                if (svgW <= 0 || svgH <= 0) return;
-                const z = Math.min(availW / svgW, availH / svgH);
+                if (svgW <= 0 || svgH <= 0) return false;
+                // zoom 设下限（与 ZOOM_MIN 一致）：超大图不再缩小到不可见，超出部分可拖拽平移
+                const z = Math.max(ZOOM_MIN, Math.min(availW / svgW, availH / svgH));
                 zoom.value = +z.toFixed(3);
                 panX.value = +((availW - svgW * z) / 2 + padH).toFixed(2);
                 panY.value = +((availH - svgH * z) / 2 + padV).toFixed(2);
+                return true;
             }
             function getCanvasEl() { return getMyCanvas(); }
             function clientToCanvas(ev) {
@@ -1000,10 +1020,16 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 return { x: ev.clientX - r.left, y: ev.clientY - r.top };
             }
             function _scheduleFit() {
+                // 多帧重试 + 定时兜底：容器未布局好（rect 无效）时避免 fit 静默失败
+                if (_fitTimer) { clearInterval(_fitTimer); _fitTimer = null; }
                 requestAnimationFrame(() => {
                     fitToContainer();
                     requestAnimationFrame(() => fitToContainer());
                 });
+                let tries = 0;
+                _fitTimer = setInterval(() => {
+                    if (fitToContainer() || ++tries >= 10) { clearInterval(_fitTimer); _fitTimer = null; }
+                }, 120);
             }
 
             // 首次布局
@@ -1020,6 +1046,8 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 return { nodes, edges };
             }
             let { nodes: initNodes, edges: initEdges } = initFromData();
+            // 缩略图画布高度跟随内容（180 ~ 400px）：固定 180px 会把大图压到 zoom 极小而看不见节点
+            const canvasH = Math.min(Math.max(Math.ceil(svgH), 180), 400);
             const pos = reactive({});
             initNodes.forEach(n => { pos[n.id] = { x: n.x + 10, y: n.y + 10, w: n.w, h: n.h, lines: n.lines }; });
 
@@ -1106,6 +1134,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 window.removeEventListener('mousemove', onMouseMove);
                 window.removeEventListener('mouseup', onMouseUp);
                 if (_ro) { _ro.disconnect(); _ro = null; }
+                if (_fitTimer) { clearInterval(_fitTimer); _fitTimer = null; }
             });
 
             // —— 重置 ——
@@ -1205,7 +1234,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     h('div', {
                         ref: _canvasRef,
                         class: 'viz-flow-canvas viz-mind-canvas',
-                        style: { cursor },
+                        style: { cursor, height: canvasH + 'px' },
                         onWheel: onCanvasWheel,
                         onMousedown: onCanvasMouseDown
                     }, [
@@ -1246,17 +1275,17 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
     });
 
     // ============ html ============
-    // 预注入的 base CSS（滚动条 + range slider + 基础排版），智能体生成的 iframe srcdoc 自动带上
+    // 预注入的 base CSS：禁止 html/body 层的滚动条溢出，但保留用户自定义容器的 overflow
+    // 缩略图和全屏弹窗都用这一套（全屏弹窗也不滚）
     const IFRAME_BASE_CSS = `<style>
-html,body{margin:0;padding:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:13px;color:#e6ebf5;background:#0a0e1a;}
-/* —— 滚动条（上下左右四个方向，尽量小）—— */
+html,body{margin:0;padding:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:13px;color:#e6ebf5;background:#0a0e1a;overflow:hidden;}
+/* 仅给用户自定义的 overflow 容器美化滚动条（body 自己不滚，所以下面的规则只作用于用户内部容器）*/
 *,*::before,*::after{scrollbar-width:thin;scrollbar-color:rgba(157,180,255,0.4) transparent;}
 *::-webkit-scrollbar{width:4px;height:4px;}
 *::-webkit-scrollbar-track{background:transparent;}
 *::-webkit-scrollbar-thumb{background:rgba(157,180,255,0.4);border-radius:3px;}
 *::-webkit-scrollbar-thumb:hover{background:rgba(157,180,255,0.7);}
 *::-webkit-scrollbar-thumb:active{background:rgba(157,180,255,0.9);}
-*::-webkit-scrollbar-corner{background:transparent;}
 /* —— range slider 小巧美化 —— */
 input[type=range]{-webkit-appearance:none;appearance:none;background:transparent;cursor:pointer;outline:none;padding:0;margin:4px 0;}
 input[type=range]::-webkit-slider-runnable-track{height:3px;border-radius:2px;background:rgba(120,140,255,0.15);}
@@ -1269,29 +1298,33 @@ input[type=range].viz-vertical{writing-mode:vertical-lr;direction:rtl;height:80p
 input[type=range].viz-vertical::-webkit-slider-runnable-track{width:3px;height:100%;}
 input[type=range].viz-vertical::-webkit-slider-thumb{margin-top:0;margin-left:-3.5px;}
 </style>`;
+    // 把 CSS 注入到 srcdoc 的辅助函数
+    function injectBaseCss(rawHtml, baseCss) {
+        return /<html[\s>]/i.test(rawHtml)
+            ? rawHtml.replace(/<head([^>]*)>/i, '<head$1>' + baseCss)
+            : baseCss + rawHtml;
+    }
     const Html = defineComponent({
         props: { data: Object, raw: String, extAPI: Object },
         setup(props) {
             const full = ref(false);
             const data = props.data || {};
             const rawHtml = safeStr(data.html, '');
-            // 自动注入 base CSS（如果用户的 HTML 里还没有 <style> 标记则包一层 html/head/body）
-            const srcdoc = /<html[\s>]/i.test(rawHtml)
-                ? rawHtml.replace(/<head([^>]*)>/i, '<head$1>' + IFRAME_BASE_CSS)
-                : IFRAME_BASE_CSS + rawHtml;
+            const srcdoc = injectBaseCss(rawHtml, IFRAME_BASE_CSS);
             const height = data.height || 200;
+            const sandbox = data.sandbox || 'allow-scripts allow-forms allow-popups';
             return () => h('div', { class: 'viz-html viz-root' }, [
                 h('div', { class: 'viz-html-bar' }, [
                     h('div', { style: 'flex:1' }),
                     h('button', { class: 'viz-html-zoom', onClick: () => { full.value = true; } }, '放大')
                 ]),
-                h('iframe', { srcdoc, style: { height: height + 'px' }, sandbox: data.sandbox || 'allow-scripts allow-forms allow-popups' }),
+                h('iframe', { srcdoc, style: { height: height + 'px' }, sandbox }),
                 full.value ? h('div', { class: 'viz-html-full', onClick: (e) => { if (e.target.classList.contains('viz-html-full')) full.value = false; } }, [
                     h('div', { class: 'viz-html-full-bar' }, [
                         h('div', { style: 'flex:1' }),
                         h('button', { class: 'viz-html-close', onClick: () => { full.value = false; } }, '关闭 ✕')
                     ]),
-                    h('iframe', { srcdoc, sandbox: data.sandbox || 'allow-scripts allow-forms allow-popups' })
+                    h('iframe', { srcdoc, sandbox })
                 ]) : null
             ]);
         }

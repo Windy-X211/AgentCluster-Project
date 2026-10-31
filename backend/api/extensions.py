@@ -342,3 +342,74 @@ def collect_extension_system_prompts() -> list[dict]:
         except Exception as e:
             print(f"[extensions] 读取 {eid}/{fname} 失败：{e}")
     return out
+
+# —— 拓展后端服务挂载（backend-service / hybrid 类拓展的 backend.py）——
+# manifest 声明 backend_entry 的已启用拓展，其 <backend_entry>.py 中定义的 APIRouter
+# 会在启动时被动态加载并挂载到 /api/ext/<ext_id>/ 前缀。
+# 挂载只发生在启动时（include_router 是静态注册）；拓展停用后由各路由内部
+# 调用 is_extension_enabled 自检并返回 503，前端/宿主据此感知"已停用"。
+
+import importlib.util
+import sys as _sys
+
+# 已加载的拓展后端模块 { ext_id: module }
+_EXT_BACKEND_MODULES: dict[str, Any] = {}
+
+
+def is_extension_enabled(ext_id: str) -> bool:
+    """查询某拓展当前是否已安装且启用（供拓展后端路由自检）。"""
+    installed = _load_installed()
+    st = installed.get(ext_id)
+    return bool(st and st.get("enabled"))
+
+
+def _safe_entry(entry: Any) -> str | None:
+    """校验 backend_entry：纯模块名/文件名（防路径穿越），返回模块 stem。"""
+    if not entry or not isinstance(entry, str):
+        return None
+    if "/" in entry or "\\" in entry or entry.startswith("."):
+        return None
+    return entry[:-3] if entry.endswith(".py") else entry
+
+
+def mount_extension_backends(app: Any) -> int:
+    """把所有已启用拓展的 backend.py 路由挂载到 /api/ext/<ext_id>/ 前缀。
+
+    在 lifespan 中（init_store + auto_install 之后）调用一次：
+    - 动态 import AppData/extensions/<id>/<entry>.py，取模块级 ``router``
+    - include_router 挂载 /api/ext/<id> 前缀
+    - 加载失败不阻断启动（打印告警）
+    返回成功挂载的拓展数。
+    """
+    _ensure_dirs()
+    installed = _load_installed()
+    mounted = 0
+    for eid, st in installed.items():
+        if not st.get("enabled"):
+            continue
+        mf = _read_manifest(eid)
+        if not mf:
+            continue
+        stem = _safe_entry(mf.get("backend_entry"))
+        if not stem:
+            continue
+        fp = _ext_dir(eid) / f"{stem}.py"
+        if not fp.exists():
+            continue
+        try:
+            mod_name = f"_ext_backend_{eid}"
+            spec = importlib.util.spec_from_file_location(mod_name, fp)
+            mod = importlib.util.module_from_spec(spec)
+            _sys.modules[mod_name] = mod
+            spec.loader.exec_module(mod)
+            router = getattr(mod, "router", None)
+            if router is None:
+                print(f"[extensions] 拓展 {eid} 的 {stem}.py 未定义 router，跳过后端挂载")
+                continue
+            app.include_router(router, prefix=f"/api/ext/{eid}", tags=[f"ext-{eid}"])
+            _EXT_BACKEND_MODULES[eid] = mod
+            mounted += 1
+            print(f"[extensions] 已挂载拓展后端：/api/ext/{eid}/")
+        except Exception as e:
+            print(f"[extensions] 拓展 {eid} 后端加载失败（不阻断启动）：{e}")
+    return mounted

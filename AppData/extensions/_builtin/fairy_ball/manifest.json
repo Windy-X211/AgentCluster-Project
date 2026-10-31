@@ -1,0 +1,21 @@
+{
+    "id": "fairy_ball",
+    "name": "精灵悬浮球",
+    "version": "1.0.0",
+    "type": "hybrid",
+    "author": "AgentCluster",
+    "description": "桌面精灵悬浮球：小精灵随智能体运行状态活动（空闲呼吸眨眼/运行中欢快跳动发光/后端异常变灰委屈）；左键点击打开主窗口，右键菜单支持区域截图提问（主窗/小窗两种去向）、临时对话小窗、打开设置",
+    "icon": "🧚",
+    "tags": [
+        "companion",
+        "float",
+        "screenshot",
+        "quickchat"
+    ],
+    "frontend_files": [],
+    "backend_entry": "backend",
+    "pages": [
+        "fairy.html",
+        "snip.html"
+    ]
+}

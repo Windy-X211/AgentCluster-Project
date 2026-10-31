@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref, computed } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
-import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP } from '@/stores'
+import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, useAgentStore, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP } from '@/stores'
 import { api } from '@/api'
 import FileExplorerDialog from '@/components/FileExplorerDialog.vue'
 import { getAvatarGradient } from '@/utils/avatar'
@@ -9,6 +9,7 @@ import { testSuccess, testError } from '@/utils/sound'
 
 const models = useModelStore()
 const settings = useSettingsStore()
+const agents = useAgentStore()
 const layout = useLayoutStore()
 const guide = useGuideStore()
 const router = useRouter()
@@ -208,7 +209,7 @@ async function toggleAutostart() {
 }
 
 onMounted(async () => {
-  await Promise.all([models.fetch(), settings.fetch(), loadLaunchMode(), loadAutostart()])
+  await Promise.all([models.fetch(), settings.fetch(), agents.fetch(), loadLaunchMode(), loadAutostart()])
   syncCtxSettings()
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
@@ -353,6 +354,27 @@ const soundEnabled = computed({
   set(v: boolean) { settings.update({ sound_enabled: v }) }
 })
 function toggleSound() { soundEnabled.value = !soundEnabled.value }
+
+// —— 默认智能体（新建对话未选中智能体时自动选中） ——
+const defaultAgentId = computed({
+  get() {
+    const v = Number(settings.data.default_agent_id)
+    // 智能体已删除 → 视为未设置（下拉不残留无效选项）
+    if (!Number.isFinite(v) || v <= 0 || !agents.list.some((a: any) => a.id === v)) return 0
+    return v
+  },
+  set(v: number) { settings.update({ default_agent_id: v > 0 ? v : null }) },
+})
+/** 下拉选项：按分组 optgroup 分列（与对话区智能体下拉同结构） */
+const agentGroupOptions = computed(() => {
+  const out: { id: 'all' | number; name: string; agents: any[] }[] = [
+    { id: 'all', name: '未分组', agents: agents.list.filter((a: any) => a.group_id == null) },
+  ]
+  for (const g of agents.groups) {
+    out.push({ id: g.id, name: g.name, agents: agents.list.filter((a: any) => a.group_id === g.id) })
+  }
+  return out
+})
 </script>
 
 <template>
@@ -419,6 +441,28 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
           <div class="hint-empty" style="margin-top: 8px">
             各模型的窗口在上方接口编辑中按「模型:token」配置（支持 128k / 1m 写法）；未配置的模型使用此默认窗口。
             对话区发送按钮上方的数值边框颜色表示达到压缩线的进度（绿 → 黄 → 橙 → 红）。
+          </div>
+        </div>
+      </div>
+
+      <!-- 默认智能体 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>🤖 默认智能体</span>
+          <span class="hint">新建对话时自动选中</span>
+        </div>
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">默认智能体</span>
+          </div>
+          <select class="input" v-model.number="defaultAgentId" style="margin-top: 10px">
+            <option :value="0">未设置（不自动选择）</option>
+            <optgroup v-for="g in agentGroupOptions" :key="g.id" :label="g.name">
+              <option v-for="a in g.agents" :key="a.id" :value="a.id">{{ a.name }}</option>
+            </optgroup>
+          </select>
+          <div class="hint-empty" style="margin-top: 8px">
+            新建对话（主窗口与临时对话小窗的「＋ 新建」）未选中智能体时，自动选中该智能体；已选中智能体时保持不变。集群 / 工作区分组内新建不预设智能体，不受此项影响。
           </div>
         </div>
       </div>
@@ -494,6 +538,12 @@ function toggleSound() { soundEnabled.value = !soundEnabled.value }
               <span class="asr-switch-knob"></span>
             </button>
             <span class="asr-toggle-text">{{ showOtherAgents ? '显示其他智能体消息' : '隐藏其他智能体消息' }}</span>
+          </div>
+          <div class="asr-toggle" style="margin-top: 10px">
+            <button class="asr-switch" :class="{ on: settings.ctxBadgeEnabled }" @click="settings.setCtxBadgeEnabled(!settings.ctxBadgeEnabled)">
+              <span class="asr-switch-knob"></span>
+            </button>
+            <span class="asr-toggle-text">{{ settings.ctxBadgeEnabled ? '显示上下文长度指示' : '隐藏上下文长度指示' }}</span>
           </div>
           <div class="appearance-row" style="margin-top: 10px">
             <label class="radio-label" :class="{ active: otherAgentsSide === 'left', disabled: !showOtherAgents }">

@@ -10,6 +10,7 @@ export const useSettingsStore = defineStore('settings', {
     pluginsMeta: {} as any,    // {name: {label, params, description}}
     asrAvailable: false,       // 语音识别是否可用（funasr-onnx 已安装）
     asrEnabled: localStorage.getItem('agentcluster.asrEnabled') !== 'false',  // 用户启停开关，默认开启
+    ctxBadgeEnabled: localStorage.getItem('agentcluster.ctxBadge') !== 'false',  // 上下文长度指示开关，默认显示
   }),
   actions: {
     async fetch() {
@@ -24,6 +25,10 @@ export const useSettingsStore = defineStore('settings', {
     setAsrEnabled(v: boolean) {
       this.asrEnabled = v
       localStorage.setItem('agentcluster.asrEnabled', String(v))
+    },
+    setCtxBadgeEnabled(v: boolean) {
+      this.ctxBadgeEnabled = v
+      localStorage.setItem('agentcluster.ctxBadge', String(v))
     },
     /** 让后端热加载插件/技能目录，再把最新元数据拉回前端（无需重启）。 */
     async reloadCapabilities() {

@@ -136,6 +136,14 @@ async def lifespan(app: FastAPI):
         auto_install_first_time()
     except Exception as e:
         print(f"[main] 自动安装拓展失败（不阻断启动）：{e}")
+    # 挂载已启用拓展的后端服务路由（backend-service / hybrid 类拓展的 backend.py → /api/ext/<id>/）
+    try:
+        from api.extensions import mount_extension_backends
+        n = mount_extension_backends(app)
+        if n:
+            print(f"[main] 已挂载 {n} 个拓展后端服务")
+    except Exception as e:
+        print(f"[main] 挂载拓展后端失败（不阻断启动）：{e}")
     yield
 
 
@@ -618,22 +626,25 @@ def fs_image(path: str = ""):
         # _safe_resolve 拒绝（403）→ 放宽到画布工作区 / default_workdir：
         # 智能体常把图片生成在工作区里，缩略图走本接口加载需放行这些路径。
         p = _P(path).resolve()
-        if not any(_is_under(p, r) for r in _collect_workdir_roots()):
+        roots = _collect_workdir_roots()
+        if not _P(path).is_absolute():
+            # 相对路径（模型常给 workdir 内相对引用，如 tyut_img/campus1.jpg）
+            # → 逐个工作区根尝试拼接，命中文件且解析后仍在该根内才放行
+            for r in roots:
+                try:
+                    cand = (r / path).resolve()
+                except Exception:
+                    continue
+                if cand.is_file():
+                    p = cand
+                    break
+        if not any(_is_under(p, r) for r in roots):
             from fastapi import HTTPException
             raise HTTPException(403, f"path 超出允许范围：{path}")
         fp = p
     if not fp.is_file():
-        # fallback: 如果原始 path 是相对路径，遍历所有工作区根目录搜索
-        # AI 常输出 "tyut_img/campus1.jpg" 这样的相对路径，文件实际在会话工作区下
-        if not _P(path).is_absolute():
-            for root in _collect_workdir_roots():
-                candidate = root / path
-                if candidate.is_file():
-                    fp = candidate
-                    break
-        if not fp.is_file():
-            from fastapi import HTTPException
-            raise HTTPException(404, f"文件不存在：{path}")
+        from fastapi import HTTPException
+        raise HTTPException(404, f"文件不存在：{path}")
     mime = _IMG_EXT_MIME.get(fp.suffix.lower(), "")
     if not mime:
         from fastapi import HTTPException
