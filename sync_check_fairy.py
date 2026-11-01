@@ -1,0 +1,53 @@
+# -*- coding: utf-8 -*-
+"""同步 fairy_ball 拓展到已安装目录并做静态校验（菜单独立窗改造验证脚本）。"""
+import json
+import os
+import py_compile
+import shutil
+
+SRC = 'AppData/extensions/_builtin/fairy_ball'
+DST = 'AppData/extensions/fairy_ball'
+FILES = ['fairy.html', 'menu.html', 'backend.py', 'manifest.json']
+
+for f in FILES:
+    shutil.copy2(os.path.join(SRC, f), os.path.join(DST, f))
+    print('copied:', f)
+
+py_compile.compile(os.path.join(DST, 'backend.py'), doraise=True)
+print('backend.py 编译 OK')
+
+for j in [os.path.join(SRC, 'manifest.json'), 'AppData/extensions/extensions_market.json']:
+    json.load(open(j, encoding='utf-8'))
+print('JSON OK')
+
+for f in FILES:
+    same = open(os.path.join(SRC, f), encoding='utf-8').read() == open(os.path.join(DST, f), encoding='utf-8').read()
+    print('一致 %-14s: %s' % (f, same))
+
+# —— fairy.html 关键逻辑检查 ——
+fh = open(os.path.join(DST, 'fairy.html'), encoding='utf-8').read()
+checks_fairy = [
+    ('右键改 IPC openMenu', "fairyAPI.openMenu && fairyAPI.openMenu(e.screenX, e.screenY)" in fh),
+    ('storage 联动换装', "window.addEventListener('storage'" in fh and "fairy.skin" in fh),
+    ('菜单 DOM 已移除', 'id="menu"' not in fh and 'mview' not in fh),
+    ('穿透 hit-test 保留', 'elementFromPoint' in fh and 'setIgnoreMouse' in fh),
+    ('皮肤变量体系保留', 'data-skin="flame"' in fh and '--c1' in fh),
+    ('缩放层保留', 'data-size="s"' in fh and '.wrap' in fh),
+]
+for name, ok in checks_fairy:
+    print(('✓ ' if ok else '✗ ') + name)
+
+# —— menu.html 关键逻辑检查 ——
+mh = open(os.path.join(DST, 'menu.html'), encoding='utf-8').read()
+checks_menu = [
+    ('三视图', 'data-v="main"' in mh and 'data-v="skin"' in mh and 'data-v="size"' in mh),
+    ('写 localStorage', "localStorage.setItem('fairy.skin'" in mh and "localStorage.setItem('fairy.size'" in mh),
+    ('尺寸上报', 'fairyAPI.menuSize' in mh),
+    ('选完即关', 'fairyAPI.closeMenu' in mh),
+    ('动作分发', 'fairyAPI.action' in mh),
+]
+for name, ok in checks_menu:
+    print(('✓ ' if ok else '✗ ') + name)
+
+bad = [n for n, ok in checks_fairy + checks_menu if not ok]
+print('RESULT:', 'FAIL ' + str(bad) if bad else 'ALL PASS')

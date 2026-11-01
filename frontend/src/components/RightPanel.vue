@@ -506,9 +506,9 @@ function readConvGroupMode(): ConvGroupMode {
 }
 const groupMode = ref<ConvGroupMode>(readConvGroupMode())
 watch(groupMode, v => { try { localStorage.setItem('agent-cluster.conversation.groupMode', v) } catch { /* ignore */ } })
-// 分组折叠状态：null = 未交互（全部展开）；点击组头后进入手风琴模式（展开一组时其他组折叠）
+// 分组折叠状态：null = 未交互（默认折叠，仅当前打开对话所在组展开）；点击组头后进入手风琴模式（展开一组时其他组折叠）
 const expandedGroupKeys = ref<Set<string> | null>(null)
-watch(groupMode, () => { expandedGroupKeys.value = null }) // 切换分类方式 → 重置为全部展开
+watch(groupMode, () => { expandedGroupKeys.value = null }) // 切换分类方式 → 重置为默认折叠
 
 // 图片浮窗：滚轮缩放（以鼠标为锚） + 鼠标拖拽平移 + 8 方向 resize
 // —— 解耦架构：窗口尺寸 ≠ 图片缩放 ≠ 图片平移 ——
@@ -1232,22 +1232,29 @@ function convGroupTag(c: any): string {
   }
   return ''
 }
-/** 组是否展开：null = 未交互（全部展开），否则按手风琴集合判断 */
+/** 组是否展开：null = 未交互（默认折叠，仅当前打开对话所在组自动展开）；否则按手风琴集合判断 */
 function isGroupExpanded(key: string): boolean {
-  return expandedGroupKeys.value == null || expandedGroupKeys.value.has(key)
+  const cur = expandedGroupKeys.value
+  if (cur != null) return cur.has(key)
+  // 未交互：默认全折叠，只展开当前打开对话所在的组（跟随当前会话切换）
+  const cid = conv.value?.id
+  if (cid == null) return false
+  const g = (convGroups.value || []).find(x => x.key === key)
+  return !!g && g.convs.some(c => c.id === cid)
 }
 /** 点击组头折叠/展开：折叠 → 其余组不变；展开 → 其他展开组全部折叠（手风琴） */
 function toggleGroupExpand(key: string) {
   const cur = expandedGroupKeys.value
-  if (cur == null) {
-    // 从「全部展开」首次交互：仅折叠被点的组，其余保持展开
-    const s = new Set<string>()
-    for (const g of convGroups.value || []) if (g.key !== key) s.add(g.key)
+  const expandedNow = cur != null ? cur.has(key) : isGroupExpanded(key)
+  if (expandedNow) {
+    // 折叠该组：其余组展开状态不变（首次交互时其余本就全折叠 → 全部折叠）
+    const s = cur ? new Set(cur) : new Set<string>()
+    s.delete(key)
     expandedGroupKeys.value = s
-    return
+  } else {
+    // 展开该组：其他展开组全部折叠（手风琴）
+    expandedGroupKeys.value = new Set([key])
   }
-  if (cur.has(key)) cur.delete(key)
-  else expandedGroupKeys.value = new Set([key])
 }
 
 /** 从 a2a 信封的 parts 中拼接出纯文字（text 类型 part 用 \n\n 连接） */
@@ -2333,7 +2340,11 @@ watch(() => convs.current, async (id) => {
   const lastAssistant = [...msgs].reverse().find(
     (m: any) => m.role === 'assistant' && m.agent_id != null
   )
-  const pick = streamingAgent ?? lastAssistant?.agent_id ?? null
+  // 兜底：精简列表（无 messages）时 selectConv 的 _ensureFullMessages 尚未返回，
+  // lastAssistant 拿不到 → 用列表元数据 last_agent_id（后端 _slim_payload 取自
+  // 最后一条可预览消息的 agent_id，与 lastAssistant 同源）先行选中，
+  // 避免首次打开历史会话时下拉框漏选
+  const pick = streamingAgent ?? lastAssistant?.agent_id ?? (data as any)?.last_agent_id ?? null
   if (pick != null) {
     currentAgentId.value = pick
     convs.selectedAgentId = pick
@@ -2574,7 +2585,7 @@ async function newConv() {
 }
 /** 分组头「＋」：在对应集群（画布）/工作区上下文中新建对话（立即创建）。
  *  集群组新建 → 工作区默认为空，并自动打开对应集群画布；工作区组新建 → 集群默认为空；均不预设智能体。
- *  创建后展开该组（手风琴模式下其余组折叠），确保新对话立即可见。 */
+ *  创建后展开该组（其余组折叠），确保新对话立即可见。 */
 async function newConvInGroup(g: ConvGroup) {
   if (g.kind === 'cluster' && g.canvasId != null) {
     await convs.create({ name: '新对话', agent_ids: [], canvas_id: g.canvasId, workdir: null, execution_mode: null })
@@ -2584,7 +2595,7 @@ async function newConvInGroup(g: ConvGroup) {
   } else {
     await convs.create({ name: '新对话', agent_ids: [], canvas_id: null, workdir: null, execution_mode: null })
   }
-  if (expandedGroupKeys.value != null) expandedGroupKeys.value = new Set([g.key])
+  expandedGroupKeys.value = new Set([g.key]) // 无条件展开该组（默认折叠模式下也要让新对话立即可见）
 }
 function selectConv(id: number) {
   if (selMode.value) { toggleSel(id); return }
@@ -2859,7 +2870,14 @@ onMounted(async () => {
   // 父级 Home 的 fetch 可能还没返回，这里先确保拉到列表，避免误判为空而重复新建
   if (!convs.list.length) await convs.fetch()
   convs.ensureCurrent()
-  if (!currentAgentId.value && agents.list.length) currentAgentId.value = agents.list[0].id
+  // 空会话（无消息可回填）的兜底选中：设置里的默认智能体优先（与 newConv 兜底同一语义，
+  // 小窗临时对话/主窗恢复空会话都同步设置选定项），未设置或已删除才退回列表第一个
+  if (!currentAgentId.value && agents.list.length) {
+    const d = Number(settings.data?.default_agent_id)
+    currentAgentId.value = (Number.isFinite(d) && d > 0 && agents.list.some((a: any) => a.id === d))
+      ? d
+      : agents.list[0].id
+  }
   if (!convs.list.length) await newConv()
   scheduleCtxRefresh()
   // —— 注入 extAPI 给拓展渲染器 ——
@@ -3066,7 +3084,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-if="!sortedConvs.length" class="empty">暂无对话，点「＋」新建</div>
               </template>
-              <!-- 分组：按集群（画布名）/ 按工作区（文件夹名）；条目标注 工作区名 / 画布名；组头点击折叠/展开（手风琴） -->
+              <!-- 分组：按集群（画布名）/ 按工作区（文件夹名）；条目标注 工作区名 / 画布名；默认折叠、当前对话所在组自动展开；组头点击折叠/展开（手风琴） -->
               <template v-else>
                 <div v-for="g in convGroups" :key="g.key" class="conv-group">
                   <div class="conv-group-head" :title="(g.hint || g.title) + (isGroupExpanded(g.key) ? '（点击折叠）' : '（点击展开）')"

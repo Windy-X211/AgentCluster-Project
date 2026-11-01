@@ -163,7 +163,7 @@ renderer.js 是一段在**浏览器主世界**执行的 JavaScript，运行时�
 | `image` | `{url, caption?, width?}` | 配图，支持本地/远程，可放大 |
 | `flowchart` | `{nodes:[{id,label}], edges:[{from,to,label?}]}` | 流程图（简易 SVG） |
 | `mindmap` | `{root:{label, children:[...]}}` | 思维导图（树形） |
-| `html` | `{html, sandbox?}` | HTML 缩略卡片，可交互，可放大全屏 |
+| `html` | `{html, height?, sandbox?}` | HTML 缩略卡片，可交互，可放大全屏；缩略图自适应内容尺寸并按对话区限制（超宽等比缩小、超高内部滚动） |
 | `layout` | `{columns, items:[{type, data}]}` | 优化排布：多列网格嵌套任意 viz |
 
 **提交按钮模式**：`choice` / `fill` 统一为「先作答 → 点提交按钮 → 发送后锁定」。

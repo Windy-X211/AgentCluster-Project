@@ -5,12 +5,13 @@
 
 端点：
 - ``GET  /page``               → 悬浮球页面 HTML（Electron 透明置顶小窗加载）
+- ``GET  /menu``               → 右键独立菜单窗页面 HTML（Electron 透明置顶菜单小窗加载）
 - ``GET  /snip``               → 区域截图选区页 HTML（全屏遮罩框选）
 - ``GET  /state``              → 精灵状态聚合：idle / running + 运行中智能体名单
 - ``GET  /enabled``            → 拓展启用状态（Electron 轮询决定球窗开关；停用后仍可访问）
 - ``POST /quickchat/cleanup``  → 小窗关闭时清理空临时会话（发过消息的保留）
 
-页面文件（fairy.html / snip.html）由本模块读取下发，按 mtime 缓存 ——
+页面文件（fairy.html / menu.html / snip.html）由本模块读取下发，按 mtime 缓存 ——
 改页面无需重启后端，也无需重建前端 dist。
 
 临时对话小窗（quickchat）不走本拓展页面：直接加载主窗口前端应用的
@@ -65,6 +66,16 @@ def fairy_page():
 def snip_page():
     _check_enabled()
     return HTMLResponse(_page("snip.html"))
+
+
+@router.get("/menu", response_class=HTMLResponse)
+def fairy_menu_page():
+    """右键独立菜单窗页面（三视图：主菜单 / 精灵样式 / 大小档位）。
+
+    皮肤与大小选择写 localStorage（与球窗同源共享），球窗经 storage 事件即时换装。
+    """
+    _check_enabled()
+    return HTMLResponse(_page("menu.html"))
 
 
 

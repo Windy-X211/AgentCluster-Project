@@ -51,6 +51,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     openMain: (route) => ipcRenderer.invoke('fairy:openMain', route),
     /** 菜单动作：screenshot | quickchat | settings */
     action: (name, payload) => ipcRenderer.invoke('fairy:action', name, payload),
+    /** 点击穿透开关（hit-test 模式：空白穿透、精灵可见部分接收；forward 保持 mousemove 派发供命中测试） */
+    setIgnoreMouse: (ignore) => ipcRenderer.invoke('fairy:setIgnoreMouse', ignore),
+    /** 右键 → 独立菜单窗：球窗把鼠标屏幕坐标交主进程定位弹窗 */
+    openMenu: (x, y) => ipcRenderer.invoke('fairy:openMenu', x, y),
+    /** 关闭菜单（菜单窗选完自关 / 全屏捕获层点击外部关闭时调用） */
+    closeMenu: () => ipcRenderer.invoke('fairy:closeMenu'),
+    /** 菜单页上报实际内容尺寸（主进程 setContentSize + 重定位） */
+    menuSize: (w, h) => ipcRenderer.invoke('fairy:menuSize', w, h),
 
     /** 当前窗口位置（拖动计算用） */
     winPos: () => ipcRenderer.invoke('fairy:winPos'),
