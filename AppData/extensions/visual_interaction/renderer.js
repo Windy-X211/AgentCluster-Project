@@ -92,7 +92,9 @@
 .viz-flow-btn-primary { background: var(--accent-light,#9db4ff); color: #0a0e1a; border-color: transparent; font-weight: 600; }
 .viz-flow-btn-primary:hover { filter: brightness(1.08); }
 .viz-flow-btn-close { background: transparent; border-color: rgba(255,255,255,.3); color: #fff; }
-.viz-flow-canvas { padding: 0; overflow: hidden; position: relative; max-height: 400px; min-height: 180px; }
+    /* 画布高度由组件内联动态设定（窗口自适应：内容显示高 + 边距，钳 [120, 窗口×0.55]），
+       CSS 不再钳 max/min-height（会覆盖内联高度把底部裁掉） */
+    .viz-flow-canvas { padding: 0; overflow: hidden; position: relative; }
 /* 画布内 SVG 必须保持在文档流内（禁止 position:absolute）：
    若脱流，零宽 shrink-to-fit 的 .viz-viewport 会把 svg 的百分比宽度钳成 0×0，
    缩略图整片空白（全屏画布类名不同 .viz-flow-full-canvas 故不受影响）。 */
@@ -202,6 +204,52 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
         ]);
     }
     function safeStr(v, d) { return (typeof v === 'string') ? v : (v == null ? d : String(v)); }
+
+    // —— 缩略图窗口适配 fit（flowchart / mindmap 共用）——
+    // 画布高度跟随「内容实际显示高度」（svgH×fitZoom），上限按窗口可视高度比例限制，
+    // 下限 120px——避免旧实现 clamp(svgH,180,400) 与容器宽度脱钩导致的四周大片空白。
+    // 内容超限（ZOOM_MIN 钳制后仍溢出）时 pan 左上对齐（居中会把两侧都推出可视区），拖拽/全屏可达。
+    const VIZ_FIT_PAD = 16;          // 画布内边距（同旧 padH/padV）
+    const VIZ_THUMB_MIN_H = 120;     // 缩略画布最小高度
+    const ZOOM_MIN = 0.3, ZOOM_MAX = 3.0;
+    function vizThumbMaxH() {
+        // 与 html 缩略图同款上限公式：窗口高度 × 0.55，钳 [160, 520]
+        const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
+        return Math.max(160, Math.min(520, Math.round(vh * 0.55)));
+    }
+    function vizPan(avail, c, pad) {
+        // 内容 c 不超可用宽 avail 时居中；超出时左/上对齐（pad 起点）
+        return c <= avail ? (avail - c) / 2 + pad : pad;
+    }
+    // 缩略图 fit：availW = 容器可用宽（画布高度由本函数产出，不需入参高度）
+    function vizThumbFit(svgW, svgH, availW) {
+        const pad = VIZ_FIT_PAD, maxH = vizThumbMaxH();
+        const availHMax = maxH - pad * 2; // 画布最高时对应的可用高
+        const z = +Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(availW / svgW, availHMax / svgH))).toFixed(3);
+        const cw = svgW * z, ch = svgH * z;
+        // 画布高 = 显示高 + 双边距，钳 [MIN, maxH]；MIN 钳高的小图垂直居中留少量空白
+        const wantH = Math.min(Math.max(Math.ceil(ch) + pad * 2, VIZ_THUMB_MIN_H), maxH);
+        const availH = wantH - pad * 2;
+        return {
+            z,
+            panX: +vizPan(availW, cw, pad).toFixed(2),
+            panY: +vizPan(availH, ch, pad).toFixed(2),
+            wantH
+        };
+    }
+    // 全屏 fit：可用宽高均来自全屏画布 rect
+    function vizFullFit(svgW, svgH, availW, availH) {
+        const pad = VIZ_FIT_PAD;
+        const z = +Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(availW / svgW, availH / svgH))).toFixed(3);
+        const cw = svgW * z, ch = svgH * z;
+        return {
+            z,
+            panX: +vizPan(availW, cw, pad).toFixed(2),
+            panY: +vizPan(availH, ch, pad).toFixed(2)
+        };
+    }
+    // 暴露纯函数（layout 嵌套复用 / 测试钩子）
+    window.__VIZ_FIT__ = { vizThumbMaxH, vizThumbFit, vizFullFit, vizPan, ZOOM_MIN, ZOOM_MAX, VIZ_FIT_PAD, VIZ_THUMB_MIN_H };
 
     // —— 全局 form 注册表 + 统一提交协调器 ——
     // 收集所有 choice/fill 实例；当同页面出现 >=2 个未提交 form 时，隐藏各自提交按钮，
@@ -651,10 +699,11 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             const panning = ref(false);   // 画布平移模式
             const panStart = reactive({ mx: 0, my: 0, px: 0, py: 0 });
             const layout = computeLayout(props.data || {});
-            // 缩略图画布高度：子元素全是绝对定位不撑高容器，若固定 min-height 180px，
-            // 大图会被压进 180px 窗口、fit 出极小 zoom，节点小到看不见（缩略图"空白"）。
-            // 让画布高度跟随内容（180 ~ 400px），大图有足够的可视空间。
-            const canvasH = Math.min(Math.max(Math.ceil(layout.svgH), 180), 400);
+            // 缩略图画布高度（响应式）：跟随内容实际显示高（svgH×fitZoom）+ 边距，
+            // 上限按窗口可视高度自适应（vizThumbFit 产出并更新），容器/窗口变化自动重算。
+            // 旧实现 clamp(svgH,180,400) 与容器宽度脱钩：宽扁图 fit 后显示高很小，
+            // 画布仍撑 180~400 → 四周大片空白。
+            const canvasH = ref(Math.min(220, vizThumbMaxH()));
             const pos = reactive({});
             Object.keys(layout.pos).forEach(k => { pos[k] = { ...layout.pos[k] }; });
 
@@ -673,17 +722,18 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 if (!canvas) return false;
                 const rect = canvas.getBoundingClientRect();
                 if (rect.width < 1 || rect.height < 1) return false;
-                const padH = 16, padV = 16;
-                const availW = rect.width - padH * 2;
-                const availH = rect.height - padV * 2;
                 const s = layout.svgW, t = layout.svgH;
                 if (s <= 0 || t <= 0) return false;
-                // 集群画布同款中心公式；zoom 设下限（与 ZOOM_MIN 一致），
-                // 超大图不再无限缩小到不可见，超出部分可拖拽平移查看
-                const z = Math.max(ZOOM_MIN, Math.min(availW / s, availH / t));
-                zoom.value = +z.toFixed(3);
-                panX.value = +((availW - s * z) / 2 + padH).toFixed(2);
-                panY.value = +((availH - t * z) / 2 + padV).toFixed(2);
+                if (full.value) {
+                    // 全屏：可用宽高均来自全屏画布 rect
+                    const f = vizFullFit(s, t, rect.width - VIZ_FIT_PAD * 2, rect.height - VIZ_FIT_PAD * 2);
+                    zoom.value = f.z; panX.value = f.panX; panY.value = f.panY;
+                    return true;
+                }
+                // 缩略：画布高度由 vizThumbFit 产出（内容显示高 + 边距，钳 [MIN, 窗口×0.55]）
+                const tf = vizThumbFit(s, t, rect.width - VIZ_FIT_PAD * 2);
+                zoom.value = tf.z; panX.value = tf.panX; panY.value = tf.panY;
+                canvasH.value = tf.wantH; // 同值赋值不触发重渲染，收敛无震荡
                 return true;
             }
             function getCanvasEl() { return getMyCanvas(); }
@@ -706,6 +756,12 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     if (fitToContainer() || ++tries >= 10) { clearInterval(_fitTimer); _fitTimer = null; }
                 }, 120);
             }
+            // 窗口尺寸变化：RO 只观察画布自身（宽度变才触发），窗口高度变化需在此重算上限。
+            // 手动缩放模式（fitMode=false）仅钳画布高度到新上限，不打断用户 pan/zoom 状态
+            function onWinResize() {
+                if (fitMode.value) { fitToContainer(); return; }
+                if (!full.value) canvasH.value = Math.min(canvasH.value, vizThumbMaxH());
+            }
             onMounted(() => {
                 _scheduleFit();
                 // ResizeObserver：容器尺寸变化自动重新 fit
@@ -716,6 +772,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 });
                 window.addEventListener('mousemove', onMouseMove);
                 window.addEventListener('mouseup', onMouseUp);
+                window.addEventListener('resize', onWinResize);
             });
             // full 切换：重新 observe 新的 canvas + fit
             watch(full, (v) => {
@@ -733,7 +790,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             });
             // CSS transform 从右向左应用: translate(panX,panY) scale(zoom) = scale 先，translate 后
             // 画布→屏幕: sx = cx*zoom + panX    屏幕→画布: cx = (sx - panX)/zoom
-            const ZOOM_MIN = 0.3, ZOOM_MAX = 3.0;
+            // （ZOOM_MIN/ZOOM_MAX 已提升为模块级常量，与 mindmap 共用）
             function doZoomAt(mx, my, delta) {
                 fitMode.value = false;
                 const oldZ = zoom.value;
@@ -792,6 +849,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             onUnmounted(() => {
                 window.removeEventListener('mousemove', onMouseMove);
                 window.removeEventListener('mouseup', onMouseUp);
+                window.removeEventListener('resize', onWinResize);
                 if (_ro) { _ro.disconnect(); _ro = null; }
                 if (_fitTimer) { clearInterval(_fitTimer); _fitTimer = null; }
             });
@@ -842,12 +900,12 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     h('div', {
                         ref: _canvasRef,
                         class: 'viz-flow-canvas',
-                        style: { cursor, height: canvasH + 'px' },
+                        style: { cursor, height: canvasH.value + 'px' },
                         onWheel: onCanvasWheel,
                         onMousedown: onCanvasMouseDown
                     }, [
                         h('div', { class: 'viz-pan-layer', style: panStyle }, [
-                            h('div', { class: 'viz-viewport', style: vpStyle }, [ buildSvgNodes(pos, layout) ])
+                            h('div', { class: 'viz-viewport', style: vpStyle }, [buildSvgNodes(pos, layout)])
                         ])
                     ]),
                     // 全屏弹窗
@@ -873,7 +931,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                             onMousedown: onCanvasMouseDown
                         }, [
                             h('div', { class: 'viz-pan-layer', style: panStyle }, [
-                                h('div', { class: 'viz-viewport', style: vpStyle }, [ buildSvgNodes(pos, layout) ])
+                                h('div', { class: 'viz-viewport', style: vpStyle }, [buildSvgNodes(pos, layout)])
                             ])
                         ])
                     ]) : null
@@ -1001,15 +1059,17 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 if (!canvas) return false;
                 const rect = canvas.getBoundingClientRect();
                 if (rect.width < 1 || rect.height < 1) return false;
-                const padH = 16, padV = 16;
-                const availW = rect.width - padH * 2;
-                const availH = rect.height - padV * 2;
                 if (svgW <= 0 || svgH <= 0) return false;
-                // zoom 设下限（与 ZOOM_MIN 一致）：超大图不再缩小到不可见，超出部分可拖拽平移
-                const z = Math.max(ZOOM_MIN, Math.min(availW / svgW, availH / svgH));
-                zoom.value = +z.toFixed(3);
-                panX.value = +((availW - svgW * z) / 2 + padH).toFixed(2);
-                panY.value = +((availH - svgH * z) / 2 + padV).toFixed(2);
+                if (full.value) {
+                    // 全屏：可用宽高均来自全屏画布 rect
+                    const f = vizFullFit(svgW, svgH, rect.width - VIZ_FIT_PAD * 2, rect.height - VIZ_FIT_PAD * 2);
+                    zoom.value = f.z; panX.value = f.panX; panY.value = f.panY;
+                    return true;
+                }
+                // 缩略：画布高度由 vizThumbFit 产出（内容显示高 + 边距，钳 [MIN, 窗口×0.55]）
+                const tf = vizThumbFit(svgW, svgH, rect.width - VIZ_FIT_PAD * 2);
+                zoom.value = tf.z; panX.value = tf.panX; panY.value = tf.panY;
+                canvasH.value = tf.wantH; // 同值赋值不触发重渲染，收敛无震荡
                 return true;
             }
             function getCanvasEl() { return getMyCanvas(); }
@@ -1046,13 +1106,15 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 return { nodes, edges };
             }
             let { nodes: initNodes, edges: initEdges } = initFromData();
-            // 缩略图画布高度跟随内容（180 ~ 400px）：固定 180px 会把大图压到 zoom 极小而看不见节点
-            const canvasH = Math.min(Math.max(Math.ceil(svgH), 180), 400);
+            // 缩略图画布高度（响应式）：跟随内容实际显示高（svgH×fitZoom）+ 边距，
+            // 上限按窗口可视高度自适应（vizThumbFit 产出并更新）。旧实现 clamp(svgH,180,400)
+            // 与容器宽度脱钩 → 宽扁图 fit 后四周大片空白。
+            const canvasH = ref(Math.min(220, vizThumbMaxH()));
             const pos = reactive({});
             initNodes.forEach(n => { pos[n.id] = { x: n.x + 10, y: n.y + 10, w: n.w, h: n.h, lines: n.lines }; });
 
             // —— 缩放 + 平移控制（定点缩放，scale-first 模型，同 flowchart）——
-            const ZOOM_MIN = 0.3, ZOOM_MAX = 3.0;
+            // （ZOOM_MIN/ZOOM_MAX 已提升为模块级常量，与 flowchart 共用）
             function doZoomAt(mx, my, delta) {
                 fitMode.value = false;
                 const oldZ = zoom.value;
@@ -1109,6 +1171,12 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 }
             }
             function onMouseUp() { draggingId.value = null; panning.value = false; }
+            // 窗口尺寸变化：RO 只观察画布自身（宽度变才触发），窗口高度变化需在此重算上限。
+            // 手动缩放模式（fitMode=false）仅钳画布高度到新上限，不打断用户 pan/zoom 状态
+            function onWinResize() {
+                if (fitMode.value) { fitToContainer(); return; }
+                if (!full.value) canvasH.value = Math.min(canvasH.value, vizThumbMaxH());
+            }
             onMounted(() => {
                 _scheduleFit();
                 _ro = new ResizeObserver(() => { if (fitMode.value) fitToContainer(); });
@@ -1117,6 +1185,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 });
                 window.addEventListener('mousemove', onMouseMove);
                 window.addEventListener('mouseup', onMouseUp);
+                window.addEventListener('resize', onWinResize);
             });
             watch(full, (v) => {
                 if (_ro) _ro.disconnect();
@@ -1133,6 +1202,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             onUnmounted(() => {
                 window.removeEventListener('mousemove', onMouseMove);
                 window.removeEventListener('mouseup', onMouseUp);
+                window.removeEventListener('resize', onWinResize);
                 if (_ro) { _ro.disconnect(); _ro = null; }
                 if (_fitTimer) { clearInterval(_fitTimer); _fitTimer = null; }
             });
@@ -1234,12 +1304,12 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     h('div', {
                         ref: _canvasRef,
                         class: 'viz-flow-canvas viz-mind-canvas',
-                        style: { cursor, height: canvasH + 'px' },
+                        style: { cursor, height: canvasH.value + 'px' },
                         onWheel: onCanvasWheel,
                         onMousedown: onCanvasMouseDown
                     }, [
                         h('div', { class: 'viz-pan-layer', style: panStyle }, [
-                            h('div', { class: 'viz-viewport', style: vpStyle }, [ buildSvg() ])
+                            h('div', { class: 'viz-viewport', style: vpStyle }, [buildSvg()])
                         ])
                     ]),
                     // 全屏弹窗
@@ -1265,7 +1335,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                             onMousedown: onCanvasMouseDown
                         }, [
                             h('div', { class: 'viz-pan-layer', style: panStyle }, [
-                                h('div', { class: 'viz-viewport', style: vpStyle }, [ buildSvg() ])
+                                h('div', { class: 'viz-viewport', style: vpStyle }, [buildSvg()])
                             ])
                         ])
                     ]) : null
@@ -1275,11 +1345,13 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
     });
 
     // ============ html ============
-    // 预注入的 base CSS：内容超出卡片高度时允许内部滚动（配合高度上报脚本，卡片高度自适应内容）
+    // 预注入的 base CSS：滚动/溢出由注入脚本按「自适应内容 + 对话区上限」动态接管，
+    // 用户自定义容器的 overflow 不受影响
     // 缩略图和全屏弹窗都用这一套
     const IFRAME_BASE_CSS = `<style>
-html,body{margin:0;padding:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:13px;color:#e6ebf5;background:#0a0e1a;overflow:auto;}
-/* 美化滚动条：body 自身在被高度上限截断时也可能出现滚动条 */
+html{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:13px;color:#e6ebf5;background:#0a0e1a;overflow:hidden;}
+body{margin:0;padding:8px;}
+/* 仅给用户自定义的 overflow 容器美化滚动条（html 层滚动由脚本动态开/关）*/
 *,*::before,*::after{scrollbar-width:thin;scrollbar-color:rgba(157,180,255,0.4) transparent;}
 *::-webkit-scrollbar{width:4px;height:4px;}
 *::-webkit-scrollbar-track{background:transparent;}
@@ -1298,59 +1370,111 @@ input[type=range].viz-vertical{writing-mode:vertical-lr;direction:rtl;height:80p
 input[type=range].viz-vertical::-webkit-slider-runnable-track{width:3px;height:100%;}
 input[type=range].viz-vertical::-webkit-slider-thumb{margin-top:0;margin-left:-3.5px;}
 </style>`;
-    // 把 CSS 注入到 srcdoc 的辅助函数
-    function injectBaseCss(rawHtml, baseCss) {
-        return /<html[\s>]/i.test(rawHtml)
-            ? rawHtml.replace(/<head([^>]*)>/i, '<head$1>' + baseCss)
-            : baseCss + rawHtml;
+    // 自适应测量脚本（注入 iframe 内运行）：
+    // 1. 宽度 fit：内容自然宽超出视口时对 body 应用 CSS zoom 等比缩小（布局级缩放，字体清晰），
+    //    zoom 下限 0.3（与 flowchart ZOOM_MIN 一致），仍超宽则开横向滚动（内容不裁剪）
+    // 2. 高度实测：body.scrollHeight（含 zoom 后布局值）postMessage 上报给父页，
+    //    由父页按「内容高度 vs 对话区上限」设定 iframe 高度
+    // 3. 滚动自判：内容高超过 iframe 视口高时 html 纵向滚动（超上限时内容完整可达）
+    // 4. ResizeObserver 持续监听：内容动态变化（JS 生成/展开折叠）、视口变化都重新自适应
+    const IFRAME_FIT_SCRIPT = `<script>(function () {
+var MINZ = 0.3, T = 0;
+function measure() {
+    try {
+        var d = document, de = d.documentElement, b = d.body;
+        if (!b) return;
+        // 清 zoom 测自然宽（同一次任务内完成，无渲染帧，不闪烁）
+        b.style.zoom = '';
+        var vw = window.innerWidth || (de && de.clientWidth) || 0;
+        var nw = Math.max(b.scrollWidth, (de && de.scrollWidth) || 0);
+        var r = 1;
+        if (nw > vw + 1) r = Math.max(MINZ, vw / nw);
+        b.style.zoom = (r < 1) ? r : '';
+        var h = b.scrollHeight + 2;
+        var visW = Math.ceil(nw * r);
+        if (de) {
+            de.style.overflowX = (visW > vw + 2) ? 'auto' : 'hidden';
+            de.style.overflowY = (h > (window.innerHeight || 0) + 2) ? 'auto' : 'hidden';
+        }
+        parent.postMessage({ __vizHtmlSize: 1, w: visW, h: h }, '*');
+    } catch (e) { /* 沙箱异常静默 */ }
+}
+function sched() { if (T) return; T = setTimeout(function () { T = 0; measure(); }, 80); }
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { setTimeout(measure, 0); });
+} else { setTimeout(measure, 0); }
+window.addEventListener('load', function () { setTimeout(measure, 0); });
+window.addEventListener('resize', sched);
+setTimeout(measure, 300); // 初帧兜底
+function bindRO() {
+    if (!window.ResizeObserver || !document.body) return;
+    try {
+        var ro = new ResizeObserver(sched);
+        ro.observe(document.documentElement);
+        ro.observe(document.body);
+    } catch (e) { /* RO 不可用时靠事件兜底 */ }
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindRO);
+else bindRO();
+})();</script>`;
+    // 把 CSS + 测量脚本注入 srcdoc 的辅助函数（注入点多级兜底：head → body 前 → html 后 → 开头拼接）
+    function injectBoot(rawHtml, boot) {
+        if (/<head[^>]*>/i.test(rawHtml)) return rawHtml.replace(/<head([^>]*)>/i, '<head$1>' + boot);
+        if (/<body[^>]*>/i.test(rawHtml)) return rawHtml.replace(/<body([^>]*)>/i, '<body$1>' + boot);
+        if (/<html[^>]*>/i.test(rawHtml)) return rawHtml.replace(/<html([^>]*)>/i, '<html$1>' + boot);
+        return boot + rawHtml;
     }
-    // 高度上报脚本：iframe 内测量内容真实高度 → postMessage 通知宿主 → 卡片自适应高度
-    const HEIGHT_REPORT_SCRIPT = `<script>(function(){
-  function report(){
-    try{
-      var d=document.documentElement, b=document.body;
-      var h=Math.max(d?d.scrollHeight:0, b?b.scrollHeight:0);
-      if(h>0) parent.postMessage({__vizHtmlHeight__:h}, '*');
-    }catch(e){}
-  }
-  window.addEventListener('load', report);
-  window.addEventListener('resize', report);
-  try{ if(window.ResizeObserver) new ResizeObserver(report).observe(document.documentElement); }catch(e){}
-  setTimeout(report, 80); setTimeout(report, 400); setTimeout(report, 1200);
-})();<\/script>`;
     const Html = defineComponent({
         props: { data: Object, raw: String, extAPI: Object },
         setup(props) {
             const full = ref(false);
             const data = props.data || {};
             const rawHtml = safeStr(data.html, '');
-            const srcdoc = injectBaseCss(rawHtml, IFRAME_BASE_CSS) + HEIGHT_REPORT_SCRIPT;
+            const srcdoc = injectBoot(rawHtml, IFRAME_BASE_CSS + IFRAME_FIT_SCRIPT);
             const sandbox = data.sandbox || 'allow-scripts allow-forms allow-popups';
-            // 智能体显式指定 height → 固定高度；否则高度自适应内容（上限约视口 80%，超出可内部滚动）
-            const fixedHeight = Number(data.height) > 0 ? Number(data.height) : 0;
-            const maxHeight = fixedHeight || Math.max(320, Math.round((window.innerHeight || 800) * 0.8));
-            const height = ref(fixedHeight || 200);
-            const thumbFrame = ref(null);
+
+            // —— 缩略图尺寸自适应（内容完整 + 对话区上限）——
+            // iframe 高度 = min(内容实测高, 上限)；上限按对话区可视高度比例计算，
+            // 超上限时 iframe 内部自动开滚动（见 IFRAME_FIT_SCRIPT），内容完整可达
+            const thumbIframe = ref(null);
+            const lastH = ref(0); // 最近一次上报的内容视觉高度
+            function maxH() {
+                const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
+                return Math.max(160, Math.min(520, Math.round(vh * 0.55)));
+            }
+            const MIN_INIT_H = 120;
+            const thumbH = ref(Math.max(MIN_INIT_H, Math.min(Number(data.height) || 200, maxH())));
+            function applyH(h) {
+                lastH.value = h;
+                thumbH.value = Math.max(MIN_INIT_H, Math.min(h, maxH()));
+            }
             function onMsg(e) {
-                const el = thumbFrame.value;
-                if (!el || e.source !== el.contentWindow) return;
-                const d = e.data;
-                if (d && typeof d === 'object' && typeof d.__vizHtmlHeight__ === 'number') {
-                    const want = Math.ceil(d.__vizHtmlHeight__);
-                    if (want > 0) {
-                        const nh = Math.max(80, Math.min(maxHeight, want));
-                        if (nh !== height.value) height.value = nh;
-                    }
+                const d = e && e.data;
+                if (!d || d.__vizHtmlSize !== 1) return;
+                // e.source 精确匹配本实例的缩略 iframe（多实例不串扰；全屏 iframe 自适应自身视口无需处理）
+                if (thumbIframe.value && e.source === thumbIframe.value.contentWindow) {
+                    const h = Number(d.h) || 0;
+                    if (h > 0) applyH(h);
                 }
             }
-            onMounted(() => window.addEventListener('message', onMsg));
-            onUnmounted(() => window.removeEventListener('message', onMsg));
+            function onWinResize() {
+                // 对话区尺寸变化 → 重算上限（内容高度不变）
+                if (lastH.value) thumbH.value = Math.max(MIN_INIT_H, Math.min(lastH.value, maxH()));
+            }
+            onMounted(() => {
+                window.addEventListener('message', onMsg);
+                window.addEventListener('resize', onWinResize);
+            });
+            onUnmounted(() => {
+                window.removeEventListener('message', onMsg);
+                window.removeEventListener('resize', onWinResize);
+            });
             return () => h('div', { class: 'viz-html viz-root' }, [
                 h('div', { class: 'viz-html-bar' }, [
                     h('div', { style: 'flex:1' }),
                     h('button', { class: 'viz-html-zoom', onClick: () => { full.value = true; } }, '放大')
                 ]),
-                h('iframe', { ref: thumbFrame, srcdoc, style: { height: height.value + 'px' }, sandbox }),
+                h('iframe', { ref: thumbIframe, srcdoc, style: { height: thumbH.value + 'px' }, sandbox }),
                 full.value ? h('div', { class: 'viz-html-full', onClick: (e) => { if (e.target.classList.contains('viz-html-full')) full.value = false; } }, [
                     h('div', { class: 'viz-html-full-bar' }, [
                         h('div', { style: 'flex:1' }),

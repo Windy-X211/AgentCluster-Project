@@ -1,11 +1,11 @@
 {
     "version": "1.0",
-    "updated_at": "2026-10-30",
+    "updated_at": "2026-10-31",
     "extensions": [
         {
             "id": "visual_interaction",
             "name": "可视化交互",
-            "version": "1.2.0",
+            "version": "1.4.0",
             "type": "viz-renderer",
             "author": "AgentCluster",
             "description": "解析智能体输出的 JSON，渲染为选择题、填空题、配图、流程图、思维导图、HTML、优化排布等富交互组件；启用后自动向所有智能体注入 viz 输出协议",
@@ -33,24 +33,28 @@
         {
             "id": "fairy_ball",
             "name": "精灵悬浮球",
-            "version": "1.0.0",
+            "version": "1.2.0",
             "type": "hybrid",
             "author": "AgentCluster",
-            "description": "桌面精灵悬浮球：小精灵随智能体运行状态活动（空闲呼吸眨眼/运行中欢快跳动发光/异常变灰）；左键打开主窗口，右键菜单支持区域截图提问（主窗/小窗）、临时对话、打开设置",
+            "description": "桌面精灵悬浮球：小精灵随智能体运行状态活动（空闲呼吸眨眼/运行中欢快跳动发光/异常变灰）；左键打开主窗口，右键弹出独立菜单窗支持区域截图提问（主窗/小窗）、临时对话、打开设置，并可切换 5 款精灵与三档大小",
             "icon": "🧚",
             "tags": [
                 "companion",
                 "float",
                 "screenshot",
-                "quickchat"
+                "quickchat",
+                "skin",
+                "size"
             ],
             "source": "builtin",
             "frontend_files": [],
             "backend_entry": "backend",
             "pages": [
                 "fairy.html",
+                "menu.html",
                 "snip.html"
             ]
+
         },
         {
             "id": "external_control",
@@ -123,6 +127,7 @@
                 "renderer.js"
             ],
             "status": "preview"
+
         }
     ]
 }

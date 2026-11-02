@@ -51,9 +51,9 @@ id 必须唯一；edges 的 from/to 引用 nodes 的 id。
 
 **html 交互卡片**（缩略展示，可放大全屏交互）：
 ```json
-{"html":"<完整的HTML片段>","height":200}
+{"html":"<完整的HTML片段>"}
 ```
-html 为字符串，含完整标签与内联 script/style；默认高约 200px。
+html 为字符串，含完整标签与内联 script/style。缩略图尺寸自动适应内容并按对话区大小限制（超宽等比缩小、超高内部滚动，内容始终完整），无需指定高度；可加 `"height":200` 作为初始高度提示，实际仍以自适应为准。
 
 **layout 优化排布**（多列网格，items 可嵌套任意 viz 类型）：
 ```json

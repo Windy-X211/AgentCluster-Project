@@ -29,6 +29,12 @@ const fs = require('fs')
 const os = require('os')
 const { spawn } = require('child_process')
 
+// 精灵球窗动画冻结修复：右键弹独立菜单时全屏透明捕获层会盖住球窗，
+// Windows 的 Chromium native occlusion 计算按"窗口几何覆盖"判定（不识别透明像素），
+// 球窗被判完全遮挡 → 停止产出渲染帧 → CSS 动画冻结。全局关闭该计算
+// （本应用窗口数量少，放弃遮挡省电优化的代价可忽略）。必须在 app ready 前执行。
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion')
+
 _log('app.isPackaged=' + app.isPackaged + ' argv=' + JSON.stringify(process.argv.slice(2)))
 
 // ---------- 配置 ----------
@@ -734,7 +740,9 @@ let _snipFullImg = null    // 选区期间的全屏 nativeImage（物理分辨�
 let _snipScale = 1         // 主屏 DPI 缩放（CSS 逻辑坐标 → 物理像素）
 
 function _fairyWebPrefs() {
-  return { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: false }
+  // backgroundThrottling:false —— fairy 系窗口（球窗/菜单窗/小窗等）失去焦点或被垫层
+  // 覆盖时 Chromium 不节流 rAF/timer：球窗的逐帧命中测试与状态轮询保持实时
+  return { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: false, backgroundThrottling: false }
 }
 
 function createFairyWin() {
@@ -746,10 +754,13 @@ function createFairyWin() {
     frame: false, transparent: true, alwaysOnTop: true,
     skipTaskbar: true, resizable: false, hasShadow: false,
     show: false,
+    focusable: false,   // 不可聚焦：点击球体不抢系统焦点，主窗 isFocused() 判断不被扰动（单击切换最小化的关键）
     webPreferences: _fairyWebPrefs(),
   })
   fairyWin.setAlwaysOnTop(true, 'screen-saver')
   fairyWin.loadURL(`${FAIRY_BASE}/page`)
+  // 初始即穿透（页面脚本加载前的窗口里大部分是空白；页面加载后由 hit-test 动态翻转）
+  try { fairyWin.setIgnoreMouseEvents(true, { forward: true }) } catch { }
   fairyWin.once('ready-to-show', () => fairyWin.show())
   fairyWin.webContents.on('did-fail-load', (_e, code) => {
     // 后端未就绪 / 拓展刚停用 → 关闭，等下一轮轮询重试
@@ -773,6 +784,110 @@ async function showMainWindow(route) {
     // hash 路由跳转（避免整页刷新）
     mainWindow.webContents.executeJavaScript(`location.hash = ${JSON.stringify(route)}; true`).catch(() => { })
   }
+}
+
+// ---------- 精灵右键独立菜单窗 ----------
+// 菜单不再塞在球窗 180×170 里（受边界钳制、内容要视图切换滚动），
+// 而是独立透明置顶小窗：位置随鼠标、屏幕自由弹出、内容平铺。
+// 「点击外部关闭」用全屏透明捕获层实现（原生菜单行为）：
+//   捕获层 level 1（先 show，盖住桌面/球窗）→ 菜单窗 level 2（最上）；
+//   用户点捕获层任意处（含点球）= 关闭菜单（本次点击被吃掉不透传，与原生一致）。
+// 两窗均 focusable:false —— 不抢系统焦点，主窗 isFocused() 三态切换判断不被扰动。
+let fairyMenuWin = null
+let fairyCatchWin = null
+let _menuAnchor = { x: 0, y: 0 }   // 弹出锚点（右键鼠标屏幕坐标，重定位用）
+let _menuHadMainFocus = false      // 弹菜单前主窗是否持有焦点（选完关闭后归还，防打字被打断后回不来）
+
+// 捕获层页面：全屏透明，任意 mousedown/contextmenu → 请求关闭菜单
+const _FAIRY_CATCH_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;cursor:default}
+</style></head><body><script>
+function close(){ try{ window.electronAPI && window.electronAPI.fairy && window.electronAPI.fairy.closeMenu() }catch(e){} }
+document.addEventListener('mousedown', close, true);
+document.addEventListener('contextmenu', e => { e.preventDefault(); close() });
+</script></body></html>`
+
+/**
+ * 关闭菜单（含捕获层）。
+ * restoreFocus=true：菜单页自身收起（选完皮肤/大小）→ 归还弹菜单前主窗的焦点；
+ * false（点外部/失焦/动作分发）：焦点留给用户点击的目标或后续动作窗口，不强行拉回主窗。
+ */
+function closeFairyMenu(restoreFocus) {
+  const had = _menuHadMainFocus
+  _menuHadMainFocus = false
+  if (fairyMenuWin && !fairyMenuWin.isDestroyed()) { try { fairyMenuWin.close() } catch { } }
+  fairyMenuWin = null
+  if (fairyCatchWin && !fairyCatchWin.isDestroyed()) { try { fairyCatchWin.close() } catch { } }
+  fairyCatchWin = null
+  if (restoreFocus && had && mainWindow && !mainWindow.isDestroyed()
+    && mainWindow.isVisible() && !mainWindow.isMinimized()) {
+    try { mainWindow.focus() } catch { }
+  }
+}
+
+/** 菜单位置：锚点右下偏移，工作区四缘钳制（右/下缘超界朝左/上翻转） */
+function _clampMenuPos(anchor, w, h, workArea) {
+  let mx = anchor.x + 8, my = anchor.y + 8
+  if (mx + w > workArea.x + workArea.width - 6) mx = anchor.x - w - 8
+  if (my + h > workArea.y + workArea.height - 6) my = anchor.y - h - 8
+  mx = Math.max(workArea.x + 4, Math.min(mx, workArea.x + workArea.width - w - 4))
+  my = Math.max(workArea.y + 4, Math.min(my, workArea.y + workArea.height - h - 4))
+  return [Math.round(mx), Math.round(my)]
+}
+
+function openFairyMenu(x, y) {
+  closeFairyMenu()   // 重开 = 重定位（幂等）
+  _menuAnchor = { x: Math.round(x), y: Math.round(y) }
+  // 弹菜单前记录主窗焦点状态（菜单窗要抢焦点使 blur 机制生效，关闭后据此归还）
+  _menuHadMainFocus = !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused())
+  const disp = screen.getDisplayNearestPoint({ x: _menuAnchor.x, y: _menuAnchor.y })
+  // 1) 全屏透明捕获层（先建先 show → 垫在菜单窗下面）
+  fairyCatchWin = new BrowserWindow({
+    x: disp.bounds.x, y: disp.bounds.y,
+    width: disp.bounds.width, height: disp.bounds.height,
+    frame: false, transparent: true, hasShadow: false,
+    resizable: false, movable: false, fullscreenable: false,
+    skipTaskbar: true, show: false, focusable: false,
+    webPreferences: _fairyWebPrefs(),
+  })
+  fairyCatchWin.setAlwaysOnTop(true, 'screen-saver', 1)
+  fairyCatchWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(_FAIRY_CATCH_HTML))
+  fairyCatchWin.once('ready-to-show', () => { if (fairyCatchWin && !fairyCatchWin.isDestroyed()) fairyCatchWin.show() })
+  fairyCatchWin.on('closed', () => { if (fairyCatchWin) fairyCatchWin = null })
+  // 2) 菜单窗（内容 = 拓展后端下发的 menu.html；尺寸由页面上报后 setContentSize）
+  fairyMenuWin = new BrowserWindow({
+    width: 200, height: 300, useContentSize: true,
+    frame: false, transparent: true, hasShadow: false,
+    resizable: false, movable: false, fullscreenable: false,
+    skipTaskbar: true, show: false,
+    focusable: true,   // 可聚焦：失焦自动消失（blur 关闭）+ 能收键盘（ESC）
+    webPreferences: _fairyWebPrefs(),
+  })
+  fairyMenuWin.setAlwaysOnTop(true, 'screen-saver', 2)   // 盖在捕获层之上
+  const [mx, my] = _clampMenuPos(_menuAnchor, 200, 300, disp.workArea)
+  fairyMenuWin.setPosition(mx, my)
+  fairyMenuWin.loadURL(`${FAIRY_BASE}/menu`)
+  // 页面上报实际尺寸（load 后 rAF）→ 调整窗尺寸并重定位；600ms 兜底强制显示（页面异常不弹死）
+  let shown = false
+  const showMenu = () => {
+    if (shown || !fairyMenuWin || fairyMenuWin.isDestroyed()) return
+    shown = true
+    fairyMenuWin.show()
+    fairyMenuWin.focus()   // 抢焦点使 blur 机制生效
+  }
+  fairyMenuWin._showMenu = showMenu
+  setTimeout(showMenu, 600)
+  // 失焦自动关（点其他应用/窗口、Alt+Tab 切走）；短延迟复核防 show 焦点竞态误关
+  fairyMenuWin.on('blur', () => {
+    setTimeout(() => {
+      if (fairyMenuWin && !fairyMenuWin.isDestroyed() && !fairyMenuWin.isFocused()) closeFairyMenu(false)
+    }, 120)
+  })
+  fairyMenuWin.on('closed', () => {
+    if (fairyMenuWin) fairyMenuWin = null
+    // 菜单窗销毁时捕获层一并收（选完菜单项自关时也走到这里）
+    if (fairyCatchWin && !fairyCatchWin.isDestroyed()) { try { fairyCatchWin.close() } catch { } }
+  })
 }
 
 function openQuickChat(shotPath) {
@@ -811,6 +926,7 @@ function sendQuickShot(shotPath) {
 
 // —— 区域截图：隐藏球 → desktopCapturer 全屏截 → 选区窗框选 → 裁剪保存 → 分发去向 ——
 async function startSnip() {
+  closeFairyMenu()   // 菜单开着时点截图提问：先进截图流程（捕获层不能入镜）
   // 球置顶会入镜 → 先藏（结束后恢复）
   let fairyHidden = false
   if (fairyWin && !fairyWin.isDestroyed() && fairyWin.isVisible()) {
@@ -916,6 +1032,7 @@ function startFairyPolling() {
       } else if (fairyWin && !fairyWin.isDestroyed()) {
         fairyWin.close()
         fairyWin = null
+        closeFairyMenu()   // 拓展停用：菜单（含捕获层）一并关闭
       }
     } catch (e) {
       _log('[fairy] 球窗管理异常：' + e.message)
@@ -924,8 +1041,21 @@ function startFairyPolling() {
 }
 
 function registerFairyIPC() {
-  ipcMain.handle('fairy:openMain', (_e, route) => { showMainWindow(route).catch(() => { }) })
+  ipcMain.handle('fairy:openMain', (_e, route) => {
+    // 单击切换：主窗不可见/已最小化 → 恢复显示；可见但被遮挡（非焦点）→ 置前聚焦；可见且已聚焦 → 最小化到任务栏
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !mainWindow.isMinimized()) {
+      if (mainWindow.isFocused()) {
+        mainWindow.minimize()
+      } else {
+        mainWindow.show()
+        mainWindow.focus()
+      }
+      return
+    }
+    showMainWindow(route).catch(() => { })
+  })
   ipcMain.handle('fairy:action', (_e, name) => {
+    closeFairyMenu()   // 菜单动作分发前收起菜单（动作现在来自独立菜单窗）
     if (name === 'screenshot') {
       startSnip().catch(e => _log('[fairy] startSnip: ' + e.message))
     } else if (name === 'quickchat') {
@@ -934,12 +1064,36 @@ function registerFairyIPC() {
       showMainWindow('#/settings').catch(() => { })
     }
   })
+  // —— 独立菜单窗 IPC ——
+  ipcMain.handle('fairy:openMenu', (_e, x, y) => { openFairyMenu(x, y) })
+  ipcMain.handle('fairy:closeMenu', (e) => {
+    // 来源区分：菜单页自身收起（选完皮肤/大小）→ 归还主窗焦点；
+    // 捕获层点击外部 → 不归还（焦点应留给用户点击的目标应用/窗口）
+    const fromMenu = !!(fairyMenuWin && !fairyMenuWin.isDestroyed() && e.sender === fairyMenuWin.webContents)
+    closeFairyMenu(fromMenu)
+  })
+  ipcMain.handle('fairy:menuSize', (e, w, h) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (!win || win.isDestroyed()) return
+    const cw = Math.max(120, Math.min(Math.round(w) || 200, 420))
+    const ch = Math.max(80, Math.min(Math.round(h) || 300, 900))
+    win.setContentSize(cw, ch)
+    // 视图切换尺寸变化 → 以锚点重新钳制定位（防超屏幕边缘）
+    const disp = screen.getDisplayNearestPoint({ x: _menuAnchor.x, y: _menuAnchor.y })
+    win.setPosition(..._clampMenuPos(_menuAnchor, cw, ch, disp.workArea))
+    if (typeof win._showMenu === 'function') win._showMenu()   // 尺寸就绪立即显示
+  })
 
   ipcMain.handle('fairy:winPos', (e) => {
     const w = BrowserWindow.fromWebContents(e.sender)
     if (!w) return null
     const p = w.getPosition()
     return { x: p[0], y: p[1] }
+  })
+  // 穿透开关（球页 hit-test 驱动）：forward:true → 穿透期间 mousemove 仍派发给球页做命中测试
+  ipcMain.handle('fairy:setIgnoreMouse', (e, ignore) => {
+    const w = BrowserWindow.fromWebContents(e.sender)
+    if (w) { try { w.setIgnoreMouseEvents(!!ignore, { forward: true }) } catch { } }
   })
   ipcMain.handle('fairy:moveTo', (e, x, y) => {
     const w = BrowserWindow.fromWebContents(e.sender)

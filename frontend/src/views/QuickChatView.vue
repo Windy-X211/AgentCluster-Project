@@ -46,7 +46,10 @@ onMounted(async () => {
       convs.fetch(),
     ])
     // 直接 api 建临时会话并设为 current（RightPanel 的 ensureCurrent 会保持它）
-    const c = await api.convs.create({ name: '⚡ 临时对话', mode: 'independent', agent_ids: [] })
+    // 带上设置里的默认智能体（与主窗 newConv 兜底同语义；未设置/已删除则不预设）
+    const d = Number(settings.data?.default_agent_id)
+    const defaultAgentId = (Number.isFinite(d) && d > 0 && agents.list.some((a: any) => a.id === d)) ? d : null
+    const c = await api.convs.create({ name: '⚡ 临时对话', mode: 'independent', agent_ids: defaultAgentId ? [defaultAgentId] : [] })
     convs.list = [c, ...convs.list]
     convs.current = c.id
     window.__qcConvId = c.id
@@ -82,7 +85,9 @@ window.addEventListener('beforeunload', () => {
     <div class="qc-titlebar">
       <span class="qc-logo">🧚</span>
       <span class="qc-title">临时对话 · 智能体集群</span>
-      <button class="qc-close" title="关闭" @click="closeSelf">✕</button>
+      <button class="qc-close" title="关闭" @click="closeSelf">
+        <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2.2 2.2 L9.8 9.8 M9.8 2.2 L2.2 9.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
     </div>
     <div class="qc-body">
       <KeepAlive>
@@ -100,6 +105,10 @@ window.addEventListener('beforeunload', () => {
   flex-direction: column;
   background: #0a0e1a;
   overflow: hidden;
+  /* 与主窗 .app-root 同款层级保护：BackgroundLayer 是 fixed + z-index:0，
+     无定位的正常流内容会被背景层盖住（设置背景图时小窗内容全部变暗） */
+  position: relative;
+  z-index: 1;
 }
 .qc-titlebar {
   flex: none;
@@ -119,8 +128,11 @@ window.addEventListener('beforeunload', () => {
   -webkit-app-region: no-drag;
   width: 26px; height: 26px;
   border: none; border-radius: 7px;
-  background: transparent; color: #8b9bc0;
-  font-size: 14px; cursor: pointer;
+  background: transparent;
+  /* 文本 ✕ 依赖字体 fallback 且颜色暗淡曾与标题栏融为一体不可见：
+     改 SVG 描边图标 + 亮色（对齐主窗 WindowControls 的可见性） */
+  color: rgba(232, 236, 244, .9);
+  cursor: pointer;
   display: flex; align-items: center; justify-content: center;
 }
 .qc-close:hover { background: rgba(255, 90, 90, .18); color: #ff9a9a; }
