@@ -1575,6 +1575,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 assistant_msg_fast["reasoning"] = assistant_reasoning
             messages.append(assistant_msg_fast)
             # 执行这些 tool_calls
+            _fast_img_followups: list[dict] = []
             for tc in fast_tool_calls:
                 try:
                     args = json.loads(tc.get("arguments", "{}")) if isinstance(tc.get("arguments"), str) else (tc.get("arguments") or {})
@@ -1590,7 +1591,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
                 messages.append(tool_msg)
                 if img_followup:
-                    messages.append(img_followup)
+                    _fast_img_followups.append(img_followup)
                 # 提取图片引用（供前端缩略图渲染，不受 truncate 影响）
                 img_refs = _extract_image_refs(result)
                 tool_entry = {**tool_msg, "ts": datetime.utcnow().isoformat()}
@@ -1603,6 +1604,9 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 if img_refs:
                     yield f"I:{tc['id']}|{json.dumps(img_refs, ensure_ascii=False)}\n"
                 tool_history.append({"name": tc["name"], "args": args, "result": result})
+            # 所有 tool 结果已追加完毕，再统一追加图片 followup，避免在 tool 结果之间插入 user 消息
+            # 破坏 "assistant.tool_calls 后必须连续 tool 消息" 的契约（DeepSeek 等严格校验会 400）
+            messages.extend(_fast_img_followups)
             # 进入慢通道循环
         else:
             if _fast_upstream_error:
@@ -1923,6 +1927,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # 下一轮 chat 前 strip 时，index >= 此值的 img_followup 要保留
             # （本轮刚追加，本轮 LLM 还没看过）；< 此值的是之前轮次的，替换为占位。
             _tool_round_start = len(messages)
+            _round_img_followups: list[dict] = []
             exec_mode = turn.get("_locked_exec_mode", "serial")
             _send_handled = False  # 串行：一轮只允许给一个目标发送（并行不限，可多目标）
             for tc in assistant_tool_calls:
@@ -2023,7 +2028,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
                 messages.append(tool_msg)
                 if img_followup:
-                    messages.append(img_followup)
+                    _round_img_followups.append(img_followup)
                 # 提取图片引用（供前端缩略图渲染，不受 truncate 影响）
                 img_refs = _extract_image_refs(result)
                 tool_entry = {**tool_msg, "ts": datetime.utcnow().isoformat()}
@@ -2037,6 +2042,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     yield f"I:{tc['id']}|{json.dumps(img_refs, ensure_ascii=False)}\n"
                 tool_history.append({"name": fn["name"], "args": args, "result": result})
 
+
+            # 所有 tool 结果已追加完毕，再统一追加图片 followup，避免在 tool 结果之间插入 user 消息
+            # 破坏 "assistant.tool_calls 后必须连续 tool 消息" 的契约（DeepSeek 等严格校验会 400）
+            messages.extend(_round_img_followups)
 
             # 执行了工具 = 任务取得实质进展 → 验证重试配额清零。
             # 否则模型每轮工具之间"过渡解说文字"都会触发一次验证器（上一条工具常有

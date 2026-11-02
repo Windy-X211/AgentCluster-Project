@@ -276,6 +276,27 @@ def _inject_reasoning(payload: dict, model: str, level: str, interface_url: str 
     _inject(payload, model, level, protocol=protocol)
 
 
+def _drop_dangling_tool_calls(assistant_msg: dict, dangling_ids: set[str]) -> None:
+    """从 assistant 消息的 tool_calls 中剔除悬空（无对应 tool 结果）的 tool_call。
+
+    上游 LLM 网关要求：带 tool_calls 的 assistant 消息后必须紧跟对应 tool 结果消息，
+    否则以 "insufficient tool messages following tool_calls message" HTTP 400 拒绝。
+    触发场景：truncate/undo_from 裸切片从中间切断、delete_message 删单条 tool 未回溯配对、
+    崩溃恢复时序窗口（assistant 已 flush 而 tool 未 flush）。
+    剔除后若 tool_calls 为空，则删除该字段，避免空数组被网关拒绝。
+    """
+    tcs = assistant_msg.get("tool_calls")
+    if not isinstance(tcs, list) or not dangling_ids:
+        return
+    kept = [tc for tc in tcs if isinstance(tc, dict) and tc.get("id", "") not in dangling_ids]
+    if len(kept) == len(tcs):
+        return
+    if kept:
+        assistant_msg["tool_calls"] = kept
+    else:
+        assistant_msg.pop("tool_calls", None)
+
+
 def _sanitize_payload(payload: dict) -> None:
     """原地清洗 payload，修正对国产模型（glm/sensenova 等）常见的不兼容字段。
 
@@ -287,6 +308,8 @@ def _sanitize_payload(payload: dict) -> None:
       3. tool_calls[].function.arguments 若是 JSON 对象字符串，保持原样；
          若是裸 dict，序列化为 JSON 字符串
       4. tool role 消息必须有 tool_call_id 字段（否则模型无法匹配）
+      5. 反向修复：assistant@tool_calls 缺少对应 tool 消息 → 剔除悬空 tool_call
+         （避免 "insufficient tool messages following tool_calls message" 400）
     """
     # —— tools schema 清洗 ——
     tools = payload.get("tools")
@@ -312,6 +335,9 @@ def _sanitize_payload(payload: dict) -> None:
     # 上一段 assistant.tool_calls 中保留下来（合法）的 tool_call id 集合，
     # 用于把「引用了被丢弃 tool_call」的 tool 消息降级为 user，避免悬空引用被网关 400。
     pending_tool_ids: set[str] = set()
+    # 当前等待 tool 结果的 assistant 消息引用；循环中遇到新 assistant 或结束时，
+    # 据此回溯剔除无对应 tool 消息的悬空 tool_call（反向修复）。
+    pending_assistant_msg: dict | None = None
     for idx in range(len(messages)):
         m = messages[idx]
         if not isinstance(m, dict):
@@ -332,6 +358,9 @@ def _sanitize_payload(payload: dict) -> None:
             role = "user"
         # assistant.tool_calls 清洗
         if role == "assistant" and isinstance(m.get("tool_calls"), list):
+            # 反向修复：先处理上一个 assistant 的悬空 tool_call（其 tool 结果在本轮 assistant 之前未出现）
+            if pending_assistant_msg is not None and pending_tool_ids:
+                _drop_dangling_tool_calls(pending_assistant_msg, pending_tool_ids)
             cleaned = []
             for j, tc in enumerate(m["tool_calls"]):
                 if not isinstance(tc, dict):
@@ -363,22 +392,30 @@ def _sanitize_payload(payload: dict) -> None:
             if cleaned:
                 m["tool_calls"] = cleaned
                 pending_tool_ids = {tc.get("id", "") for tc in cleaned}
+                pending_assistant_msg = m
             else:
                 m.pop("tool_calls", None)
                 pending_tool_ids = set()
+                pending_assistant_msg = None
             continue
         # tool role 消息：必须匹配到上一条 assistant 的合法 tool_call 才能保留；
         # 否则（引用了被丢弃的空名调用 / 无主消息）降级为 user，避免网关拒绝。
         if role == "tool":
             tc_id = m.get("tool_call_id") or ""
             if tc_id in pending_tool_ids:
-                # 正常匹配。tool_call_id 已由 runtime 在落库时填充，这里留空串或原值均可。
+                # 正常匹配。标记该 tool_call 已消费，避免循环末尾误判为悬空。
+                pending_tool_ids.discard(tc_id)
                 continue
             content = m.get("content")
             m.clear()
             m["role"] = "user"
             m["content"] = content if content is not None else ""
             continue
+
+    # 反向修复：循环结束后处理最后一个 assistant 的悬空 tool_call
+    # （其 tool 结果在消息历史尾部未出现，常见于 truncate 截断 / 崩溃恢复时序窗口）
+    if pending_assistant_msg is not None and pending_tool_ids:
+        _drop_dangling_tool_calls(pending_assistant_msg, pending_tool_ids)
 
 
 async def chat(interface: dict, model: str, messages: list, stream: bool = False, tools: list | None = None,

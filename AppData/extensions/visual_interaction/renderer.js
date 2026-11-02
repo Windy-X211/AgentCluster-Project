@@ -1275,11 +1275,11 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
     });
 
     // ============ html ============
-    // 预注入的 base CSS：禁止 html/body 层的滚动条溢出，但保留用户自定义容器的 overflow
-    // 缩略图和全屏弹窗都用这一套（全屏弹窗也不滚）
+    // 预注入的 base CSS：内容超出卡片高度时允许内部滚动（配合高度上报脚本，卡片高度自适应内容）
+    // 缩略图和全屏弹窗都用这一套
     const IFRAME_BASE_CSS = `<style>
-html,body{margin:0;padding:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:13px;color:#e6ebf5;background:#0a0e1a;overflow:hidden;}
-/* 仅给用户自定义的 overflow 容器美化滚动条（body 自己不滚，所以下面的规则只作用于用户内部容器）*/
+html,body{margin:0;padding:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:13px;color:#e6ebf5;background:#0a0e1a;overflow:auto;}
+/* 美化滚动条：body 自身在被高度上限截断时也可能出现滚动条 */
 *,*::before,*::after{scrollbar-width:thin;scrollbar-color:rgba(157,180,255,0.4) transparent;}
 *::-webkit-scrollbar{width:4px;height:4px;}
 *::-webkit-scrollbar-track{background:transparent;}
@@ -1304,21 +1304,53 @@ input[type=range].viz-vertical::-webkit-slider-thumb{margin-top:0;margin-left:-3
             ? rawHtml.replace(/<head([^>]*)>/i, '<head$1>' + baseCss)
             : baseCss + rawHtml;
     }
+    // 高度上报脚本：iframe 内测量内容真实高度 → postMessage 通知宿主 → 卡片自适应高度
+    const HEIGHT_REPORT_SCRIPT = `<script>(function(){
+  function report(){
+    try{
+      var d=document.documentElement, b=document.body;
+      var h=Math.max(d?d.scrollHeight:0, b?b.scrollHeight:0);
+      if(h>0) parent.postMessage({__vizHtmlHeight__:h}, '*');
+    }catch(e){}
+  }
+  window.addEventListener('load', report);
+  window.addEventListener('resize', report);
+  try{ if(window.ResizeObserver) new ResizeObserver(report).observe(document.documentElement); }catch(e){}
+  setTimeout(report, 80); setTimeout(report, 400); setTimeout(report, 1200);
+})();<\/script>`;
     const Html = defineComponent({
         props: { data: Object, raw: String, extAPI: Object },
         setup(props) {
             const full = ref(false);
             const data = props.data || {};
             const rawHtml = safeStr(data.html, '');
-            const srcdoc = injectBaseCss(rawHtml, IFRAME_BASE_CSS);
-            const height = data.height || 200;
+            const srcdoc = injectBaseCss(rawHtml, IFRAME_BASE_CSS) + HEIGHT_REPORT_SCRIPT;
             const sandbox = data.sandbox || 'allow-scripts allow-forms allow-popups';
+            // 智能体显式指定 height → 固定高度；否则高度自适应内容（上限约视口 80%，超出可内部滚动）
+            const fixedHeight = Number(data.height) > 0 ? Number(data.height) : 0;
+            const maxHeight = fixedHeight || Math.max(320, Math.round((window.innerHeight || 800) * 0.8));
+            const height = ref(fixedHeight || 200);
+            const thumbFrame = ref(null);
+            function onMsg(e) {
+                const el = thumbFrame.value;
+                if (!el || e.source !== el.contentWindow) return;
+                const d = e.data;
+                if (d && typeof d === 'object' && typeof d.__vizHtmlHeight__ === 'number') {
+                    const want = Math.ceil(d.__vizHtmlHeight__);
+                    if (want > 0) {
+                        const nh = Math.max(80, Math.min(maxHeight, want));
+                        if (nh !== height.value) height.value = nh;
+                    }
+                }
+            }
+            onMounted(() => window.addEventListener('message', onMsg));
+            onUnmounted(() => window.removeEventListener('message', onMsg));
             return () => h('div', { class: 'viz-html viz-root' }, [
                 h('div', { class: 'viz-html-bar' }, [
                     h('div', { style: 'flex:1' }),
                     h('button', { class: 'viz-html-zoom', onClick: () => { full.value = true; } }, '放大')
                 ]),
-                h('iframe', { srcdoc, style: { height: height + 'px' }, sandbox }),
+                h('iframe', { ref: thumbFrame, srcdoc, style: { height: height.value + 'px' }, sandbox }),
                 full.value ? h('div', { class: 'viz-html-full', onClick: (e) => { if (e.target.classList.contains('viz-html-full')) full.value = false; } }, [
                     h('div', { class: 'viz-html-full-bar' }, [
                         h('div', { style: 'flex:1' }),

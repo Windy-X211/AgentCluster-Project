@@ -224,6 +224,13 @@ export function renderMarkdown(text: string | undefined | null): string {
   }
 }
 
+/** 仅渲染纯 Markdown 片段（不做 viz 协议分段）——供 ChatBody 逐段渲染 md 用。
+ *  viz 段由 ChatBody 以 Vue 组件方式渲染，避免 v-html 整体重建销毁组件。 */
+export function renderMarkdownSegment(text: string | undefined | null): string {
+  const html = renderMarkdown(text)
+  return html ? _postChatAttachments(html) : html
+}
+
 /** 在 renderMarkdown 基础上，额外处理"聊天附件"场景：
  *   - `/file-viewer?path=...&name=...&size=...` 的 <a> → 可点击的文件卡片 HTML
  *   - `/api/fs/image?path=...` 的 <img> → 加 data-chat-img 标记，供外层做缩略图+点击灯箱

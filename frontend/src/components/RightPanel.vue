@@ -10,6 +10,7 @@ import { api } from '@/api'
 import { API_BASE } from '@/utils/env'
 import FileViewer, { type ViewerFile } from './FileViewer.vue'
 import VizBlock from '@/extensions/VizBlock.vue'
+import ChatBody from '@/extensions/ChatBody.vue'
 import { setExtAPIImpl } from '@/extensions/loader'
 
 /** 去掉消息首尾纯空行（保留中间换行）—— 用于修复气泡顶部空白；顺带剥离 <continue> 续跑标记 */
@@ -17,11 +18,7 @@ function trimMsgContent(s: string | undefined): string {
   if (!s) return ''
   return stripContinueTag(s).replace(/^\s*\n+/, '').replace(/\n+\s*$/, '')
 }
-/** 消息泡泡 Markdown 渲染（用户/助手统一走这里，含流式光标 + 聊天附件后处理） */
-function msgBubbleHtml(m: any): string {
-  const html = renderChatMarkdown(trimMsgContent(m.content))
-  return isStreamingMsg(m) ? html + '<span class="stream-cursor">▌</span>' : html
-}
+
 
 const convs = useConvStore()
 const agents = useAgentStore()
@@ -39,6 +36,9 @@ const chatAvatarSize = computed(() => {
   const v = Number(settings.data.chat_avatar_size)
   return Number.isFinite(v) && v >= 16 && v <= 48 ? v : 24
 })
+
+// 拓展 extAPI（由 loader 在启动时挂到 window；viz 组件需要它发送用户输入）
+const extAPI = computed(() => (window as any).__extAPI__)
 
 /** 消息是否处于"活动流式"状态：仅当全局确实在流（convs.streaming）且该消息标了 streaming
  *  才视为流式。避免历史遗留的 streaming:true（异常中断被持久化）渲染出永不消失的空泡泡+闪烁光标 */
@@ -1295,6 +1295,14 @@ const visibleMsgs = computed(() => {
  *    side='left'  = 下拉框选中智能体的输出（对话对象）
  *    side='right' = 其它发送方（其它智能体发给它的消息）
  *  同侧连续子块收进同一个自适应"过程框"流式展示（封顶260px，详见过程窗口逻辑）。 */
+/** 渲染项稳定 key：用消息身份（而非索引）作 key，避免列表增删/流式更新时
+ *  Vue 复用错位 DOM、把已挂载的交互组件（如填空题输入框）销毁重建。 */
+function itemKey(it: any): string {
+  if (it.type === 'user') return 'u-' + it.idx
+  if (it.type === 'ctx-summary') return 'c-' + it.idx
+  return 't-' + it.start + '-' + it.end + '-' + (it.side || 'l')
+}
+
 const renderItems = computed(() => {
   const msgs = visibleMsgs.value
   const cur = currentAgentId.value
@@ -3248,7 +3256,7 @@ onBeforeUnmount(() => {
         <!-- ============ 消息列表 ============
              tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
              连续 a2a 信封合并成一组，默认折叠为一条摘要（两级展开） -->
-        <template v-for="(it, ri) in renderItems" :key="ri">
+        <template v-for="it in renderItems" :key="itemKey(it)">
           <!-- ===== 用户消息（靠右，作为每轮智能体输出的分界） ===== -->
           <div v-if="it.type === 'user'" class="msg user" @contextmenu.prevent.stop="onMsgContextMenu($event, it.idx)">
             <div class="avatar user-avatar" :style="{ background: userAvatarGradient() }"
@@ -3256,7 +3264,7 @@ onBeforeUnmount(() => {
               <img v-if="userAvatarPhoto" class="avatar-photo" :src="userAvatarPhoto" alt="U" />
               <template v-else>U</template>
             </div>
-            <div class="bubble markdown user-bubble" v-html="msgBubbleHtml(it.msg)"></div>
+            <div class="bubble markdown user-bubble"><ChatBody :content="trimMsgContent(it.msg.content)" :streaming="isStreamingMsg(it.msg)" :extAPI="extAPI" /></div>
 
           </div>
 
@@ -3375,12 +3383,12 @@ onBeforeUnmount(() => {
                       </div>
 
                       <!-- 流式正文（仅流式中，带光标）—— 始终在过程框内流式显示 -->
-                      <div v-if="isStreamingMsg(ch.msg) && trimMsgContent(ch.msg.content)" class="bubble markdown" v-html="msgBubbleHtml(ch.msg)"></div>
+                      <div v-if="isStreamingMsg(ch.msg) && trimMsgContent(ch.msg.content)" class="bubble markdown"><ChatBody :content="trimMsgContent(ch.msg.content)" :streaming="true" :extAPI="extAPI" /></div>
                       <div v-else-if="isStreamingMsg(ch.msg) && !hasTools(ch.idx) && !(ch.msg.reasoning || '').trim()" class="bubble streaming-placeholder">
                         <span class="stream-cursor">▌</span>
                       </div>
                       <!-- 非末条正文（停止后留在过程框里，未被提出） -->
-                      <div v-else-if="!isStreamingMsg(ch.msg) && !isPromotedMessage(ch.idx) && trimMsgContent(ch.msg.content)" class="bubble markdown" v-html="msgBubbleHtml(ch.msg)"></div>
+                      <div v-else-if="!isStreamingMsg(ch.msg) && !isPromotedMessage(ch.idx) && trimMsgContent(ch.msg.content)" class="bubble markdown"><ChatBody :content="trimMsgContent(ch.msg.content)" :streaming="false" :extAPI="extAPI" /></div>
 
                       <!-- 工具返回图片缩略图：覆盖本地生图（sd_webui）、浏览器截图（browser_control）、
                            桌面截图（desktop_control）、网络下载图片等所有能返回图片的插件/技能。
@@ -3444,7 +3452,7 @@ onBeforeUnmount(() => {
               </div>
 
               <!-- 提出来：本轮末条带正文的 assistant（停止后）作为正常气泡原样渲染 -->
-              <div v-if="turnPromotedMsg(it)" class="bubble markdown promoted-bubble" v-html="msgBubbleHtml(turnPromotedMsg(it))"></div>
+              <div v-if="turnPromotedMsg(it)" class="bubble markdown promoted-bubble"><ChatBody :content="trimMsgContent(turnPromotedMsg(it).content)" :streaming="isStreamingMsg(turnPromotedMsg(it))" :extAPI="extAPI" /></div>
             </div>
           </div>
         </template>
@@ -4468,6 +4476,10 @@ onBeforeUnmount(() => {
 .bubble.markdown { white-space: normal; word-break: break-word; overflow-wrap: anywhere; line-height: 1.6; }
 .bubble.markdown > :first-child { margin-top: 0 !important; }
 .bubble.markdown > :last-child { margin-bottom: 0 !important; }
+/* ChatBody 的 Markdown 段包裹层：保持与原「直接子元素」一致的间距表现 */
+.bubble.markdown > .cb-md { margin: 0; }
+.bubble.markdown > .cb-md > :first-child { margin-top: 0 !important; }
+.bubble.markdown > .cb-md > :last-child { margin-bottom: 0 !important; }
 
 /* —— 段落 —— */
 .bubble.markdown p { margin: 0 0 6px; line-height: 1.65; }
