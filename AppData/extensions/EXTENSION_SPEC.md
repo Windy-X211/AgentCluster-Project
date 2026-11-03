@@ -26,6 +26,7 @@ AppData/extensions/
     renderer.js                  ← viz-renderer 类拓展必选；前端渲染器代码
     backend.py                   ← backend-service 类拓展可选；后端服务代码
     README.md                    ← 【可选】说明文档
+    skills/<skill_id>/SKILL.md   ← 【可选】配套技能（给外部 AI / 其他智能体用，遵循技能规范）
     *.js / *.json / ...          ← 【可选】拓展所需的其他资源
 ```
 
@@ -64,6 +65,15 @@ AppData/extensions/
 | `system_prompt_file` | 否 | string | **system prompt 注入文件**（如 `system_prompt.md`）：拓展启用时其内容自动追加到所有智能体的 system prompt，让智能体天然获得该拓展的协议/能力说明；停用/卸载后自动撤销 |
 | `viz_types` | 否 | string[] | viz-renderer 类拓展声明的可视化类型（见第 4 节） |
 | `backend_entry` | 否 | string | backend-service 类拓展的后端入口模块名 |
+| `skills` | 否 | string[] | 拓展内置的配套技能 id 列表（对应 `skills/<id>/SKILL.md`，遵循技能规范；供外部 AI 接入或管理页展示） |
+
+### skills · 配套技能（拓展赋能外部 AI）
+
+拓展可在 `skills/<skill_id>/` 下内置符合「技能规范」的 `SKILL.md`（见
+`AppData/skills/SPECIFICATION.md`），面向**外部 AI 程序**（DeepSeek Harness、Codex、
+Claude Code 等）或需要该能力说明的智能体。外部 AI 把技能目录拷入自己的技能目录即可
+获得接口用法，无需人工解释。`manifest.skills` 声明技能 id 列表，便于管理页/文档展示；
+技能正文与脚本内容由拓展自包含维护，不参与自动加载（属于分发资源）。
 
 ### system_prompt_file 机制（拓展赋能智能体）
 
