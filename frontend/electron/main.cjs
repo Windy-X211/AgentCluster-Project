@@ -92,7 +92,44 @@ function _killPortIfBusy(port) {
 // 检测系统 Node.js（Electron 内置 Node 不能 spawn 外部 http server，会 ACCESS_VIOLATION）
 function _detectSystemNode() {
   // Electron 内置 Node 不能 spawn 外部 http server（会 ACCESS_VIOLATION），
-  // 必须用系统 Node.js；纯走 PATH，保证跨设备可用
+  // 必须用系统 Node.js；优先硬编码候选目录（跨设备、自启 PATH 被裁剪时也能命中），
+  // 最后才 fallback 到 where node（依赖 PATH 完整）。
+  const home = os.homedir()
+  const appData = process.env.APPDATA || ''
+  const localAppData = process.env.LOCALAPPDATA || ''
+
+  // 候选目录按优先级排序：项目内置 > 开发机固定位置 > 系统常见安装 > nvm > scoop > PATH
+  const candidates = [
+    path.join(PROJECT_ROOT, 'node-v20.18.0-win-x64', 'node.exe'),
+    path.join(PROJECT_ROOT, 'node', 'node.exe'),
+    path.join('E:', 'app', 'node-v20.18.0-win-x64', 'node.exe'),
+    path.join('C:', 'Program Files', 'nodejs', 'node.exe'),
+    path.join('C:', 'Program Files (x86)', 'nodejs', 'node.exe'),
+    path.join(localAppData, 'Programs', 'nodejs', 'node.exe'),
+    path.join(home, 'scoop', 'apps', 'nodejs', 'current', 'node.exe'),
+  ]
+
+  // nvm-windows：遍历 APPDATA\nvm 下所有已安装版本
+  const nvmRoot = path.join(appData, 'nvm')
+  try {
+    if (fs.existsSync(nvmRoot)) {
+      const entries = fs.readdirSync(nvmRoot)
+      for (const name of entries) {
+        const p = path.join(nvmRoot, name, 'node.exe')
+        if (fs.existsSync(p)) candidates.push(p)
+      }
+    }
+  } catch { }
+
+  // 项目里 __dirname 是 frontend/electron，PROJECT_ROOT 是项目根
+  for (const exePath of candidates) {
+    if (fs.existsSync(exePath)) {
+      _log('Found system node via hardcoded path: ' + exePath)
+      return exePath
+    }
+  }
+
+  // 最后 fallback：where node（依赖 PATH 完整）
   try {
     const where = require('child_process').execSync('where node', { encoding: 'utf8', timeout: 2000 }).trim()
     const first = where.split('\n')[0].trim()
@@ -103,6 +140,8 @@ function _detectSystemNode() {
   } catch {
     _log('where node failed, PATH 中找不到 Node.js')
   }
+
+  _log('⚠️ 所有候选路径均未找到 node.exe')
   return null
 }
 
@@ -1190,7 +1229,18 @@ app.whenReady().then(async () => {
       await startDistServer()
     } catch (err) {
       console.warn('[Electron] Dist server 启动失败:', err.message)
-      try { _dialogSync('前端构建缺失', err.message) } catch { }
+      _log('Dist server failed: ' + err.message + '\n' + (err.stack || ''))
+      // 根据错误类型弹不同标题，给用户明确的引导
+      const msg = err.message || String(err)
+      let title = '启动警告'
+      if (msg.includes('找不到 Node.js') || msg.includes('node.exe') || msg.includes('node')) {
+        title = 'Node.js 未找到'
+      } else if (msg.includes('dist/index.html')) {
+        title = '前端未构建'
+      } else if (msg.includes('timeout')) {
+        title = '前端服务启动超时'
+      }
+      try { _dialogSync(title, msg) } catch { }
     }
   }
 

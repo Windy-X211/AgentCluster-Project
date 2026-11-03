@@ -1510,6 +1510,27 @@ export const useConvStore = defineStore('conv', {
         return
       }
 
+      if (line.startsWith('SPK_DONE:')) {
+        // 某个智能体的运行真正结束（正常完成/出错/被精确停止）→ 立即摘掉该节点高亮。
+        // 接收方（接力子任务）的 DONE 行被后端过滤（会话级 DONE 只由顶层流发一次），
+        // 若不单独通知，已停止运行的接收方节点会一直保持 speaking 高亮直到整轮结束。
+        const id = parseInt(line.slice(9), 10)
+        if (!Number.isNaN(id)) {
+          const sa = this._speakingAgents[cid]
+          if (sa && sa.has(id)) {
+            const next = new Set(sa)
+            next.delete(id)
+            this._speakingAgents[cid] = next
+          }
+          if (this._speakingAgent[cid] === id) {
+            // 该发言者已结束：把"最近发言者"让给仍在运行的第一个，没有则清空
+            const rest = [...(this._speakingAgents[cid] ?? [])]
+            this._speakingAgent[cid] = rest[0] ?? null
+          }
+        }
+        return
+      }
+
       if (line.startsWith('E:')) {
         // 后端错误行（LLM 调用失败/运行时异常/上游 HTTP 错误）→ 必须呈现给用户，
         // 否则表现为"无缘无故停止运行"

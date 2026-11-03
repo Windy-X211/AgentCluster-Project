@@ -131,6 +131,13 @@ def list_convs():
 def create_conv(c: ConvIn):
     item = c.model_dump()
     item["id"] = next_id("conversations")
+    # 绑定画布且未显式给出工作区 → 继承画布当前工作区并随会话落盘。
+    # （部分前端创建路径会传 workdir=null，靠运行时回退画布值，但会话记录本身
+    #   落盘 null 会让「按工作区分组」与画布解绑后的会话失去工作区归属）
+    if item.get("canvas_id") and not item.get("workdir"):
+        canvas = get_by("canvases", item["canvas_id"])
+        if canvas and canvas.get("workdir"):
+            item["workdir"] = canvas["workdir"]
     item["messages"] = []
     item["created_at"] = __import__("datetime").datetime.utcnow().isoformat()
     return upsert("conversations", item)
@@ -242,6 +249,28 @@ def get_context_stats(cid: int, agent_id: int = Query(..., description="按该�
     canvas = get_by("canvases", conv.get("canvas_id")) if conv.get("canvas_id") else None
     from core.ctx_compress import context_stats
     return context_stats(conv, agent, canvas)
+
+
+@router.post("/{cid}/compress")
+async def compress_now(cid: int,
+                       agent_id: int = Query(..., description="按该智能体视角执行压缩（接口/模型窗口不同）"),
+                       force: bool = Query(True, description="手动压缩默认跳过压缩线判定，只要存在可压缩区间就压缩")):
+    """手动触发历史上下文压缩（对话区指示器点击）。
+
+    复用 maybe_compress 的同一套压缩逻辑：force=True（默认，手动点击）跳过压缩线判定，
+    只要历史中存在可压缩区间就调用模型生成摘要；无可压缩区间 / 摘要生成失败返回
+    compressed=false，不改历史。"""
+    conv = run_registry.peek_live_conv(cid) or get_by("conversations", cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    agent = get_by("agents", agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    canvas = get_by("canvases", conv.get("canvas_id")) if conv.get("canvas_id") else None
+    from core.ctx_compress import assemble_context, maybe_compress
+    asb = assemble_context(conv, agent, canvas)
+    info = await maybe_compress(conv, agent, asb["interface"], asb["model"], asb["system_prompt"], force=force)
+    return {"compressed": bool(info), **(info or {})}
 
 
 @router.get("/{cid}/events")

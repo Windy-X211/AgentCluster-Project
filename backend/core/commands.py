@@ -9,6 +9,7 @@
 import os, subprocess, shutil, re, signal, socket, time, threading
 import base64
 import locale
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from contextvars import ContextVar
@@ -1819,6 +1820,13 @@ COMMAND_CN_LABELS = {
     "cluster.update_group": "✏️ 重命名分组",
     "cluster.delete_group": "🗑 删除分组",
     "cluster.assign_agent_group": "🏷 归纳分组",
+    "cluster.create_conversation": "💬 新建会话",
+    "cluster.update_conversation": "✏️ 编辑会话",
+    "cluster.continue_conversation": "▶️ 继续会话",
+    "cluster.stop_agent": "🛑 停止智能体",
+    "cluster.list_running": "📡 查看运行中",
+    "cluster.list_conversations": "🗂 列出会话",
+    "cluster.get_conversation": "🗨️ 查看对话记录",
     "cluster.handoff": "🤝 A2A 移交",
     "cluster.send_message": "📨 发送消息",
 }
@@ -2314,6 +2322,366 @@ def cmd_cluster_assign_agent_group(agent_id: int | str,
     return {"ok": True, "agent": {"id": a["id"], "name": a["name"], "group_id": group_id}}
 
 
+# ---- 会话 / 运行管理（新建/编辑/继续会话、停止运行、查看运行态与对话记录）----
+def _find_conversation(conversation_id):
+    """按 id 查找会话：优先运行期共享对象（运行中落库不互踩），兜底磁盘。"""
+    from core import run_registry
+    try:
+        cid = int(conversation_id)
+    except Exception:
+        return None
+    return run_registry.peek_live_conv(cid) or _get_by("conversations", cid)
+
+
+def _conv_activity_ts(c: dict):
+    """会话活跃时间：最后一条消息 ts → created_at → id（与 api/conversations.py 同口径，保证可比较）"""
+    last_ts = None
+    for m in c.get("messages") or []:
+        ts = m.get("ts")
+        if ts and (last_ts is None or ts > last_ts):
+            last_ts = ts
+    return last_ts or c.get("created_at") or f"{c.get('id', 0):020d}"
+
+
+def _normalize_workdir(path):
+    """工作区路径归一：空串/None → None；否则转绝对路径并自动建目录。失败返回 None 并由调用方报错。"""
+    if path is None:
+        return None
+    p = str(path).strip()
+    if not p:
+        return None
+    import os as _os
+    abs_p = _os.path.abspath(p)
+    _os.makedirs(abs_p, exist_ok=True)
+    return abs_p
+
+
+def _normalize_exec_mode(mode):
+    """串并行模式归一：空串/None → None；仅允许 serial | parallel。非法返回 error dict。"""
+    if mode is None:
+        return None
+    m = str(mode).strip().lower()
+    if not m:
+        return None
+    if m not in ("serial", "parallel"):
+        return {"error": f"execution_mode 只允许 serial（串行）或 parallel（并行），收到：{mode}"}
+    return m
+
+
+def _agent_display_map() -> dict:
+    return {a.get("id"): a.get("name") for a in _load_all("agents")}
+
+
+async def _send_and_run(conv: dict, agent: dict, message: str) -> dict:
+    """在主事件循环内：防重入 → 落用户消息 → run_registry.start 启动后台运行。
+    与 api/conversations.py send_message 流程同口径（原子：整个协程在主循环线程执行）。"""
+    import copy as _copy
+    from core import run_registry
+    cid = conv.get("id")
+    if run_registry.is_running(cid, agent.get("id")):
+        return {"error": f"该智能体正在运行中（会话 {cid}），请先 cluster.stop_agent 或稍后再试",
+                "conversation_id": cid, "agent_id": agent.get("id")}
+    canvas = _get_by("canvases", conv.get("canvas_id")) if conv.get("canvas_id") else None
+    # 会话级串并行模式优先覆盖画布当前设置（与 send 端点同语义）
+    if canvas is not None and conv.get("execution_mode"):
+        canvas = {**canvas, "execution_mode": conv["execution_mode"]}
+    mode = "linked" if conv.get("canvas_id") else "independent"
+    conv.setdefault("messages", []).append({
+        "role": "user", "content": message, "ts": datetime.utcnow().isoformat(),
+        "to_agent_id": agent.get("id"),
+    })
+    from core.store import upsert as _upsert_store
+    _upsert_store("conversations", conv)
+    run_registry.start(cid, agent, message, mode, canvas,
+                       base_conv=_copy.deepcopy(conv), workdir=conv.get("workdir"))
+    return {
+        "ok": True, "running": True,
+        "conversation_id": cid, "conversation_name": conv.get("name"),
+        "agent_id": agent.get("id"), "agent_name": agent.get("name"),
+        "mode": mode, "workdir": conv.get("workdir"),
+        "execution_mode": conv.get("execution_mode") or (canvas or {}).get("execution_mode") or "serial",
+        "note": "运行已在后台启动，可用 cluster.get_conversation 查看对话进展、cluster.stop_agent 停止",
+    }
+
+
+def cmd_cluster_create_conversation(name: str = "", canvas_id: int | str | None = None,
+                                    agent_ids: list | None = None,
+                                    workdir: str | None = None,
+                                    execution_mode: str | None = None) -> dict:
+    """新建会话。可绑定画布（linked 集群模式）、指定成员智能体、工作区与串/并行运行模式；
+    绑画布时 workdir / execution_mode 省略则继承画布设置，显式给出则作为会话级覆盖。"""
+    item = {
+        "name": (name or "").strip() or "新对话",
+        "mode": "independent",
+        "agent_ids": [],
+        "canvas_id": None,
+        "workdir": None,
+        "execution_mode": None,
+        "messages": [],
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    if canvas_id is not None and str(canvas_id).strip() != "":
+        c = _find_canvas(canvas_id)
+        if not c: return {"error": f"canvas {canvas_id} not found"}
+        item["mode"] = "linked"
+        item["canvas_id"] = c.get("id")
+        if workdir is None:
+            item["workdir"] = c.get("workdir")
+        if execution_mode is None:
+            item["execution_mode"] = c.get("execution_mode")
+        if not (name or "").strip():
+            item["name"] = f"{c.get('name', '画布')} · 集群"
+    if workdir is not None:
+        wd = _normalize_workdir(workdir)
+        if wd is None and str(workdir).strip():
+            return {"error": f"工作区路径不可用：{workdir}"}
+        item["workdir"] = wd
+    em = _normalize_exec_mode(execution_mode)
+    if isinstance(em, dict): return em
+    item["execution_mode"] = em if execution_mode is not None else item["execution_mode"]
+    if agent_ids:
+        norm_ids = []
+        for aid in agent_ids:
+            a = _find_agent(aid)
+            if not a: return {"error": f"agent {aid} not found"}
+            norm_ids.append(a.get("id"))
+        item["agent_ids"] = sorted(set(norm_ids))
+    item["id"] = _next_id("conversations")
+    _upsert("conversations", item)
+    return {"ok": True, "conversation": item}
+
+
+def cmd_cluster_update_conversation(conversation_id: int | str, name: str | None = None,
+                                    workdir: str | None = None,
+                                    execution_mode: str | None = None,
+                                    agent_ids: list | None = None,
+                                    reset_messages: bool = False) -> dict:
+    """编辑会话元信息：改名、改工作区、切换串/并行模式、改成员智能体、清空消息。
+    workdir / execution_mode 传空串表示清除（回归画布/全局默认）。不支持改绑画布（需要换画布请新建会话）。"""
+    conv = _find_conversation(conversation_id)
+    if not conv: return {"error": f"conversation {conversation_id} not found"}
+    if name is not None:
+        if not str(name).strip():
+            return {"error": "name 不能为空"}
+        conv["name"] = str(name).strip()
+    if workdir is not None:
+        wd = _normalize_workdir(workdir)
+        if wd is None and str(workdir).strip():
+            return {"error": f"工作区路径不可用：{workdir}"}
+        conv["workdir"] = wd  # 空串/None → None 清除
+    if execution_mode is not None:
+        em = _normalize_exec_mode(execution_mode)
+        if isinstance(em, dict): return em
+        conv["execution_mode"] = em  # 空串/None → None 清除
+    if agent_ids is not None:
+        norm_ids = []
+        for aid in agent_ids:
+            a = _find_agent(aid)
+            if not a: return {"error": f"agent {aid} not found"}
+            norm_ids.append(a.get("id"))
+        conv["agent_ids"] = sorted(set(norm_ids))
+    if reset_messages:
+        conv["messages"] = []
+    _upsert("conversations", conv)
+    return {"ok": True, "conversation": {
+        "id": conv.get("id"), "name": conv.get("name"), "mode": conv.get("mode"),
+        "canvas_id": conv.get("canvas_id"), "agent_ids": conv.get("agent_ids"),
+        "workdir": conv.get("workdir"), "execution_mode": conv.get("execution_mode"),
+        "message_count": len(conv.get("messages") or []),
+    }}
+
+
+def cmd_cluster_continue_conversation(conversation_id: int | str, agent_id: int | str,
+                                      message: str, workdir: str | None = None,
+                                      execution_mode: str | None = None) -> dict:
+    """继续会话：向会话中某智能体发消息并启动后台运行（该智能体未入会时自动加入）。
+    workdir / execution_mode 给定时先写入会话再运行（一次调用完成切换）。
+    「以画布中某个智能体启动画布」= 先 cluster.create_conversation 绑画布，再向该节点智能体 continue_conversation。"""
+    conv = _find_conversation(conversation_id)
+    if not conv: return {"error": f"conversation {conversation_id} not found"}
+    agent = _find_agent(agent_id)
+    if not agent: return {"error": f"agent {agent_id} not found"}
+    if not (message or "").strip():
+        return {"error": "message 不能为空"}
+    changed = False
+    if workdir is not None:
+        wd = _normalize_workdir(workdir)
+        if wd is None and str(workdir).strip():
+            return {"error": f"工作区路径不可用：{workdir}"}
+        conv["workdir"] = wd
+        changed = True
+    if execution_mode is not None:
+        em = _normalize_exec_mode(execution_mode)
+        if isinstance(em, dict): return em
+        conv["execution_mode"] = em
+        changed = True
+    aid = agent.get("id")
+    if aid not in (conv.get("agent_ids") or []):
+        conv.setdefault("agent_ids", []).append(aid)
+        changed = True
+    if changed:
+        _upsert("conversations", conv)
+    # 调度到主事件循环执行（run_registry.start 必须在事件循环内调用）
+    from core import mainloop
+    return mainloop.run_coro(_send_and_run(conv, agent, message.strip()))
+
+
+def cmd_cluster_stop_agent(agent_id: int | str | None = None,
+                           conversation_id: int | str | None = None) -> dict:
+    """停止运行中的智能体。conversation_id 给定 → 停该会话（agent_id 可选精确停某智能体，缺省停整个会话）；
+    只给 agent_id → 停该智能体在所有会话中的运行。二者至少给一个。"""
+    if agent_id is None and conversation_id is None:
+        return {"error": "agent_id 与 conversation_id 至少给一个"}
+    from core import mainloop, run_registry
+
+    async def _do_stop(cid: int | None, aid: int | None):
+        stopped = run_registry.stop(cid, aid) if cid is not None else False
+        return stopped
+
+    stopped_items = []
+    if conversation_id is not None:
+        conv = _find_conversation(conversation_id)
+        if not conv: return {"error": f"conversation {conversation_id} not found"}
+        aid = None
+        if agent_id is not None:
+            a = _find_agent(agent_id)
+            if not a: return {"error": f"agent {agent_id} not found"}
+            aid = a.get("id")
+        ok = mainloop.run_coro(_do_stop(conv.get("id"), aid))
+        if ok:
+            stopped_items.append({"conversation_id": conv.get("id"), "conversation_name": conv.get("name"),
+                                  "agent_id": aid, "agent_name": a.get("name") if aid else None})
+    else:
+        a = _find_agent(agent_id)
+        if not a: return {"error": f"agent {agent_id} not found"}
+        aid = a.get("id")
+        convs = {r.get("conv_id") for r in run_registry.list_running() if r.get("agent_id") == aid}
+        for cid in convs:
+            if mainloop.run_coro(_do_stop(cid, aid)):
+                c = _get_by("conversations", cid) or {}
+                stopped_items.append({"conversation_id": cid, "conversation_name": c.get("name"),
+                                      "agent_id": aid, "agent_name": a.get("name")})
+    if not stopped_items:
+        return {"ok": False, "stopped": [], "note": "没有正在运行的任务"}
+    return {"ok": True, "stopped": stopped_items, "count": len(stopped_items)}
+
+
+def cmd_cluster_list_running() -> dict:
+    """查看当前所有正在运行的智能体（会话、归属画布、开始时间）。"""
+    from core import run_registry
+    agent_map = _agent_display_map()
+    conv_map = {c.get("id"): c for c in _load_all("conversations")}
+    canvas_map = {c.get("id"): c for c in _load_all("canvases")}
+    out = []
+    for r in run_registry.list_running():
+        conv = conv_map.get(r.get("conv_id")) or {}
+        canvas = canvas_map.get(conv.get("canvas_id")) if conv.get("canvas_id") else None
+        out.append({
+            "conversation_id": r.get("conv_id"),
+            "conversation_name": conv.get("name"),
+            "agent_id": r.get("agent_id"),
+            "agent_name": agent_map.get(r.get("agent_id"), f"?{r.get('agent_id')}"),
+            "canvas_id": conv.get("canvas_id"),
+            "canvas_name": canvas.get("name") if canvas else None,
+            "started_at": r.get("started_at"),
+            "seq": r.get("seq"),
+        })
+    return {"running": out, "count": len(out)}
+
+
+def cmd_cluster_list_conversations(limit: int = 50) -> dict:
+    """列出会话（按活跃时间新→旧），含运行状态，供编排师了解有哪些对话、哪些正在跑。"""
+    from core import run_registry
+    items = _load_all("conversations")
+    items.sort(key=_conv_activity_ts, reverse=True)
+    agent_map = _agent_display_map()
+    canvas_map = {c.get("id"): c.get("name") for c in _load_all("canvases")}
+    running_pairs = {(r.get("conv_id"), r.get("agent_id")) for r in run_registry.list_running()}
+    running_convs = {r.get("conv_id") for r in run_registry.list_running()}
+    out = []
+    for c in items[: max(1, int(limit))]:
+        msgs = c.get("messages") or []
+        last_preview = ""
+        for m in reversed(msgs):
+            content = m.get("content")
+            if isinstance(content, str) and content.strip() and m.get("role") in ("user", "assistant"):
+                last_preview = content[:80].replace("\n", " ")
+                break
+        out.append({
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "mode": c.get("mode", "independent"),
+            "canvas_id": c.get("canvas_id"),
+            "canvas_name": canvas_map.get(c.get("canvas_id")) if c.get("canvas_id") else None,
+            "agent_ids": c.get("agent_ids", []),
+            "agent_names": [agent_map.get(i, f"?{i}") for i in (c.get("agent_ids") or [])],
+            "workdir": c.get("workdir"),
+            "execution_mode": c.get("execution_mode"),
+            "message_count": len(msgs),
+            "last_preview": last_preview,
+            "last_ts": _conv_activity_ts(c),
+            "running": c.get("id") in running_convs,
+            "running_agents": [aid for (cid, aid) in running_pairs if cid == c.get("id")],
+        })
+    return {"conversations": out, "count": len(out)}
+
+
+def cmd_cluster_get_conversation(conversation_id: int | str | None = None,
+                                 agent: int | str | None = None,
+                                 last_n: int = 30, full: bool = False) -> dict:
+    """查看对话记录。conversation_id 给定直接用；否则按 agent（id 或名称）找其最新会话。
+    默认只返回最近 30 条、每条内容截断 400 字（full=true 返回完整内容）。"""
+    if conversation_id is not None:
+        conv = _find_conversation(conversation_id)
+        if not conv: return {"error": f"conversation {conversation_id} not found"}
+    elif agent is not None:
+        a = _find_agent(agent)
+        if not a: return {"error": f"agent {agent} not found"}
+        convs = [c for c in _load_all("conversations") if a.get("id") in (c.get("agent_ids") or [])]
+        if not convs:
+            return {"error": f"智能体「{a.get('name')}」没有参与任何会话", "agent_id": a.get("id")}
+        convs.sort(key=_conv_activity_ts, reverse=True)
+        conv = convs[0]
+    else:
+        return {"error": "conversation_id 与 agent 至少给一个"}
+    agent_map = _agent_display_map()
+    canvas = _get_by("canvases", conv.get("canvas_id")) if conv.get("canvas_id") else None
+    from core import run_registry
+    running = run_registry.is_running(conv.get("id"))
+    msgs = conv.get("messages") or []
+    try:
+        n = max(1, int(last_n))
+    except Exception:
+        n = 30
+    shown = msgs[-n:] if n < len(msgs) else msgs
+    out_msgs = []
+    for idx, m in enumerate(shown):
+        start_idx = len(msgs) - len(shown)
+        content = m.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        if not full and len(content) > 400:
+            content = content[:400] + f"…（共 {len(content)} 字，full=true 查看全文）"
+        aid = m.get("agent_id") or m.get("to_agent_id")
+        out_msgs.append({
+            "index": start_idx + idx,
+            "role": m.get("role"),
+            "agent_id": aid,
+            "agent_name": agent_map.get(aid) if aid is not None else None,
+            "ts": m.get("ts"),
+            "content": content,
+        })
+    return {
+        "conversation_id": conv.get("id"), "name": conv.get("name"),
+        "mode": conv.get("mode", "independent"),
+        "canvas_id": conv.get("canvas_id"),
+        "canvas_name": canvas.get("name") if canvas else None,
+        "workdir": conv.get("workdir"), "execution_mode": conv.get("execution_mode"),
+        "running": running, "message_count": len(msgs),
+        "shown_count": len(out_msgs), "messages": out_msgs,
+    }
+
+
 def cmd_cluster_list_capabilities() -> dict:
     """返回系统中所有可用的命令、技能、插件清单（含描述信息），供编排师在创建智能体时主动配置能力。"""
     from plugins import list_plugins as _list_plugins
@@ -2676,6 +3044,115 @@ CLUSTER_TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.create_conversation",
+            "description": "新建一个会话。可绑定画布（绑定为集群协作模式，未指定工作区/运行模式时自动继承画布设置）、指定成员智能体、设置工作区绝对路径 workdir 与串/并行运行模式 execution_mode（serial=串行接力，parallel=并行并发）。「启动一张画布」的第一步：先用本命令绑画布建会话，再 cluster.continue_conversation 向画布上某个智能体发初始任务。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "可选：会话名称；绑画布且省略时自动取「画布名 · 集群」"},
+                    "canvas_id": {"type": ["integer", "string"], "description": "可选：绑定的画布 id 或名称（集群协作模式）；省略=独立对话"},
+                    "agent_ids": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "可选：会话成员智能体（id 或名称），运行时可用 cluster.continue_conversation 追加"},
+                    "workdir": {"type": "string", "description": "可选：工作区绝对路径（不存在会自动创建）；省略且绑画布时继承画布工作区"},
+                    "execution_mode": {"type": "string", "enum": ["serial", "parallel"], "description": "可选：串/并行运行模式；省略且绑画布时继承画布设置"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.update_conversation",
+            "description": "编辑一个已有会话：改名、改工作区（workdir）、切换串/并行运行模式（execution_mode）、增删成员智能体、清空对话历史。workdir / execution_mode 传空字符串表示清除（回归画布/全局默认）。不支持更换绑定的画布（需要换画布请新建会话）。conversation_id 用 cluster.list_conversations 查询。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": ["integer", "string"], "description": "会话 id"},
+                    "name": {"type": "string", "description": "可选：新会话名"},
+                    "workdir": {"type": "string", "description": "可选：新工作区绝对路径；空串=清除"},
+                    "execution_mode": {"type": "string", "enum": ["serial", "parallel"], "description": "可选：切换串/并行模式；空串=清除（回归画布默认）"},
+                    "agent_ids": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "可选：整组替换会话成员智能体"},
+                    "reset_messages": {"type": "boolean", "description": "true=清空对话历史（不删除会话）"}
+                },
+                "required": ["conversation_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.continue_conversation",
+            "description": "继续会话：向会话中的某个智能体发送消息并立即启动后台运行（该智能体不在会话成员里会自动加入）。这是「运行/启动智能体」的标准方式；画布会话中向任一节点智能体发消息即可启动整张画布的串/并行协作。可在继续时顺手传 workdir / execution_mode 切换该会话的工作区或运行模式。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": ["integer", "string"], "description": "会话 id（cluster.list_conversations 查询）"},
+                    "agent_id": {"type": ["integer", "string"], "description": "要发言的智能体 id 或名称（画布场景=从该节点启动画布）"},
+                    "message": {"type": "string", "description": "发给该智能体的消息/任务内容"},
+                    "workdir": {"type": "string", "description": "可选：继续前切换会话工作区绝对路径"},
+                    "execution_mode": {"type": "string", "enum": ["serial", "parallel"], "description": "可选：继续前切换串/并行运行模式"}
+                },
+                "required": ["conversation_id", "agent_id", "message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.stop_agent",
+            "description": "停止运行中的智能体。传 conversation_id（可选配 agent_id 精确停该会话中某个智能体；缺省停整个会话全部运行）；或只传 agent_id 停该智能体在所有会话中的运行。建议先 cluster.list_running 查看当前运行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": ["integer", "string"], "description": "可选：要停止的智能体 id 或名称"},
+                    "conversation_id": {"type": ["integer", "string"], "description": "可选：要停止的会话 id"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.list_running",
+            "description": "查看当前所有正在运行的智能体：所在会话、归属画布、开始时间。用于回答「现在谁在跑」「启动画布前/停止前先看看状态」。【不需要任何参数，留空即可】",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.list_conversations",
+            "description": "列出会话（新→旧），含每个会话的名称、绑定画布、成员智能体、工作区、串/并行模式、消息数、最后预览与运行状态。用于找 conversation_id、了解有哪些对话在进行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "可选：最多返回条数，默认 50"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.get_conversation",
+            "description": "查看某个会话的对话记录（角色、发言智能体、时间、内容）。conversation_id 直接指定；或传 agent（智能体 id/名称）自动找其最新会话。默认只取最近 30 条、内容截断 400 字；full=true 返回完整内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": ["integer", "string"], "description": "可选：会话 id"},
+                    "agent": {"type": ["integer", "string"], "description": "可选：按智能体（id 或名称）找其最新会话"},
+                    "last_n": {"type": "integer", "description": "可选：只看最近 N 条消息，默认 30"},
+                    "full": {"type": "boolean", "description": "可选：true=不截断消息内容，默认 false"}
+                },
+                "required": []
+            }
+        }
+    },
 ]
 
 # A2A 工具并入 cluster.* 工具表
@@ -2711,6 +3188,9 @@ COMMAND_GROUPS = [
         "cluster.get_canvas", "cluster.add_node", "cluster.remove_node",
         "cluster.connect", "cluster.disconnect",
         "cluster.list_rules", "cluster.create_rule", "cluster.update_rule", "cluster.delete_rule",
+        "cluster.create_conversation", "cluster.update_conversation", "cluster.continue_conversation",
+        "cluster.stop_agent", "cluster.list_running",
+        "cluster.list_conversations", "cluster.get_conversation",
     ]),
 ]
 

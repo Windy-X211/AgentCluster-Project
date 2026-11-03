@@ -31,7 +31,14 @@
     "cluster.update_group",
     "cluster.delete_group",
     "cluster.assign_agent_group",
-    "cluster.list_capabilities"
+    "cluster.list_capabilities",
+    "cluster.create_conversation",
+    "cluster.update_conversation",
+    "cluster.continue_conversation",
+    "cluster.stop_agent",
+    "cluster.list_running",
+    "cluster.list_conversations",
+    "cluster.get_conversation"
   ],
   "skills": [],
   "plugins": [],

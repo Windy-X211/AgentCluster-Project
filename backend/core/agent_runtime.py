@@ -542,6 +542,31 @@ def _sanitize_tool_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, 
     return cleaned
 
 
+def _history_llm_entry(m, mode: str, speaker_names: dict) -> dict | None:
+    """落库消息 → LLM 历史条目；返回 None 表示跳过（a2a 信封只供前端展示、损坏消息防御）。
+
+    初始组装与运行中压缩重建共用同一转换，保证两条路径产出的 LLM 历史完全一致：
+    - <continue> 标记剥离 + 超长内容截断
+    - linked 集群模式给 assistant 消息标注发言者（智能体分得清谁说了什么）
+    - 保留 tool_calls / tool_call_id（工具配对历史完整回灌）"""
+    if not isinstance(m, dict):
+        return None
+    if m.get("role") == "a2a":
+        return None
+    _m_role = m.get("role")
+    if not _m_role or _m_role not in ("system", "user", "assistant", "tool"):
+        return None
+    content = strip_continue(_truncate_history_content(m.get("content", "")))
+    if mode == "linked" and _m_role == "assistant" and m.get("agent_id") and content:
+        name = speaker_names.get(m["agent_id"])
+        if name:
+            content = f"[{name}] {content}"
+    entry = {"role": _m_role, "content": content}
+    if m.get("tool_calls"): entry["tool_calls"] = m["tool_calls"]
+    if m.get("tool_call_id"): entry["tool_call_id"] = m["tool_call_id"]
+    return entry
+
+
 def _max_tool_rounds(agent: dict | None = None) -> int:
     """工具调用最大轮数：智能体自定义 > 全局 settings.max_tool_rounds > 默认 50（最小 1）。"""
     try:
@@ -1411,32 +1436,20 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # 保存不带工作流 preamble 的核心 prompt（每轮刷新 preamble 时复用）
     _system_prompt_core = system_prompt_base
     # —— 历史上下文压缩：达到压缩线（模型窗口×阈值）时，先把较早历史压成摘要再组装 ——
-    # 压缩改写共享 conv.messages（会话级生效）：旧消息 → 一条带 compressed_summary 标记的
-    # system 摘要，最近 N 条完整对话原样保留；任何异常都不阻断本轮对话
-    from core.ctx_compress import maybe_compress
+    # 压缩是智能体级的：不改写共享 conv.messages，只写 conv.agent_compactions[agent_id]
+    # （{summary_msg, split}），该智能体视图 = [自己的摘要] + messages[split:]；
+    # 任何异常都不阻断本轮对话
+    from core.ctx_compress import maybe_compress, agent_view
     await maybe_compress(conv, agent, interface, model, system_prompt_base)
     if _wf_mode in ("plan", "spec", "goal") and _wf:
         system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})
-    for m in conv.get("messages", []):
-        # a2a 信封只用于前端展示，不进 LLM 历史（未知 role 会被接口拒绝）
-        if m.get("role") == "a2a":
-            continue
-        # 防御：跳过 role 缺失/空/非标准的损坏历史消息（旧版数据 / 序列化异常导致）
-        _m_role = m.get("role")
-        if not _m_role or _m_role not in ("system", "user", "assistant", "tool"):
-            continue
-        # tool role / tool_calls 历史也要带上（上下文中的 <continue> 标记一律剥离）
-        content = strip_continue(_truncate_history_content(m.get("content", "")))
-        if mode == "linked" and _m_role == "assistant" and m.get("agent_id") and content:
-            # 给历史消息标注发言者，让智能体分得清谁说了什么
-            name = speaker_names.get(m["agent_id"])
-            if name:
-                content = f"[{name}] {content}"
-        entry = {"role": _m_role, "content": content}
-        if m.get("tool_calls"): entry["tool_calls"] = m["tool_calls"]
-        if m.get("tool_call_id"): entry["tool_call_id"] = m["tool_call_id"]
-        messages.append(entry)
+    for m in agent_view(conv, agent.get("id")):
+        # a2a 信封只用于前端展示，不进 LLM 历史（未知 role 会被接口拒绝）；
+        # tool role / tool_calls 历史也要带上 —— 转换规则见 _history_llm_entry
+        entry = _history_llm_entry(m, mode, speaker_names)
+        if entry is not None:
+            messages.append(entry)
     messages.append({"role": "user", "content": user_input})
     # 本轮用户消息的引用：快通道在其末尾动态附加 <continue> 续跑提示（仅本次请求的
     # 内存 messages，不写入 conv）；进入慢通道时用它把提示动态剔除。
@@ -1483,7 +1496,37 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             err_line = f"RN:（接收方 {tgt.get('name', '?')} 异常：{e}）\n"
             if parent_session is not None:
                 parent_session.push(err_line)
+        finally:
+            # 接收方运行结束（正常完成/异常/被精确停止）→ 通知前端立即摘掉该节点高亮。
+            # 接收方的 DONE 行已被过滤（前端会话级 DONE 只由顶层流发一次），若不单独
+            # 通知，已停止运行的接收方节点会一直保持 speaking 高亮直到整轮结束。
+            if parent_session is not None and tgt.get("id") is not None:
+                parent_session.push(f"SPK_DONE:{tgt.get('id')}\n")
 
+    async def _drain_calls_now():
+        """并行模式专用：立即消费本智能体排队的 cluster.send_message 并当场 spawn 接收方，
+        不等本轮结束的接力阶段（否则 A 长时间跑工具时，空闲的 B 迟迟无法开始）。
+        串行模式不调用本函数（保持"发送即停 → 本轮结束 spawn"语义）。
+        复用 collect_call_targets 的预算/单对熔断，排队的消息消费后接力阶段不会再重复 spawn。"""
+        for target, d in collect_call_targets(turn, agent):
+            env = build_call_envelope(conversation_id, agent, target, d)
+            fresh = run_registry.live_conv(conversation_id) or conv
+            fresh.setdefault("messages", []).append({
+                "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
+            })
+            upsert("conversations", fresh)
+            yield f"SPEAK:{target.get('id')}\n"
+            yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
+            child_turn = dict(turn)
+            child_turn["reply_to_msg_id"] = env.get("message_id")
+            child_turn["reply_to_from"] = agent.get("id")
+            task = asyncio.create_task(_push_agent_to_queue(
+                conversation_id, target, render_envelope(env),
+                "linked", canvas, child_turn,
+            ))
+            _register_child_task(turn, task, turn.get("_run_session"), target.get("id"))
+            # 接收方独立运行，发送方不等待；标记 keepalive 避免根 finally 取消下游
+            turn["_keep_children_alive"] = True
 
     # ===== 分层自适应路由：默认快通道 =====
     # 非 linked 模式一律从快通道开始（把 <continue> 续跑提示动态附加到当前用户消息）；
@@ -1607,6 +1650,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # 所有 tool 结果已追加完毕，再统一追加图片 followup，避免在 tool 结果之间插入 user 消息
             # 破坏 "assistant.tool_calls 后必须连续 tool 消息" 的契约（DeepSeek 等严格校验会 400）
             messages.extend(_fast_img_followups)
+            # 并行模式：本轮快通道若发送了 cluster.send_message，立即 spawn 接收方（不等本轮结束）
+            if turn.get("_locked_exec_mode", "serial") == "parallel" and turn.get("calls"):
+                async for _line in _drain_calls_now():
+                    yield _line
             # 进入慢通道循环
         else:
             if _fast_upstream_error:
@@ -1704,6 +1751,43 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         # 实时检测：本轮中收集到的非法工具调用（用于流式结束后注入纠错反馈）
         _round_invalid_calls: list[dict] = []
         _upstream_error = False  # 上游返回非 200（如 400）时置位，跳过本轮后续处理
+
+        # —— 运行中压缩检查（不打断轨迹）：达到压缩线 → 压缩该智能体的历史视图 → 就地重建 LLM 上下文 → 继续本轮调用 ——
+        # 长任务多轮工具循环中上下文会持续增长，仅在轮次开头（上一轮 assistant/tool 已落库后）
+        # 检查：压缩只写 conv.agent_compactions[agent_id]（智能体级，不动共享 conv.messages），
+        # 本地 messages 用该智能体视图 + 与初始组装完全相同的规则（_history_llm_entry）重建，
+        # 模型在压缩后的历史上无缝继续当前任务。
+        # 本地独有的瞬态消息（纠错反馈/图片 followup）随压缩一并沉入摘要，重复循环会再次
+        # 触发纠错注入，不影响轨迹连续性。
+        if round_idx > 0:
+            try:
+                from core.ctx_compress import (
+                    compress_settings as _cs_fn, model_window as _mw_fn,
+                    maybe_compress as _mc, agent_view as _av,
+                    estimate_tokens as _et, estimate_message_tokens as _emt,
+                )
+                _cs = _cs_fn()
+                if _cs["enabled"]:
+                    _limit = int(_mw_fn(interface, model) * _cs["threshold"])
+                    _total = _et(messages[0].get("content")) + sum(_emt(m) for m in messages[1:])
+                    if _limit > 0 and _total > _limit:
+                        _cinfo = await _mc(conv, agent, interface, model, system_prompt_base)
+                        if _cinfo:
+                            _rebuilt = [messages[0]]
+                            for m in _av(conv, agent.get("id")):
+                                _entry = _history_llm_entry(m, mode, speaker_names)
+                                if _entry is not None:
+                                    _rebuilt.append(_entry)
+                            messages[:] = _rebuilt
+                            # 重建后历史中已无图片 followup，重置本轮起点标记
+                            _tool_round_start = len(messages)
+                            yield (f"RN:（上下文达到压缩线：已把 {_cinfo['dropped']} 条较早历史压缩为摘要，"
+                                   f"压缩前估算 {_cinfo['tokens_before']} token，继续当前任务）\n")
+                            logger.info("[agent_runtime] 运行中压缩 round=%d conv=%s dropped=%s",
+                                        round_idx, conversation_id, _cinfo['dropped'])
+            except Exception as _ce:
+                # 压缩任何异常都不打断本轮运行（保持原上下文继续）
+                logger.warning("[agent_runtime] 运行中压缩失败（忽略，继续原上下文）: %s", _ce)
 
         # —— 每轮 LLM 调用前：把之前轮次追加的图片多模态 followup 替换为占位文本 ——
         # 完整 base64 data URL 只在图片产生的当轮让 LLM 看到即可，后续轮次继续携带
@@ -1991,14 +2075,15 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                                     "via": ("parallel_send" if exec_mode == "parallel" else "serial_send"),
                                 })
                                 if exec_mode == "parallel":
-                                    # 并行：发送后不停止迭代（继续循环）→ 返回"可继续"文案
+                                    # 并行：发送后不停止迭代（继续循环）→ 返回"可继续"文案；
+                                    # 接收方在本轮工具执行完毕后立即启动（不等本轮结束）
                                     result = {
                                         "ok": True,
                                         "to": target.get("name"),
                                         "to_agent_id": to_id,
                                         "note": (
                                             f"消息发送成功：已发送给「{target.get('name')}」，"
-                                            f"你可以继续当前任务。"
+                                            f"对方将立即开始独立运行，你可以继续当前任务。"
                                         ),
                                     }
                                 else:
@@ -2056,6 +2141,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # 串/并行统一：本轮发送的消息由接力阶段 spawn 接收方独立运行。
             # 串行发送即停 → 进入收尾轮（tool_choice=none）输出结束语后结束本轮；
             # 并行发送后不停止迭代，继续 tool loop。
+            # 并行模式增强：本轮工具已执行完 → 立即消费排队的 send_message 并当场 spawn
+            # 接收方（空闲的 B 马上开始运行，不等 A 整轮结束的接力阶段）。
+            if exec_mode == "parallel" and turn.get("calls"):
+                async for _line in _drain_calls_now():
+                    yield _line
             continue
 
         # —— 无 tool_calls → 模型声称完成，进入独立验证 ——

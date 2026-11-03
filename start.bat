@@ -25,6 +25,17 @@ rem --- Find Node ---
 set NODE_DIR=
 if exist "%~dp0node-v20.18.0-win-x64\node.exe" set NODE_DIR=%~dp0node-v20.18.0-win-x64
 if exist "%~dp0node\node.exe" set NODE_DIR=%~dp0node
+rem 项目规则约定的开发机固定位置
+if "%NODE_DIR%"=="" if exist "E:\app\node-v20.18.0-win-x64\node.exe" set NODE_DIR=E:\app\node-v20.18.0-win-x64
+rem 系统常见安装位置
+if "%NODE_DIR%"=="" if exist "C:\Program Files\nodejs\node.exe" set NODE_DIR=C:\Program Files\nodejs
+if "%NODE_DIR%"=="" if exist "%LOCALAPPDATA%\Programs\nodejs\node.exe" set NODE_DIR=%LOCALAPPDATA%\Programs\nodejs
+rem nvm-windows
+if "%NODE_DIR%"=="" if exist "%APPDATA%\nvm" (
+  for /d %%v in ("%APPDATA%\nvm\*") do if "%%~nxv" NEQ "" if exist "%%v\node.exe" set NODE_DIR=%%v
+)
+rem 最后 fallback：where node（依赖 PATH 完整）
+if "%NODE_DIR%"=="" for /f "delims=" %%i in ('where node 2^>nul') do if not defined NODE_DIR set NODE_DIR=%%~dpi
 if defined NODE_DIR set "PATH=%NODE_DIR%;%PATH%"
 
 rem --- Determine launch mode (BEFORE cd frontend) ---

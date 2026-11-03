@@ -28,7 +28,8 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是「集群编排师」，一位资深的 AI
    - `cluster.add_node` 把智能体加到画布上
    - `cluster.connect` 把节点按协作顺序连起来（A→B 表示 B 依赖 A 的产出）
 4. **修改也直接来**：用户说「把 XX 智能体的提示词改一下」「给它加个浏览器能力」「让 A 直接汇报给 C」，你直接调 cluster.update_agent / add_node / connect。涉及能力变更时先 `cluster.list_capabilities` 确认当前有哪些可用。
-5. **操作完告知用户**：给一份简洁的总结，告诉用户你做了什么、当前画布状态是什么、每个智能体分配了哪些能力，附一段后续可聊的话。
+5. **运行与会话管理**：用户说「启动/运行某个智能体」「启动这张画布」「看看它在干嘛」「停掉它」，你用 cluster.create_conversation 新建会话（可绑画布、指定工作区 workdir 与串并行 execution_mode）、cluster.continue_conversation 向智能体发消息使其运行（绑画布后向任一节点发消息即启动整张画布协作）、cluster.stop_agent 停止运行、cluster.list_running / cluster.list_conversations / cluster.get_conversation 查看运行态与对话记录、cluster.update_conversation 编辑会话。
+6. **操作完告知用户**：给一份简洁的总结，告诉用户你做了什么、当前画布状态是什么、每个智能体分配了哪些能力，附一段后续可聊的话。
 
 ## 能力配置原则（非常重要！）
 
@@ -81,6 +82,12 @@ ORCHESTRATOR_CAPABILITY_CMDS = [
     "cluster.list_capabilities",
 ]
 
+# 会话 / 运行管理命令（新建/编辑/继续会话、停止智能体、查看运行态与对话记录）
+ORCHESTRATOR_RUNTIME_CMDS = [
+    "cluster.create_conversation", "cluster.update_conversation", "cluster.continue_conversation",
+    "cluster.stop_agent", "cluster.list_running", "cluster.list_conversations", "cluster.get_conversation",
+]
+
 
 def _ensure_orchestrator():
     """启动时如果没有「集群编排师」agent，就自动创建一个；已有则补齐缺失的 cluster.* 命令"""
@@ -91,7 +98,7 @@ def _ensure_orchestrator():
         ):
             # 已存在 → 确保规章制度 / 分组工具 / 能力查询工具可用
             cmds = a.get("commands") or []
-            missing = [c for c in ORCHESTRATOR_RULE_CMDS + ORCHESTRATOR_GROUP_CMDS + ORCHESTRATOR_CAPABILITY_CMDS if c not in cmds]
+            missing = [c for c in ORCHESTRATOR_RULE_CMDS + ORCHESTRATOR_GROUP_CMDS + ORCHESTRATOR_CAPABILITY_CMDS + ORCHESTRATOR_RUNTIME_CMDS if c not in cmds]
             if missing:
                 a["commands"] = cmds + missing
                 upsert("agents", a)
@@ -113,6 +120,8 @@ def _ensure_orchestrator():
             *ORCHESTRATOR_RULE_CMDS,
             # 智能体分组（agent_groups）
             *ORCHESTRATOR_GROUP_CMDS,
+            # 会话 / 运行管理（新建/编辑/继续会话、停止运行、查看对话记录等）
+            *ORCHESTRATOR_RUNTIME_CMDS,
             # 同时给基础文件能力，方便写系统提示词时参考
             "file.read", "file.write", "file.structure",
         ],
@@ -129,6 +138,10 @@ def _ensure_orchestrator():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_store()
+    # 捕获主事件循环：cluster.* 运行管理命令（启动/停止智能体）在 worker 线程执行，
+    # 需要把协程调度回本循环（run_registry.start/stop 必须在事件循环内调用）
+    from core import mainloop
+    mainloop.set(asyncio.get_running_loop())
     _ensure_orchestrator()
     # 首次启动自动安装核心功能拓展（visual_interaction 等）
     try:

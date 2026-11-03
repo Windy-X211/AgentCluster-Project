@@ -66,17 +66,98 @@ def _kill_residual(process_names):
     time.sleep(0.5)  # 等进程彻底退出
 
 
+def _find_node_dirs() -> list[str]:
+    """扫描系统所有可能的 node.exe 位置，返回包含 node.exe 的目录列表（按优先级排序）。"""
+    candidates = []
+
+    # 1. 项目内置的 node（最确定，不依赖用户机器安装）
+    candidates.append(ROOT / "node-v20.18.0-win-x64")
+    candidates.append(ROOT / "node")
+
+    # 2. 项目规则里约定的开发机 Node 位置
+    candidates.append(Path(r"E:\app\node-v20.18.0-win-x64"))
+
+    # 3. 系统常见安装位置（MSI / winget / 手动安装）
+    candidates.append(Path(r"C:\Program Files\nodejs"))
+    candidates.append(Path(r"C:\Program Files (x86)\nodejs"))
+    candidates.append(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "nodejs")
+
+    # 4. nvm-windows（用户级 Node 版本管理器）
+    nvm_root = Path(os.environ.get("APPDATA", "")) / "nvm"
+    if nvm_root.exists():
+        try:
+            for ver_dir in sorted(nvm_root.iterdir()):
+                if ver_dir.is_dir() and (ver_dir / "node.exe").exists():
+                    candidates.append(ver_dir)
+        except OSError:
+            pass
+
+    # 5. 其他包管理器
+    candidates.append(Path(os.environ.get("USERPROFILE", "")) / "scoop" / "apps" / "nodejs" / "current")
+    candidates.append(Path(os.environ.get("USERPROFILE", "")) / ".nvm" / "versions" / "node")
+
+    # 6. 从当前 os.environ["PATH"] 里解析 node.exe（如果系统 PATH 本身已经配置好了）
+    import shutil as _shutil
+    which = _shutil.which("node")
+    if which:
+        candidates.append(Path(which).resolve().parent)
+
+    # 过滤出真正有 node.exe 的目录，并去重保持顺序
+    seen = set()
+    result = []
+    for c in candidates:
+        try:
+            c = Path(c)
+        except (TypeError, ValueError):
+            continue
+        if not c or not str(c):
+            continue
+        resolved = str(c.resolve()) if c.exists() else str(c)
+        if resolved in seen:
+            continue
+        if (c / "node.exe").exists():
+            seen.add(resolved)
+            result.append(str(c))
+    return result
+
+
 def build_env() -> dict:
-    """构造 PATH 包含 node/npm 目录的环境变量。"""
+    """构造 PATH 包含 node/npm 目录的环境变量，保证开机自启的裁剪 PATH 也能找到 Node。"""
     env = os.environ.copy()
-    for node_dir in [
-        ROOT / "node-v20.18.0-win-x64",
-        ROOT / "node",
-        Path(r"E:\app\node-v20.18.0-win-x64"),
-    ]:
-        if (node_dir / "node.exe").exists():
-            env["PATH"] = str(node_dir) + os.pathsep + env.get("PATH", "")
-            break
+    node_dirs = _find_node_dirs()
+
+    if not node_dirs:
+        # 一个都没找到，把当前状态记下来方便排障（launcher.py 本身无控制台，
+        # 写进 ROOT 下的 launcher_node.log 供用户事后查看）
+        try:
+            log = ROOT / "launcher_node.log"
+            log.write_text(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 警告：未在任何候选位置找到 node.exe\n"
+                f"  当前 PATH: {env.get('PATH', '')}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        return env
+
+    # 把所有找到的 Node 目录统一前置到 PATH（多个版本时取第一个，其他供 fallback）
+    env["PATH"] = os.pathsep.join(node_dirs) + os.pathsep + env.get("PATH", "")
+
+    # 同时显式设置 NODE_PATH（有些脚本会读这个变量）
+    env["NODE_PATH"] = node_dirs[0]
+
+    # 记录命中情况（排障用）
+    try:
+        log = ROOT / "launcher_node.log"
+        log.write_text(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Node 搜索命中 {len(node_dirs)} 处:\n"
+            + "\n".join(f"  - {d}" for d in node_dirs)
+            + f"\n  PATH head: {env['PATH'][:200]}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
     return env
 
 
@@ -141,13 +222,42 @@ def ensure_electron():
 
 
 def run_build(env: dict) -> bool:
-    """执行 npm run build（阻塞等待完成），返回是否成功。"""
-    result = subprocess.run(
-        ["npm.cmd", "run", "build"],
-        cwd=str(FRONTEND),
-        env=env,
+    """执行 npm run build（阻塞等待完成），返回是否成功。
+    构建日志写到 ROOT/build_frontend.log，失败时把错误输出完整记录下来方便排障。"""
+    import time as _time
+    log_path = ROOT / "build_frontend.log"
+    header = (
+        f"===== {_time.strftime('%Y-%m-%d %H:%M:%S')} npm run build =====\n"
+        f"cwd={FRONTEND}\n"
+        f"PATH head={env.get('PATH', '')[:200]}\n\n"
     )
-    return result.returncode == 0
+    log_path.write_text(header, encoding="utf-8")
+    try:
+        result = subprocess.run(
+            ["npm.cmd", "run", "build"],
+            cwd=str(FRONTEND),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        log_path.write_text(
+            header + result.stdout + f"\n\n===== returncode={result.returncode} =====\n",
+            encoding="utf-8",
+        )
+        return result.returncode == 0
+    except FileNotFoundError as e:
+        log_path.write_text(
+            header + f"❌ npm.cmd 找不到: {e}\n"
+                     f"PATH={env.get('PATH', '')}\n",
+            encoding="utf-8",
+        )
+        return False
+    except Exception as e:
+        log_path.write_text(header + f"❌ 构建异常: {e}\n", encoding="utf-8")
+        return False
 
 
 def spawn(cmd, cwd=None, env=None):

@@ -194,6 +194,9 @@ export const api = {
     running: (id: number) => req<any>(`/conversations/${id}/running?include_base=1`),
     // 当前智能体视角的上下文长度（估算 token）与压缩线进度
     context: (id: number, agentId: number) => req<any>(`/conversations/${id}/context?agent_id=${agentId}`),
+    // 手动触发历史压缩（force=true 跳过压缩线判定；返回 compressed=false 表示无可压缩区间/摘要生成失败）
+    compress: (id: number, agentId: number, force = true) =>
+      req<any>(`/conversations/${id}/compress?agent_id=${agentId}&force=${force}`, { method: 'POST' }),
     // agentId 给定 → 只停该智能体；缺省 → 停该会话全部智能体
     stop: (id: number, agentId?: number | null) =>
       req(`/conversations/${id}/stop`, { method: 'POST', body: JSON.stringify(agentId != null ? { agent_id: agentId } : {}) }),

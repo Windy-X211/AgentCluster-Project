@@ -615,10 +615,12 @@ async function doChat(node: any) {
       execution_mode: canvas.value?.execution_mode ?? null,
     })
   } else if ((conv.canvas_id ?? null) !== canvasId) {
-    // 空会话：直接换绑本画布
+    // 空会话：直接换绑本画布（工作区随会话落盘，未设置过则继承画布当前工作区）
     await convs.update(conv.id, {
       canvas_id: canvasId,
       agent_ids: Array.from(new Set([...(conv.agent_ids || []), node.agent_id])),
+      workdir: conv.workdir ?? canvas.value?.workdir ?? null,
+      execution_mode: conv.execution_mode ?? canvas.value?.execution_mode ?? null,
     })
   } else if (!(conv.agent_ids || []).includes(node.agent_id)) {
     await convs.update(conv.id, {

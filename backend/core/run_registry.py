@@ -247,6 +247,11 @@ async def _pump(session: RunSession, conv_id: int, agent: dict, content: str, mo
         err_text = str(e).replace("\n", "\\n").replace("\r", "\\r")
         session.push(f"E:后端崩溃：{err_text}\n")
     finally:
+        # 父运行结束（正常完成/取消/异常）→ 通知前端摘掉父 agent 的节点高亮。
+        # 子任务还在跑时下方提前 return 不发 DONE，但父 agent 本身已停止运行，
+        # 高亮必须先摘掉（与"高亮=正在运行"严格一致）。
+        if session.agent_id is not None:
+            session.push(f"SPK_DONE:{session.agent_id}\n")
         # 如果还有 child_tasks 没完成（精确停止后它们继续运行），延迟清理到 child_tasks 全 done 时
         if session.child_tasks and any(not ct.done() for ct in session.child_tasks):
             # 不设 ended_at、不 push DONE，等 _on_session_children_done 回调

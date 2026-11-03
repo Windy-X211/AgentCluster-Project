@@ -1274,16 +1274,16 @@ function extractEnvelopeText(envelope: any): string {
 //     · 其它智能体 B 的 assistant/tool 输出**不进入对话区**（画布节点气泡仍按各自 agent_id 全量展示）
 //     未选中智能体（cur == null）时展示全量。左右侧由 renderItems 分段决定。
 const visibleMsgs = computed(() => {
-  const all = conv.value?.messages || []
+  const all: any[] = conv.value?.messages || []
   const cur = currentAgentId.value
   const isA2aInput = (m: any): boolean => m.role === 'user' &&
     (m.a2a_input === true || (typeof m.content === 'string' && m.content.startsWith('【A2A 协议消息】')))
-  if (cur == null) return all.filter((m: any) => !isA2aInput(m))
   const fromOf = (m: any): number | null => m.from_agent_id ?? m.envelope?.from?.agent_id ?? null
   const toOf = (m: any): number | null => m.envelope?.to?.agent_id ?? null
-  return all.filter((m: any) => {
+  const keep = (m: any): boolean => {
     // 历史压缩摘要卡片：会话级，不受智能体视角过滤
     if (m.compressed_summary) return true
+    if (cur == null) return !isA2aInput(m)
     if (m.role === 'user') return !isA2aInput(m) && (m.to_agent_id == null || m.to_agent_id === cur)
     if (m.role === 'a2a') {
       if (fromOf(m) === cur) return true                 // 当前智能体自己发出的
@@ -1291,7 +1291,22 @@ const visibleMsgs = computed(() => {
       return false
     }
     return m.agent_id === cur
-  })
+  }
+  // 过滤时保留原始下标，供压缩摘要定位（split 是共享历史下标）
+  const pairs = all.map((m: any, idx: number) => [m, idx] as const).filter(([m]) => keep(m))
+  // 注入当前智能体的压缩摘要（agent_compactions[agent_id].summary_msg，覆盖 msgs[:split]）：
+  // 插在摘要覆盖区间最后一条可见消息（= 开始压缩前的最后一条消息泡泡）之后，沿用原摘要卡片样式
+  if (cur != null) {
+    const state = (conv.value as any)?.agent_compactions?.[String(cur)]
+    const sm = state?.summary_msg
+    if (sm) {
+      const split = Math.max(0, Math.min(Number(state.split) || 0, all.length))
+      let pos = 0
+      for (let k = 0; k < pairs.length; k++) if (pairs[k][1] < split) pos = k + 1
+      pairs.splice(pos, 0, [sm, -1] as const)
+    }
+  }
+  return pairs.map(([m]) => m)
 })
 
 
@@ -2411,8 +2426,97 @@ const ctxTitle = computed(() => {
   const i = ctxInfo.value
   if (!i) return ''
   if (!i.enabled) return `上下文估算 ${fmtCtxTokens(i.tokens)} token（历史压缩已停用）`
-  return `上下文估算 ${fmtCtxTokens(i.tokens)} token / 压缩线 ${fmtCtxTokens(i.limit)}（窗口 ${fmtCtxTokens(i.window)} × ${Math.round((i.threshold ?? 0) * 100)}%）· 已达 ${Math.round((i.progress ?? 0) * 100)}%`
+  const winPct = i.window ? Math.round((i.tokens / i.window) * 100) : 0
+  const base = `上下文估算 ${fmtCtxTokens(i.tokens)} token / 上下文窗口 ${fmtCtxTokens(i.window)}（边框进度 ${winPct}%）· 压缩线 ${fmtCtxTokens(i.limit)}（窗口 × ${Math.round((i.threshold ?? 0) * 100)}%，已达 ${Math.round((i.progress ?? 0) * 100)}%）`
+  // 该智能体自身的压缩状态（智能体级压缩：摘要只对本智能体生效）
+  const compacted = i.compacted ? ` · 已压缩 ${i.compacted.count} 条早期消息` : ''
+  return base + ' · 点击立即压缩' + compacted
 })
+
+// —— 指示器可点击：随时手动触发压缩（不论是否达到压缩线），弹窗确认（发送消息时后端也会自动压缩） ——
+const ctxOverLine = computed(() => {
+  const i = ctxInfo.value
+  return !!(i?.enabled && i.limit && (i.progress ?? 0) >= 1)
+})
+const ctxCompressing = ref(false)
+async function onCtxBadgeClick() {
+  const i = ctxInfo.value
+  if (!i || !i.enabled || ctxCompressing.value) return
+  const cid = convs.current
+  const aid = currentAgentId.value
+  if (cid == null || aid == null) return
+  const tip = ctxOverLine.value
+    ? '当前上下文已达到压缩线，立即压缩历史消息？\n\n早期消息会被摘要替代，之后对话保留。'
+    : '当前上下文尚未达到压缩线，仍要立即压缩历史消息？\n\n早期消息会被摘要替代，之后对话保留。'
+  if (!confirm(tip)) return
+  ctxCompressing.value = true
+  try {
+    const res = await api.convs.compress(cid, aid)
+    if (res && res.compressed === false) {
+      // force 下仍返回 false：没有可压缩区间（历史太短）或摘要生成失败
+      alert('没有可压缩的历史区间（历史太短或摘要生成失败），本次未压缩。')
+    }
+    await convs.refreshConv(cid)
+    await refreshCtx()
+  } catch { /* 压缩失败保持原历史，静默恢复指示器 */ }
+  finally { ctxCompressing.value = false }
+}
+
+// —— ctx-badge 进度条边框：动态尺寸 + 上边中心起点顺时针 ——
+const badgeRef = ref<HTMLElement | null>(null)
+const badgeW = ref(44)
+const badgeH = ref(18)
+let badgeRo: ResizeObserver | null = null
+watch(badgeRef, (el) => {
+  if (!el) { badgeRo?.disconnect(); badgeRo = null; return }
+  const measure = () => {
+    badgeW.value = el.offsetWidth || 44
+    badgeH.value = el.offsetHeight || 18
+  }
+  measure()
+  badgeRo = new ResizeObserver(measure)
+  badgeRo.observe(el)
+})
+onBeforeUnmount(() => badgeRo?.disconnect())
+
+/** 把 5 段进度像素值转为 4 条边的 CSS 渐变样式 */
+function buildEdgeStyles(p: { topRight: number; right: number; bottom: number; left: number; topLeft: number }) {
+  const W = badgeW.value, H = badgeH.value, halfW = W / 2
+  const TRACK = 'var(--edge-track)'   // 未填充段的轨道色（随主题）
+  const EMPTY = { background: TRACK }
+  const topStyle = {
+    background: `linear-gradient(to right, var(--edge-color) ${p.topLeft}px, ${TRACK} ${p.topLeft}px) 0 0 / ${halfW}px 100% no-repeat,` +
+                `linear-gradient(to right, var(--edge-color) ${p.topRight}px, ${TRACK} ${p.topRight}px) ${halfW}px 0 / ${halfW}px 100% no-repeat`,
+  }
+  const mkV = (fill: number, dir: 'to bottom' | 'to top') => fill > 0
+    ? { background: `linear-gradient(${dir}, var(--edge-color) ${fill}px, ${TRACK} ${fill}px)` }
+    : EMPTY
+  const mkH = (fill: number, dir: 'to right' | 'to left') => fill > 0
+    ? { background: `linear-gradient(${dir}, var(--edge-color) ${fill}px, ${TRACK} ${fill}px)` }
+    : EMPTY
+  // 顺时针方向：右边自上而下、下边自右向左、左边自下而上
+  return { top: topStyle, right: mkV(p.right, 'to bottom'), bottom: mkH(p.bottom, 'to left'), left: mkV(p.left, 'to top') }
+}
+
+/** 每条边的进度像素值，起点=上边中心，顺时针：上边右半→右→下→左→上边左半 */
+const edgeStyle = computed(() => {
+  const i = ctxInfo.value
+  if (!i || !i.enabled || !i.window) return buildEdgeStyles({ topRight: 0, right: 0, bottom: 0, left: 0, topLeft: 0 })
+  // 进度比例 = 当前上下文 token / 默认上下文窗口（window），而非压缩线 limit
+  const p = Math.max(0, Math.min(1, i.tokens / i.window))
+  // 边线两端各内缩 1px（圆角端点），按实际线长计算占比
+  const W = Math.max(0, badgeW.value - 2), H = Math.max(0, badgeH.value - 2)
+  const halfW = W / 2
+  const perimeter = W * 2 + H * 2
+  let remaining = p * perimeter
+  const topRight = Math.min(remaining, halfW);  remaining -= topRight
+  const right    = Math.min(remaining, H);      remaining -= right
+  const bottom   = Math.min(remaining, W);      remaining -= bottom
+  const left     = Math.min(remaining, H);      remaining -= left
+  const topLeft  = Math.min(remaining, halfW)
+  return buildEdgeStyles({ topRight, right, bottom, left, topLeft })
+})
+
 // —— 历史压缩摘要卡片：展开查看摘要全文 ——
 const expandedCtxSummary = ref(new Set<number>())
 function toggleCtxSummary(idx: number) {
@@ -3637,8 +3741,14 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="row2">
-          <!-- 上下文长度指示：紧贴发送按钮上方（绝对定位），外框颜色 = 达到压缩线的进度（绿→黄→橙→红） -->
-          <div v-if="ctxBadgeText" class="ctx-badge" :class="'lv-' + ctxLevel" :title="ctxTitle">{{ ctxBadgeText }}</div>
+          <!-- 上下文长度指示：进度条边框，起点从上边中心顺时针走；点击（弹窗确认后）立即压缩 -->
+          <div v-if="ctxBadgeText" ref="badgeRef" class="ctx-badge" :class="['lv-' + ctxLevel, { clickable: ctxInfo?.enabled }]" :title="ctxTitle" @click="onCtxBadgeClick">
+            <span class="edge edge-top"    :style="edgeStyle?.top"></span>
+            <span class="edge edge-right"   :style="edgeStyle?.right"></span>
+            <span class="edge edge-bottom"  :style="edgeStyle?.bottom"></span>
+            <span class="edge edge-left"    :style="edgeStyle?.left"></span>
+            <span class="ctx-text">{{ ctxCompressing ? '压缩中…' : ctxBadgeText }}</span>
+          </div>
           <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true"></textarea>
           <button v-if="settings.asrAvailable && settings.asrEnabled" class="btn voice-btn" :class="{ recording: isRecording }" @click="toggleVoiceInput" :title="isRecording ? '停止同声传译' : '同声传译'" aria-label="语音输入">
             <span class="voice-icon">
@@ -4338,13 +4448,44 @@ onBeforeUnmount(() => {
 }
 
 .row2 { display: flex; gap: 6px; align-items: flex-end; position: relative; }
-/* —— 上下文长度指示（紧贴发送按钮上方）：数值外围线条包围，颜色=压缩线进度 —— */
-.ctx-badge { position: absolute; right: 0; bottom: 43px; font-family: Consolas, monospace; font-size: calc(10.5px * var(--font-scale)); line-height: 1.45; padding: 0 8px; border-radius: 5px; border: 1.5px solid; letter-spacing: .3px; user-select: none; font-variant-numeric: tabular-nums; z-index: 2; }
-.ctx-badge.lv-ok { color: #4ade80; border-color: rgba(74, 222, 128, .6); background: rgba(74, 222, 128, .07); }
-.ctx-badge.lv-warn { color: #eab308; border-color: rgba(234, 179, 8, .6); background: rgba(234, 179, 8, .07); }
-.ctx-badge.lv-warn2 { color: #fb923c; border-color: rgba(251, 146, 60, .65); background: rgba(251, 146, 60, .08); }
-.ctx-badge.lv-crit { color: #f87171; border-color: rgba(248, 113, 113, .7); background: rgba(248, 113, 113, .1); animation: ctxBadgePulse 1.6s ease-in-out infinite; }
-.ctx-badge.lv-off { color: rgba(var(--text-rgb), .5); border-color: rgba(var(--surface-rgb), .25); }
+/* —— 上下文长度指示：进度条边框，起点从上边中心顺时针走 —— */
+.ctx-badge {
+  position: absolute; right: 0; bottom: 43px;
+  display: inline-block;
+  padding: 0 8px;
+  border-radius: 6px;
+  z-index: 2;
+  --edge-color: #4ade80;
+  /* 未走完部分的轨道色：随主题文字色自动适配（各主题下都是柔和的半透明线） */
+  --edge-track: rgba(var(--text-rgb), 0.22);
+  background: rgba(var(--surface-rgb), 0.3);
+  font-family: Consolas, monospace;
+  font-size: calc(10.5px * var(--font-scale));
+  line-height: 18px;
+  letter-spacing: .3px;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+.ctx-text { position: relative; color: var(--edge-color); }
+/* 四条边线：胶囊圆角端点，未填充段用主题轨道色 */
+.edge {
+  position: absolute; background: var(--edge-track);
+  border-radius: 999px;
+  pointer-events: none;
+}
+.edge-top    { top: 0;    left: 1px;  width: calc(100% - 2px); height: 1.5px; }
+.edge-right  { top: 1px;  right: 0;  width: 1.5px;  height: calc(100% - 2px); }
+.edge-bottom { bottom: 0; left: 1px;  width: calc(100% - 2px); height: 1.5px; }
+.edge-left   { top: 1px;  left: 0;    width: 1.5px;  height: calc(100% - 2px); }
+.ctx-badge.lv-ok     { --edge-color: #4ade80; }
+.ctx-badge.lv-warn   { --edge-color: #eab308; }
+.ctx-badge.lv-warn2  { --edge-color: #fb923c; }
+.ctx-badge.lv-crit   { --edge-color: #f87171; animation: ctxBadgePulse 1.6s ease-in-out infinite; }
+.ctx-badge.lv-off    { --edge-color: rgba(var(--text-rgb), .5); }
+/* 超过压缩线：可点击立即压缩 */
+.ctx-badge.clickable { cursor: pointer; }
+.ctx-badge.clickable:hover .ctx-text { text-decoration: underline dotted; text-underline-offset: 2px; }
+.ctx-badge.clickable:hover { filter: brightness(1.15); }
 @keyframes ctxBadgePulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
 /* —— 历史压缩摘要卡片（会话级，居中） —— */
 .ctx-summary-card { align-self: center; max-width: 86%; margin: 2px 0; border: 1px dashed rgba(var(--accent2-rgb), .4); border-radius: 10px; padding: 4px 12px; font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), .65); background: rgba(var(--accent2-rgb), .05); }

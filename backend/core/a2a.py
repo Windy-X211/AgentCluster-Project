@@ -385,10 +385,14 @@ def cmd_cluster_send_message(to_agent: Any = None, message: str = "") -> dict:
         "reply_to": turn.get("reply_to_msg_id"),
     }
     turn.setdefault("calls", []).append(d)
+    # 并行模式：接收方在本轮工具执行完毕后立即被 spawn 启动（不等发送方整轮结束）；
+    # 串行模式：本轮结束后由接力阶段送达。（exec_mode 已在上方串行约束处计算）
+    _note = ("对方将立即开始独立运行，你可继续当前任务" if exec_mode == "parallel"
+             else "本轮结束后送达对方")
     return {
         "ok": True,
         "call": {"to": target.get("name"), "to_agent_id": target.get("id")},
-        "note": "已排队：本轮结束后送达对方进行发送消息（可往返多轮）。对方可用 cluster.send_message 回复你继续往返。",
+        "note": f"已发送（{_note}）。对方可用 cluster.send_message 回复你继续往返。",
     }
 
 

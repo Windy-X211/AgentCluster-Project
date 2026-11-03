@@ -3,9 +3,12 @@
 机制：
 - token 估算为本地规则（中日韩字符 ≈ 1 token/字符，ASCII ≈ 1 token/4 字符），零请求开销
 - 压缩线 = 模型上下文窗口（接口配置 model_windows，缺省用全局默认）× 全局阈值百分比
-- 达到压缩线即触发压缩：用 LLM 把较早历史总结成一条带 compressed_summary 标记的
-  system 摘要消息替换旧消息（会话历史共享，压缩对全会话生效），最近 N 条完整对话
-  原样保留；摘要生成失败则放弃压缩（保持原历史，宁超不长错）。
+- 压缩是**智能体级**的：conv.messages（集群共享历史）永不改写，每个智能体在
+  conv.agent_compactions[agent_id] 维护自己的压缩状态 {summary_msg, split}，
+  有效视图 = [自己的摘要] + messages[split:]。达到各自压缩线（按该智能体的
+  接口/模型窗口计算）才压缩：用 LLM 把自己视图中较早历史总结成一条带
+  compressed_summary 标记的 system 摘要，最近 N 条完整对话原样保留；
+  摘要生成失败则放弃压缩（保持原视图，宁超不长错）。
 """
 import json
 import logging
@@ -119,6 +122,29 @@ def compress_settings(settings: dict | None = None) -> dict:
 
 
 # ==============================================================
+# 智能体历史视图
+# ==============================================================
+def agent_view(conv: dict | None, agent_id) -> list:
+    """某智能体的有效历史视图：[自己的压缩摘要] + 共享历史未压缩部分。
+
+    压缩是智能体级的：conv.messages（集群共享历史）永不改写，每个智能体在
+    conv.agent_compactions[agent_id] 维护自己的压缩状态 {summary_msg, split}。
+    split = 该智能体已压缩到的共享历史下标（摘要覆盖 msgs[:split]）。
+    """
+    if not conv:
+        return []
+    msgs = conv.get("messages") or []
+    state = (conv.get("agent_compactions") or {}).get(str(agent_id)) or {}
+    try:
+        split = int(state.get("split", 0) or 0)
+    except (TypeError, ValueError):
+        split = 0
+    split = max(0, min(split, len(msgs)))
+    sm = state.get("summary_msg")
+    return ([sm] if sm else []) + list(msgs[split:])
+
+
+# ==============================================================
 # 上下文统计（对话区指示器数据源）
 # ==============================================================
 def assemble_context(conv: dict, agent: dict, canvas: dict | None):
@@ -135,7 +161,7 @@ def assemble_context(conv: dict, agent: dict, canvas: dict | None):
     system_prompt = _system_prompt(agent, tools, cluster_context,
                                    canvas.get("id") if canvas else None, canvas, None)
     tokens = estimate_tokens(system_prompt)
-    for m in (conv or {}).get("messages") or []:
+    for m in agent_view(conv, agent.get("id")):
         tokens += estimate_message_tokens(m)
     return {"interface": interface, "model": model, "system_prompt": system_prompt, "tokens": tokens}
 
@@ -147,6 +173,8 @@ def context_stats(conv: dict, agent: dict, canvas: dict | None) -> dict:
     window = model_window(asb["interface"], asb["model"])
     limit = int(window * cs["threshold"])
     tokens = asb["tokens"]
+    state = ((conv or {}).get("agent_compactions") or {}).get(str(agent.get("id"))) or {}
+    sm = state.get("summary_msg")
     return {
         "tokens": tokens,
         "window": window,
@@ -156,6 +184,8 @@ def context_stats(conv: dict, agent: dict, canvas: dict | None) -> dict:
         "enabled": cs["enabled"],
         "keep_recent": cs["keep_recent"],
         "model": asb["model"],
+        # 该智能体自身的压缩状态（无则为 None）
+        "compacted": ({"count": sm.get("compressed_count"), "ts": state.get("ts")} if sm else None),
     }
 
 
@@ -166,14 +196,17 @@ def _renderable(m) -> bool:
     return isinstance(m, dict) and m.get("role") in _RENDERABLE_ROLES
 
 
-async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, system_prompt: str) -> dict | None:
-    """组装 LLM 上下文前调用：达到压缩线则压缩 conv.messages 并落库，返回压缩信息。
+async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, system_prompt: str, force: bool = False) -> dict | None:
+    """组装 LLM 上下文前调用：达到压缩线则压缩该智能体的历史视图并落库，返回压缩信息。
 
-    压缩语义（会话级共享历史）：
-    - 被压缩的旧消息（含旧摘要）→ 一条新摘要消息（role=system + compressed_summary 标记）
+    force=True（手动点击指示器）跳过压缩线判定，只要存在可压缩区间就压缩。
+    压缩语义（智能体级）：conv.messages（集群共享历史）不改写，压缩状态写入
+    conv.agent_compactions[agent_id] = {summary_msg, split}：
+    - 该智能体视图中被压缩的旧消息（含旧摘要）→ 一条新摘要消息（role=system +
+      compressed_summary 标记），只对该智能体生效
     - 最近 keep_recent 条完整对话原样保留（保留段起点对齐到 user 消息边界，
       保证 assistant.tool_calls 与 tool 结果的配对不被拦腰截断）
-    - 摘要生成失败 → 返回 None，本轮不压缩（保持原历史）
+    - 摘要生成失败 → 返回 None，本轮不压缩（保持原视图）
     """
     try:
         cs = compress_settings()
@@ -184,14 +217,21 @@ async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, s
         if limit <= 0:
             return None
         msgs = conv.get("messages") or []
-        if not msgs:
+        agent_id = agent.get("id")
+        states = conv.setdefault("agent_compactions", {})
+        state = states.get(str(agent_id)) or {}
+        old_split = min(int(state.get("split", 0) or 0), len(msgs))
+        old_summary = state.get("summary_msg")
+        offset = 1 if old_summary else 0
+        view = ([old_summary] if old_summary else []) + list(msgs[old_split:])
+        if not view:
             return None
-        total = estimate_tokens(system_prompt) + sum(estimate_message_tokens(m) for m in msgs)
-        if total <= limit:
+        total = estimate_tokens(system_prompt) + sum(estimate_message_tokens(m) for m in view)
+        if total <= limit and not force:
             return None
 
         keep = cs["keep_recent"]
-        rend = [i for i, m in enumerate(msgs) if _renderable(m)]
+        rend = [i for i, m in enumerate(view) if _renderable(m)]
         # 消息条数不足保留量（历史短但单条超长的小窗口场景）→ 收缩保留量，保证仍有可压缩区间
         if len(rend) <= keep:
             keep = max(4, len(rend) // 2)
@@ -200,14 +240,14 @@ async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, s
         split = rend[-keep]
         # 保留段起点向前对齐到最近的 user 消息（tool 配对完整性）
         j = split
-        while j > 0 and msgs[j].get("role") != "user":
+        while j > 0 and view[j].get("role") != "user":
             j -= 1
-        if msgs[j].get("role") == "user":
+        if view[j].get("role") == "user":
             split = j
-        if split <= 0:
-            return None
+        if split <= offset:
+            return None  # 除旧摘要外已无可压缩的历史
 
-        dropped = msgs[:split]
+        dropped = view[:split]
         summary = await _generate_summary(interface, model, dropped, window)
         if not summary:
             return None
@@ -219,11 +259,17 @@ async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, s
             "compressed_count": len(dropped),
             "ts": datetime.utcnow().isoformat(),
         }
-        conv["messages"] = [summary_msg] + list(msgs[split:])
+        # view 下标 p（p>=offset）对应共享历史下标 old_split + (p - offset)
+        states[str(agent_id)] = {
+            "summary_msg": summary_msg,
+            "split": old_split + split - offset,
+            "ts": datetime.utcnow().isoformat(),
+        }
         upsert("conversations", conv)
-        _logger.info("conv=%s 上下文压缩：%d 条历史 → 摘要（压缩前估算 %d token，窗口 %d，压缩线 %d）",
-                     conv.get("id"), len(dropped), total, window, limit)
-        return {"dropped": len(dropped), "tokens_before": total, "window": window, "limit": limit}
+        _logger.info("conv=%s agent=%s 智能体上下文压缩：%d 条历史 → 摘要（压缩前估算 %d token，窗口 %d，压缩线 %d）",
+                     conv.get("id"), agent_id, len(dropped), total, window, limit)
+        return {"dropped": len(dropped), "tokens_before": total, "window": window,
+                "limit": limit, "agent_id": agent_id}
     except Exception as e:  # 压缩任何异常都不阻断本轮对话
         _logger.warning("上下文压缩失败（忽略，继续用原历史）：%s", e)
         return None
