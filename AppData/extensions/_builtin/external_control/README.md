@@ -95,7 +95,7 @@
 ### WebSocket
 
 ```
-ws://127.0.0.1:8000/api/ext/external_control/ws/events/{cid}?token=<token>&agent_id=<可选>
+ws://127.0.0.1:8870/api/ext/external_control/ws/events/{cid}?token=<token>&agent_id=<可选>
 ```
 
 每条消息为 JSON：`{"seq": 1, "data": "事件行"}`，结束发 `{"done": true}`。
@@ -114,27 +114,27 @@ GET /api/ext/external_control/events/{cid}?token=<token>&agent_id=<可选>
 
 ```bash
 # 查看命令清单
-curl http://127.0.0.1:8000/api/ext/external_control/info
+curl http://127.0.0.1:8870/api/ext/external_control/info
 
 # 创建智能体
-curl -X POST http://127.0.0.1:8000/api/ext/external_control/command \
+curl -X POST http://127.0.0.1:8870/api/ext/external_control/command \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"cmd":"agents.create","args":{"name":"研究员","system_prompt":"你是一名研究员"}}'
 
 # 创建画布团队（含两个智能体节点 + 一条 handoff 边）
-curl -X POST http://127.0.0.1:8000/api/ext/external_control/command \
+curl -X POST http://127.0.0.1:8870/api/ext/external_control/command \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"cmd":"canvases.create","args":{"name":"研究团队","nodes":[{"id":1,"agent_id":10,"x":100,"y":100},{"id":2,"agent_id":11,"x":300,"y":100}],"edges":[{"id":1,"from_node":1,"to_node":2,"type":"handoff"}]}}'
 
 # 创建会话并发消息
-curl -X POST http://127.0.0.1:8000/api/ext/external_control/command \
+curl -X POST http://127.0.0.1:8870/api/ext/external_control/command \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"cmd":"conversations.create","args":{"name":"测试"}}'
 # 假设返回 data.id=5
-curl -X POST http://127.0.0.1:8000/api/ext/external_control/command \
+curl -X POST http://127.0.0.1:8870/api/ext/external_control/command \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"cmd":"conversations.send","args":{"id":5,"agent_id":10,"content":"研究一下量子计算"}}'
@@ -145,7 +145,7 @@ curl -X POST http://127.0.0.1:8000/api/ext/external_control/command \
 ```python
 import requests, json
 
-BASE = "http://127.0.0.1:8000/api/ext/external_control"
+BASE = "http://127.0.0.1:8870/api/ext/external_control"
 TOKEN = open("AppData/extensions/external_control/token.txt").read().strip()
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
@@ -172,7 +172,7 @@ print(res["data"]["text"])
 import asyncio, websockets
 async def stream():
     async with websockets.connect(
-        f"ws://127.0.0.1:8000/api/ext/external_control/ws/events/{conv['id']}?token={TOKEN}"
+        f"ws://127.0.0.1:8870/api/ext/external_control/ws/events/{conv['id']}?token={TOKEN}"
     ) as ws:
         while True:
             msg = json.loads(await ws.recv())
@@ -186,7 +186,7 @@ async def stream():
 
 - **工具名**：`agentcluster_control`
 - **描述**：控制 AgentCluster 智能体集群程序：创建智能体、组建团队画布、发起对话、获取回复
-- **端点**：`POST http://127.0.0.1:8000/api/ext/external_control/command`
+- **端点**：`POST http://127.0.0.1:8870/api/ext/external_control/command`
 - **鉴权头**：`Authorization: Bearer <token>`
 - **入参**：`{cmd: string, args: object}`，cmd 取值见上表
 - **出参**：`{ok: bool, data?: any, error?: string}`
@@ -196,6 +196,48 @@ async def stream():
 ## 可视化交互
 
 本拓展为 `backend-service` 类，不直接提供 viz 渲染器。但外部 AI 控制本程序创建的智能体，其输出若含 ` ```viz:type ` 代码块，会由 `visual_interaction` 拓展正常渲染（两个拓展协同工作）。
+
+## 配套技能（给外部 AI 用）
+
+本拓展内置一份配套技能 `agentcluster-control`，位于：
+
+```
+AppData/extensions/external_control/skills/agentcluster-control/
+  SKILL.md                      ← 技能说明书（Agent Skills 开放标准格式）
+  scripts/ac_client.py          ← 轻量命令行客户端（封装 token 与 HTTP 调用）
+```
+
+这份技能是**给外部 AI 用的说明书**：外部 AI（Codex / Claude Code / DeepSeek Harness）把整个
+`skills/agentcluster-control/` 目录拷入自己的技能目录后，就会自动获得"如何控制 AgentCluster"的知识
+（命令清单、工作流、WebSocket 流式用法），无需人工解释接口。
+
+### 把技能装到外部 AI
+
+| 外部 AI | 技能目录 | 安装方式 |
+|---------|----------|----------|
+| Claude Code | `~/.claude/skills/` 或项目 `.claude/skills/` | 拷贝 `agentcluster-control/` 目录 |
+| Codex / 其他兼容 Agent Skills 的工具 | 其约定的 skills 目录 | 拷贝 `agentcluster-control/` 目录 |
+| 自定义 harness | 读取 `SKILL.md` 内容注入 system prompt | 直接把 SKILL.md 正文拼进提示词 |
+
+### 用配套脚本快速操作
+
+```bash
+# 查看命令清单
+python skills/agentcluster-control/scripts/ac_client.py info
+
+# 创建智能体（key=value，值自动转 int/bool/JSON）
+python skills/agentcluster-control/scripts/ac_client.py cmd agents.create name=研究员 system_prompt=你负责研究
+
+# 发消息拿完整回复
+python skills/agentcluster-control/scripts/ac_client.py cmd conversations.send id=5 agent_id=10 content=分析量子计算
+
+# WebSocket 实时打印智能体输出
+python skills/agentcluster-control/scripts/ac_client.py stream 5
+```
+
+环境变量：`AC_BASE`（默认 `http://127.0.0.1:8870`）、`AC_TOKEN`（默认自动读取 token.txt）。
+
+> 依赖：`pip install requests`（`stream` 子命令额外需要 `pip install websockets`）。
 
 ## 安全提示
 

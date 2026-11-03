@@ -12,7 +12,7 @@
     "source": "builtin"
   },
   "external_control": {
-    "enabled": true,
+    "enabled": false,
     "installed_at": "2026-11-02T12:58:52.481622",
     "version": "1.0.0",
     "source": "builtin"

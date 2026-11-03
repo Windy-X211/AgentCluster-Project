@@ -74,7 +74,10 @@
             "source": "builtin",
             "frontend_files": [],
             "backend_entry": "backend",
-            "system_prompt_file": "system_prompt.md"
+            "system_prompt_file": "system_prompt.md",
+            "skills": [
+                "agentcluster-control"
+            ]
         },
         {
             "id": "screen_qa",
