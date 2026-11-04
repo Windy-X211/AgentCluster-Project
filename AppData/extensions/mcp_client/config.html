@@ -302,9 +302,43 @@
     <div class="card">
         <div class="row between" style="margin-bottom: 8px">
             <b>MCP 服务器</b>
-            <button class="small primary" onclick="newServer()">+ 添加服务器</button>
+            <div class="row">
+                <button class="small" onclick="showImport()">📋 粘贴 JSON 配置</button>
+                <button class="small primary" onclick="newServer()">+ 添加服务器</button>
+            </div>
         </div>
         <div id="servers"></div>
+
+        <div id="importCard" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid #22304c">
+            <div class="row between" style="margin-bottom: 8px">
+                <b>粘贴 MCP 配置 JSON</b>
+                <button class="small" onclick="hideImport()">收起</button>
+            </div>
+            <textarea id="importText" style="min-height: 150px" placeholder='{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:\\work"]
+    },
+    "agentcluster": {
+      "type": "http",
+      "url": "http://127.0.0.1:8870/api/ext/mcp_server/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}'></textarea>
+            <div class="row" style="margin-top: 8px">
+                <button class="primary" onclick="importConfig()">解析并导入</button>
+                <button onclick="hideImport()">取消</button>
+            </div>
+            <pre id="importResult" style="display: none; margin-top: 8px"></pre>
+            <div class="hint">
+                支持标准 <code>mcpServers</code> 结构（Claude Desktop / Cursor / Codex / DeepSeek Harness），也支持单个服务器对象或数组。
+                含 <code>command</code> 走 stdio；含 <code>url</code> 走 Streamable HTTP（URL 含 <code>/sse</code> 或
+                <code>type=sse</code> 时走 SSE）；
+                <code>headers</code> / <code>env</code> / <code>timeout</code> / <code>agents</code> 原样保留。
+            </div>
+        </div>
     </div>
 
     <div class="card" id="formCard" style="display: none">
@@ -470,6 +504,102 @@
             const t = document.getElementById('fTransport').value;
             document.querySelectorAll('.stdio-only').forEach(e => e.style.display = t === 'stdio' ? '' : 'none');
             document.querySelectorAll('.net-only').forEach(e => e.style.display = t === 'stdio' ? 'none' : '');
+        }
+
+        function showImport() {
+            document.getElementById('importCard').style.display = '';
+            document.getElementById('importText').focus();
+        }
+
+        function hideImport() {
+            document.getElementById('importCard').style.display = 'none';
+            document.getElementById('importResult').style.display = 'none';
+        }
+
+        function parseMcpConfig(raw) {
+            const text = String(raw || '').trim();
+            if (!text) throw new Error('请粘贴 MCP 配置 JSON');
+            let obj;
+            try { obj = JSON.parse(text); } catch (e) { throw new Error('JSON 解析失败：' + e.message); }
+
+            let entries = [];
+            if (Array.isArray(obj)) {
+                entries = obj.map((cfg, i) => ({ key: (cfg && (cfg.name || cfg.id)) || ('server_' + (i + 1)), cfg: cfg || {} }));
+            } else if (obj && typeof obj === 'object' && obj.mcpServers && typeof obj.mcpServers === 'object') {
+                entries = Object.entries(obj.mcpServers).map(([key, cfg]) => ({ key, cfg: cfg || {} }));
+            } else if (obj && typeof obj === 'object' && (obj.command || obj.url || obj.transport)) {
+                entries = [{ key: obj.name || obj.id || 'server', cfg: obj }];
+            }
+            if (!entries.length) {
+                throw new Error('未识别到 mcpServers 配置，请粘贴包含 "mcpServers" 的 JSON');
+            }
+
+            const asObject = (v) => {
+                if (!v) return {};
+                if (typeof v === 'object' && !Array.isArray(v)) return v;
+                if (typeof v === 'string' && v.trim()) {
+                    try {
+                        const p = JSON.parse(v);
+                        return (p && typeof p === 'object' && !Array.isArray(p)) ? p : {};
+                    } catch (e) { return {}; }
+                }
+                return {};
+            };
+
+            return entries.map(({ key, cfg }) => {
+                let transport = String(cfg.transport || cfg.type || '').toLowerCase();
+                if (transport === 'streamable-http' || transport === 'streamable_http' || transport === 'streamablehttp') transport = 'http';
+                if (!transport) {
+                    transport = cfg.command ? 'stdio' : (String(cfg.url || '').toLowerCase().includes('/sse') ? 'sse' : 'http');
+                }
+                let args = [];
+                if (Array.isArray(cfg.args)) args = cfg.args.map(String);
+                else if (typeof cfg.args === 'string' && cfg.args.trim()) args = cfg.args.trim().split(/\s+/);
+                return {
+                    id: String(cfg.id || key),
+                    name: String(cfg.name || key),
+                    enabled: cfg.enabled !== false,
+                    transport: transport,
+                    command: String(cfg.command || ''),
+                    args: args,
+                    cwd: String(cfg.cwd || ''),
+                    env: asObject(cfg.env),
+                    url: String(cfg.url || ''),
+                    headers: asObject(cfg.headers),
+                    timeout: Number(cfg.timeout || cfg.call_timeout || 120) || 120,
+                    agents: cfg.agents || 'all',
+                };
+            });
+        }
+
+        async function importConfig() {
+            const resEl = document.getElementById('importResult');
+            let servers;
+            try {
+                servers = parseMcpConfig(document.getElementById('importText').value);
+            } catch (e) {
+                resEl.style.display = '';
+                resEl.textContent = e.message;
+                showMsg(e.message, false);
+                return;
+            }
+            let ok = 0;
+            const fails = [];
+            for (const s of servers) {
+                try {
+                    await api('/api/ext/mcp_client/servers', { method: 'POST', body: JSON.stringify(s) });
+                    ok += 1;
+                } catch (e) {
+                    fails.push((s.name || s.id) + '：' + e.message);
+                }
+            }
+            const summary = '导入完成：成功 ' + ok + ' 个' + (fails.length ? '，失败 ' + fails.length + ' 个' : '');
+            resEl.style.display = '';
+            resEl.textContent = summary + (fails.length ? '\n' + fails.join('\n') : '');
+            showMsg(summary, fails.length === 0);
+            if (ok) {
+                await load();
+            }
         }
 
         function newServer() {

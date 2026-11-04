@@ -26,6 +26,28 @@ function calling 列表。
 
 配置保存在本目录 `servers.json`，修改后点击「保存并重连」即可生效，无需重启后端。
 
+## 快捷导入（推荐）
+
+配置页「📋 粘贴 JSON 配置」可直接粘贴标准 `mcpServers` 片段（Claude Desktop / Cursor / Codex / DeepSeek Harness 同款格式），解析后自动识别传输方式并保存：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:\\work"]
+    },
+    "agentcluster": {
+      "type": "http",
+      "url": "http://127.0.0.1:8870/api/ext/mcp_server/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+规则：含 `command` → stdio；含 `url` → Streamable HTTP（`type: "sse"` 或 URL 含 `/sse` → SSE）；`headers` / `env` / `timeout` / `agents` 原样保留。也支持粘贴单个服务器对象或数组。
+
 ## 示例
 
 ```json
