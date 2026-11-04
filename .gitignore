@@ -49,3 +49,7 @@ Thumbs.db
 /nul
 # Launch mode preference (client/web)
 .launch_mode.txt
+# 功能拓展运行时生成文件（可能包含本地 token / 私有服务器地址）
+/AppData/extensions/*/token.txt
+/AppData/extensions/*/settings.json
+/AppData/extensions/*/servers.json

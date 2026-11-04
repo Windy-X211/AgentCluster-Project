@@ -286,7 +286,7 @@ function startDistServer() {
       distServerProc = null
     })
 
-    // 等待端口就绪（最多 10s）
+    // 等待端口就绪（最多 90s：开机冷启动时杀软扫描 node.exe 可达 1 分钟）
     let waited = 0
     const interval = setInterval(async () => {
       waited += 0.5
@@ -298,7 +298,7 @@ function startDistServer() {
           resolve()
         }
       } catch { }
-      if (waited > 10) {
+      if (waited > 90) {
         clearInterval(interval)
         reject(new Error('dist server timeout'))
       }
@@ -519,8 +519,24 @@ async function createMainWindow() {
   })
 
   // ---- 诊断日志（白屏时救命用）----
+  // 连接类失败（dist server 冷启动未就绪）→ 静默延迟重试，最多 30 次（60s）
+  // 其余失败 → 开 DevTools 让用户看到错误
+  let _loadRetry = 0
   mainWindow.webContents.on('did-fail-load', (_e, errCode, errDesc, url) => {
     _log('❌ 主窗口加载失败: ' + errCode + ' ' + errDesc + ' url=' + url)
+    const desc = String(errDesc || '')
+    const transient = !IS_DEV && (
+      desc.includes('ERR_CONNECTION_REFUSED') ||
+      desc.includes('ERR_CONNECTION_TIMED_OUT') ||
+      desc.includes('ERR_NAME_NOT_RESOLVED'))
+    if (transient && _loadRetry < 30) {
+      _loadRetry++
+      _log(`⏳ dist server 未就绪，第 ${_loadRetry}/30 次重试（2s 后）...`)
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(startURL)
+      }, 2000)
+      return
+    }
     // 自动开 DevTools 让用户看到错误
     mainWindow.webContents.openDevTools({ mode: 'detach' })
   })
@@ -1230,17 +1246,16 @@ app.whenReady().then(async () => {
     } catch (err) {
       console.warn('[Electron] Dist server 启动失败:', err.message)
       _log('Dist server failed: ' + err.message + '\n' + (err.stack || ''))
-      // 根据错误类型弹不同标题，给用户明确的引导
       const msg = err.message || String(err)
-      let title = '启动警告'
-      if (msg.includes('找不到 Node.js') || msg.includes('node.exe') || msg.includes('node')) {
-        title = 'Node.js 未找到'
-      } else if (msg.includes('dist/index.html')) {
-        title = '前端未构建'
-      } else if (msg.includes('timeout')) {
-        title = '前端服务启动超时'
+      // 超时：开机冷启动常见（杀软扫描 node.exe 可近 1 分钟），静默继续——
+      // distServerProc 未被杀仍在后台启动，主窗口加载失败会自动重试直至就绪。
+      // 严禁此处用 showMessageBoxSync：同步弹窗会阻塞主进程直到用户点确定。
+      // 仅致命配置错误（找不到 Node.js / dist 未构建）异步提示，不阻塞主进程。
+      if (!msg.includes('timeout')) {
+        try {
+          dialog.showMessageBox({ type: 'info', title: 'AgentCluster', message: `启动警告\n\n${msg}` }).catch(() => { })
+        } catch { }
       }
-      try { _dialogSync(title, msg) } catch { }
     }
   }
 

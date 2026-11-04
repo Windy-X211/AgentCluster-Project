@@ -54,7 +54,6 @@
                 "menu.html",
                 "snip.html"
             ]
-
         },
         {
             "id": "external_control",
@@ -78,6 +77,44 @@
             "skills": [
                 "agentcluster-control"
             ]
+        },
+        {
+            "id": "mcp_server",
+            "name": "MCP 服务端",
+            "version": "1.0.0",
+            "type": "backend-service",
+            "author": "AgentCluster",
+            "description": "把本程序的智能体、画布、会话与运行态能力封装为 MCP 工具，供 Claude Desktop、Cursor、Codex、DeepSeek Harness 等外部 MCP 客户端通过 Streamable HTTP 或 stdio 连接调用。Token 鉴权。",
+            "icon": "🛰️",
+            "tags": [
+                "mcp",
+                "server",
+                "integration",
+                "external"
+            ],
+            "source": "builtin",
+            "frontend_files": [],
+            "backend_entry": "backend",
+            "config_page": "config.html"
+        },
+        {
+            "id": "mcp_client",
+            "name": "MCP 客户端",
+            "version": "1.0.0",
+            "type": "hybrid",
+            "author": "AgentCluster",
+            "description": "连接外部 MCP 服务器（stdio 子进程 / Streamable HTTP / SSE），自动把对方提供的工具注入智能体的 function calling，智能体可直接调用这些外部工具。",
+            "icon": "🔗",
+            "tags": [
+                "mcp",
+                "client",
+                "tools",
+                "integration"
+            ],
+            "source": "builtin",
+            "frontend_files": [],
+            "backend_entry": "backend",
+            "config_page": "config.html"
         },
         {
             "id": "screen_qa",
@@ -130,7 +167,6 @@
                 "renderer.js"
             ],
             "status": "preview"
-
         }
     ]
 }

@@ -152,12 +152,18 @@ async def lifespan(app: FastAPI):
     # 挂载已启用拓展的后端服务路由（backend-service / hybrid 类拓展的 backend.py → /api/ext/<id>/）
     try:
         from api.extensions import mount_extension_backends
-        n = mount_extension_backends(app)
+        n = await mount_extension_backends(app)
         if n:
             print(f"[main] 已挂载 {n} 个拓展后端服务")
     except Exception as e:
         print(f"[main] 挂载拓展后端失败（不阻断启动）：{e}")
     yield
+    # 关闭拓展后端（释放托管子应用、后台连接、stdio 子进程等）
+    try:
+        from api.extensions import unmount_extension_backends
+        await unmount_extension_backends()
+    except Exception as e:
+        print(f"[main] 卸载拓展后端失败（忽略）：{e}")
 
 
 class JsonGzipMiddleware:

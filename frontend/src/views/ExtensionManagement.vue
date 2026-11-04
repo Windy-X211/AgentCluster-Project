@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api } from '@/api'
 import { loadExtensions } from '@/extensions/loader'
+import { API_BASE } from '@/utils/env'
 
 interface MarketItem {
   id: string; name: string; version: string; type: string
   author?: string; description: string; icon?: string
   tags?: string[]; source?: string; frontend_files?: string[]
-  viz_types?: string[]; status?: string
+  viz_types?: string[]; status?: string; config_page?: string
   installed?: boolean; enabled?: boolean
 }
 
@@ -16,6 +17,27 @@ const market = ref<MarketItem[]>([])
 const loading = ref(false)
 const busy = ref<string>('')   // 正在操作的拓展 id
 const toast = ref('')
+
+// 拓展自带配置页弹窗（manifest.config_page 指向拓展目录内 HTML，由拓展后端 /config 下发）
+const configTarget = ref<MarketItem | null>(null)
+
+function configURL(m: MarketItem): string {
+  if (!m.config_page) return ''
+  // 拓展后端统一路由：GET /api/ext/<id>/config（返回拓展目录内的 config_page 页面）
+  return `${API_BASE}/api/ext/${encodeURIComponent(m.id)}/config`
+}
+
+function openConfig(m: MarketItem) {
+  configTarget.value = m
+}
+function closeConfig() {
+  configTarget.value = null
+}
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && configTarget.value) closeConfig()
+}
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
 const hasInstalled = computed(() => market.value.some(m => m.installed))
 
@@ -126,6 +148,7 @@ onMounted(refresh)
             <span v-if="m.viz_types && m.viz_types.length" class="tag dim">viz: {{ m.viz_types.join(', ') }}</span>
           </div>
           <div class="ec-actions">
+            <button v-if="m.config_page" class="act" :disabled="busy === m.id" @click="openConfig(m)">配置</button>
             <button v-if="!m.enabled" class="act primary" :disabled="busy === m.id" @click="enable_(m)">启用</button>
             <button v-else class="act" :disabled="busy === m.id" @click="disable_(m)">停用</button>
             <button class="act danger" :disabled="busy === m.id" @click="uninstall(m)">卸载</button>
@@ -160,6 +183,21 @@ onMounted(refresh)
     </div>
 
     <Teleport to="body">
+      <!-- 拓展配置弹窗：加载拓展后端下发的设置页（/api/ext/<id>/config） -->
+      <div v-if="configTarget" class="ext-modal-mask" @click.self="closeConfig">
+        <div class="ext-modal">
+          <div class="em-head">
+            <span class="em-title">{{ configTarget.icon || '🧩' }} {{ configTarget.name }} · 配置</span>
+            <button class="em-close" @click="closeConfig">✕</button>
+          </div>
+          <iframe
+            :key="configTarget.id"
+            :src="configURL(configTarget)"
+            class="em-frame"
+            allow="clipboard-write"
+          />
+        </div>
+      </div>
       <div v-if="toast" class="ext-toast" @click="toast = ''">{{ toast }}</div>
     </Teleport>
   </div>
@@ -216,4 +254,31 @@ onMounted(refresh)
 .act.danger:hover { background: rgba(255,128,128,.12); }
 
 .ext-toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 10000; padding: 8px 18px; border-radius: 8px; background: rgba(20,25,40,.95); color: #fff; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,.4); cursor: pointer; }
+
+/* —— 拓展配置弹窗 —— */
+.ext-modal-mask {
+  position: fixed; inset: 0; z-index: 9999;
+  background: rgba(6, 10, 20, .62);
+  display: flex; align-items: center; justify-content: center;
+}
+.ext-modal {
+  width: min(940px, 92vw); height: min(720px, 84vh);
+  display: flex; flex-direction: column;
+  background: #0f1626; border: 1px solid rgba(255,255,255,.14);
+  border-radius: 12px; overflow: hidden;
+  box-shadow: 0 18px 48px rgba(0,0,0,.5);
+}
+.em-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px; border-bottom: 1px solid rgba(255,255,255,.09);
+  font-size: 13px; flex-shrink: 0;
+}
+.em-title { flex: 1; font-weight: 600; }
+.em-close {
+  width: 26px; height: 26px; border-radius: 6px; cursor: pointer;
+  border: 1px solid rgba(255,255,255,.16); background: transparent; color: inherit;
+  font-size: 13px; line-height: 1;
+}
+.em-close:hover { background: rgba(255,255,255,.08); }
+.em-frame { flex: 1; width: 100%; border: 0; background: #0f1626; }
 </style>

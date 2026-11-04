@@ -16,5 +16,17 @@
     "installed_at": "2026-11-02T12:58:52.481622",
     "version": "1.0.0",
     "source": "builtin"
+  },
+  "mcp_server": {
+    "enabled": true,
+    "installed_at": "2026-11-04T00:00:00",
+    "version": "1.0.0",
+    "source": "builtin"
+  },
+  "mcp_client": {
+    "enabled": true,
+    "installed_at": "2026-11-04T00:00:00",
+    "version": "1.0.0",
+    "source": "builtin"
   }
 }

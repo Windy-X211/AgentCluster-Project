@@ -717,7 +717,8 @@ def _cancel_pending_child_tasks(turn: dict | None) -> None:
 
 
 def _agent_tools(agent: dict) -> list:
-    return filter_tools(agent.get("commands", []), agent.get("plugins", []), PLUGIN_REGISTRY, agent.get("skills"))
+    return filter_tools(agent.get("commands", []), agent.get("plugins", []), PLUGIN_REGISTRY,
+                        agent.get("skills"), agent=agent)
 
 
 def _tool_capability_brief(tools: list) -> str:
@@ -973,6 +974,14 @@ def _execute_tool(name: str, arguments: dict,
                 return run_workflow_tool(name, arguments or {}, conv_id or 0, agent_id or 0)
             if name in COMMAND_META:
                 return run_command(name, **(arguments or {}))
+            # —— 外部工具（功能拓展注册，如 MCP 客户端） ——
+            # 放在命令之后、插件之前：外部工具名带专属前缀（mcp__），不会与命令冲突。
+            try:
+                from core.external_tools import owner_of as _ext_owner, dispatch as _ext_dispatch
+                if _ext_owner(name):
+                    return _ext_dispatch(name, arguments or {}, None)
+            except Exception as e:
+                return {"error": f"外部工具分发失败：{type(e).__name__}: {e}"}
             # 插件执行：注入能力参数预设的固定参数（模型不可见、不可改，固定值优先覆盖）
             from core.param_presets import get_fixed_values
             fixed = get_fixed_values("plugin", name)

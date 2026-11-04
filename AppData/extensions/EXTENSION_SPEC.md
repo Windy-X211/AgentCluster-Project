@@ -66,6 +66,7 @@ AppData/extensions/
 | `viz_types` | 否 | string[] | viz-renderer 类拓展声明的可视化类型（见第 4 节） |
 | `backend_entry` | 否 | string | backend-service 类拓展的后端入口模块名 |
 | `skills` | 否 | string[] | 拓展内置的配套技能 id 列表（对应 `skills/<id>/SKILL.md`，遵循技能规范；供外部 AI 接入或管理页展示） |
+| `config_page` | 否 | string | 拓展配置页文件名（如 `config.html`）。声明后管理页显示「配置」按钮，弹窗加载 `GET /api/ext/<id>/config` 下发的页面；页面与后端同源，可直接 fetch 拓展自有 API |
 
 ### skills · 配套技能（拓展赋能外部 AI）
 
@@ -97,6 +98,36 @@ Claude Code 等）或需要该能力说明的智能体。外部 AI 把技能目�
 | `backend-service` | 提供后端能力（打电话、屏幕共享等） | `backend.py` |
 | `ui-module` | 注入界面元素/样式 | `renderer.js` |
 | `hybrid` | 同时含前端渲染与后端服务 | `renderer.js` + `backend.py` |
+
+### backend.py 生命周期钩子（on_mount / on_unmount）
+
+除模块级 `router` 外，backend.py 可选导出：
+
+- `async def on_mount(app)`：路由挂载后调用，可挂载子应用（如 MCP 的 Streamable HTTP
+  子应用）、启动后台任务/连接池。需要托管子应用 lifespan 时在这里手动进入。
+- `on_unmount()` / `async def on_unmount()`：进程关闭时逆序调用，用于释放连接与子进程。
+
+两个钩子的异常都不会阻断主程序启动/关闭（仅打印告警）。
+
+### 外部工具提供者（拓展给智能体注入工具）
+
+拓展可通过 `core.external_tools.register_provider(...)` 把外部工具（如 MCP 服务器工具）
+注入智能体 function calling：
+
+```python
+from core.external_tools import register_provider
+
+register_provider(
+    "my_provider",
+    tools_fn=lambda agent: [openai_tool_schema, ...],   # 该智能体可见的工具
+    call_fn=lambda name, args, agent: {"ok": True, ...}, # 执行工具
+    prefix="mcp__",                                      # 工具名前缀
+)
+```
+
+- `commands.filter_tools` 在传入 `agent` 时自动合并 provider 工具（schema 原样保留）；
+- `agent_runtime._execute_tool` 会按前缀把调用分发给对应 provider；
+- provider 内部应自行检查拓展是否启用（停用后返回空工具/错误），并完成异步桥接。
 
 ## 3. renderer.js（前端渲染器）
 

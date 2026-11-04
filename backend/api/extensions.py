@@ -372,12 +372,16 @@ def _safe_entry(entry: Any) -> str | None:
     return entry[:-3] if entry.endswith(".py") else entry
 
 
-def mount_extension_backends(app: Any) -> int:
+async def mount_extension_backends(app: Any) -> int:
     """把所有已启用拓展的 backend.py 路由挂载到 /api/ext/<ext_id>/ 前缀。
 
     在 lifespan 中（init_store + auto_install 之后）调用一次：
     - 动态 import AppData/extensions/<id>/<entry>.py，取模块级 ``router``
     - include_router 挂载 /api/ext/<id> 前缀
+    - 若模块定义 ``async def on_mount(app)``，在路由挂载后调用（可挂载子应用、
+      启动拓展自有后台任务/连接池；MCP 服务端拓展用它托管 Streamable HTTP 子应用）
+    - 若模块定义 ``on_unmount()``（同步或异步），进程关闭时由
+      :func:`unmount_extension_backends` 统一调用
     - 加载失败不阻断启动（打印告警）
     返回成功挂载的拓展数。
     """
@@ -410,6 +414,28 @@ def mount_extension_backends(app: Any) -> int:
             _EXT_BACKEND_MODULES[eid] = mod
             mounted += 1
             print(f"[extensions] 已挂载拓展后端：/api/ext/{eid}/")
+            on_mount = getattr(mod, "on_mount", None)
+            if callable(on_mount):
+                ret = on_mount(app)
+                if hasattr(ret, "__await__"):
+                    await ret
+                print(f"[extensions] 拓展 {eid} on_mount 完成")
         except Exception as e:
             print(f"[extensions] 拓展 {eid} 后端加载失败（不阻断启动）：{e}")
     return mounted
+
+
+async def unmount_extension_backends() -> None:
+    """进程关闭时调用各拓展注册的 ``on_unmount``（逆序，异常不阻断）。"""
+    for eid in list(reversed(list(_EXT_BACKEND_MODULES.keys()))):
+        mod = _EXT_BACKEND_MODULES.get(eid)
+        hook = getattr(mod, "on_unmount", None)
+        if not callable(hook):
+            continue
+        try:
+            ret = hook()
+            if hasattr(ret, "__await__"):
+                await ret
+            print(f"[extensions] 拓展 {eid} on_unmount 完成")
+        except Exception as e:
+            print(f"[extensions] 拓展 {eid} on_unmount 失败（忽略）：{e}")

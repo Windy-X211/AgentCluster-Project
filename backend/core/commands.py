@@ -1882,11 +1882,15 @@ def build_plugin_tool(name: str, meta: dict) -> dict:
     }
 
 
-def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict, skills: list | None = None) -> list:
+def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict,
+                 skills: list | None = None, agent: dict | None = None) -> list:
     """根据 agent 的能力列表，构建要传给 LLM 的 tools。
 
     所有 tool 的 parameters 都强制加 additionalProperties=False，
     明确禁止 LLM 传 schema 未声明的多余字段（如凭空加 root / 空键等）。
+
+    agent 传入时额外合并「外部工具提供者」注册的工具（MCP 客户端等拓展通过
+    core.external_tools 注册；schema 原样保留，避免破坏 MCP 的 $defs/additionalProperties）。
     """
     result = []
     cmd_names = set(command_names or [])
@@ -1909,6 +1913,19 @@ def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict,
         if meta:
             tool = meta.get("function_schema") or build_plugin_tool(pname, meta)
             result.append(_seal_schema(_with_preset(tool, pname)))
+    # —— 外部工具提供者（拓展注册，如 MCP 客户端） ——
+    # 放在最后：不覆盖内建命令/插件，schema 原样注入（MCP inputSchema 可能含 $defs）。
+    if agent is not None:
+        try:
+            from core.external_tools import collect_tools
+            existing = {(t.get("function") or {}).get("name") for t in result}
+            for tool in collect_tools(agent):
+                name = (tool.get("function") or {}).get("name")
+                if name and name not in existing:
+                    result.append(tool)
+                    existing.add(name)
+        except Exception as e:  # 外部工具故障不影响内建能力
+            print(f"[commands] 收集外部工具失败：{e}")
     return result
 
 
