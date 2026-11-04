@@ -42,6 +42,13 @@ from typing import Any
 # 允许独立 import（不依赖 backend 作为包）
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+# 把插件目录加入 sys.path：本插件经 spec_from_file_location 加载（无包上下文），
+# `from . import recording_panel` 必然失败；加了 sys.path 后
+# `from recording_panel import ...` 可命中 sys.modules 缓存的同一模块实例，
+# 全局只启一个 Tk UI 线程（否则每次录制都会新建独立模块 + 独立 UI 线程）。
+_PLUGIN_DIR = str(Path(__file__).resolve().parent)
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
 
 try:
     from playwright.sync_api import sync_playwright, Page, TimeoutError as _PWTimeout
@@ -65,11 +72,13 @@ class _BrowserWorker:
         self._thread.start()
         # —— 录制状态（线程安全）——
         self._recording = False
+        self._recording_paused = False  # 暂停录制期间 append_step 会忽略新步骤
         self._recording_steps: list[dict] = []
         self._recording_meta: dict = {}   # {name, description, start_url, start_time, mode}
         self._recording_lock = threading.Lock()
         self._recording_started_at: float = 0   # Unix 时间戳，过滤录制开始前的 console 消息
-        self._recording_handlers: list = []      # 保存 Playwright handler 引用（用于 detach）
+        self._last_step_time: float = 0         # 上一步的时间戳，用于计算 wait_after
+        self._recording_handlers: list = []      # (page/context, event, fn) 三元组，teardown 精确移除
         # —— 模板目录 ——
         self._templates_dir = Path(__file__).resolve().parent / "templates"
         self._templates_dir.mkdir(parents=True, exist_ok=True)
@@ -123,14 +132,39 @@ class _BrowserWorker:
         # 处理请求
         while True:
             try:
-                req, out = self._q.get()
+                req, out = self._q.get(timeout=0.25)
                 res = self._handle(req)
                 out.put(res)
+            except _queue.Empty:
+                # 录制期间必须泵事件：Playwright sync API 的 console/framenavigated
+                # 事件只在线程处于某个 Playwright 调用内部时才分发。record_start
+                # 返回后线程若阻塞在普通队列上，用户操作产生的 __AC_REC__ console
+                # 事件会永远滞留、步骤数恒为 0。所以空闲时用 wait_for_timeout 泵。
+                if self._recording:
+                    self._pump_recording_events()
             except Exception as e:
                 try:
                     out.put({"ok": False, "data": "", "error": f"{type(e).__name__}: {e}", "current_url": self.current_url()})
                 except Exception:
                     pass
+
+    def _pump_recording_events(self) -> None:
+        """录制期间空闲泵：挑一个存活 page 做一次轻量 Playwright 调用，
+        让积压的 console / framenavigated 事件得到分发。"""
+        try:
+            page = self._page
+            if page is None or page.is_closed():
+                page = None
+                ctx = self._context
+                if ctx is not None:
+                    for p in ctx.pages:
+                        if not p.is_closed():
+                            page = p
+                            break
+            if page is not None:
+                page.wait_for_timeout(150)
+        except Exception:
+            pass
 
     def _loop_fail(self) -> None:
         while True:
@@ -711,6 +745,11 @@ class _BrowserWorker:
   // —— click（window 捕获阶段，最先触发，防页面脚本拦截）——
   window.addEventListener('click', function(e) {
     var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
+    var tn = (tgt.tagName || '').toUpperCase();
+    // 点 BODY/HTML = 点页面空白处，不是有效步骤；且 body.innerText 会把
+    // 悬浮条文字「正在录制操作模板」带进来，回放时形成一个没有选择器的
+    // click 直接报错中断 —— 必须过滤。
+    if (tn === 'BODY' || tn === 'HTML') return;
     emit({ kind:'click', selector: stableSel(tgt), text:(tgt.innerText||tgt.textContent||'').trim().slice(0,100), tag: tgt.tagName.toLowerCase() });
   }, true);
 
@@ -751,6 +790,7 @@ class _BrowserWorker:
   var lastUrl = location.href;
   function navEmit(){
     try {
+      if (window.top !== window) return;  // 只记顶层窗口的 SPA 路由，子 iframe 导航是噪音
       if (location.href === lastUrl) return;
       lastUrl = location.href;
       emit({ kind:'navigate', url: location.href });
@@ -767,24 +807,36 @@ class _BrowserWorker:
 })()""")
 
     def _user_recording_overlay_js(self) -> str:
-        """浏览器内悬浮提示条。"""
+        """浏览器内悬浮提示条。
+
+        注意：必须用 DOM API 逐节点构建，不能用 innerHTML ——
+        启用 Trusted Types 的站点（如 B 站）会抛
+        "Failed to set the 'innerHTML' property: This document requires 'TrustedHTML' assignment"。
+        """
         return (r"""(function(){
   if (document.getElementById('__ac_rec_overlay__')) return;
-  const div = document.createElement('div');
+  var mount = document.body || document.documentElement;
+  if (!mount) return;
+  var div = document.createElement('div');
   div.id = '__ac_rec_overlay__';
-  div.innerHTML = '<span class="dot">●</span><span class="txt">正在录制操作模板</span>';
-  const st = div.style;
+  var dot = document.createElement('span');
+  dot.textContent = '●';
+  dot.style.cssText = 'font-size:11px;animation:acRecPulse 1.2s infinite;';
+  var txt = document.createElement('span');
+  txt.textContent = '正在录制操作模板';
+  txt.style.cssText = 'font-weight:500;';
+  var st = div.style;
   st.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;'
                'background:rgba(231,76,60,0.92);color:#fff;padding:8px 14px;'
                'border-radius:8px;font-size:13px;font-family:system-ui,-apple-system,sans-serif;'
                'box-shadow:0 4px 16px rgba(0,0,0,0.25);cursor:default;user-select:none;'
                'display:flex;align-items:center;gap:8px;';
-  div.querySelector('.dot').style.cssText = 'font-size:11px;animation:pulse 1.2s infinite;';
-  div.querySelector('.txt').style.cssText = 'font-weight:500;';
-  const kf = '@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}';
-  const st2 = document.createElement('style'); st2.textContent = kf;
-  document.head.appendChild(st2);
-  document.body.appendChild(div);
+  div.appendChild(dot);
+  div.appendChild(txt);
+  var st2 = document.createElement('style');
+  st2.textContent = '@keyframes acRecPulse{0%,100%{opacity:1}50%{opacity:0.3}}';
+  (document.head || mount).appendChild(st2);
+  mount.appendChild(div);
 })()""")
 
     def _user_recording_teardown_js(self) -> str:
@@ -819,6 +871,9 @@ class _BrowserWorker:
             "_kind": kind,
         }
         if kind == "click":
+            # 没有选择器的 click（点 BODY/HTML 空白处）无法回放，丢弃
+            if not payload.get("selector"):
+                return None
             step["action"] = "click"
         elif kind == "type":
             step["action"] = "type"
@@ -838,6 +893,44 @@ class _BrowserWorker:
         with self._recording_lock:
             if not self._recording:
                 return
+            # 暂停期间不录制新步骤
+            if self._recording_paused:
+                return
+
+            # —— navigate 去重保护 ——
+            # 原因：JS 监听器的 pushState 和其他入口（如直接改 location）
+            # 可能在短时间内重复 emit 同一个 URL。此外用户快速连续操作也可能
+            # 产生连续 navigate。规则：
+            #   1. 如果最新一步已经是 navigate 且 URL 完全相同 → 跳过
+            #   2. 如果当前 step 是 navigate，而上一步是 click（间隔 < 3s）→ 跳过
+            #      因为 click 本身已经会触发跳转，回放时会自然到达目标页
+            now = _time.time()
+            action = step.get("action", "")
+            if action == "navigate":
+                url = step.get("url") or step.get("url_after") or ""
+                # 检查步骤列表尾部的已有步骤
+                n = len(self._recording_steps)
+                if n > 0:
+                    last = self._recording_steps[-1]
+                    # 规则 1：同 URL navigate 去重
+                    if last.get("action") == "navigate":
+                        last_url = last.get("url") or last.get("url_after") or ""
+                        if url and url == last_url:
+                            return  # 重复，跳过
+                    # 规则 2：上一步是 click，且间隔 < 3s —— 说明是 click 触发的跳转
+                    # 回放时 click 执行后页面会自动跳到这个 URL，不需要额外 navigate
+                    if last.get("action") == "click":
+                        # 通过 wait_after 判断间隔
+                        gap_ms = int(last.get("wait_after") or 0)
+                        if gap_ms < 3000:
+                            return  # click 自带跳转，跳过这个 navigate
+
+            # 计算与上一步的间隔（毫秒）
+            wait_after = 0
+            if self._last_step_time > 0:
+                wait_after = int((now - self._last_step_time) * 1000)
+            self._last_step_time = now
+            step["wait_after"] = wait_after
             step["index"] = len(self._recording_steps)
             self._recording_steps.append(step)
 
@@ -863,6 +956,7 @@ class _BrowserWorker:
 
         with self._recording_lock:
             self._recording = True
+            self._recording_paused = False
             self._recording_steps = []
             self._recording_meta = {
                 "name": name, "description": description,
@@ -871,34 +965,10 @@ class _BrowserWorker:
                 "mode": mode,
             }
             self._recording_started_at = _time.time()
+            self._last_step_time = 0
 
-        # —— 注入监听器（两重保险：add_init_script 跨导航 + 当前页面立即注入）——
-        try:
-            init_script = self._user_recording_listeners_js()
-            _sl = lambda s: s.encode("ascii", "replace").decode("ascii") if s else s
-            print(f"[browser_control] injecting recording listeners, context={self._context}, pages={len(self._context.pages) if self._context else 0}")
-            if self._context is not None:
-                self._context.add_init_script(init_script)
-                print("[browser_control] [OK] add_init_script set")
-            injected_count = 0
-            for p in (self._context.pages if self._context else []):
-                for frame in p.frames:
-                    try:
-                        frame.evaluate(init_script)
-                        injected_count += 1
-                    except Exception as e:
-                        print(f"[browser_control] frame evaluate failed ({_sl((frame.url or '')[:60])}): {e}")
-            print(f"[browser_control] [OK] listeners injected into {injected_count} frames")
-            for p in (self._context.pages if self._context else []):
-                try:
-                    p.evaluate(self._user_recording_overlay_js())
-                    print(f"[browser_control] [OK] overlay injected into {_sl((p.url or '')[:60])}")
-                except Exception as e:
-                    print(f"[browser_control] overlay inject failed: {e}")
-        except Exception as e:
-            return {"ok": False, "error": f"注入录制监听器失败：{e}"}
-
-        # —— 给所有现有 page 挂 console 监听器 ——
+        # —— 给所有现有 page 挂 console 监听器（必须先于注入：注入的 JS 会立刻
+        #     发心跳 console.log，先挂 handler 才能在日志里确认链路通、不丢事件）——
         # 重要：Windows 控制台是 gbk，B 站页面自身的中文 console 输出会让
         # print() 抛 UnicodeEncodeError。所以先判断 PREFIX 再打印，
         # 打印也必须包 try——否则一个中文噪音就把整条 __AC_REC__ 消息吞掉。
@@ -932,57 +1002,100 @@ class _BrowserWorker:
                 except Exception:
                     pass
 
-        def _on_nav(page_obj, url):
+        def _on_nav(page_obj, frame):
+            """framenavigated handler —— 只负责导航后重新注入 overlay，
+            不再追加 navigate step（navigate 记录完全交给 JS 监听器的 pushState/
+            location change 检测，避免同一 URL 被重复记录两次）。"""
             try:
-                print(f"[browser_control] navigated: {url}")
+                if frame is not page_obj.main_frame:
+                    return
+                url = frame.url or ""
+            except Exception:
+                return
+            try:
+                print(f"[browser_control] navigated (skip record): {url}")
             except Exception:
                 pass
             if not self._recording:
                 return
-            with self._recording_lock:
-                if not self._recording:
-                    return
-            self._append_step({
-                "index": 0,
-                "action": "navigate",
-                "url": url,
-                "url_before": "",
-                "url_after": url,
-                "selector": "",
-                "stable_selector": "",
-                "text": "",
-                "coordinate": None,
-                "annotation": "",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            })
             # 导航后重新注入 overlay（页面重建了 DOM）
             try:
                 page_obj.evaluate(self._user_recording_overlay_js())
             except Exception:
                 pass
 
+        def _attach_page_handlers(p) -> None:
+            """给单个 page 挂 console/framenavigated handler，并按 (page, event, fn)
+            三元组精确登记，保证 teardown 能一一对应移除（不泄漏、不重复）。"""
+            try:
+                p.on("console", _on_console)
+                self._recording_handlers.append((p, "console", _on_console))
+            except Exception:
+                pass
+            try:
+                fn_nav = lambda u, _p=p: _on_nav(_p, u)  # noqa: E731
+                p.on("framenavigated", fn_nav)
+                self._recording_handlers.append((p, "framenavigated", fn_nav))
+            except Exception:
+                pass
+
         with self._recording_lock:
-            # 清理旧 handler（避免多次 record_start 累积）
-            for p in (self._context.pages if self._context else []):
+            # 精确清理旧 handler（避免多次 record_start 累积 / 错位）
+            for target, event, fn in list(self._recording_handlers):
                 try:
-                    p.remove_listener("console", self._recording_handlers.pop(0))
-                except Exception:
-                    pass
-                try:
-                    p.remove_listener("framenavigated", self._recording_handlers.pop(0))
+                    target.remove_listener(event, fn)
                 except Exception:
                     pass
             self._recording_handlers.clear()
-            # 挂新 handler
             if self._context is not None:
-                for p in self._context.pages:
+                # 用户录制中新开的标签页也要有监听器
+                def _on_new_page(new_p):
+                    if not self._recording:
+                        return
+                    _attach_page_handlers(new_p)
                     try:
-                        p.on("console", _on_console)
-                        self._recording_handlers.append(_on_console)
-                        p.on("framenavigated", lambda u, _p=p: _on_nav(_p, u))
-                        self._recording_handlers.append(_on_nav)
+                        init_script = self._user_recording_listeners_js()
+                        for frame in new_p.frames:
+                            try:
+                                frame.evaluate(init_script)
+                            except Exception:
+                                pass
+                        new_p.evaluate(self._user_recording_overlay_js())
                     except Exception:
                         pass
+                try:
+                    self._context.on("page", _on_new_page)
+                    self._recording_handlers.append((self._context, "page", _on_new_page))
+                except Exception:
+                    pass
+                for p in self._context.pages:
+                    _attach_page_handlers(p)
+
+        # —— 注入监听器（两重保险：add_init_script 跨导航 + 当前页面立即注入）——
+        try:
+            init_script = self._user_recording_listeners_js()
+            _sl = lambda s: s.encode("ascii", "replace").decode("ascii") if s else s
+            print(f"[browser_control] injecting recording listeners, context={self._context}, pages={len(self._context.pages) if self._context else 0}")
+            if self._context is not None:
+                self._context.add_init_script(init_script)
+                print("[browser_control] [OK] add_init_script set")
+            injected_count = 0
+            for p in (self._context.pages if self._context else []):
+                for frame in p.frames:
+                    try:
+                        frame.evaluate(init_script)
+                        injected_count += 1
+                    except Exception as e:
+                        print(f"[browser_control] frame evaluate failed ({_sl((frame.url or '')[:60])}): {e}")
+            print(f"[browser_control] [OK] listeners injected into {injected_count} frames")
+            for p in (self._context.pages if self._context else []):
+                try:
+                    p.evaluate(self._user_recording_overlay_js())
+                    print(f"[browser_control] [OK] overlay injected into {_sl((p.url or '')[:60])}")
+                except Exception as e:
+                    print(f"[browser_control] overlay inject failed: {e}")
+        except Exception as e:
+            return {"ok": False, "error": f"注入录制监听器失败：{e}"}
 
         # —— 弹出 Python 录制面板（独立于主应用和浏览器）——
         _panel_error = None
@@ -1020,17 +1133,12 @@ class _BrowserWorker:
         """停止录制：清理 handler + 浏览器内悬浮条 + add_init_script。"""
         if self._context is None:
             return
-        # detach handlers
-        for p in self._context.pages:
-            for h in self._recording_handlers:
-                try:
-                    p.remove_listener("console", h)
-                except Exception:
-                    pass
-                try:
-                    p.remove_listener("framenavigated", h)
-                except Exception:
-                    pass
+        # detach handlers（按 (target, event, fn) 三元组精确移除，含 context 级 page 监听）
+        for target, event, fn in list(self._recording_handlers):
+            try:
+                target.remove_listener(event, fn)
+            except Exception:
+                pass
         self._recording_handlers.clear()
         # 移除浏览器内悬浮条
         try:
@@ -1057,10 +1165,11 @@ class _BrowserWorker:
     def _record_status(self) -> dict:
         with self._recording_lock:
             if not self._recording:
-                return {"recording": False, "steps": [], "meta": {}}
+                return {"recording": False, "paused": False, "steps": [], "meta": {}}
             steps_copy = [dict(s) for s in self._recording_steps]
             meta_copy = dict(self._recording_meta)
-        return {"recording": True, "steps": steps_copy, "meta": meta_copy}
+            paused = self._recording_paused
+        return {"recording": True, "paused": paused, "steps": steps_copy, "meta": meta_copy}
 
     def _record_step_annotate(self, req: dict) -> dict:
         idx = int(req.get("step_index", -1))
@@ -1101,6 +1210,46 @@ class _BrowserWorker:
                 s["index"] = i
         return {"ok": True, "new_order": new_order}
 
+    def _record_step_set_wait(self, req: dict) -> dict:
+        """设置某步的 wait_after（毫秒）。"""
+        idx = int(req.get("step_index", -1))
+        try:
+            wait_ms = int(req.get("wait_after", 0))
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "wait_after 必须是整数（毫秒）"}
+        if wait_ms < 0:
+            wait_ms = 0
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": False, "error": "当前没有正在进行的录制"}
+            if 0 <= idx < len(self._recording_steps):
+                self._recording_steps[idx]["wait_after"] = wait_ms
+                return {"ok": True, "step_index": idx, "wait_after": wait_ms}
+        return {"ok": False, "error": f"step_index {idx} 越界（共 {len(self._recording_steps)} 步）"}
+
+    def _record_pause(self) -> dict:
+        """暂停录制（已录步骤保留，暂停期间新的用户操作不会被记录）。"""
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": False, "error": "当前没有正在进行的录制"}
+            if self._recording_paused:
+                return {"ok": True, "_note": "已处于暂停状态"}
+            self._recording_paused = True
+        print("[browser_control] recording PAUSED")
+        return {"ok": True, "paused": True}
+
+    def _record_resume(self) -> dict:
+        """恢复录制。"""
+        with self._recording_lock:
+            if not self._recording:
+                return {"ok": False, "error": "当前没有正在进行的录制"}
+            if not self._recording_paused:
+                return {"ok": True, "_note": "已处于录制中"}
+            self._recording_paused = False
+            self._last_step_time = 0  # 恢复后第一步的间隔重新计算
+        print("[browser_control] recording RESUMED")
+        return {"ok": True, "paused": False}
+
     def _record_complete(self, req: dict) -> dict:
         template_name = (req.get("template_name") or req.get("record_name") or "").strip()
         description = (req.get("record_description") or "").strip()
@@ -1111,8 +1260,10 @@ class _BrowserWorker:
             meta_copy = dict(self._recording_meta)
             final_url = self.current_url()
             self._recording = False
+            self._recording_paused = False
             self._recording_steps = []
             self._recording_meta = {}
+            self._last_step_time = 0
         self._teardown_user_recording()
         if template_name:
             meta_copy["name"] = template_name
@@ -1150,8 +1301,10 @@ class _BrowserWorker:
             if not self._recording:
                 return {"ok": True, "_note": "当前没有正在进行的录制"}
             self._recording = False
+            self._recording_paused = False
             self._recording_steps = []
             self._recording_meta = {}
+            self._last_step_time = 0
         self._teardown_user_recording()
         return {"ok": True, "_note": "录制已取消，步骤已丢弃。"}
 
@@ -1201,7 +1354,8 @@ class _BrowserWorker:
         if found_path is None:
             return {"ok": False, "error": f"未找到模板：{name}"}
         try:
-            data = _json.loads(found_path.read_text(encoding="utf-8"))
+            # utf-8-sig：兼容带 BOM 的文件（手编辑/外部工具改写模板时常见）
+            data = _json.loads(found_path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             return {"ok": False, "error": f"模板读取失败：{e}"}
         return {"ok": True, "template": data, "path": str(found_path)}
@@ -1222,7 +1376,11 @@ class _BrowserWorker:
     def _template_run(self, req: dict) -> dict:
         """依次执行模板中的每一步（navigate → click → type → coordinate_click）。
         每一步调用 worker 内部的 _handle 方法。
-        回放期间临时禁用录制捕获（避免把回放步骤录进当前录制会话）。"""
+        回放期间临时禁用录制捕获（避免把回放步骤录进当前录制会话）。
+        使用步骤自带的 wait_after（毫秒）作为步骤间等待，默认 1000ms。
+
+        回放前会预处理 steps：如果某个 navigate 紧邻 click（间隔 < 3s），
+        说明是 click 触发的跳转，回放时跳过这个 navigate（click 本身会触发跳转）。"""
         load_res = self._template_load(req)
         if not load_res.get("ok"):
             return load_res
@@ -1230,6 +1388,30 @@ class _BrowserWorker:
         steps = template.get("steps", [])
         if not steps:
             return {"ok": False, "error": "模板没有步骤"}
+
+        # —— 回放前预处理：标记可跳过的 navigate ——
+        # 场景：navigate 被 framenavigated 记录了，同时 click 也被正确记录了，
+        # 回放时 navigate 先跳到目标 URL，然后 click 在新页面上找不到元素就报错。
+        # 规则：如果 navigate 的 wait_after < 3000ms（说明紧跟某个操作），且
+        #   (a) 它前面是 click → skip（click 本身触发了跳转）
+        #   (b) 它后面紧跟着 click → skip（click 在 navigate 之前就该执行）
+        skip_indices: set[int] = set()
+        for i in range(len(steps)):
+            s = steps[i]
+            if s.get("action") != "navigate":
+                continue
+            gap = int(s.get("wait_after") or 0)
+            prev_action = steps[i - 1].get("action") if i > 0 else None
+            next_action = steps[i + 1].get("action") if i + 1 < len(steps) else None
+            if prev_action == "click" and gap < 3000:
+                # click 触发的跳转 → 跳过 navigate
+                skip_indices.add(i)
+            elif next_action == "click" and gap == 0:
+                # navigate 记录顺序不对（应该先 click 再 navigate）→ 跳过 navigate，
+                # click 本身已经会处理跳转
+                skip_indices.add(i)
+        if skip_indices:
+            print(f"[browser_control] template_run: skip {len(skip_indices)} redundant navigate steps: {sorted(skip_indices)}")
 
         results = []
         # 确保有 page
@@ -1241,21 +1423,38 @@ class _BrowserWorker:
         except Exception as e:
             return {"ok": False, "error": f"启动浏览器失败：{e}"}
 
+        # 允许用户通过参数覆盖默认等待时间
+        default_wait_ms = int(req.get("default_wait_ms", 1000))
+
         # —— 临时禁用录制捕获 ——
         with self._recording_lock:
             _prev_recording = self._recording
             self._recording = False
         try:
             for i, step in enumerate(steps):
+                # 跳过预处理标记的冗余 navigate
+                if i in skip_indices:
+                    results.append({"step": i, "action": step.get("action", ""), "ok": True,
+                                    "skipped": True, "note": "冗余 navigate（click 自带跳转）"})
+                    continue
+
                 action = step.get("action", "")
                 step_req: dict = {}
                 if action == "navigate":
                     step_req = {"action": "navigate", "url": step.get("url") or step.get("url_after") or ""}
                 elif action == "click":
                     sel = step.get("stable_selector") or step.get("selector") or ""
+                    if not sel.strip():
+                        results.append({"step": i, "action": action, "ok": True, "skipped": True,
+                                        "note": "无选择器（页面空白处误录），已跳过"})
+                        continue
                     step_req = {"action": "click", "selector": sel}
                 elif action == "type":
                     sel = step.get("stable_selector") or step.get("selector") or ""
+                    if not sel.strip():
+                        results.append({"step": i, "action": action, "ok": True, "skipped": True,
+                                        "note": "无选择器（误录步骤），已跳过"})
+                        continue
                     step_req = {"action": "type", "selector": sel, "text": step.get("text", "")}
                 elif action == "coordinate_click":
                     coord = step.get("coordinate") or {}
@@ -1268,12 +1467,44 @@ class _BrowserWorker:
                     results.append({"step": i, "action": action, "ok": False, "error": f"跳过未知 action: {action}"})
                     continue
                 step_req.setdefault("timeout", req.get("timeout", 15))
+                step_req.setdefault("visible", True)
                 r = self._handle(step_req)
                 results.append({"step": i, "action": action, **r})
                 if not r.get("ok"):
                     return {"ok": False, "error": f"步骤 {i}({action}) 失败：{r.get('error','')}",
                             "results": results, "failed_at_step": i}
-                page.wait_for_timeout(300)
+                page = self._page  # 刷新引用
+
+                # —— 步骤间等待 ——
+                wait_ms = int(step.get("wait_after") or 0)
+                if wait_ms <= 0:
+                    wait_ms = default_wait_ms
+
+                # navigate 后额外等待页面加载完成
+                if action == "navigate":
+                    try:
+                        # 优先等 networkidle（网络完全空闲），超时再用 domcontentloaded
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        try:
+                            page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        except Exception:
+                            pass
+                # click 后如果页面可能导航，也等一下
+                elif action == "click":
+                    try:
+                        # 短暂等待是否会发生导航（监听 load 事件）
+                        page.wait_for_load_state("domcontentloaded", timeout=3000)
+                    except Exception:
+                        # 没导航（SPA 或 AJAX 更新），不报错
+                        pass
+
+                # 使用步骤自己的 wait_after 额外等待
+                if wait_ms > 0:
+                    try:
+                        page.wait_for_timeout(wait_ms)
+                    except Exception:
+                        pass
         except Exception as e:
             return {"ok": False, "error": f"执行异常：{type(e).__name__}: {e}", "results": results}
         finally:
@@ -1313,6 +1544,15 @@ class _BrowserWorker:
 
         if action == "record_cancel":
             return self._record_cancel()
+
+        if action == "record_pause":
+            return self._record_pause()
+
+        if action == "record_resume":
+            return self._record_resume()
+
+        if action == "record_step_set_wait":
+            return self._record_step_set_wait(req)
 
         if action == "record_template_list":
             return self._template_list()

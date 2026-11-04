@@ -94,6 +94,10 @@ export interface RichMsg {
    *  type="data_url" → src 是 data:image/...base64 直接渲染
    *  type="file" → src 是本地绝对路径，前端通过 /api/fs/image 加载 */
   image_refs?: Array<{ type: 'data_url' | 'file'; src: string }>
+  /** agent.spawn 的子智能体运行事件（运行中由 SUB: 行实时追加；
+   *  历史会话由 tool 消息 sub_process 字段经 hydrateHistoryMsgs 恢复），
+   *  事件格式：{t:'round',n,of} | {t:'call',name,args_preview} | {t:'done',name,ok,preview} | {t:'note',text} */
+  sub_process?: any[]
 }
 
 // —— 简化 cron 匹配：5 字段（分 时 日 月 周），支持 * , - / ——
@@ -395,6 +399,13 @@ export function toolLabel(name: string | undefined, args?: any): string {
     return '🔧 调用技能'
   }
 
+  // agent.spawn → 显示派生的子智能体名称（类似 skill.invoke 显示具体技能名）
+  if (clean === 'agent.spawn') {
+    const sn = args && typeof args === 'object' ? String(args.name || '').trim() : ''
+    if (sn) return '🐣 子智能体 · ' + sn
+    return '🐣 派生子智能体'
+  }
+
   if (SPECIAL_TOOL_LABELS[clean]) return SPECIAL_TOOL_LABELS[clean]
   const meta = _resolveToolMeta(clean)
   if (meta?.label) {
@@ -542,8 +553,12 @@ function _stampRaw(m: any, rawIdx: number): any {
 
 /** 段内合成一对 tool_call/tool_result 并推入 out（agent_id 归属所属 assistant） */
 function _pushSynthPair(out: any[], tcId: string, name: string, args: any, result: any,
-                        images: any[] | null, agentId: number | undefined, ts: string | undefined) {
-  out.push({ role: 'tool_call', content: '', name, tool_call_id: tcId, args: args || {}, ts, agent_id: agentId ?? undefined })
+  images: any[] | null, agentId: number | undefined, ts: string | undefined,
+  subProcess?: any[] | null) {
+  const tcMsg: any = { role: 'tool_call', content: '', name, tool_call_id: tcId, args: args || {}, ts, agent_id: agentId ?? undefined }
+  // agent.spawn 的子智能体运行事件（后端落库在 tool 消息 sub_process 字段）→ 挂回合成 tool_call
+  if (Array.isArray(subProcess) && subProcess.length) tcMsg.sub_process = subProcess
+  out.push(tcMsg)
   const rMsg: any = { role: 'tool_result', content: '', tool_call_id: tcId, result: result ?? {}, ts, agent_id: agentId ?? undefined }
   if (Array.isArray(images) && images.length) rMsg.image_refs = images
   out.push(rMsg)
@@ -582,7 +597,7 @@ export function hydrateHistoryMsgs(raw: any[]): any[] {
           _pushSynthPair(out,
             t?.m?.tool_call_id || `hist-${k}-${nextTool}`,
             h?.name || '?', h?.args || {}, h?.result ?? {},
-            t?.m?.images || null, m.agent_id, m.ts)
+            t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null)
         }
       } else if (!hasFinal && Array.isArray(m.tool_calls) && m.tool_calls.length) {
         // 无最终回复的段（运行中断）：按中间轮 OpenAI tool_calls 精确 id 配对
@@ -597,7 +612,7 @@ export function hydrateHistoryMsgs(raw: any[]): any[] {
           let result: any = {}
           const rc = t?.m?.content
           if (rc != null) { try { result = JSON.parse(rc) } catch { result = { _raw: rc } } }
-          _pushSynthPair(out, tcId, tc?.function?.name || '?', args, result, t?.m?.images || null, m.agent_id, m.ts)
+          _pushSynthPair(out, tcId, tc?.function?.name || '?', args, result, t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null)
         }
       }
     }
@@ -1685,6 +1700,22 @@ export const useConvStore = defineStore('conv', {
           const hasOpen = !!own && !(own.content || '').trim()
           if (!hasOpen) {
             msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), agent_id: curAgent ?? undefined })
+          }
+        }
+      } else if (line.startsWith('SUB:')) {
+        // 子智能体运行事件（agent.spawn 工具执行中实时发来）：tcId|{json ev}
+        // 按工具调用归属：把事件追加到对应 tool_call 消息的 sub_process 数组，
+        // 工具详情展开区的「子智能体过程」框实时渲染；历史会话由 tool 消息
+        // 的 sub_process 字段（落库时写入）经 hydrateHistoryMsgs 恢复。
+        const rest = line.slice(4); const sep = rest.indexOf('|')
+        const tcId = rest.slice(0, sep), evJson = rest.slice(sep + 1)
+        let ev: any = null
+        try { ev = JSON.parse(evJson) } catch { ev = null }
+        if (ev && typeof ev === 'object') {
+          const tc = msgs.find((m: RichMsg) => m.role === 'tool_call' && m.tool_call_id === tcId)
+          if (tc) {
+            if (!Array.isArray(tc.sub_process)) tc.sub_process = []
+            tc.sub_process.push(ev)
           }
         }
       } else if (line.startsWith('I:')) {

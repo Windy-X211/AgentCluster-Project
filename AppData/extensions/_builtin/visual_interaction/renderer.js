@@ -261,8 +261,10 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
         // 找最后一个活跃 form 的 DOM
         const last = activeForms[activeForms.length - 1];
         if (!last || !last.el) return;
-        // 已存在 bar 且就在正确位置
-        if (window.__vizFormUnifiedBar__ && window.__vizFormUnifiedBar__._afterEl === last.el) return;
+        const scope = last.scope;
+        // 已存在 bar 且就在正确位置（同 scope 同锚点）
+        if (window.__vizFormUnifiedBar__ && window.__vizFormUnifiedBar__._afterEl === last.el
+            && window.__vizFormUnifiedBar__._scope === scope) return;
         // 清理旧的
         if (window.__vizFormUnifiedBar__) {
             window.__vizFormUnifiedBar__.remove();
@@ -272,13 +274,15 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
         const bar = document.createElement('div');
         bar.className = 'viz-unified-bar';
         bar._afterEl = last.el;
+        bar._scope = scope;
         bar.innerHTML = `
             <span class="viz-unified-title">共 <b>${activeForms.length}</b> 道题</span>
             <button class="viz-submit viz-unified-submit">提交</button>
         `;
         bar.querySelector('button').addEventListener('click', () => {
             const reg = window.__vizFormRegistry__ || [];
-            const pending = reg.filter(f => !f.submitted && !f.unmounted);
+            // 只提交本消息容器内的 form，避免把历史消息的选项一起再次提交
+            const pending = reg.filter(f => !f.submitted && !f.unmounted && f.scope === scope);
             if (!pending.length) return;
             const answers = pending.map((f, idx) => {
                 const q = f.question ? `Q${idx + 1}: ${f.question}\n` : '';
@@ -305,19 +309,38 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
         if (alive.length !== reg.length) {
             window.__vizFormRegistry__ = alive;
         }
-        // 标记多表单模式
-        const unsubmitted = alive.filter(f => !f.submitted);
+        // scope（消息容器 .bubble）隔离：
+        // 只有文档位置最靠后的 scope（即最新一条带 form 的消息）里的 form 可交互；
+        // 历史消息里遗留的未提交 form 一律冻结，防止新一次提交把之前对话中的选项一起再次提交。
+        const withEl = alive.filter(f => f.el);
+        let latestScope = null, latestEl = null;
+        withEl.forEach(f => {
+            if (!latestEl || (latestEl.compareDocumentPosition(f.el) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+                latestEl = f.el; latestScope = f.scope;
+            }
+        });
         alive.forEach(f => {
-            const isMulti = unsubmitted.length >= 2;
+            if (!f.frozen && !f.submitted && latestScope != null && f.scope !== latestScope) {
+                f.frozen = true;
+                f.onFrozen && f.onFrozen();
+            }
+        });
+        // 标记多表单模式：只统计同一消息容器内未提交的 form
+        const unsubmitted = alive.filter(f => !f.submitted && !f.frozen);
+        const scopeCount = new Map();
+        unsubmitted.forEach(f => scopeCount.set(f.scope, (scopeCount.get(f.scope) || 0) + 1));
+        alive.forEach(f => {
+            const isMulti = (scopeCount.get(f.scope) || 0) >= 2;
             if (f.multiRef) f.multiRef.value = isMulti;
             if (f.el) {
                 if (isMulti) f.el.classList.add('viz-multi-form');
                 else f.el.classList.remove('viz-multi-form');
             }
         });
-        // 统一提交栏管理
-        if (unsubmitted.length >= 2) {
-            _vizEnsureUnifiedBar(alive);
+        // 统一提交栏管理（只在最新消息的 scope 内创建）
+        const latestGroup = unsubmitted.filter(f => f.scope === latestScope);
+        if (latestGroup.length >= 2) {
+            _vizEnsureUnifiedBar(latestGroup);
         } else {
             if (window.__vizFormUnifiedBar__) {
                 window.__vizFormUnifiedBar__.remove();
@@ -334,6 +357,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             const rootEl = ref(null);
             const selected = ref(new Set());
             const submitted = ref(false);
+            const frozen = ref(false);
             const multiRef = ref(false);
             const data = props.data || {};
             const multiple = !!data.multiple;
@@ -345,7 +369,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 return vals.map(v => typeof v === 'object' ? JSON.stringify(v) : String(v)).join(', ') || '(未作答)';
             }
             function toggle(i) {
-                if (submitted.value) return;
+                if (submitted.value || frozen.value) return;
                 if (multiple) {
                     const s = new Set(selected.value);
                     s.has(i) ? s.delete(i) : s.add(i);
@@ -355,7 +379,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 }
             }
             function submit() {
-                if (submitted.value || selected.value.size === 0) return;
+                if (submitted.value || frozen.value || selected.value.size === 0) return;
                 // 多表单模式下 submit 不直接发，只标记 — 但实际上 multi 模式下按钮不显示
                 // 这里保留以防 Enter key 等触发
                 submitted.value = true;
@@ -368,12 +392,15 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     el: rootEl.value,
                     type: 'choice',
                     question: safeStr(data.question, ''),
+                    // scope = 所属消息容器（.bubble），用于把提交范围限制在本条消息内
+                    scope: rootEl.value ? (rootEl.value.closest('.bubble') || rootEl.value) : null,
                     getAnswer,
                     submitted: false,
                     multiRef,
                     extAPI: props.extAPI,
                     unmounted: false,
-                    onSubmitted: () => { submitted.value = true; }
+                    onSubmitted: () => { submitted.value = true; },
+                    onFrozen: () => { frozen.value = true; }
                 });
             });
             onUnmounted(() => {
@@ -388,15 +415,15 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     h('div', { class: 'viz-opts' },
                         options.map((o, i) => h('button', {
                             class: 'viz-opt' + (selected.value.has(i) ? ' selected' : ''),
-                            disabled: submitted.value,
+                            disabled: submitted.value || frozen.value,
                             onClick: () => toggle(i)
                         }, optLabel(o))
                         )),
                     showBtn ? h('button', {
                         class: 'viz-submit',
-                        disabled: submitted.value || selected.value.size === 0,
+                        disabled: submitted.value || frozen.value || selected.value.size === 0,
                         onClick: submit
-                    }, submitted.value ? '已提交 ✓' : (multiple ? `提交选择（已选 ${selected.value.size} 项）` : '提交')) : null
+                    }, submitted.value ? '已提交 ✓' : (frozen.value ? '已过期' : (multiple ? `提交选择（已选 ${selected.value.size} 项）` : '提交'))) : null
                 ]);
             };
         }
@@ -410,6 +437,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
             const rootEl = ref(null);
             const data = props.data || {};
             const submitted = ref(false);
+            const frozen = ref(false);
             const multiRef = ref(false);
             const blanks = (Array.isArray(data.blanks) ? data.blanks : []).map(b =>
                 typeof b === 'string' ? { label: b } : (b || {})
@@ -428,7 +456,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                 return parts.join(' / ') || '(未作答)';
             }
             function submit() {
-                if (submitted.value || !canSubmit.value) return;
+                if (submitted.value || frozen.value || !canSubmit.value) return;
                 submitted.value = true;
                 if (!multiRef.value && props.extAPI && props.extAPI.sendUserInput) {
                     props.extAPI.sendUserInput(getAnswer());
@@ -439,12 +467,15 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     el: rootEl.value,
                     type: 'fill',
                     question: safeStr(data.question, ''),
+                    // scope = 所属消息容器（.bubble），用于把提交范围限制在本条消息内
+                    scope: rootEl.value ? (rootEl.value.closest('.bubble') || rootEl.value) : null,
                     getAnswer,
                     submitted: false,
                     multiRef,
                     extAPI: props.extAPI,
                     unmounted: false,
-                    onSubmitted: () => { submitted.value = true; }
+                    onSubmitted: () => { submitted.value = true; },
+                    onFrozen: () => { frozen.value = true; }
                 });
             });
             onUnmounted(() => {
@@ -464,7 +495,7 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                                 type: b.type === 'number' ? 'number' : 'text',
                                 placeholder: safeStr(b.placeholder, ''),
                                 value: values.value[i],
-                                disabled: submitted.value,
+                                disabled: submitted.value || frozen.value,
                                 onInput: (e) => { values.value[i] = e.target.value; },
                                 // 多表单模式下 Enter 也不单独提交，等统一提交栏
                                 onKeydown: (e) => { if (e.key === 'Enter' && !multiRef.value) submit(); }
@@ -473,9 +504,9 @@ input[type=range].viz-vertical::-webkit-slider-thumb {
                     ),
                     showBtn ? h('button', {
                         class: 'viz-submit',
-                        disabled: submitted.value || !canSubmit.value,
+                        disabled: submitted.value || frozen.value || !canSubmit.value,
                         onClick: submit
-                    }, submitted.value ? '已提交 ✓' : '提交') : null
+                    }, submitted.value ? '已提交 ✓' : (frozen.value ? '已过期' : '提交')) : null
                 ]);
             };
         }

@@ -1588,7 +1588,7 @@ function onProcessBox(turnStart: number, el: HTMLElement | null) {
     ensureProcessWatcher(el)
   } else processBoxes.delete(turnStart)
 }
-/** 用户在过程框内滑动即脱离自动跟随；记录最近一次滑动时间，5s 无滑动后恢复跟随。
+/** 用户在该过程框内滑动即脱离自动跟随；记录最近一次滑动时间，5s 无滑动后恢复跟随。
  *  注意：我们自己写的 scrollTop 也会触发 scroll 事件，那种不算"用户滑动"，必须忽略，
  *  否则每次自动滚底都会把自己标记成脱离，导致永远贴不住底部。
  *  判定用"距底部距离"而不是纯时序标记：程序滚底后 dist≈0 一定不算用户滑动；
@@ -1599,6 +1599,28 @@ function onProcessScroll(turnStart: number, e: Event) {
   if ((el as any).__autoScrolling) return
   const dist = el.scrollHeight - el.scrollTop - el.clientHeight
   if (dist <= 4) {   // 仍在底部 → 保持（或恢复）跟随
+    ;(el as any).__stickBottom = true
+    return
+  }
+  ;(el as any).__stickBottom = false
+  ;(el as any).__lastUserScroll = Date.now()
+}
+/** 子过程框（agent.spawn 工具详情内的嵌套过程框）：复用主过程框的贴底机制
+ *  （stickProcessBox + ensureProcessWatcher 按元素操作，天然通用）。
+ *  内联 :ref 每次重渲染都会触发：仅初次挂载时置默认跟随，不覆盖用户上滑后的
+ *  __stickBottom=false；watcher 已挂过（__procObserved）不重复挂。 */
+function onSubProcBox(el: HTMLElement | null) {
+  if (!el) return
+  if (typeof (el as any).__stickBottom !== 'boolean') (el as any).__stickBottom = true
+  ensureProcessWatcher(el)
+}
+/** 子过程框的滚动判定：与 onProcessScroll 同口径（程序滚底不误判、上滑脱离、
+ *  回底恢复），但按元素自身判定（无 turn 键）。 */
+function onSubProcScroll(e: Event) {
+  const el = e.target as HTMLElement
+  if (!el || (el as any).__autoScrolling) return
+  const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+  if (dist <= 4) {
     ;(el as any).__stickBottom = true
     return
   }
@@ -1796,6 +1818,22 @@ function toolIsRunning(tc: any): boolean {
     (x: any) => x.role === 'tool_result' && x.tool_call_id === tc.tool_call_id
   )
   return !hasResult
+}
+
+// ============ 子智能体过程（agent.spawn 工具详情内的嵌套过程框） ============
+// 数据源：tool_call.sub_process 事件数组 —— 运行中由 SUB: 行实时追加；
+// 历史会话由 hydrateHistoryMsgs 从 tool 消息 sub_process 字段恢复。
+function subProcessOf(tc: any): any[] {
+  return Array.isArray(tc?.sub_process) ? tc.sub_process : []
+}
+function subProcessTitle(tc: any): string {
+  const nm = tc?.args && typeof tc.args === 'object' ? String(tc.args.name || '').trim() : ''
+  return nm ? `子智能体「${nm}」运行过程` : '子智能体运行过程'
+}
+/** 子工具是否执行中：最后一条事件是 call（尚未 done）且整体工具仍在运行 */
+function subCallRunning(tc: any, evIdx: number): boolean {
+  const evs = subProcessOf(tc)
+  return toolIsRunning(tc) && evIdx === evs.length - 1 && evs[evIdx]?.t === 'call'
 }
 
 const latestToolInfoMap = computed(() => {
@@ -3557,6 +3595,33 @@ onBeforeUnmount(() => {
                                 <pre v-else-if="prettyArgs(t.args) && prettyArgs(t.args) !== '{}'">{{ prettyArgs(t.args) }}</pre>
                                 <pre v-else>{{ prettyArgs(t.args) || '（无参数）' }}</pre>
                               </div>
+                              <!-- 子智能体过程框（agent.spawn 专用）：实时/历史显示子智能体运行事件 -->
+                              <div v-if="subProcessOf(t).length" class="tr-block sub-proc-block">
+                                <div class="tr-block-title">🐣 {{ subProcessTitle(t) }}</div>
+                                <div class="sub-proc"
+                                     :ref="(el) => onSubProcBox(el as HTMLElement | null)"
+                                     @scroll.passive="onSubProcScroll($event)">
+                                  <div v-for="(ev, si) in subProcessOf(t)" :key="si" class="sp-item" :class="'sp-' + ev.t">
+                                    <template v-if="ev.t === 'round'"><span class="sp-round">▶</span><span class="sp-txt">第 {{ ev.n }}/{{ ev.of }} 轮</span></template>
+                                    <template v-else-if="ev.t === 'call'">
+                                      <span class="sp-ico" :class="{ spinning: subCallRunning(t, si) }">🔧</span>
+                                      <span class="sp-txt">{{ toolLabel(ev.name) }}</span>
+                                      <pre v-if="ev.args_preview" class="sp-args">{{ ev.args_preview }}</pre>
+                                    </template>
+                                    <template v-else-if="ev.t === 'done'">
+                                      <span class="sp-ok" :class="{ err: !ev.ok }">{{ ev.ok ? '✓' : '✗' }}</span>
+                                      <span class="sp-txt">{{ toolLabel(ev.name) }}</span>
+                                      <pre v-if="ev.preview" class="sp-args">{{ ev.preview }}</pre>
+                                    </template>
+                                    <template v-else-if="ev.t === 'text'">
+                                      <span class="sp-ico">💬</span><span class="sp-round">第 {{ ev.round }} 轮输出</span>
+                                      <pre class="sp-text">{{ ev.text }}</pre>
+                                    </template>
+                                    <template v-else-if="ev.t === 'note'"><span class="sp-ico">⚠️</span><span class="sp-txt">{{ ev.text }}</span></template>
+                                  </div>
+                                  <div v-if="toolIsRunning(t)" class="sp-item sp-running"><span class="ti-spinner"></span><span>子智能体运行中…</span></div>
+                                </div>
+                              </div>
                               <template v-for="res in toolsOfAssistant(ch.idx).filter(x => x.role === 'tool_result' && x.tool_call_id === t.tool_call_id)" :key="res.tool_call_id + '-r'">
                                 <div class="tr-block"><div class="tr-block-title">📥 结果</div><pre>{{ prettyResult(res.result) }}</pre></div>
                               </template>
@@ -4572,6 +4637,21 @@ onBeforeUnmount(() => {
 .tr-block-title { font-size: calc(9.5px * var(--font-scale)); opacity: .65; margin-bottom: 1px; font-family: Consolas, monospace; }
 .tr-block pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: calc(10px * var(--font-scale)); max-height: 180px; overflow-y: auto; }
 .ti-spinner { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid rgba(var(--accent-rgb), 0.25); border-top-color: var(--accent); animation: tiSpin .8s linear infinite; flex-shrink: 0; display: inline-block; }
+
+/* 子智能体过程框（agent.spawn 工具详情内嵌套）：比 tr-block 再浅一级的琥珀底，
+   事件条目按类型着色（轮次灰 / 调用蓝 / 完成 绿红 / 提示黄） */
+.sub-proc-block { padding: 4px 7px; }
+.sub-proc { display: flex; flex-direction: column; gap: 2px; padding: 3px 5px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.18); border: 1px solid rgba(var(--surface-rgb), 0.06); font-size: calc(10px * var(--font-scale)); max-height: 220px; overflow-y: auto; }
+.sp-item { display: flex; align-items: baseline; gap: 5px; line-height: 1.5; min-width: 0; flex-wrap: wrap; }
+.sp-round { color: rgba(var(--text-rgb), 0.45); font-size: calc(9px * var(--font-scale)); }
+.sp-txt { color: rgba(var(--text-rgb), 0.85); }
+.sp-ico { font-size: calc(10px * var(--font-scale)); }
+.sp-ico.spinning { display: inline-block; animation: tiSpin 1.2s linear infinite; }
+.sp-ok { color: var(--green-ink); font-size: calc(10px * var(--font-scale)); }
+.sp-ok.err { color: #e06c5f; }
+.sp-args { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: calc(9.5px * var(--font-scale)); font-family: Consolas, monospace; opacity: .7; max-height: 90px; overflow-y: auto; flex: 1 1 100%; padding-left: 16px; }
+.sp-text { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: calc(10px * var(--font-scale)); line-height: 1.55; color: rgba(var(--text-rgb), 0.9); background: rgba(var(--shadow-rgb), 0.22); border-radius: 4px; padding: 4px 7px; max-height: 180px; overflow-y: auto; flex: 1 1 100%; }
+.sp-running { display: inline-flex; align-items: center; gap: 5px; color: var(--accent-ink); }
 
 /* Share 截图缩略图：purpose=share 的截图直接挂在对话流里，点击可放大 */
 .share-shots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }

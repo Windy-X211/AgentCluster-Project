@@ -20,6 +20,9 @@ from core.a2a import cmd_cluster_handoff, HANDOFF_TOOL, cmd_cluster_send_message
 # agent.smart_search（智能搜索子智能体）— 同样导入进 globals，供 run_command 反射分发
 from core.smart_search import cmd_agent_smart_search, SMART_SEARCH_TOOL  # noqa: F401
 
+# agent.spawn（派生子智能体：主智能体自定义临时子 agent 并配置能力）— 同上
+from core.subagent import cmd_agent_spawn, SUBAGENT_TOOL  # noqa: F401
+
 
 # ======================================================
 #  后台进程管理（cmd.run 自动识别长运行命令并后台化）
@@ -1454,7 +1457,7 @@ def cmd_skill_read_section(skill_name: str, section: str, max_chars: int = 6000)
 
 
 def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = True,
-                background: bool | None = None) -> dict:
+                background: bool | None = None, shell_type: str = "auto") -> dict:
     """执行一条系统命令。
 
     长运行自动后台化规则：
@@ -1462,6 +1465,11 @@ def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = T
       - 若显式传 background=False → 强制前台（阻塞直到退出或超时）
       - 若省略 / null（默认）：自动检测命令关键词（http.server / uvicorn / node / vite / watch 等），
         命中则后台启动；否则前台执行
+
+    shell_type：显式指定执行解释器（仅 Windows 生效），取值 auto / cmd / powershell，默认 auto：
+      - auto：沿用 _is_powershell_command 自动判断，命中 PowerShell 语法自动转 PowerShell（保持原行为）
+      - cmd：强制走 cmd.exe，不做 PowerShell 转换
+      - powershell：强制走 PowerShell（用 -EncodedCommand 包装，多行脚本 / $变量 / cmdlet 均可正确执行）
     """
     try:
         # 显式传了 cwd 就用它，否则回落到 workdir 或 CWD
@@ -1481,11 +1489,24 @@ def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = T
         if should_bg is None:
             should_bg = _is_long_running(command) or _is_gui_launch(command)
 
-        # Windows 下 shell=True 走 cmd.exe：智能体常用的 PowerShell 写法会直接报
-        # 「不是内部或外部命令」，这里自动转成 PowerShell 执行
+        # 解释器选择（仅 Windows）：auto 沿用自动判断，cmd 强制 cmd.exe，powershell 强制 PowerShell。
+        # 显式 powershell 时用 -EncodedCommand 包装，多行脚本也能整体传入（不受 shell 逐行解析影响）。
         exec_command = command
-        if os.name == "nt" and shell and _is_powershell_command(command):
-            exec_command = _wrap_powershell(command)
+        st = (shell_type or "auto").strip().lower()
+        if st not in ("auto", "cmd", "powershell"):
+            st = "auto"
+        if os.name == "nt" and shell:
+            lower_cmd = command.strip().lower()
+            explicit_ps = lower_cmd.startswith("powershell") or lower_cmd.startswith("pwsh")
+            if st == "powershell":
+                # 命令本身已是 powershell/pwsh 入口则原样执行，避免二次包装
+                if not explicit_ps:
+                    exec_command = _wrap_powershell(command)
+            elif st == "auto" and _is_powershell_command(command):
+                # Windows 下 shell=True 走 cmd.exe：智能体常用的 PowerShell 写法会直接报
+                # 「不是内部或外部命令」，这里自动转成 PowerShell 执行
+                exec_command = _wrap_powershell(command)
+            # st == "cmd"：原样走 cmd.exe
 
         if should_bg:
             return _start_bg_process(exec_command, cwd_eff, shell=shell,
@@ -1724,6 +1745,7 @@ COMMAND_TOOLS = [
                 "\n- dir / cd / where.exe 可用（cmd.exe 语法在 PowerShell 也能跑）"
                 "\n- 管道符号用 | 即可；PowerShell 5 不支持 &&，用分号 ; 串联命令"
                 "\n- npm/node 前需确保 PATH 含 E:\\app\\node-v20.18.0-win-x64（见项目规则）"
+                "\n- 执行 PowerShell 脚本（含 $变量、cmdlet、多行）时，建议显式传 shell_type=powershell"
                 "\n慎用，避免破坏性命令。"
             ),
             "parameters": {
@@ -1733,7 +1755,8 @@ COMMAND_TOOLS = [
                     "cwd": {"type": "string", "description": "工作目录，默认当前目录"},
                     "timeout": {"type": "integer", "description": "前台执行超时秒数，默认60"},
                     "shell": {"type": "boolean", "description": "是否通过 shell 执行，默认true"},
-                    "background": {"type": "boolean", "description": "可选：true=强制后台启动，false=强制前台；省略则自动识别长运行关键词"}
+                    "background": {"type": "boolean", "description": "可选：true=强制后台启动，false=强制前台；省略则自动识别长运行关键词"},
+                    "shell_type": {"type": "string", "enum": ["auto", "cmd", "powershell"], "description": "执行解释器选择（仅 Windows 生效）：auto=自动识别（默认，命中 PowerShell 语法自动转 PowerShell）；cmd=强制 cmd.exe；powershell=强制 PowerShell（自动包装，支持多行脚本 / $变量 / cmdlet）。执行 PowerShell 脚本时建议显式传 powershell。"}
                 },
                 "required": ["command"]
             }
@@ -1792,6 +1815,7 @@ COMMAND_CN_LABELS = {
     "file.find": "🔎 查找文件",
     "workspace.search": "🌐 工作区检索",
     "agent.smart_search": "🧠 智能搜索",
+    "agent.spawn": "🐣 派生子智能体",
     "skill.invoke": "🔧 调用技能",
     "skill.read_section": "📑 读取技能章节",
     "cmd.run": "🚀 运行命令",
@@ -3169,6 +3193,9 @@ COMMAND_TOOLS.extend(CLUSTER_TOOLS)
 # 智能搜索子智能体命令（独立于 cluster.*，作为一项可勾选能力）
 COMMAND_TOOLS.append(SMART_SEARCH_TOOL)
 
+# 派生子智能体命令（主智能体自定义临时子 agent 并配置能力）
+COMMAND_TOOLS.append(SUBAGENT_TOOL)
+
 # ---- 命令分组（前端命令选择器按组展示，可整组勾选或展开后单独勾选）----
 # 顺序即展示顺序；未列入分组的命令归入「其他」。
 COMMAND_GROUPS = [
@@ -3177,7 +3204,7 @@ COMMAND_GROUPS = [
         "file.patch", "file.structure", "file.search", "file.find",
         "workspace.search",
     ]),
-    ("智能命令", ["agent.smart_search"]),
+    ("智能命令", ["agent.smart_search", "agent.spawn"]),
     ("命令运行", ["cmd.run", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
     ("集群编排", [
         "cluster.list_agents", "cluster.list_capabilities",

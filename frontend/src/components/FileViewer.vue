@@ -4,8 +4,15 @@
          @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
       <div class="fv-head" @mousedown="startDrag">
         <span class="fv-ico">{{ icon }}</span>
+        <!-- 同目录快速切换（仅当宿主下发可切换列表时显示） -->
+        <div v-if="canNav" class="fv-nav">
+          <button class="fv-btn nav" @click.stop="requestNav(-1)" title="上一个文件（同目录，首尾循环）">←</button>
+          <button class="fv-btn nav" @click.stop="requestNav(1)" title="下一个文件（同目录，首尾循环）">→</button>
+        </div>
         <span class="fv-title" :title="file.path">{{ file.name }}</span>
         <span class="fv-meta">{{ sizeText }}<template v-if="ext"> · {{ ext }}</template></span>
+        <span v-if="kind === 'image' && src && !imgErr && !loading" class="fv-zoom-pct"
+              title="当前缩放比例（滚轮缩放 · 双击复位）">{{ Math.round(imgScale * 100) }}%</span>
         <button v-if="editable" class="fv-btn" :disabled="loading || !!err"
                 @click.stop="toggleMode"
                 :title="mode === 'edit' ? '切换到预览（未保存内容保留）' : '在当前窗口内编辑（编辑与预览同一窗口）'">
@@ -16,7 +23,11 @@
       <!-- 关闭按钮固定在窗口右上角（不随标题栏内容流动） -->
       <button class="fv-close" @click.stop="requestClose" title="关闭（Esc）">✕</button>
 
-      <div ref="bodyEl" class="fv-body" :class="{ editing: mode === 'edit' }">
+      <div ref="bodyEl" class="fv-body"
+           :class="{ editing: mode === 'edit', 'img-view': kind === 'image' }"
+           @wheel="kind === 'image' ? onImgWheel($event) : undefined"
+           @mousedown="kind === 'image' ? onImgPanStart($event) : undefined"
+           @dblclick="kind === 'image' && onImgDblClick()">
         <!-- pptx 渲染挂载容器：v-show 保留 DOM，供 PptxViewer.open 使用 -->
         <div v-if="kind === 'pptx'" v-show="!pptxFallback && !err" ref="pptxEl" class="fv-pptx"></div>
 
@@ -27,8 +38,9 @@
                   @keydown.ctrl.enter.prevent="save"></textarea>
 
         <template v-else-if="kind === 'image'">
-          <div v-if="src && !imgErr" class="fv-img-wrap" :class="{ full: imgFull }" @click="imgFull = !imgFull">
-            <img class="fv-img" :class="{ full: imgFull }" :src="src" @error="imgErr = true" />
+          <div v-if="src && !imgErr" class="fv-img-wrap">
+            <img class="fv-img" :src="src" :style="{ transform: imgTransform }"
+                 @load="onImgLoad" @error="imgErr = true" draggable="false" />
           </div>
           <div v-else class="fv-hint err">
             <div>图片加载失败（可能超出 50MB 预览限制）</div>
@@ -106,7 +118,7 @@
           </span>
           <span v-else-if="kind === 'pptx' && pptxCount && !pptxFallback" class="fv-foot-hint">共 {{ pptxCount }} 页</span>
           <span v-else-if="kind === 'image' && !imgErr && !loading" class="fv-foot-hint">
-            {{ imgFull ? '点击图片还原为适应窗口' : '点击图片按 100% 查看' }}
+            {{ Math.round(imgScale * 100) }}% · 滚轮缩放（鼠标为锚）· 拖拽平移 · 双击复位
           </span>
           <button v-if="mode === 'edit' && editable" class="fv-btn ok"
                   :disabled="saving || !!err" @click="save" title="Ctrl+Enter 保存">
@@ -147,11 +159,15 @@ export interface ViewerFile {
 const props = defineProps<{
   canvasId: number | null
   file: ViewerFile | null
+  /** 同目录可预览文件列表（按名称排序）；不传或 ≤1 项时不显示左右切换按钮 */
+  navList?: ViewerFile[] | null
 }>()
 const emit = defineEmits<{
   (e: 'close'): void
   /** 文本已保存（工作区面板据此刷新文件树） */
   (e: 'saved'): void
+  /** 请求切换同目录文件：dir=-1 上一个 / 1 下一个（首尾循环由宿主处理） */
+  (e: 'nav', dir: number): void
 }>()
 
 // —— 分类：与工作区右键/双击分流保持一致（程序类文件不会进查看器） ——
@@ -225,7 +241,14 @@ const sheetIdx = ref(0)
 const docLines = ref<string[]>([])     // docx 文本回退
 const slides = ref<{ idx: number; lines: string[] }[]>([])   // pptx 文本回退
 const imgErr = ref(false)
-const imgFull = ref(false)
+// —— 图片缩放/平移（对齐右侧对话区 lightbox：窗口尺寸与图片缩放解耦） ——
+const imgScale = ref(1)
+const imgPanX = ref(0)
+const imgPanY = ref(0)
+const imgOrigW = ref(600)
+const imgOrigH = ref(400)
+const IMG_MAX_SCALE = 8
+const IMG_MIN_SCALE = 0.1
 const pdfUrl = ref('')         // Office 转 PDF 的 blob URL
 const officeFallback = ref(false)
 const pptxFallback = ref(false)
@@ -266,7 +289,9 @@ function reset() {
   docLines.value = []
   slides.value = []
   imgErr.value = false
-  imgFull.value = false
+  imgScale.value = 1
+  imgPanX.value = 0
+  imgPanY.value = 0
   officeFallback.value = false
   pptxFallback.value = false
   pptxCount.value = 0
@@ -423,6 +448,90 @@ async function load() {
   }
 }
 
+// —— 图片缩放/平移：与右侧对话区 lightbox 完全一致的交互与参数 ——
+const imgTransform = computed(() =>
+  `translate(${imgPanX.value}px, ${imgPanY.value}px) scale(${imgScale.value})`
+)
+
+/** 图片 load：记录原始尺寸并复位缩放/平移（图片按 object-fit: contain 已填满窗口） */
+function onImgLoad(e: Event) {
+  const img = e.target as HTMLImageElement
+  if (!img) return
+  imgOrigW.value = img.naturalWidth || img.width || 600
+  imgOrigH.value = img.naturalHeight || img.height || 400
+  imgScale.value = 1; imgPanX.value = 0; imgPanY.value = 0
+}
+
+/** 以 body 内 (ax, ay) 为锚点缩放；null=中心。保证锚点像素在屏幕上位置不变 */
+function imgZoomAt(s: number, anchor: { x: number; y: number } | null) {
+  const newScale = Math.max(IMG_MIN_SCALE, Math.min(IMG_MAX_SCALE, s))
+  if (newScale === imgScale.value) return
+  const body = bodyEl.value
+  const bw = body?.clientWidth ?? 320
+  const bh = body?.clientHeight ?? 240
+  const cx = bw / 2; const cy = bh / 2
+  const ax = anchor?.x ?? cx; const ay = anchor?.y ?? cy
+  const dx = ax - cx; const dy = ay - cy
+  const ratio = newScale / imgScale.value
+  imgPanX.value = dx * (1 - ratio) + imgPanX.value * ratio
+  imgPanY.value = dy * (1 - ratio) + imgPanY.value * ratio
+  imgScale.value = newScale
+}
+
+/** 滚轮缩放（以鼠标位置为锚，鼠标不动；无过渡动画） */
+function onImgWheel(e: WheelEvent) {
+  e.preventDefault()
+  const body = bodyEl.value
+  if (!body) { imgZoomAt(imgScale.value * (e.deltaY > 0 ? 0.85 : 1.18), null); return }
+  const r = body.getBoundingClientRect()
+  imgZoomAt(imgScale.value * (e.deltaY > 0 ? 0.85 : 1.18), { x: e.clientX - r.left, y: e.clientY - r.top })
+}
+
+/** 双击 body：图片按窗口自适应（scale=1，pan=0） */
+function onImgDblClick() {
+  imgScale.value = 1
+  imgPanX.value = 0
+  imgPanY.value = 0
+}
+
+// —— body 内左键拖拽平移图片（clamp 防止拖丢） ——
+let imgPanning = false
+let imgPanStartX = 0
+let imgPanStartY = 0
+let imgPanStartPanX = 0
+let imgPanStartPanY = 0
+function onImgPanStart(e: MouseEvent) {
+  if (e.button !== 0) return
+  imgPanning = true
+  imgPanStartX = e.clientX; imgPanStartY = e.clientY
+  imgPanStartPanX = imgPanX.value; imgPanStartPanY = imgPanY.value
+  e.preventDefault()
+  window.addEventListener('mousemove', onImgPanMove)
+  window.addEventListener('mouseup', onImgPanEnd)
+}
+function onImgPanMove(e: MouseEvent) {
+  if (!imgPanning) return
+  let px = imgPanStartPanX + (e.clientX - imgPanStartX)
+  let py = imgPanStartPanY + (e.clientY - imgPanStartY)
+  const body = bodyEl.value
+  if (body) {
+    const bw = body.clientWidth
+    const bh = body.clientHeight
+    // 图片至少留 30% 在可视区，防止拖到完全看不见
+    const maxPanX = Math.max(0, imgOrigW.value * imgScale.value / 2 - bw * 0.3)
+    const maxPanY = Math.max(0, imgOrigH.value * imgScale.value / 2 - bh * 0.3)
+    px = Math.max(-maxPanX, Math.min(maxPanX, px))
+    py = Math.max(-maxPanY, Math.min(maxPanY, py))
+  }
+  imgPanX.value = px
+  imgPanY.value = py
+}
+function onImgPanEnd() {
+  imgPanning = false
+  window.removeEventListener('mousemove', onImgPanMove)
+  window.removeEventListener('mouseup', onImgPanEnd)
+}
+
 watch(
   () => props.file,
   (f) => {
@@ -477,6 +586,15 @@ async function save() {
 function requestClose() {
   if (dirty.value && !window.confirm('有未保存的修改，放弃并关闭？')) return
   emit('close')
+}
+
+// —— 同目录切换 ——
+const canNav = computed(() => (props.navList?.length || 0) > 1)
+function requestNav(dir: number) {
+  if (!props.file || !canNav.value) return
+  // 编辑态有未保存内容时先确认，避免切走丢改动
+  if (dirty.value && !window.confirm('有未保存的修改，切换文件将放弃修改？')) return
+  emit('nav', dir)
 }
 
 async function openSystem() {
@@ -632,9 +750,18 @@ function onVpResize() {
   vp.value = { w: window.innerWidth, h: window.innerHeight }
 }
 function onKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Escape' || !props.file) return
-  e.stopImmediatePropagation()
-  requestClose()
+  if (!props.file) return
+  if (e.key === 'Escape') {
+    e.stopImmediatePropagation()
+    requestClose()
+    return
+  }
+  // 图片缩放快捷键：+ / = / - / 0（对齐右侧对话区 lightbox）
+  if (kind.value === 'image') {
+    if (e.key === '+' || e.key === '=') { e.stopImmediatePropagation(); imgZoomAt(imgScale.value * 1.2, null) }
+    else if (e.key === '-') { e.stopImmediatePropagation(); imgZoomAt(imgScale.value / 1.2, null) }
+    else if (e.key === '0') { e.stopImmediatePropagation(); onImgDblClick() }
+  }
 }
 onMounted(() => {
   window.addEventListener('mousemove', onMove)
@@ -647,6 +774,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onUp)
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('resize', onVpResize)
+  window.removeEventListener('mousemove', onImgPanMove)
+  window.removeEventListener('mouseup', onImgPanEnd)
   cleanupAll()
 })
 </script>
@@ -666,8 +795,18 @@ onBeforeUnmount(() => {
 }
 .fv-head:active { cursor: grabbing; }
 .fv-ico { flex-shrink: 0; }
+.fv-nav { display: flex; gap: 4px; flex-shrink: 0; }
+.fv-btn.nav { min-width: 26px; padding: 3px 7px; font-weight: 700; text-align: center; }
 .fv-title { font-size: calc(13.5px * var(--font-scale)); font-weight: 600; flex-shrink: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .fv-meta { font-size: calc(11px * var(--font-scale)); opacity: .55; font-family: Consolas, monospace; white-space: nowrap; flex-shrink: 0; }
+.fv-zoom-pct {
+  font-variant-numeric: tabular-nums;
+  font-size: calc(11px * var(--font-scale));
+  padding: 1px 6px; border-radius: 999px; flex-shrink: 0;
+  background: rgba(var(--accent-rgb), 0.18);
+  color: rgb(var(--accent));
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
+}
 .fv-btn {
   background: rgba(var(--surface-rgb), 0.05);
   border: 1px solid rgba(var(--surface-rgb), 0.12);
@@ -693,6 +832,7 @@ onBeforeUnmount(() => {
 .fv-close:hover { background: rgba(255, 80, 80, 0.28); border-color: rgba(255, 80, 80, 0.5); }
 
 .fv-body { flex: 1; min-height: 0; overflow: auto; overflow-anchor: none; padding: 10px 12px; position: relative; }
+.fv-body.img-view { overflow: hidden; }   /* 图片态：缩放/平移由 transform 控制，禁用滚动条 */
 .fv-body.editing { padding: 8px 10px; overflow: hidden; display: flex; }
 .fv-hint { padding: 30px 12px; text-align: center; font-size: calc(12.5px * var(--font-scale)); opacity: .65; }
 .fv-hint.err { color: #ffb0b0; opacity: 1; display: flex; flex-direction: column; align-items: center; gap: 12px; }
@@ -715,11 +855,19 @@ onBeforeUnmount(() => {
 }
 .fv-edit:focus { border-color: rgba(var(--accent-rgb), 0.6); }
 
-/* 图片 */
-.fv-img-wrap { display: flex; align-items: center; justify-content: center; min-height: 100%; cursor: zoom-in; }
-.fv-img-wrap.full { cursor: zoom-out; }
-.fv-img { max-width: 100%; max-height: 100%; border-radius: 6px; display: block; }
-.fv-img.full { max-width: none; max-height: none; }
+/* 图片：窗口内 object-fit contain，缩放/平移用 transform（对齐右侧对话区 lightbox） */
+.fv-img-wrap {
+  height: 100%; display: flex; align-items: center; justify-content: center;
+  overflow: hidden; cursor: grab;
+}
+.fv-img-wrap:active { cursor: grabbing; }
+.fv-img {
+  width: 100%; height: 100%; object-fit: contain;
+  border-radius: 6px; display: block;
+  pointer-events: none;             /* wheel / mousedown 冒泡到 .fv-body */
+  transform-origin: center center;  /* 以中心为缩放原点，pan 叠加在 translate 上 */
+  transition: none;                 /* 缩放即时响应，无动画 */
+}
 
 /* PDF / Office 转 PDF 的 iframe */
 .fv-frame { width: 100%; height: 100%; min-height: 420px; border: none; background: rgba(var(--shadow-rgb), 0.35); border-radius: 8px; }

@@ -25,6 +25,7 @@ from core import run_registry  # 运行期共享会话对象（并发按智能�
 from core.llm import chat_with_failover as chat, ModelDegenerateError, ModelRepetitionError, _encode_tool_name
 from core.commands import run_command, filter_tools, COMMAND_META, WORKDIR_CTX
 from core.smart_search import SMART_SEARCH_CTX
+from core.subagent import SUBAGENT_CTX
 from core.a2a import (
     TURN_CTX, collect_relay_targets, collect_call_targets,
     build_handoff_envelope, build_call_envelope,
@@ -988,6 +989,71 @@ def _execute_tool(name: str, arguments: dict,
             BACKUP_CTX.reset(backup_token)
 
 
+async def _exec_spawn_with_events(tc_id: str, args: dict, out: dict):
+    """agent.spawn 专用执行路径（快/慢通道共用）。
+
+    与普通 _execute_tool 的区别：子智能体运行事件（轮次开始 / 工具调用 / 工具完成 /
+    收尾提示）经 queue 从 worker 线程实时传出，本协程消费后以 SUB: 行转发前端
+    （工具详情「子智能体过程」框实时渲染）。用法：
+
+        out: dict = {}
+        async for line in _exec_spawn_with_events(tc_id, args, out):
+            yield line
+        result = out["result"]
+
+    事件副本同时随 result["_sub_events"] 返回，调用方取出后放 tool 消息
+    sub_process 字段落库（前端历史加载恢复）。SUBAGENT_CTX 经 asyncio.to_thread
+    的上下文快照传递给 worker 线程，与 smart_search 同机制。
+    """
+    import queue as _queue
+
+    q: _queue.Queue = _queue.Queue()
+    _args = dict(args or {})
+
+    def _worker():
+        from core.subagent import run_subagent
+        out["result"] = run_subagent(
+            name=_args.get("name") or "",
+            role=_args.get("role") or "",
+            task=_args.get("task") or "",
+            commands=_args.get("commands") or [],
+            max_rounds=_args.get("max_rounds"),
+            event_queue=q,
+        )
+
+    task = asyncio.create_task(asyncio.to_thread(_worker))
+    # 轮询消费事件队列：事件量小（每工具 2-3 条），0.1s 轮询延迟无感；
+    # 先 drain 再查 done，保证 worker 结束前 put 的最后一批事件不丢。
+    while True:
+        while True:
+            try:
+                ev = q.get_nowait()
+            except _queue.Empty:
+                break
+            # ⚠️ JSON 行不做 _esc（与 R:/C: 同惯例）
+            yield f"SUB:{tc_id}|{json.dumps(ev, ensure_ascii=False)}\n"
+        if task.done():
+            break
+        await asyncio.sleep(0.1)
+    # worker 内部的异常经 to_task 传递给 await（兜底返回错误 dict）
+    try:
+        await task
+    except Exception as e:  # noqa: BLE001
+        out["result"] = {"ok": False, "error": f"子智能体执行异常：{type(e).__name__}: {e}"}
+
+
+def _extract_spawn_events(result: Any) -> list | None:
+    """从 agent.spawn 的 result 中取出运行事件副本（_sub_events）并从 result 剔除。
+
+    调用方把返回值放进 tool 消息的 sub_process 字段落库；返回 None 表示无事件。
+    必须在 _truncate_tool_result 之前调用，避免事件进 R: 行 JSON 被截断。
+    """
+    if isinstance(result, dict) and "_sub_events" in result:
+        events = result.pop("_sub_events")
+        return events if isinstance(events, list) else None
+    return None
+
+
 
 def _agent_on_canvas_edges(canvas: dict, agent: dict) -> bool:
     """该智能体在画布上是否有连线（任一入边/出边）——有连线才具备 A2A 交接能力。"""
@@ -1364,6 +1430,16 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
     # 会读到本智能体当前选定的接口/模型，从而复用同一模型进行搜索。
     _ss_token = SMART_SEARCH_CTX.set({"interface": interface, "model": selected_model})
 
+    # 注入派生子智能体上下文：agent.spawn 命令读取当前接口/模型 + 本智能体命令/插件白名单
+    # + 工具调用最大轮数（agent.max_tool_rounds > 全局 settings > 默认 50，作为子智能体
+    # 未显式指定 max_rounds 时的默认轮次），用于限定子智能体可配置的能力范围与运行预算。
+    _spawn_token = SUBAGENT_CTX.set({
+        "interface": interface, "model": selected_model,
+        "commands": agent.get("commands") or [],
+        "plugins": agent.get("plugins") or [],
+        "max_tool_rounds": _max_tool_rounds(agent),
+    })
+
     try:
         try:
             async for line in _agent_reply_inner(conversation_id, agent, user_input, mode, canvas, turn, is_relay):
@@ -1380,6 +1456,7 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
         reset_stop_event(_stop_token)
         TURN_CTX.reset(token)
         SMART_SEARCH_CTX.reset(_ss_token)
+        SUBAGENT_CTX.reset(_spawn_token)
         if _wd_token is not None:
             WORKDIR_CTX.reset(_wd_token)
         # 释放本 agent 占用的所有模型槽
@@ -1624,10 +1701,19 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     args = json.loads(tc.get("arguments", "{}")) if isinstance(tc.get("arguments"), str) else (tc.get("arguments") or {})
                 except Exception:
                     args = {}
-                result = await asyncio.to_thread(_execute_tool, tc["name"], args,
-                                      conv_id=conversation_id,
-                                      tool_call_id=tc["id"],
-                                      agent_id=agent.get("id"))
+                if tc["name"] == "agent.spawn":
+                    # 派生子智能体：运行事件实时 SUB: 行转发（前端子过程框）
+                    _spawn_out: dict = {}
+                    async for _sl in _exec_spawn_with_events(tc["id"], args, _spawn_out):
+                        yield _sl
+                    result = _spawn_out.get("result") or {"ok": False, "error": "子智能体执行异常"}
+                else:
+                    result = await asyncio.to_thread(_execute_tool, tc["name"], args,
+                                          conv_id=conversation_id,
+                                          tool_call_id=tc["id"],
+                                          agent_id=agent.get("id"))
+                # 子智能体运行事件副本 → 落库字段（须在 truncate 前取出，避免进 R: JSON 被截断）
+                _spawn_events = _extract_spawn_events(result)
                 # 先判断是不是图片：一次调用同时给 truncate 和 followup 用，避免重复 I/O
                 img_followup = _build_image_followup(result)
                 result_str = _truncate_tool_result(result, is_image=(img_followup is not None))
@@ -1640,6 +1726,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 tool_entry = {**tool_msg, "ts": datetime.utcnow().isoformat()}
                 if img_refs:
                     tool_entry["images"] = img_refs
+                if _spawn_events:
+                    tool_entry["sub_process"] = _spawn_events
                 conv["messages"].append(tool_entry)
                 # ⚠️ JSON 行（R:/I:/C:/A2A:）都不做 _esc——json.dumps 自己转义引号/反斜杠/换行，
                 #    直接嵌 f-string 即可；只有纯文本行（T:/RN:）才需要 _esc 防止破坏行分隔。
@@ -2102,10 +2190,19 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                                     }
                 else:
                     # 非 send_message（串/并行一致）→ 走普通同步执行路径
-                    result = await asyncio.to_thread(_execute_tool, fn["name"], args,
-                                          conv_id=conversation_id,
-                                          tool_call_id=tc["id"],
-                                          agent_id=agent.get("id"))
+                    if fn["name"] == "agent.spawn":
+                        # 派生子智能体：运行事件实时 SUB: 行转发（前端子过程框）
+                        _spawn_out: dict = {}
+                        async for _sl in _exec_spawn_with_events(tc["id"], args, _spawn_out):
+                            yield _sl
+                        result = _spawn_out.get("result") or {"ok": False, "error": "子智能体执行异常"}
+                    else:
+                        result = await asyncio.to_thread(_execute_tool, fn["name"], args,
+                                              conv_id=conversation_id,
+                                              tool_call_id=tc["id"],
+                                              agent_id=agent.get("id"))
+                # 子智能体运行事件副本 → 落库字段（须在 truncate 前取出，避免进 R: JSON 被截断）
+                _spawn_events = _extract_spawn_events(result)
 
                 # 先判断是不是图片：一次调用同时给 truncate 和 followup 用，避免重复 I/O
                 img_followup = _build_image_followup(result)
@@ -2120,6 +2217,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
                 if img_refs:
                     tool_entry["images"] = img_refs
+                if _spawn_events:
+                    tool_entry["sub_process"] = _spawn_events
                 conv["messages"].append(tool_entry)
                 # ⚠️ JSON 行不做 _esc（见快通道同名行注释）
                 yield f"R:{tc['id']}|{result_str}\n"

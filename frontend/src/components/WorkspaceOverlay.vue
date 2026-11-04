@@ -197,8 +197,8 @@
   </Teleport>
 
   <!-- 内置简易查看器（双击非程序文件 / 右键"预览"） -->
-  <FileViewer :canvas-id="canvasId" :file="viewerFile"
-              @close="viewerFile = null" @edit="onViewerEdit" />
+  <FileViewer :canvas-id="canvasId" :file="viewerFile" :nav-list="viewerNavList"
+              @close="viewerFile = null" @edit="onViewerEdit" @nav="onViewerNav" />
 </template>
 
 <script setup lang="ts">
@@ -903,6 +903,38 @@ function canPreview(name: string) {
 const viewerFile = ref<ViewerFile | null>(null)
 function openViewer(row: any) {
   viewerFile.value = { path: row.path, name: row.name, size: row.size || 0, mtime: row.mtime }
+}
+
+/** 从全量树中找出 path 所在的同级节点数组（即其父目录的 children；根级文件即 tree 顶层） */
+function findSiblings(nodes: any[], path: string): any[] | null {
+  for (const n of nodes || []) {
+    if (n.path === path) return nodes
+    if (n.children?.length) {
+      const r = findSiblings(n.children, path)
+      if (r) return r
+    }
+  }
+  return null
+}
+
+/** 当前查看文件「同目录 + 可预览」文件列表（按名称自然排序），供查看器左右切换 */
+const viewerNavList = computed<ViewerFile[]>(() => {
+  const cur = viewerFile.value
+  if (!cur) return []
+  const sibs = findSiblings(tree.value, cur.path) || []
+  return sibs
+    .filter((n: any) => n && !n.is_dir && canPreview(n.name))
+    .map((n: any) => ({ path: n.path, name: n.name, size: n.size || 0, mtime: n.mtime }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh', { numeric: true, sensitivity: 'base' }))
+})
+
+/** 切换同目录文件（dir=-1 上一个 / 1 下一个，首尾循环） */
+function onViewerNav(dir: number) {
+  const list = viewerNavList.value
+  if (list.length <= 1) return
+  const idx = Math.max(0, list.findIndex(f => f.path === viewerFile.value?.path))
+  const next = list[(idx + dir + list.length) % list.length]
+  if (next) viewerFile.value = { ...next }
 }
 function onViewerEdit(f: ViewerFile) {
   openEditor({ path: f.path, name: f.name })
