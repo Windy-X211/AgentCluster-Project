@@ -23,7 +23,49 @@ _log('=== Electron main.cjs starting ===')
 process.on('uncaughtException', (e) => { _log('UNCAUGHT: ' + e.message); _log(e.stack || '') })
 process.on('unhandledRejection', (e) => { _log('REJECTION: ' + (e?.message || e)) })
 
+// ---- ELECTRON_RUN_AS_NODE 自恢复 ----
+// IDE / CI / 某些启动器会注入 ELECTRON_RUN_AS_NODE，让 Electron 以纯 Node 模式运行，
+// require('electron') 拿到的只是 Node 模块、app 为 undefined，结果就是"双击没反应、无窗口"。
+// 修复策略：如果此变量已被设置，清除它并用干净的环境重新 spawn 自身，然后当前进程退出。
+// 这样无论用户怎么启动（IDE、快捷方式、直接双击）都能自恢复，不需要依赖 start.bat。
+if (process.env.ELECTRON_RUN_AS_NODE) {
+  _log('检测到 ELECTRON_RUN_AS_NODE=' + process.env.ELECTRON_RUN_AS_NODE + '，清除并重启自身...')
+  const { spawn } = require('child_process')
+  const env = { ...process.env }
+  delete env.ELECTRON_RUN_AS_NODE
+  try {
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      env,
+      stdio: 'inherit',
+      detached: false,
+      windowsHide: false,
+    })
+    child.on('spawn', () => {
+      _log('✅ 已用干净环境 spawn 新实例 PID=' + child.pid + '，当前进程退出')
+      process.exit(0)
+    })
+    child.on('error', (err) => {
+      _log('❌ spawn 失败: ' + err.message)
+      process.exit(1)
+    })
+    // 兜底：如果 spawn 同步失败（不太可能），直接在下一 tick 退出
+    setTimeout(() => process.exit(0), 300)
+    return   // ← 关键：不让代码继续往下 require('electron')，避免拿不到 app 崩溃
+  } catch (err) {
+    _log('❌ 重启异常: ' + err.message + '\n' + err.stack)
+    process.exit(1)
+  }
+}
+
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, shell, screen, dialog, desktopCapturer } = require('electron')
+
+// 双保险：即使上面的自恢复没触发（极端情况），这里也防止 app 为 undefined 时崩溃
+if (!app || typeof app.commandLine?.appendSwitch !== 'function') {
+  const msg = 'Electron 以 Node 模式运行（ELECTRON_RUN_AS_NODE 被设置），无法创建窗口。'
+  _log('FATAL: ' + msg)
+  try { console.error(msg) } catch { }
+  process.exit(1)
+}
 const path = require('path')
 const fs = require('fs')
 const os = require('os')

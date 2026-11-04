@@ -1,6 +1,10 @@
 @echo off
 cd /d "%~dp0"
 
+rem ????? ELECTRON_RUN_AS_NODE ????IDE/CI????Electron ????? Node
+rem ???require('electron') ??? app?main.cjs ??????????????????
+set "ELECTRON_RUN_AS_NODE="
+
 rem ============================================================
 rem  AgentCluster Launcher
 rem    start.bat          = production / reads .launch_mode.txt
@@ -25,16 +29,16 @@ rem --- Find Node ---
 set NODE_DIR=
 if exist "%~dp0node-v20.18.0-win-x64\node.exe" set NODE_DIR=%~dp0node-v20.18.0-win-x64
 if exist "%~dp0node\node.exe" set NODE_DIR=%~dp0node
-rem 项目规则约定的开发机固定位置
+rem ??????????????
 if "%NODE_DIR%"=="" if exist "E:\app\node-v20.18.0-win-x64\node.exe" set NODE_DIR=E:\app\node-v20.18.0-win-x64
-rem 系统常见安装位置
+rem ????????
 if "%NODE_DIR%"=="" if exist "C:\Program Files\nodejs\node.exe" set NODE_DIR=C:\Program Files\nodejs
 if "%NODE_DIR%"=="" if exist "%LOCALAPPDATA%\Programs\nodejs\node.exe" set NODE_DIR=%LOCALAPPDATA%\Programs\nodejs
 rem nvm-windows
 if "%NODE_DIR%"=="" if exist "%APPDATA%\nvm" (
   for /d %%v in ("%APPDATA%\nvm\*") do if "%%~nxv" NEQ "" if exist "%%v\node.exe" set NODE_DIR=%%v
 )
-rem 最后 fallback：where node（依赖 PATH 完整）
+rem ?? fallback?where node??? PATH ???
 if "%NODE_DIR%"=="" for /f "delims=" %%i in ('where node 2^>nul') do if not defined NODE_DIR set NODE_DIR=%%~dpi
 if defined NODE_DIR set "PATH=%NODE_DIR%;%PATH%"
 
@@ -50,13 +54,13 @@ if exist ".launch_mode.txt" (
 )
 if "%LAUNCH_MODE%"=="web" goto :web
 
+rem --- Check electron binary (prod/web 需要，dev 由 npm 自己处理) ---
 cd frontend
-
-rem --- Check electron binary ---
 if not exist "node_modules\electron\dist\electron.exe" (
   echo [AgentCluster] Downloading Electron binary...
   powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://npmmirror.com/mirrors/electron/v33.4.11/electron-v33.4.11-win32-x64.zip' -OutFile '%TEMP%\electron.zip'; if (-not (Test-Path 'node_modules\electron\dist')) { Expand-Archive '%TEMP%\electron.zip' 'node_modules\electron\dist' -Force }; Remove-Item '%TEMP%\electron.zip' -Force"
 )
+goto :prod
 
 :dev
 echo [AgentCluster] DEV mode...
@@ -68,7 +72,6 @@ goto :end
 
 :prod
 echo [AgentCluster] PROD mode (client)...
-cd frontend
 if not exist "dist\index.html" (
   echo [AgentCluster] Building frontend...
   call npm run build || goto :error
@@ -89,9 +92,9 @@ timeout /t 4 >nul
 rem 2. Dist server
 powershell -NoProfile -Command "Start-Process 'node' -ArgumentList 'electron\serve-dist.cjs','.\dist','5173' -WorkingDirectory '%cd%' -WindowStyle Hidden"
 timeout /t 1 >nul
-rem 3. Tray-only Electron (隐藏，只建托盘)
+rem 3. Tray-only Electron (???????)
 start "" node_modules\electron\dist\electron.exe . --tray-only
-rem 4. 浏览器
+rem 4. ???
 start http://localhost:5173
 goto :end
 

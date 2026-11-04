@@ -6,7 +6,7 @@
     "source": "builtin"
   },
   "fairy_ball": {
-    "enabled": true,
+    "enabled": false,
     "installed_at": "2026-10-31T02:07:06.423744",
     "version": "1.0.0",
     "source": "builtin"

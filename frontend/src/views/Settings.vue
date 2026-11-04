@@ -28,6 +28,8 @@ const themeOptions = [
 const showDialog = ref(false)
 const isEditing = ref(false)
 const ifaceForm = ref<any>({})
+const fetchingModels = ref(false)
+const fetchMsg = ref<{ text: string; kind: 'ok' | 'err' } | null>(null)
 
 // 数据存储路径
 const storagePaths = ref<any>(null)
@@ -269,10 +271,12 @@ async function browseStorage() {
 // —— 模型接口 ——
 function openNew() {
   ifaceForm.value = { name: '', url: '', api_key: '', default_model: 'gpt-4o-mini', models_str: '', models: [], description: '', windows_str: '' }
+  fetchMsg.value = null
   isEditing.value = false; showDialog.value = true
 }
 function edit(i: any) {
   ifaceForm.value = { ...i, models_str: (i.models || []).join(','), windows_str: Object.entries(i.model_windows || {}).map(([k, v]) => `${k}:${v}`).join(', ') }
+  fetchMsg.value = null
   isEditing.value = true; showDialog.value = true
 }
 function closeDialog() { showDialog.value = false; ifaceForm.value = {} }
@@ -300,6 +304,27 @@ async function saveIface() {
   closeDialog(); await models.fetch()
 }
 async function setDefaultIface(id: number) { await settings.update({ default_model_interface: id }) }
+async function fetchIfaceModels() {
+  if (fetchingModels.value) return
+  const url = (ifaceForm.value.url || '').trim()
+  if (!url) { fetchMsg.value = { text: '请先填写接口 URL', kind: 'err' }; return }
+  fetchingModels.value = true
+  fetchMsg.value = null
+  try {
+    const r = await api.models.fetchModels({ url, api_key: ifaceForm.value.api_key || '' })
+    const list = r?.models || []
+    if (!list.length) { fetchMsg.value = { text: '未获取到模型列表', kind: 'err' }; return }
+    ifaceForm.value.models_str = list.join(',')
+    if (!ifaceForm.value.default_model || !list.includes(ifaceForm.value.default_model)) {
+      ifaceForm.value.default_model = list[0]
+    }
+    fetchMsg.value = { text: `已获取 ${list.length} 个模型，可用模型与默认模型已自动填写`, kind: 'ok' }
+  } catch (e: any) {
+    fetchMsg.value = { text: `获取失败：${e?.message || e}`, kind: 'err' }
+  } finally {
+    fetchingModels.value = false
+  }
+}
 
 // —— 历史上下文压缩设置 ——
 const ctxThreshold = ref(0.8)
@@ -862,7 +887,14 @@ const agentGroupOptions = computed(() => {
           <label>URL<input class="input" v-model="ifaceForm.url" placeholder="https://api.openai.com/v1" /></label>
           <label class="full">API Key<input class="input" v-model="ifaceForm.api_key" type="password" /></label>
           <label>默认模型<input class="input" v-model="ifaceForm.default_model" placeholder="gpt-4o-mini" /></label>
-          <label class="full">可用模型（逗号分隔，如 gpt-4o,gpt-4o-mini,o1）<input class="input" v-model="ifaceForm.models_str" /></label>
+          <label class="full">
+            <span class="field-head">
+              <span>可用模型（逗号分隔，如 gpt-4o,gpt-4o-mini,o1）</span>
+              <button class="btn sm ghost" :disabled="fetchingModels" @click="fetchIfaceModels">{{ fetchingModels ? '获取中…' : '获取模型列表' }}</button>
+            </span>
+            <input class="input" v-model="ifaceForm.models_str" />
+            <span v-if="fetchMsg" class="fetch-msg" :class="fetchMsg.kind">{{ fetchMsg.text }}</span>
+          </label>
           <label class="full">上下文窗口（格式 模型:token，逗号分隔，如 gpt-4o:128k, glm-4.5:200k；未配置的模型用全局默认窗口）<input class="input" v-model="ifaceForm.windows_str" placeholder="gpt-4o:128k, o1:200k" /></label>
           <label class="full">描述<input class="input" v-model="ifaceForm.description" /></label>
         </div>
@@ -1150,6 +1182,12 @@ const agentGroupOptions = computed(() => {
 .modal { width: 520px; padding: 20px; }
 .modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; margin-bottom: 14px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; label { display: flex; flex-direction: column; gap: 4px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); &.full { grid-column: 1 / -1; } } }
+.field-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.field-head .btn { flex-shrink: 0; }
+.field-head .btn:disabled { opacity: .5; cursor: not-allowed; }
+.fetch-msg { font-size: calc(11px * var(--font-scale)); line-height: 1.5; word-break: break-all; }
+.fetch-msg.ok { color: var(--accent-light); }
+.fetch-msg.err { color: #e05a5a; }
 .ctx-cfg-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 12px; label { display: flex; flex-direction: column; gap: 4px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); } .input { width: 100%; } }
 .actions-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 

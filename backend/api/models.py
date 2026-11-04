@@ -19,6 +19,11 @@ class IfaceIn(BaseModel):
     model_windows: dict = {}
 
 
+class FetchModelsIn(BaseModel):
+    url: str
+    api_key: str = ""
+
+
 def _norm_windows(w: dict) -> dict[str, int]:
     """窗口表规范化：容忍 128k/1m/2b 字符串值，剔除非法项。"""
     out: dict[str, int] = {}
@@ -49,6 +54,73 @@ def _norm_windows(w: dict) -> dict[str, int]:
 @router.get("")
 def list_interfaces():
     return load("model_interfaces")
+
+
+def _extract_model_ids(data) -> list[str]:
+    items = data
+    if isinstance(data, dict):
+        for key in ("data", "models", "result"):
+            if isinstance(data.get(key), list):
+                items = data[key]
+                break
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    for m in items:
+        mid = None
+        if isinstance(m, dict):
+            mid = m.get("id") or m.get("name") or m.get("model")
+        elif isinstance(m, str):
+            mid = m
+        if not isinstance(mid, str):
+            continue
+        mid = mid.strip()
+        if mid.startswith("models/"):
+            mid = mid.split("/", 1)[1]
+        if mid and mid not in out:
+            out.append(mid)
+    return out
+
+
+@router.post("/fetch_models")
+async def fetch_models(body: FetchModelsIn):
+    base = (body.url or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(400, "请先填写接口 URL")
+    if not base.startswith(("http://", "https://")):
+        raise HTTPException(400, "URL 需以 http:// 或 https:// 开头")
+
+    if base.endswith("/models"):
+        candidates = [base]
+    else:
+        candidates = [f"{base}/models"]
+        if not base.endswith("/v1"):
+            candidates.append(f"{base}/v1/models")
+
+    headers = {"Authorization": f"Bearer {body.api_key}"} if body.api_key else {}
+    errors: list[str] = []
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for u in candidates:
+            try:
+                resp = await client.get(u, headers=headers)
+            except Exception as e:
+                errors.append(f"{u}: {e}")
+                continue
+            if resp.status_code != 200:
+                if resp.status_code in (401, 403):
+                    errors.append(f"{u}: HTTP {resp.status_code}（API Key 无效或未填写）")
+                else:
+                    errors.append(f"{u}: HTTP {resp.status_code}")
+                continue
+            try:
+                ids = _extract_model_ids(resp.json())
+            except Exception:
+                errors.append(f"{u}: 响应不是合法 JSON")
+                continue
+            if ids:
+                return {"models": ids, "count": len(ids), "endpoint": u}
+            errors.append(f"{u}: 未解析到模型字段")
+    raise HTTPException(400, "获取模型列表失败：" + "；".join(errors))
 
 
 @router.post("")

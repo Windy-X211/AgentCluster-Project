@@ -229,6 +229,19 @@ export const api = {
     create: (d: any) => req('/model_interfaces', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/model_interfaces/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/model_interfaces/${id}`, { method: 'DELETE' }),
+    fetchModels: async (d: { url: string; api_key?: string }) => {
+      const r = await fetch(BASE + '/model_interfaces/fetch_models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(d),
+      })
+      if (!r.ok) {
+        let e: any = null
+        try { e = await r.json() } catch { /* 非 JSON 错误体 */ }
+        throw new Error(e?.detail || `${r.status} ${r.statusText}`)
+      }
+      return r.json() as Promise<{ models: string[]; count: number; endpoint: string }>
+    },
     detectReasoning: (iid: number, modelName: string) => req<any>(`/model_interfaces/${iid}/reasoning/${encodeURIComponent(modelName)}`),
   },
   settings: {

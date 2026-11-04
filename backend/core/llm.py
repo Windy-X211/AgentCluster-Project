@@ -1,5 +1,5 @@
 """统一的 LLM 调用 - 兼容 OpenAI 格式接口 + function calling"""
-import asyncio, httpx, json, logging
+import asyncio, httpx, json, logging, uuid
 from typing import AsyncGenerator
 
 _logger = logging.getLogger("llm")
@@ -231,6 +231,177 @@ def _encode_tool_name(name: str) -> str:
     if not name:
         return name
     return _TOOL_NAME_ILLEGAL_RE.sub("_", str(name)).strip("_") or "tool"
+
+
+# —— 文本化工具调用（伪协议块）——
+# 现象：部分 OpenAI 兼容上游把 function calling 序列化成正文返回（不填 delta.tool_calls），形如：
+#   <｜｜DSML｜｜>tool_calls>
+#   <｜｜DSML｜｜>invoke name="file_write">
+#   <｜｜DSML｜｜>parameter name="path" string="true">a.md</｜｜DSML｜｜>parameter>
+#   </｜｜DSML｜｜>invoke>
+#   </｜｜DSML｜｜>tool_calls>
+# 还存在特殊 token 后带空格的变体（<｜｜DSML｜｜> calls> / <｜｜DSML｜｜> invoke>），竖线有全角/半角两种。
+# 处理策略：
+#   1) 完整闭合块 → 从正文剥离；若 invoke 的工具体在本次注入的白名单内，解析成标准 tool_call 事件执行；
+#   2) 未闭合块（上游截断）→ 整段丢弃并告警，避免半截协议串刷进气泡；
+#   3) 块外正文原样透传，不误伤正常 markdown（含代码块）。
+# 真实字节形态：<||DSML||calls> / <|｜DSML｜|calls>（两侧 1~2 条竖线，特殊 token 后直接跟名字再闭合 >）
+_PSEUDO_TOOL_PREFIX = r"<\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}\s*"
+_PSEUDO_TOOL_PREFIX_CLOSE = r"<\s*/\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}\s*"
+_PSEUDO_TOOL_TOKEN_RE = _re.compile(
+    r"<\s*/?\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}\s*(?:tool_calls|calls|invoke|parameter)?\s*>?",
+    _re.IGNORECASE,
+)
+_PSEUDO_CALLS_OPEN = _PSEUDO_TOOL_PREFIX + r"(?:tool_calls|calls)\s*>"
+_PSEUDO_CALLS_CLOSE = _PSEUDO_TOOL_PREFIX_CLOSE + r"(?:tool_calls|calls)\s*>"
+_PSEUDO_CALLS_OPEN_RE = _re.compile(_PSEUDO_CALLS_OPEN, _re.IGNORECASE)
+_PSEUDO_CALLS_CLOSE_RE = _re.compile(_PSEUDO_CALLS_CLOSE, _re.IGNORECASE)
+_PSEUDO_INVOKE_RE = _re.compile(
+    _PSEUDO_TOOL_PREFIX + r"invoke\s+name\s*=\s*[\"']([^\"']*)[\"']\s*>(.*?)"
+    + _PSEUDO_TOOL_PREFIX_CLOSE + r"invoke\s*>",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_PSEUDO_PARAM_RE = _re.compile(
+    _PSEUDO_TOOL_PREFIX
+    + r"parameter\s+name\s*=\s*[\"']([^\"']*)[\"'](?:\s+string\s*=\s*[\"'](true|false)[\"'])?\s*>(.*?)"
+    + _PSEUDO_TOOL_PREFIX_CLOSE + r"parameter\s*>",
+    _re.IGNORECASE | _re.DOTALL,
+)
+# 允许作为"开始标记前缀"被暂留的字符集合（避免把跨 chunk 的标记切断）
+_PSEUDO_START_PARTIAL_RE = _re.compile(r"<[|｜\sDSMLdsmlr13>toolcas_]*", _re.IGNORECASE)
+
+
+class PseudoToolBlockFilter:
+    """流式剥离伪协议工具调用块，支持跨 chunk 边界。
+
+    feed() 返回 (可立即下发的正文, 已完整闭合的伪块列表)；
+    flush() 在流结束时调用：未闭合的伪块整段丢弃（不展示半截协议串），
+    非块状态下残留的标记 token 也会被清掉。
+    """
+
+    MAX_BLOCK_BYTES = 256 * 1024
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_block = False
+
+    @staticmethod
+    def _partial_prefix_len(s: str) -> int:
+        if not s:
+            return 0
+        i = s.rfind("<")
+        if i < 0:
+            return 0
+        tail = s[i:]
+        if len(tail) > 64 or not _PSEUDO_START_PARTIAL_RE.fullmatch(tail):
+            return 0
+        return len(tail)
+
+    def feed(self, text: str) -> tuple[str, list[str]]:
+        if text:
+            self._buf += text
+        out: list[str] = []
+        blocks: list[str] = []
+        while True:
+            if self._in_block:
+                m = _PSEUDO_CALLS_CLOSE_RE.search(self._buf)
+                if not m:
+                    if len(self._buf) > self.MAX_BLOCK_BYTES:
+                        _logger.warning(
+                            "文本化工具调用块超过 %d 字节仍未闭合，放弃缓冲并丢弃（防止无限占用）",
+                            self.MAX_BLOCK_BYTES,
+                        )
+                        self._buf, self._in_block = "", False
+                    break
+                blocks.append(self._buf[:m.end()])
+                self._buf = self._buf[m.end():]
+                self._in_block = False
+                continue
+            m = _PSEUDO_CALLS_OPEN_RE.search(self._buf)
+            if m:
+                out.append(self._buf[:m.start()])
+                self._buf = self._buf[m.start():]
+                self._in_block = True
+                continue
+            keep = self._partial_prefix_len(self._buf)
+            if keep:
+                out.append(self._buf[:-keep])
+                self._buf = self._buf[-keep:]
+            else:
+                out.append(self._buf)
+                self._buf = ""
+            break
+        return "".join(out), blocks
+
+    def flush(self) -> str:
+        buf, was_in_block = self._buf, self._in_block
+        self._buf, self._in_block = "", False
+        if not buf:
+            return ""
+        if was_in_block:
+            _logger.warning("流结束仍有未闭合的文本化工具调用块（%d 字符），已丢弃", len(buf))
+            return ""
+        return _PSEUDO_TOOL_TOKEN_RE.sub("", buf)
+
+
+def _parse_pseudo_tool_calls(
+    block: str, known_names: set[str], name_decode: dict[str, str]
+) -> list[dict]:
+    """把伪协议块解析成 [{name, encoded, arguments}]；无法解析时返回空列表。"""
+    calls: list[dict] = []
+    if not block:
+        return calls
+    for m in _PSEUDO_INVOKE_RE.finditer(block):
+        raw_name = (m.group(1) or "").strip()
+        if not raw_name:
+            continue
+        encoded = _clean_tool_name(_encode_tool_name(raw_name), known_names)
+        args: dict = {}
+        for pm in _PSEUDO_PARAM_RE.finditer(m.group(2) or ""):
+            pname = (pm.group(1) or "").strip()
+            if not pname:
+                continue
+            value = pm.group(3) or ""
+            if (pm.group(2) or "").lower() != "true":
+                try:
+                    value = json.loads(value.strip())
+                except Exception:
+                    pass
+            args[pname] = value
+        calls.append({"name": name_decode.get(encoded, raw_name), "encoded": encoded, "arguments": args})
+    return calls
+
+
+def _pseudo_tool_events(
+    blocks: list[str],
+    known_names: set[str],
+    name_decode: dict[str, str],
+    seen: set[tuple[str, str]],
+) -> list[tuple[str, dict]]:
+    """把完整的伪协议块转成 tool_call 事件；白名单外的调用只剥离不执行。"""
+    events: list[tuple[str, dict]] = []
+    for block in blocks:
+        for call in _parse_pseudo_tool_calls(block, known_names, name_decode):
+            if not known_names or call["encoded"] not in known_names:
+                _logger.warning(
+                    "文本化工具调用无法执行（工具名 %r 不在本次注入的白名单内），已从正文剥离",
+                    call["name"],
+                )
+                continue
+            args_json = json.dumps(call["arguments"], ensure_ascii=False, sort_keys=True)
+            dedup_key = (call["name"], args_json)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            call_id = f"call_pseudo_{uuid.uuid4().hex[:12]}"
+            _logger.info("从正文中识别并转换文本化工具调用：%s %s", call["name"], args_json[:200])
+            events.append(("tool_call_start", {"id": call_id, "name": call["name"]}))
+            events.append((
+                "tool_args_delta",
+                {"id": call_id, "name": call["name"], "delta": args_json, "accumulated": args_json},
+            ))
+            events.append(("tool_call", {"id": call_id, "name": call["name"], "arguments": call["arguments"]}))
+    return events
 
 
 def _diag_payload(payload: dict, model: str) -> str:
@@ -471,21 +642,25 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
     # —— payload 兼容性清洗：修正对国产模型（glm/sensenova 等）常见的不兼容字段 ——
     _sanitize_payload(payload)
 
+    # 工具白名单 + schema 索引（便于实时校验工具名 + 参数 / 伪协议块解析）
+    known_tool_names: set[str] = set()
+    tool_schemas: dict[str, dict] = {}
+    for t in tools or []:
+        fn = t.get("function") or {}
+        nm = fn.get("name") or ""
+        if nm:
+            _enc = _encode_tool_name(nm)
+            known_tool_names.add(_enc)
+            tool_schemas[_enc] = fn.get("parameters") or {}
+
     async with httpx.AsyncClient(timeout=180) as client:
         if stream:
             # 流式解析 tool_calls（增量拼接）
             # 引入实时校验器：按 index 维护 StreamingToolValidator
             from core.tool_stream_validator import StreamingToolValidator
-            # 工具白名单 + schema 索引（便于实时校验工具名 + 参数）
-            known_tool_names: set[str] = set()
-            tool_schemas: dict[str, dict] = {}
-            for t in tools or []:
-                fn = t.get("function") or {}
-                nm = fn.get("name") or ""
-                if nm:
-                    _enc = _encode_tool_name(nm)
-                    known_tool_names.add(_enc)
-                    tool_schemas[_enc] = fn.get("parameters") or {}
+            # 正文中的文本化工具调用块过滤器（跨 chunk 安全）
+            pseudo_filter = PseudoToolBlockFilter()
+            pseudo_seen: set[tuple[str, str]] = set()
 
             tc_buf: dict[int, dict] = {}        # index -> {id, name, args}
             tc_announced: set[int] = set()      # 已发出 tool_call_start 的 index
@@ -535,14 +710,23 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                     #   正文里的伪协议串可能是文档内容本身，不做致命拦截，避免误伤）
                     if delta.get("content"):
                         ctext = _MODEL_INTERNAL_TOKEN_RE.sub("", delta["content"])
-                        if ctext:  # 清洗后还有内容才 yield，避免空 chunk 白白浪费
-                            # —— 重复检测（在 yield 前检查，避免重复内容下发到前端）——
-                            trigger, rep_error = _rep_detector.check(ctext)
-                            if trigger:
-                                # 触发重复循环错误 → 立即中止本轮，后续内容不再 yield
-                                raise rep_error
+                        if ctext:  # 清洗后还有内容才继续处理，避免空 chunk 白白浪费
+                            # —— 剥离正文中的文本化工具调用块（可跨 chunk）——
+                            safe_text, pseudo_blocks = pseudo_filter.feed(ctext)
+                            if pseudo_blocks:
+                                # 白名单内的调用转成标准 tool_call 交给上层执行；白名单外只剥离
+                                for _kind, _payload in _pseudo_tool_events(
+                                    pseudo_blocks, known_tool_names, name_decode, pseudo_seen
+                                ):
+                                    yield (_kind, _payload)
+                            if safe_text:
+                                # —— 重复检测（在 yield 前检查，避免重复内容下发到前端）——
+                                trigger, rep_error = _rep_detector.check(safe_text)
+                                if trigger:
+                                    # 触发重复循环错误 → 立即中止本轮，后续内容不再 yield
+                                    raise rep_error
+                                yield ("text", safe_text)
                             _empty_streak = 0
-                            yield ("text", ctext)
                         else:
                             # 本 chunk 全为内部 token → 连续空计数；超过阈值判定模型退化
                             _empty_streak += 1
@@ -695,6 +879,10 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                         tc_invalid = {}
                         tc_warnings = {}
                         tc_aborted = set()
+            # —— 正文过滤器收尾：未闭合伪块丢弃，残留的特殊 token 清除 ——
+            _tail_text = pseudo_filter.flush()
+            if _tail_text:
+                yield ("text", _tail_text)
             # —— 流截断检测：已 announce tool_call_start 但流结束时未 emit tool_call ——
             # 上游连接中断（RST）时 aiter_lines 可能正常结束（EOF）而非抛 ReadError，
             # 此时 finish_reason 非 "tool_calls"，已 announce 的 tool_call 不会走到 emit，
@@ -719,7 +907,31 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
-            yield ("message", data["choices"][0]["message"])
+            msg = data["choices"][0]["message"]
+            # —— 非流式同样剥离正文中的文本化工具调用块，并转换成标准 tool_calls ——
+            _content = msg.get("content") or ""
+            if _content:
+                _filter = PseudoToolBlockFilter()
+                _safe_text, _pseudo_blocks = _filter.feed(_content)
+                _safe_text += _filter.flush()
+                _calls: list[dict] = []
+                for _kind, _payload in _pseudo_tool_events(
+                    _pseudo_blocks, known_tool_names, name_decode, set()
+                ):
+                    if _kind != "tool_call":
+                        continue
+                    _calls.append({
+                        "id": _payload["id"],
+                        "type": "function",
+                        "function": {
+                            "name": _payload["name"],
+                            "arguments": json.dumps(_payload["arguments"], ensure_ascii=False),
+                        },
+                    })
+                if _calls:
+                    msg["tool_calls"] = (msg.get("tool_calls") or []) + _calls
+                msg["content"] = _safe_text
+            yield ("message", msg)
 
 
 # —— 自动故障转移：连接断开时切换到下一个模型 ——
