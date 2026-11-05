@@ -337,7 +337,7 @@ npm run dev
 │   ├── vite.config.ts
 │   └── package.json
 │
-├── market/                     # 市场资源仓库（随程序分发，提交 git）
+├── market/                     # 市场资源独立仓库 AgentCluster-Market 的工作副本（主仓库不跟踪）
 │   ├── index.json              # 统一资源索引（智能体/画布/背景/技能/插件/功能拓展）
 │   ├── agents/                 # 智能体资源
 │   ├── canvases/               # 画布资源
@@ -350,7 +350,7 @@ npm run dev
 │
 ├── start.bat                   # Windows 一键启动（自动选 pythonw / python）
 ├── start_tray.py               # 系统托盘启动器（单实例 + 健康检查 + 菜单）
-├── market_manager.pyw          # 独立市场管理程序（Tkinter，浏览/搜索/安装/发布/删除）
+├── market_manager.pyw          # 独立市场管理程序（Tkinter，浏览/安装/发布/同步/推送）
 ├── market_manager.bat          # 双击启动市场管理程序（不依赖主程序）
 └── .agentcluster.pid           # 运行时 PID 文件
 ```
