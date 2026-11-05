@@ -742,7 +742,42 @@ class _BrowserWorker:
     return false;
   }
 
+  // 归一化坐标 [0,1]（相对顶层视口；子帧坐标换算到页面级，跨域取不到则退化为帧内）
+  function normXY(clientX, clientY) {
+    var x = clientX, y = clientY;
+    try {
+      var fe = window.frameElement;
+      while (fe) {
+        var r = fe.getBoundingClientRect();
+        x += r.left; y += r.top;
+        fe = (fe.ownerDocument && fe.ownerDocument.defaultView) ? fe.ownerDocument.defaultView.frameElement : null;
+      }
+    } catch(e) {}
+    var w = window.innerWidth || 1, h = window.innerHeight || 1;
+    try {
+      if (window.top !== window) { w = window.top.innerWidth || w; h = window.top.innerHeight || h; }
+    } catch(e) {}
+    return [Math.min(1, Math.max(0, x / Math.max(1, w))), Math.min(1, Math.max(0, y / Math.max(1, h)))];
+  }
+
+  // 找真正滚动的容器（向上找 overflow 可滚祖先；到 BODY = 页面级滚动，返回 ''）
+  function scrollSel(el) {
+    try {
+      var cur = el;
+      while (cur && cur.nodeType === 1 && cur.tagName !== 'BODY' && cur.tagName !== 'HTML') {
+        var st = window.getComputedStyle(cur);
+        var ov = st.overflowY || st.overflow || '';
+        if (/auto|scroll/.test(ov) && cur.scrollHeight > cur.clientHeight + 1) {
+          return stableSel(cur);
+        }
+        cur = cur.parentElement;
+      }
+    } catch(e) {}
+    return '';
+  }
+
   // —— click（window 捕获阶段，最先触发，防页面脚本拦截）——
+  // nx/ny 归一化坐标：回放时选择器失配的坐标点击兜底用
   window.addEventListener('click', function(e) {
     var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
     var tn = (tgt.tagName || '').toUpperCase();
@@ -750,8 +785,37 @@ class _BrowserWorker:
     // 悬浮条文字「正在录制操作模板」带进来，回放时形成一个没有选择器的
     // click 直接报错中断 —— 必须过滤。
     if (tn === 'BODY' || tn === 'HTML') return;
-    emit({ kind:'click', selector: stableSel(tgt), text:(tgt.innerText||tgt.textContent||'').trim().slice(0,100), tag: tgt.tagName.toLowerCase() });
+    var pos = normXY(e.clientX, e.clientY);
+    emit({ kind:'click', selector: stableSel(tgt), text:(tgt.innerText||tgt.textContent||'').trim().slice(0,100), tag: tgt.tagName.toLowerCase(), nx:+pos[0].toFixed(4), ny:+pos[1].toFixed(4) });
   }, true);
+
+  // —— wheel 滚轮（防抖 800ms 聚合：一次滚动操作的几十个 wheel 事件 → 累计 deltaY 一步）——
+  // ctrl+wheel 是页面缩放不是滚动，忽略；deltaMode 行/页模式换算为像素
+  var wheelTimer = null;
+  var wheelBuff = null;
+  window.addEventListener('wheel', function(e) {
+    var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
+    if (e.ctrlKey) return;
+    var dy = e.deltaY || 0;
+    if (e.deltaMode === 1) dy *= 40;        // DOM_DELTA_LINE → 像素
+    else if (e.deltaMode === 2) dy *= 800;  // DOM_DELTA_PAGE → 像素
+    if (!dy) return;
+    var pos = normXY(e.clientX, e.clientY);
+    if (wheelBuff) {
+      wheelBuff.dy += dy;                   // 同一次滚动累计
+      wheelBuff.nx = +pos[0].toFixed(4); wheelBuff.ny = +pos[1].toFixed(4);
+      wheelBuff.sel = scrollSel(tgt);
+    } else {
+      wheelBuff = { dy: dy, nx: +pos[0].toFixed(4), ny: +pos[1].toFixed(4), sel: scrollSel(tgt) };
+    }
+    if (wheelTimer) clearTimeout(wheelTimer);
+    wheelTimer = setTimeout(function() {
+      if (wheelBuff && wheelBuff.dy !== 0) {
+        emit({ kind:'scroll', selector: wheelBuff.sel, delta_y: Math.round(wheelBuff.dy), nx: wheelBuff.nx, ny: wheelBuff.ny });
+      }
+      wheelBuff = null;
+    }, 800);
+  }, { capture: true, passive: true });
 
   // —— input/textarea 输入（防抖 600ms）——
   var inputTimer = null;
@@ -759,15 +823,17 @@ class _BrowserWorker:
   window.addEventListener('input', function(e) {
     var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
     if (["INPUT","TEXTAREA","SELECT"].indexOf(tgt.tagName) < 0) return;
+    var pos = normXY(e.clientX, e.clientY);
     if (inputBuff && inputBuff.selector === stableSel(tgt)) {
       inputBuff.text = tgt.value || tgt.textContent || '';
+      inputBuff.nx = +pos[0].toFixed(4); inputBuff.ny = +pos[1].toFixed(4);
     } else {
-      inputBuff = { selector: stableSel(tgt), text: tgt.value || tgt.textContent || '' };
+      inputBuff = { selector: stableSel(tgt), text: tgt.value || tgt.textContent || '', nx:+pos[0].toFixed(4), ny:+pos[1].toFixed(4) };
     }
     if (inputTimer) clearTimeout(inputTimer);
     inputTimer = setTimeout(function() {
       if (inputBuff) {
-        emit({ kind:'type', selector: inputBuff.selector, text: inputBuff.text });
+        emit({ kind:'type', selector: inputBuff.selector, text: inputBuff.text, nx: inputBuff.nx, ny: inputBuff.ny });
         inputBuff = null;
       }
     }, 600);
@@ -777,7 +843,9 @@ class _BrowserWorker:
   window.addEventListener('change', function(e) {
     var tgt = e.target; if (!tgt || isOverlayNode(tgt)) return;
     if (tgt.tagName === 'SELECT') {
-      emit({ kind:'type', selector: stableSel(tgt), text: (tgt.value||'').slice(0,200) });
+      var r = tgt.getBoundingClientRect();
+      var pos = normXY(r.left + r.width / 2, r.top + r.height / 2);
+      emit({ kind:'type', selector: stableSel(tgt), text: (tgt.value||'').slice(0,200), nx:+pos[0].toFixed(4), ny:+pos[1].toFixed(4) });
     }
   }, true);
 
@@ -847,6 +915,19 @@ class _BrowserWorker:
 })()""")
 
     # —— 将一条 console 事件转成 step dict ——
+    @staticmethod
+    def _norm_coord(payload: dict) -> dict | None:
+        """从录制 payload 提取归一化坐标 {x, y}∈[0,1]；无效/缺失返回 None。
+        回放时选择器失配的坐标点击兜底用。"""
+        try:
+            nx = float(payload.get("nx", -1))
+            ny = float(payload.get("ny", -1))
+        except (TypeError, ValueError):
+            return None
+        if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
+            return {"x": nx, "y": ny}
+        return None
+
     def _parse_rec_console(self, text: str, page) -> dict | None:
         prefix = self._AC_REC_PREFIX
         if not text.startswith(prefix):
@@ -875,8 +956,18 @@ class _BrowserWorker:
             if not payload.get("selector"):
                 return None
             step["action"] = "click"
+            step["coordinate"] = self._norm_coord(payload)
         elif kind == "type":
             step["action"] = "type"
+            step["coordinate"] = self._norm_coord(payload)
+        elif kind == "scroll":
+            # 滚轮滚动（JS 端 800ms 防抖聚合后的累计 deltaY）
+            step["action"] = "scroll"
+            try:
+                step["delta_y"] = int(float(payload.get("delta_y", 0)))
+            except (TypeError, ValueError):
+                step["delta_y"] = 0
+            step["coordinate"] = self._norm_coord(payload)
         elif kind == "form_submit":
             step["action"] = "form_submit"
         elif kind == "navigate":
@@ -924,6 +1015,23 @@ class _BrowserWorker:
                         gap_ms = int(last.get("wait_after") or 0)
                         if gap_ms < 3000:
                             return  # click 自带跳转，跳过这个 navigate
+
+            # —— scroll 连续合并 ——
+            # JS 端 800ms 防抖后仍可能把一次连续滚动拆成多步（滚动间歇偶超 800ms），
+            # Python 端再合并一次：上一步也是 scroll、间隔 < 3s、滚动容器相同 → 累计 deltaY。
+            if action == "scroll" and self._recording_steps:
+                last = self._recording_steps[-1]
+                gap_ms = int((now - self._last_step_time) * 1000) if self._last_step_time > 0 else 0
+                if (last.get("action") == "scroll" and gap_ms < 3000
+                        and (last.get("selector") or "") == (step.get("selector") or "")):
+                    last["delta_y"] = int(last.get("delta_y") or 0) + int(step.get("delta_y") or 0)
+                    if step.get("coordinate"):
+                        last["coordinate"] = step.get("coordinate")
+                    if last["delta_y"] == 0:
+                        self._recording_steps.pop()  # 正负抵消，删除
+                    else:
+                        self._last_step_time = now  # 刷新时间戳，允许继续合并
+                    return
 
             # 计算与上一步的间隔（毫秒）
             wait_after = 0
@@ -1373,11 +1481,60 @@ class _BrowserWorker:
                     return {"ok": False, "error": f"删除失败：{e}"}
         return {"ok": False, "error": f"未找到模板：{name}"}
 
+    def _do_scroll(self, page, dy: int, nx_raw=None, ny_raw=None) -> dict:
+        """在 page 上执行滚轮滚动。
+
+        可选 (nx, ny) 归一化坐标：先 mouse.move 到录制时的鼠标位置再滚，
+        保证滚动的是录制时的同一个容器（滚动容器由鼠标位置决定）。
+        分批派发（每批一格 120px、间隔 40ms）模拟真实滚轮，
+        能触发抖音等页面的懒加载/无限滚动。
+        """
+        try:
+            nx = float(nx_raw) if nx_raw is not None else -1.0
+            ny = float(ny_raw) if ny_raw is not None else -1.0
+        except (TypeError, ValueError):
+            nx, ny = -1.0, -1.0
+        if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
+            vw = vh = 0
+            try:
+                vs = page.viewport_size or {}
+                vw = int(vs.get("width") or 0)
+                vh = int(vs.get("height") or 0)
+            except Exception:
+                pass
+            if not vw or not vh:
+                try:
+                    dims = page.evaluate("() => ({w: window.innerWidth || 0, h: window.innerHeight || 0})")
+                    vw = int(dims.get("w") or 0)
+                    vh = int(dims.get("h") or 0)
+                except Exception:
+                    pass
+            if vw and vh:
+                try:
+                    page.mouse.move(max(0, min(vw - 1, int(round(nx * vw)))),
+                                    max(0, min(vh - 1, int(round(ny * vh)))))
+                except Exception:
+                    pass
+        step_px = 120 if dy > 0 else -120
+        remaining = dy
+        while remaining != 0:
+            chunk = step_px if abs(remaining) >= abs(step_px) else remaining
+            page.mouse.wheel(0, chunk)
+            remaining -= chunk
+            if remaining != 0:
+                page.wait_for_timeout(40)
+        page.wait_for_timeout(300)
+        direction = "向下" if dy > 0 else "向上"
+        return {"ok": True, "data": f"已滚动{direction} {abs(dy)}px", "current_url": self.current_url()}
+
     def _template_run(self, req: dict) -> dict:
-        """依次执行模板中的每一步（navigate → click → type → coordinate_click）。
+        """依次执行模板中的每一步（navigate → click → type → scroll → coordinate_click）。
         每一步调用 worker 内部的 _handle 方法。
         回放期间临时禁用录制捕获（避免把回放步骤录进当前录制会话）。
         使用步骤自带的 wait_after（毫秒）作为步骤间等待，默认 1000ms。
+
+        click/type 步骤带录制坐标时：选择器定位失败自动回退鼠标坐标点击
+        （type 回退为坐标点击聚焦 + 键盘输入），回退结果标注 fallback。
 
         回放前会预处理 steps：如果某个 navigate 紧邻 click（间隔 < 3s），
         说明是 click 触发的跳转，回放时跳过这个 navigate（click 本身会触发跳转）。"""
@@ -1456,6 +1613,18 @@ class _BrowserWorker:
                                         "note": "无选择器（误录步骤），已跳过"})
                         continue
                     step_req = {"action": "type", "selector": sel, "text": step.get("text", "")}
+                elif action == "scroll":
+                    try:
+                        dy = int(float(step.get("delta_y") or 0))
+                    except (TypeError, ValueError):
+                        dy = 0
+                    if not dy:
+                        results.append({"step": i, "action": action, "ok": True, "skipped": True,
+                                        "note": "滚动量为 0，已跳过"})
+                        continue
+                    coord = step.get("coordinate") or {}
+                    step_req = {"action": "scroll", "delta_y": dy,
+                                "x": coord.get("x", -1), "y": coord.get("y", -1)}
                 elif action == "coordinate_click":
                     coord = step.get("coordinate") or {}
                     step_req = {"action": "coordinate_click", "x": coord.get("x", -1), "y": coord.get("y", -1)}
@@ -1469,6 +1638,41 @@ class _BrowserWorker:
                 step_req.setdefault("timeout", req.get("timeout", 15))
                 step_req.setdefault("visible", True)
                 r = self._handle(step_req)
+
+                # —— click/type 选择器定位失败 → 回退鼠标坐标点击 ——
+                # 录制时记录了归一化坐标；nth-of-type 长链选择器在页面 DOM 变动后
+                # 极易失配，此时用录制坐标直接鼠标点击兜底（type 再键盘输入）。
+                if not r.get("ok") and action in ("click", "type"):
+                    coord = step.get("coordinate") or {}
+                    try:
+                        fb_x = float(coord.get("x", -1))
+                        fb_y = float(coord.get("y", -1))
+                        fb_ok = 0.0 <= fb_x <= 1.0 and 0.0 <= fb_y <= 1.0
+                    except (TypeError, ValueError):
+                        fb_ok = False
+                    if fb_ok:
+                        note_sel = (step.get("stable_selector") or step.get("selector") or "")[:60]
+                        print(f"[browser_control] template_run: step {i}({action}) 选择器定位失败，"
+                              f"回退坐标点击 ({fb_x:.4f},{fb_y:.4f})")
+                        fr = self._handle({"action": "coordinate_click", "x": fb_x, "y": fb_y,
+                                           "timeout": req.get("timeout", 15)})
+                        if fr.get("ok") and action == "type":
+                            # 点击聚焦输入框后键盘输入（先全选清空，对齐 locator 版 fill("") 语义）
+                            try:
+                                kb = self._page.keyboard
+                                kb.press("Control+a")
+                                kb.press("Delete")
+                                kb.type(step.get("text", ""), delay=30)
+                                fr = {"ok": True, "current_url": self.current_url(),
+                                      "data": f"选择器失配，已回退坐标输入 {len(step.get('text', ''))} 字符"}
+                            except Exception as e:
+                                fr = {"ok": False, "current_url": self.current_url(),
+                                      "error": f"坐标回退输入失败: {e}"}
+                        if fr.get("ok"):
+                            fr["fallback"] = True
+                            fr["fallback_note"] = f"选择器 [{note_sel}] 定位失败，已回退鼠标坐标点击"
+                        r = fr
+
                 results.append({"step": i, "action": action, **r})
                 if not r.get("ok"):
                     return {"ok": False, "error": f"步骤 {i}({action}) 失败：{r.get('error','')}",
@@ -1684,7 +1888,7 @@ class _BrowserWorker:
             # switch_active=True：同时切为活动页（bring_to_front + 更新 self._page）；
             # switch_active=False（默认）：后台操作，不 bring_to_front、不改 self._page。
             redirected = False
-            if action in ("navigate", "click", "coordinate_click", "type",
+            if action in ("navigate", "click", "coordinate_click", "type", "scroll",
                           "get_text", "get_html", "screenshot", "evaluate", "wait"):
                 tab_index_req = req.get("tab_index")
                 try:
@@ -1749,6 +1953,17 @@ class _BrowserWorker:
                 page.mouse.click(px, py)
                 page.wait_for_timeout(300)
                 return {"ok": True, "data": f"已点击 坐标 norm=({nx:.4f},{ny:.4f}) px=({px},{py}) viewport=({vw}x{vh})", "current_url": self.current_url(), "pixel": {"x": px, "y": py}, "viewport": {"width": vw, "height": vh}}
+
+            if action == "scroll":
+                try:
+                    dy = int(float(req.get("delta_y") if req.get("delta_y") is not None
+                                    else (req.get("dy") or 0)))
+                except (TypeError, ValueError):
+                    dy = 0
+                if not dy:
+                    return {"ok": False, "data": "", "error": "scroll 需要 delta_y（非 0 像素数；正=向下，负=向上）",
+                            "current_url": self.current_url()}
+                return self._do_scroll(page, dy, req.get("x"), req.get("y"))
 
             if action == "type":
                 selector = req.get("selector") or ""

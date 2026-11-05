@@ -856,6 +856,21 @@ export const useConvStore = defineStore('conv', {
       if (rawIdx < 0 || rawIdx == null) return { ok: false, msg: '找不到消息' }
       try {
         const r = await api.convs.deleteMessage(c.id, rawIdx)
+        // 同 undoFromUserMessage：fetch() 保留本地已加载 messages → 后端删除成功后
+        // 按对象引用同步移除，否则 UI 残留（刷新前消息看起来没删掉）
+        const msgs = (c.messages || []) as any[]
+        const localIdx = msgs.indexOf(target)
+        if (localIdx >= 0) {
+          msgs.splice(localIdx, 1)
+          // 水合把工具结果合成 tool_call/tool_result 对挂在所属 assistant 之后：
+          // 删除 assistant 时连带移除其后紧随的合成对（对齐后端连带删 tool 结果的语义）
+          if (target?.role === 'assistant') {
+            while (localIdx < msgs.length
+              && (msgs[localIdx]?.role === 'tool_call' || msgs[localIdx]?.role === 'tool_result')) {
+              msgs.splice(localIdx, 1)
+            }
+          }
+        }
         await this.fetch()
         if (this.current != null) {
           const found = this.list.find(x => x.id === this.current)
@@ -873,12 +888,34 @@ export const useConvStore = defineStore('conv', {
     async undoFromUserMessage(target: any): Promise<{ ok: boolean; msg?: string; restoredOps?: number }> {
       const c = this.currentData()
       if (!c) return { ok: false, msg: '无当前会话' }
-      // 同 deleteMessage：水合后优先用 _rawIdx 换算原始落库索引
-      const rawIdx = (target as any)?._rawIdx ?? (c.messages || []).indexOf(target)
-      if (rawIdx < 0 || rawIdx == null) return { ok: false, msg: '找不到消息' }
       if (target.role !== 'user') return { ok: false, msg: '仅可对用户消息执行撤销' }
+      // 水合消息带 _rawIdx（原始落库索引）可直接用；本地 push 的消息没有——本地渲染数组
+      // （含合成 tool_call/tool_result 对）与后端落库数组（OpenAI 格式含 role='tool'）结构不同，
+      // indexOf 会错位 → 拉落库数组按「第 k 条 user」锚点换算（user 在两数组中一一对应）
+      let rawIdx = (target as any)?._rawIdx ?? null
+      if (rawIdx == null) {
+        const msgs0 = (c.messages || []) as any[]
+        const localIdx0 = msgs0.indexOf(target)
+        if (localIdx0 < 0) return { ok: false, msg: '找不到消息' }
+        const k = msgs0.slice(0, localIdx0 + 1).filter((x: any) => x?.role === 'user').length
+        try {
+          const full: any = await api.convs.get(c.id)
+          const dbMsgs: any[] = Array.isArray(full?.messages) ? full.messages : []
+          let seen = 0
+          for (let i = 0; i < dbMsgs.length; i++) {
+            if (dbMsgs[i]?.role === 'user' && ++seen === k) { rawIdx = i; break }
+          }
+        } catch { /* 后端不可达 → 退回本地索引 */ }
+        if (rawIdx == null) rawIdx = localIdx0
+      }
+      if (rawIdx < 0) return { ok: false, msg: '找不到消息' }
       try {
         const r = await api.convs.undoFrom(c.id, rawIdx)
+        // fetch() 的合并策略保留本地已加载 messages（见 fetch 注释②）：后端已截断而本地不动
+        // → UI 残留旧消息，编辑重发表现为「没先撤回就直接发送」→ 按对象引用同步截断该消息及之后全部
+        const msgs = (c.messages || []) as any[]
+        const localIdx = msgs.indexOf(target)
+        if (localIdx >= 0) msgs.length = localIdx
         await this.fetch()
         if (this.current != null) {
           const found = this.list.find(x => x.id === this.current)

@@ -1140,6 +1140,12 @@ const seqMap = computed(() => {
   base.forEach((c, i) => m.set(c.id, base.length - i)) // 最旧 = 1
   return m
 })
+function isConvRunning(id: number): boolean {
+  return convs.streamingConvIds.has(id)
+}
+function isGroupRunning(g: ConvGroup): boolean {
+  return g.convs.some(c => isConvRunning(c.id))
+}
 
 // —— 对话记录分组（按集群=画布 / 按工作区=会话级 workdir）——
 interface ConvGroup {
@@ -3221,12 +3227,13 @@ onBeforeUnmount(() => {
               <!-- 无分类：平铺 -->
               <template v-if="groupMode === 'none'">
                 <div v-for="c in sortedConvs" :key="c.id"
-                     :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id) }]"
+                     :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id), running: isConvRunning(c.id) }]"
                      @click="selectConv(c.id)"
                      @contextmenu="onConvContext($event, c.id)">
-                  <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
-                  <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
-                  <span class="conv-body">
+                   <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
+                   <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
+                   <span v-if="isConvRunning(c.id)" class="conv-running" title="正在运行">●</span>
+                   <span class="conv-body">
                     <span class="conv-name">{{ convDisplayName(c) }}</span>
                     <span class="conv-time">{{ convTimeLabel(c) }}</span>
                   </span>
@@ -3240,20 +3247,22 @@ onBeforeUnmount(() => {
                   <div class="conv-group-head" :title="(g.hint || g.title) + (isGroupExpanded(g.key) ? '（点击折叠）' : '（点击展开）')"
                        @click="toggleGroupExpand(g.key)">
                     <span class="conv-group-caret">{{ isGroupExpanded(g.key) ? '▾' : '▸' }}</span>
-                    <span class="conv-group-title">{{ g.title }}</span>
-                    <span class="conv-group-count">{{ g.convs.length }}</span>
+                     <span class="conv-group-title">{{ g.title }}</span>
+                     <span class="conv-group-count">{{ g.convs.length }}</span>
+                     <span v-if="isGroupRunning(g)" class="conv-group-running" title="组内有正在运行的对话">●</span>
                     <span class="flex-spacer"></span>
                     <button v-if="g.canCreate" class="conv-group-add" type="button"
                             @click.stop="newConvInGroup(g)" :title="`在「${g.title}」新建对话`">＋</button>
                   </div>
                   <template v-if="isGroupExpanded(g.key)">
-                    <div v-for="c in g.convs" :key="c.id"
-                         :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id) }]"
-                         @click="selectConv(c.id)"
-                         @contextmenu="onConvContext($event, c.id)">
-                      <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
-                      <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
-                      <span class="conv-body">
+                     <div v-for="c in g.convs" :key="c.id"
+                          :class="['conv-item', { active: conv?.id === c.id, checked: selectedIds.includes(c.id), running: isConvRunning(c.id) }]"
+                          @click="selectConv(c.id)"
+                          @contextmenu="onConvContext($event, c.id)">
+                       <span v-if="selMode" class="chk">{{ selectedIds.includes(c.id) ? '☑' : '☐' }}</span>
+                       <span class="seq" title="序号：按活跃度从旧到新，最旧为 1（与排序方向无关）">{{ convSeqOf(c.id) }}</span>
+                       <span v-if="isConvRunning(c.id)" class="conv-running" title="正在运行">●</span>
+                       <span class="conv-body">
                         <span class="conv-name">{{ convDisplayName(c) }}</span>
                         <span class="conv-meta">
                           <span class="conv-tag">{{ convGroupTag(c) }}</span>
@@ -3900,6 +3909,7 @@ onBeforeUnmount(() => {
 .conv-group-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: calc(11px * var(--font-scale)); font-weight: 600; color: rgba(var(--text-rgb), 0.7); }
 .conv-group-head:hover .conv-group-title { color: rgb(var(--text-rgb)); }
 .conv-group-count { flex-shrink: 0; font-family: Consolas, monospace; font-size: calc(10px * var(--font-scale)); opacity: .5; }
+.conv-group-running { flex-shrink: 0; font-size: calc(10px * var(--font-scale)); color: #4ade80; line-height: 1; animation: cvPulse 1.2s ease-in-out infinite; }
 .conv-group-add { flex-shrink: 0; width: 18px; height: 18px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 5px; color: var(--accent); font-size: calc(12px * var(--font-scale)); cursor: pointer; line-height: 1; }
 .conv-group-add:hover { background: rgba(var(--accent-rgb), 0.18); color: #dce8ff; }
 /* 分组模式下会话条目的归属标注（按集群 → 工作区名；按工作区 → 画布名） */
@@ -3935,6 +3945,8 @@ onBeforeUnmount(() => {
 .conv-item:hover { background: rgba(var(--surface-rgb), 0.05); }
 .conv-item.active { background: rgba(var(--accent-rgb), 0.15); }
 .conv-item.checked { background: rgba(255,80,80,0.12); border: 1px solid rgba(255,80,80,0.35); }
+.conv-item.running::before { content: ''; position: absolute; left: 0; top: 4px; bottom: 4px; width: 3px; border-radius: 2px; background: #4ade80; }
+.conv-item .conv-running { flex-shrink: 0; font-size: calc(10px * var(--font-scale)); color: #4ade80; line-height: 1; animation: cvPulse 1.2s ease-in-out infinite; }
 .conv-item .chk { flex-shrink: 0; font-size: calc(13px * var(--font-scale)); opacity: .85; }
 .conv-item .conv-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .conv-item .conv-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

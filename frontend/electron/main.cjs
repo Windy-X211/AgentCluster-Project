@@ -836,6 +836,18 @@ let fairyPollTimer = null
 let _snipFullImg = null    // 选区期间的全屏 nativeImage（物理分辨率）
 let _snipScale = 1         // 主屏 DPI 缩放（CSS 逻辑坐标 → 物理像素）
 
+// 右键菜单窗内容：预读 menu.html 编码为 data URL，彻底消除每次右键的 HTTP 回环请求。
+// menu.html 是纯静态页面（皮肤选择、动作分发），不需要后端动态下发；
+// 改动后重启 Electron 生效。
+let _menuDataUrl = ''
+try {
+  const _menuHtmlPath = path.join(PROJECT_ROOT, 'AppData', 'extensions', '_builtin', 'fairy_ball', 'menu.html')
+  const _menuHtml = fs.readFileSync(_menuHtmlPath, 'utf-8')
+  _menuDataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(_menuHtml)
+} catch (e) {
+  _log('[fairy] 预读 menu.html 失败，将 fallback HTTP 加载：' + e.message)
+}
+
 function _fairyWebPrefs() {
   // backgroundThrottling:false —— fairy 系窗口（球窗/菜单窗/小窗等）失去焦点或被垫层
   // 覆盖时 Chromium 不节流 rAF/timer：球窗的逐帧命中测试与状态轮询保持实时
@@ -951,7 +963,7 @@ function openFairyMenu(x, y) {
   fairyCatchWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(_FAIRY_CATCH_HTML))
   fairyCatchWin.once('ready-to-show', () => { if (fairyCatchWin && !fairyCatchWin.isDestroyed()) fairyCatchWin.show() })
   fairyCatchWin.on('closed', () => { if (fairyCatchWin) fairyCatchWin = null })
-  // 2) 菜单窗（内容 = 拓展后端下发的 menu.html；尺寸由页面上报后 setContentSize）
+  // 2) 菜单窗（menu.html 已预读为 data URL，零延迟加载；尺寸由页面上报后 setContentSize）
   fairyMenuWin = new BrowserWindow({
     width: 200, height: 300, useContentSize: true,
     frame: false, transparent: true, hasShadow: false,
@@ -963,8 +975,9 @@ function openFairyMenu(x, y) {
   fairyMenuWin.setAlwaysOnTop(true, 'screen-saver', 2)   // 盖在捕获层之上
   const [mx, my] = _clampMenuPos(_menuAnchor, 200, 300, disp.workArea)
   fairyMenuWin.setPosition(mx, my)
-  fairyMenuWin.loadURL(`${FAIRY_BASE}/menu`)
-  // 页面上报实际尺寸（load 后 rAF）→ 调整窗尺寸并重定位；600ms 兜底强制显示（页面异常不弹死）
+  // 优先 data URL（启动时预读的 menu.html，零延迟）；fallback HTTP 加载（预读失败时）
+  fairyMenuWin.loadURL(_menuDataUrl || `${FAIRY_BASE}/menu`)
+  // 页面上报实际尺寸 → 调整窗尺寸并重定位；150ms 兜底强制显示（data URL 加载极快，150ms 足够）
   let shown = false
   const showMenu = () => {
     if (shown || !fairyMenuWin || fairyMenuWin.isDestroyed()) return
@@ -973,7 +986,7 @@ function openFairyMenu(x, y) {
     fairyMenuWin.focus()   // 抢焦点使 blur 机制生效
   }
   fairyMenuWin._showMenu = showMenu
-  setTimeout(showMenu, 600)
+  setTimeout(showMenu, 150)
   // 失焦自动关（点其他应用/窗口、Alt+Tab 切走）；短延迟复核防 show 焦点竞态误关
   fairyMenuWin.on('blur', () => {
     setTimeout(() => {

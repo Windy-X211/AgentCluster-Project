@@ -106,11 +106,12 @@ class RecordingPanel:
     ACTION_LABELS = {
         "navigate": "跳转", "click": "点击", "type": "输入",
         "coordinate_click": "坐标点击", "form_submit": "表单提交",
+        "scroll": "滚动",
     }
     ACTION_COLORS = {
         "navigate": "#e8f4fd", "click": "#e8f5e9",
         "type": "#fff3e0", "coordinate_click": "#fce4ec",
-        "form_submit": "#f3e5f5",
+        "form_submit": "#f3e5f5", "scroll": "#e0f7fa",
     }
 
     def __init__(self, worker, meta: dict):
@@ -208,7 +209,7 @@ class RecordingPanel:
             w.destroy()
         tk.Label(self._list_frame,
                  text="录制已开始，请在浏览器里正常操作\n"
-                      "(点击 / 输入 / 跳转)...",
+                      "(点击 / 输入 / 滚动 / 跳转)...",
                  bg="#f5f6f8", fg="#aaa",
                  font=("Segoe UI", 10), pady=40).pack()
 
@@ -361,6 +362,14 @@ class RecordingPanel:
         parts: list[str] = []
         if action == "navigate":
             parts.append(str(step.get("url") or step.get("url_after") or ""))
+        elif action == "scroll":
+            try:
+                dy = int(step.get("delta_y") or 0)
+            except (TypeError, ValueError):
+                dy = 0
+            arrow = "↓" if dy > 0 else "↑"
+            sel = str(step.get("selector") or "")
+            parts.append(f"{arrow} {abs(dy)}px" + (f"  容器: {sel[:40]}" if sel else "  (整页)"))
         else:
             sel = str(step.get("stable_selector") or step.get("selector") or "")
             if sel:

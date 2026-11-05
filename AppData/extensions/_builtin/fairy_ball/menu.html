@@ -242,10 +242,9 @@
                 if (e.key === 'Escape') fairyAPI.closeMenu && fairyAPI.closeMenu()
             })
 
-            // 加载完成即上报初始尺寸（主进程据此定窗、定位并 show）
-            window.addEventListener('load', () => {
-                requestAnimationFrame(reportSize)
-            })
+            // script 在 body 底部执行，DOM + CSS 均已就绪，直接同步上报尺寸。
+            // 相比原来的 window.load + rAF：省去 load 事件等待（~20-100ms）和 rAF 排队（~0-16ms）
+            reportSize()
         })()
     </script>
 </body>

@@ -42,9 +42,46 @@ logger = logging.getLogger("agent_runtime")
 
 
 def _esc(s: str) -> str:
-    """转义行协议载荷中的换行符，避免 payload 内的 \n 破坏行分隔。
+    """转义行协议载荷中的换行符，避免 payload 内的 \\n 破坏行分隔。
     同时转义 \\ 为 \\\\，还原时可唯一反解。"""
     return s.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r')
+
+
+class _TDEmitter:
+    """TD: 参数流式广播的节流 + 尾部窗口截断。
+
+    大参数（如 file.write 写大文件，content 数十~数百 KB）时，上游每个 chunk
+    都携带全量 accumulated——若逐条全量广播是 O(n²)：_esc 整串转义 × 上万次
+    delta 同步占用事件循环（/api/health 超时 → 托盘误报后端 FAIL）、事件缓冲
+    deque 滞留 GB 级行、前端每次全量替换重渲染。策略：两次广播至少间隔
+    INTERVAL 秒；超过 TAIL_CHARS 只广播尾部窗口（前端语义本就是"实时显示
+    正在接收的最新参数"）。工具执行不受影响：C: 行仍带完整参数。"""
+
+    INTERVAL = 0.15   # 广播最小间隔（秒）≈ 6.7fps，流式预览足够流畅
+    TAIL_CHARS = 2000 # 超过该长度只发尾部窗口
+
+    def __init__(self):
+        self._last_t = 0.0
+
+    def reset(self):
+        """新工具调用开始（TS:）时重置，避免上一个调用的尾巴吃掉下一个开头的显示。"""
+        self._last_t = 0.0
+
+    def build(self, accumulated: str) -> str | None:
+        """返回待 yield 的 TD: 行；节流窗口内返回 None（丢弃该次广播）。"""
+        if not accumulated:
+            return None
+        now = time.monotonic()
+        if now - self._last_t < self.INTERVAL:
+            return None
+        self._last_t = now
+        if len(accumulated) > self.TAIL_CHARS:
+            body = (f"...[参数已接收 {len(accumulated)} 字符，省略前面 "
+                    f"{len(accumulated) - self.TAIL_CHARS} 字符，仅预览尾部]...\n"
+                    + accumulated[-self.TAIL_CHARS:])
+        else:
+            body = accumulated
+        return f"TD:{_esc(body)}\n"
 
 
 # ===== <continue> 续跑标记：快通道动态注入到本轮用户消息（不进 system prompt） =====
@@ -1653,6 +1690,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         _fast_upstream_error = False
         fast_text_scan = _ContinueScanner()
         fast_reason_scan = _ContinueScanner()
+        _fast_td = _TDEmitter()   # TD: 参数广播节流器（大参数防 O(n²) 广播拖垮事件循环）
 
         try:
             async for kind, payload in chat(interface, model, messages, stream=True,
@@ -1669,12 +1707,15 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                         yield f"RN:{_esc(_delta)}\n"
                 elif kind == "tool_call_start":
                     # 名称已确定，参数仍在流式 → 前端立刻显示"正在调用: xxx"
+                    _fast_td.reset()
                     yield f"TS:{payload.get('name') or ''}\n"
                 elif kind == "tool_args_delta":
                     # 参数增量实时广播 → 前端流式显示正在接收的参数内容（TD: 通道）
+                    # 节流 + 尾部窗口：大参数（file.write 大文件）时防止全量 O(n²) 广播
                     _acc = payload.get("accumulated", "")
-                    if _acc:
-                        yield f"TD:{_esc(_acc)}\n"
+                    _td_line = _fast_td.build(_acc)
+                    if _td_line:
+                        yield _td_line
                 elif kind == "tool_call":
                     # 快通道意外遇到 tool_call（模型忽略了 tool_choice=none）→ 降级到慢通道
                     fast_tool_calls.append(payload)
@@ -1910,6 +1951,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         _garbage_hits = 0        # 流式重复垃圾命中次数
         _garbage_buf = ""        # 滚动文本窗口（用于重复字符检测）
         _garbage_aborted = False # 是否因流式垃圾中止本轮
+        _round_td = _TDEmitter() # TD: 参数广播节流器（大参数防 O(n²) 广播拖垮事件循环）
         try:
             async for kind, payload in _gen:
 
@@ -1932,12 +1974,15 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                         yield f"RN:{_esc(_delta)}\n"
                 elif kind == "tool_call_start":
                     # 名称首次确定即广播（参数还在流）→ 画布气泡/聊天区立刻显示"正在调用: xxx"
+                    _round_td.reset()
                     yield f"TS:{payload.get('name') or ''}\n"
                 elif kind == "tool_args_delta":
                     # 参数增量实时广播 → 前端流式显示正在接收的参数内容（TD: 通道）
+                    # 节流 + 尾部窗口：大参数（file.write 大文件）时防止全量 O(n²) 广播
                     _acc = payload.get("accumulated", "")
-                    if _acc:
-                        yield f"TD:{_esc(_acc)}\n"
+                    _td_line = _round_td.build(_acc)
+                    if _td_line:
+                        yield _td_line
                 elif kind == "tool_call":
                     tc = {"id": payload["id"], "type": "function", "function": {"name": payload["name"], "arguments": json.dumps(payload["arguments"], ensure_ascii=False)}}
                     assistant_tool_calls.append(tc)

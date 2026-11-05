@@ -121,7 +121,6 @@ onMounted(refresh)
       <span class="info-text">
         拓展代码保存在 <code>AppData/extensions/</code>，开发规范见
         <code>AppData/extensions/EXTENSION_SPEC.md</code>。
-        可视化交互类拓展通过智能体输出 <code>```viz:type</code> 代码块触发渲染。
       </span>
     </div>
 

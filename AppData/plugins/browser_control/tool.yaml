@@ -47,6 +47,7 @@ parameters:
         click — 点击元素。selector 传 @eN（来自 snapshot，推荐）或 CSS 选择器。
         coordinate_click — 按归一化坐标点击。必填 x、y ∈ [0.0, 1.0]。适用于无稳定选择器的元素（canvas/自绘UI）。流程：screenshot(inspect) → 识别目标位置换算归一化坐标 → 传入 x、y（插件按 viewport 实时换算像素，切勿传像素）。
         type — 输入文字。必填 selector、text。selector 同 click。
+        scroll — 滚轮滚动。必填 delta_y（像素数，正=向下，负=向上）。可选 x、y ∈ [0.0,1.0]：先移动鼠标到该位置再滚（滚动容器由鼠标位置决定，回放录制模板时会自动带上）。分批派发真实 wheel 事件，可触发懒加载/无限滚动。
         get_text — 提取元素文本。selector 同 click；缺省取整页 <body> 文本。
         get_html — 分层 DOM 提取，默认 format=snapshot：
             snapshot — 结构化快照。采集语义元素(button/input/a/[role]/h1..h6)、onclick 元素、可聚焦 tabindex、cursor:pointer 自定义可点击元素，去重排序编号 @e1..@eN，缩进表层级。标记：[clickable]=自定义可点击、[offscreen]=视口外、[disabled]=禁用。页面跳转后编号失效需重新 snapshot。找不到元素可 evaluate 查真实 DOM。
@@ -78,7 +79,8 @@ parameters:
 
       总结：用户录 → 面板管理 → 保存模板 → 智能体按场景选 run（固定）或 load（灵活）。
       选择规则：先 get_html(snapshot) 拿 @eN → click/type 传 @eN；元素细节不够再 format=element；无稳定元素 → screenshot(inspect) → coordinate_click。
-    enum: ["navigate", "new_tab", "click", "coordinate_click", "focus_tab", "type", "get_text", "get_html", "screenshot", "evaluate", "wait", "close", "info", "record_start", "record_status", "record_step_annotate", "record_step_delete", "record_step_reorder", "record_complete", "record_cancel", "record_template_list", "record_template_load", "record_template_run", "record_template_delete"]
+      模板回放兜底：录制时 click/type/scroll 均带归一化坐标，回放时选择器定位失败自动回退鼠标坐标点击（type 回退为坐标点击+键盘输入），无需人工干预。
+    enum: ["navigate", "new_tab", "click", "coordinate_click", "scroll", "focus_tab", "type", "get_text", "get_html", "screenshot", "evaluate", "wait", "close", "info", "record_start", "record_status", "record_step_annotate", "record_step_delete", "record_step_reorder", "record_complete", "record_cancel", "record_template_list", "record_template_load", "record_template_run", "record_template_delete"]
 
   - name: "mode"
     type: string
@@ -154,14 +156,20 @@ parameters:
   - name: "x"
     type: number
     required: false
-    description: "coordinate_click 的归一化横坐标 ∈ [0.0, 1.0]（0=最左，1=最右）。插件按 viewport 实时换算像素，切勿传像素。必须先截图识别位置。"
+    description: "coordinate_click 的归一化横坐标 ∈ [0.0, 1.0]（0=最左，1=最右）。插件按 viewport 实时换算像素，切勿传像素。必须先截图识别位置。scroll 可选：先移动鼠标到该位置再滚（滚动容器由鼠标位置决定）。"
     default: -1
 
   - name: "y"
     type: number
     required: false
-    description: "coordinate_click 的归一化纵坐标 ∈ [0.0, 1.0]（0=最上，1=最下）。插件按 viewport 实时换算像素，切勿传像素。必须先截图识别位置。"
+    description: "coordinate_click 的归一化纵坐标 ∈ [0.0, 1.0]（0=最上，1=最下）。插件按 viewport 实时换算像素，切勿传像素。必须先截图识别位置。scroll 可选：先移动鼠标到该位置再滚（滚动容器由鼠标位置决定）。"
     default: -1
+
+  - name: "delta_y"
+    type: number
+    required: false
+    description: "scroll 时必填：滚动像素数。正数=向下滚，负数=向上滚。分批派发（每批约 120px）模拟真实滚轮。"
+    default: 0
 
   - name: "tab_index"
     type: integer

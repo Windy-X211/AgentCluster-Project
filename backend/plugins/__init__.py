@@ -350,14 +350,16 @@ def _register_one(plugin_dir: Path, blocking: bool = False) -> dict | None:
         return None
 
     # ----------------------------------------------------------
-    # 依赖检测与安装（在 import tool.py 之前完成，避免 import 失败）
+    # 依赖检测与安装 — 仅用户主动触发（blocking=True，能力管理页
+    # 「重新扫描/安装依赖」）时执行；启动/热重载路径跳过，
+    # 避免 pip 子进程检测拖慢后端启动
     # ----------------------------------------------------------
     dep_summary: dict = {}
     raw_deps = manifest.get("dependencies")
     # 若 manifest 没有，也尝试从 tool.yaml 顶层取
     if raw_deps is None:
         raw_deps = tool_yaml.get("dependencies")
-    if raw_deps is not None:
+    if raw_deps is not None and blocking:
         parsed = parse_dependencies(raw_deps)
         try:
             dep_summary = ensure_dependencies(parsed, plugin_dir, source_label=f"plugin:{name}", blocking=blocking)
