@@ -9,7 +9,7 @@ interface KindInfo { key: string; label: string; count: number }
 interface MarketItem {
   kind: string; id: string; name: string; description?: string
   version?: string; author?: string; icon?: string; tags?: string[]
-  installed?: boolean; enabled?: boolean; preview?: string; bg_type?: string
+  installed?: boolean; enabled?: boolean; preview?: string; bg_type?: string; agent_count?: number
 }
 
 const KIND_ICON: Record<string, string> = {
@@ -25,6 +25,9 @@ const uninstalledOnly = ref(false)
 const loading = ref(false)
 const busy = ref('')
 const toast = ref('')
+const needsSync = ref(false)
+const syncing = ref(false)
+const pushing = ref(false)
 
 const agents = useAgentStore()
 const canvases = useCanvasStore()
@@ -54,6 +57,7 @@ async function loadKinds() {
   try {
     const r = await api.market.kinds()
     kinds.value = r.kinds || []
+    needsSync.value = !!r.needs_sync
   } catch (e) {
     toast.value = '市场分类加载失败：' + (e as Error).message
   }
@@ -136,12 +140,99 @@ function installText(m: MarketItem) {
   return '下载'
 }
 
+// —— 远程仓库：同步下载 / 推送上传 / 镜像设置 ——
+async function syncRemote() {
+  if (syncing.value) return
+  syncing.value = true
+  toast.value = '正在从大陆镜像同步市场，请稍候…'
+  try {
+    const r = await api.market.sync(true)
+    if (r?.up_to_date) {
+      toast.value = '市场已是最新'
+    } else {
+      const src = r?.mirror || '官方'
+      toast.value = `同步完成：新增 ${r?.added ?? 0} 项，更新 ${r?.changed ?? 0} 项（来源：${src}）`
+    }
+    needsSync.value = false
+    await loadKinds()
+    await loadItems()
+  } catch (e) {
+    toast.value = '同步失败：' + (e as Error).message
+  } finally {
+    syncing.value = false
+  }
+}
+
+async function pushRemote() {
+  if (pushing.value) return
+  pushing.value = true
+  toast.value = '正在提交并推送到远程仓库，请稍候…'
+  try {
+    const r = await api.market.push()
+    toast.value = r?.message || '已推送到远程市场仓库'
+  } catch (e) {
+    toast.value = '推送失败：' + (e as Error).message
+  } finally {
+    pushing.value = false
+  }
+}
+
+const settingsOpen = ref(false)
+const cfgRepo = ref('')
+const cfgBranch = ref('main')
+const cfgMirrors = ref('')
+const cfgState = ref<any>({})
+const savingCfg = ref(false)
+const loadingCfg = ref(false)
+
+async function openSettings() {
+  settingsOpen.value = true
+  loadingCfg.value = true
+  try {
+    const r = await api.market.config()
+    cfgRepo.value = r.repo_url || ''
+    cfgBranch.value = r.branch || 'main'
+    cfgMirrors.value = (r.mirrors || []).join('\n')
+    cfgState.value = r.state || {}
+    if (!cfgMirrors.value) {
+      cfgMirrors.value = 'https://ghfast.top/{url}\nhttps://gh-proxy.com/{url}'
+    }
+  } catch (e) {
+    toast.value = '读取仓库配置失败：' + (e as Error).message
+  } finally {
+    loadingCfg.value = false
+  }
+}
+function closeSettings() {
+  settingsOpen.value = false
+  savingCfg.value = false
+}
+async function saveSettings() {
+  if (savingCfg.value) return
+  savingCfg.value = true
+  try {
+    const r = await api.market.saveConfig({
+      repo_url: cfgRepo.value.trim(),
+      branch: cfgBranch.value.trim(),
+      mirrors: cfgMirrors.value.split('\n').map(s => s.trim()).filter(Boolean),
+    })
+    cfgState.value = (await api.market.config()).state || cfgState.value
+    toast.value = '已保存市场仓库配置' + (r?.config?.mirrors?.length ? `（${r.config.mirrors.length} 个镜像源）` : '')
+    settingsOpen.value = false
+  } catch (e) {
+    toast.value = '保存失败：' + (e as Error).message
+  } finally {
+    savingCfg.value = false
+  }
+}
+
 // —— 上传（把本机资源发布到市场）——
 const uploadOpen = ref(false)
 const uploadKind = ref('agent')
 const publishable = ref<Array<{ id: string; name: string; description?: string }>>([])
 const selectedId = ref('')
 const publishing = ref(false)
+const pushAfterPublish = ref(true)
 const uploadKinds = computed(() => kinds.value.filter(k => k.key !== 'all'))
 
 async function openUpload() {
@@ -171,9 +262,12 @@ async function doPublish() {
   if (!selectedId.value || publishing.value) return
   publishing.value = true
   try {
-    const r = await api.market.publish(uploadKind.value, selectedId.value)
+    const r = await api.market.publish(uploadKind.value, selectedId.value, pushAfterPublish.value)
     const name = r?.item?.name || selectedId.value
-    toast.value = `已发布到市场：${name}`
+    let tip = `已发布到市场：${name}`
+    if (r?.push_error) tip += `（已写入本地，推送失败：${r.push_error}）`
+    else if (r?.push) tip += '，已推送到远程仓库'
+    toast.value = tip
     uploadOpen.value = false
     await loadKinds()
     if (activeKind.value === 'all' || activeKind.value === uploadKind.value) await loadItems()
@@ -185,7 +279,9 @@ async function doPublish() {
 }
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape' && uploadOpen.value) closeUpload()
+  if (e.key !== 'Escape') return
+  if (settingsOpen.value) closeSettings()
+  else if (uploadOpen.value) closeUpload()
 }
 
 function iconStyle(m: MarketItem) {
@@ -210,9 +306,18 @@ onBeforeUnmount(() => {
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
       <div class="top-drag pywebview-drag-region">
         <h2>🛒 市场</h2>
-        <span class="sub">下载智能体、画布、背景、技能、插件与功能拓展</span>
+        <span class="sub">下载走大陆镜像，上传推送远程仓库</span>
       </div>
-      <button class="btn primary upload-btn" @click="openUpload">⬆ 上传资源</button>
+      <div class="mk-actions">
+        <button class="btn ghost" :disabled="syncing" @click="syncRemote">
+          {{ syncing ? '同步中…' : '同步最新' }}
+        </button>
+        <button class="btn ghost" :disabled="pushing" @click="pushRemote">
+          {{ pushing ? '推送中…' : '推送远程' }}
+        </button>
+        <button class="btn ghost" @click="openSettings">设置</button>
+        <button class="btn primary upload-btn" @click="openUpload">上传资源</button>
+      </div>
     </div>
 
     <div class="mk-main">
@@ -245,6 +350,13 @@ onBeforeUnmount(() => {
           <span class="search-scope">{{ searchScope }}</span>
         </div>
 
+        <div v-if="needsSync" class="sync-hint glass">
+          <span>市场资源尚未下载到本机。使用大陆镜像一键同步最新资源：</span>
+          <button class="btn primary" :disabled="syncing" @click="syncRemote">
+            {{ syncing ? '同步中…' : '从镜像同步' }}
+          </button>
+        </div>
+
         <div v-if="loading" class="empty">加载中…</div>
         <div v-else-if="!visibleItems.length" class="empty">{{ emptyText }}</div>
         <div v-else class="card-grid">
@@ -255,6 +367,7 @@ onBeforeUnmount(() => {
                 <div class="mc-title">{{ m.name }}</div>
                 <div class="mc-sub">
                   {{ kindLabel(m.kind) }}<template v-if="m.version"> · v{{ m.version }}</template>
+                  <template v-if="m.kind === 'canvas' && m.agent_count"> · 含 {{ m.agent_count }} 个智能体</template>
                   <template v-if="m.author"> · {{ m.author }}</template>
                 </div>
               </div>
@@ -303,9 +416,52 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="mm-foot">
+            <label class="mm-push-check">
+              <input v-model="pushAfterPublish" type="checkbox" />
+              <span>发布后推送到远程仓库</span>
+            </label>
             <button class="btn ghost" @click="closeUpload">取消</button>
             <button class="btn primary" :disabled="!selectedId || publishing" @click="doPublish">
               {{ publishing ? '发布中…' : '发布到市场' }}
+            </button>
+          </div>
+        </div>
+      </div>
+      <div v-if="settingsOpen" class="mk-modal-mask" @click.self="closeSettings">
+        <div class="mk-modal">
+          <div class="mm-head">
+            <span class="mm-title">⚙ 市场远程仓库设置</span>
+            <button class="mm-close" @click="closeSettings">✕</button>
+          </div>
+          <div class="mm-body">
+            <div v-if="loadingCfg" class="mm-empty">加载中…</div>
+            <template v-else>
+              <label class="mm-field">
+                <span class="mm-label">仓库地址（上传推送目标）</span>
+                <input v-model="cfgRepo" class="mm-input" spellcheck="false"
+                  placeholder="https://github.com/Windy-X211/AgentCluster-Market.git" />
+              </label>
+              <label class="mm-field">
+                <span class="mm-label">分支</span>
+                <input v-model="cfgBranch" class="mm-input" spellcheck="false" placeholder="main" />
+              </label>
+              <label class="mm-field">
+                <span class="mm-label">镜像源（每行一个，<code>{url}</code> 为占位符；末尾自动回退官方地址）</span>
+                <textarea v-model="cfgMirrors" class="mm-input mm-textarea" spellcheck="false" rows="3"
+                  placeholder="https://ghfast.top/{url}"></textarea>
+              </label>
+              <div class="mm-state">
+                本地仓库：{{ cfgState.is_repo ? (cfgState.dirty ? `有 ${cfgState.dirty_files} 个未提交改动` : '已初始化') : '未初始化（首次推送时自动创建）' }}
+                <template v-if="cfgState.branch"> · 分支 {{ cfgState.branch }}</template>
+                <template v-if="cfgState.ahead"> · 领先 {{ cfgState.ahead }} 个提交</template>
+              </div>
+              <div class="mm-tip">下载（同步）走镜像加速；上传（推送）需要访问官方仓库地址，镜像一般只读、不支持 push。</div>
+            </template>
+          </div>
+          <div class="mm-foot">
+            <button class="btn ghost" @click="closeSettings">取消</button>
+            <button class="btn primary" :disabled="loadingCfg || savingCfg" @click="saveSettings">
+              {{ savingCfg ? '保存中…' : '保存' }}
             </button>
           </div>
         </div>
@@ -328,6 +484,13 @@ onBeforeUnmount(() => {
 .top-drag { flex: 1; align-self: stretch; display: flex; align-items: center; gap: 12px; user-select: none; }
 .sub { font-size: calc(12px * var(--font-scale)); opacity: .5; }
 .upload-btn { flex-shrink: 0; background: rgba(var(--accent-rgb, 120, 140, 255), .28); border-color: rgba(var(--accent-rgb, 120, 140, 255), .5); }
+.mk-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.mk-actions .btn { padding: 5px 12px; font-size: calc(12px * var(--font-scale)); white-space: nowrap; }
+.sync-hint {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+  border-radius: 10px; font-size: calc(12px * var(--font-scale)); flex-shrink: 0;
+}
+.sync-hint span { flex: 1; opacity: .75; }
 
 .mk-main { flex: 1; min-height: 0; display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 12px; }
 
@@ -427,4 +590,21 @@ onBeforeUnmount(() => {
 .mm-item-name { font-size: 13px; font-weight: 600; }
 .mm-item-desc { font-size: 11px; opacity: .55; margin-top: 2px; }
 .mm-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid rgba(255, 255, 255, .09); flex-shrink: 0; }
+.mm-push-check {
+  margin-right: auto; display: inline-flex; align-items: center; gap: 6px;
+  font-size: calc(12px * var(--font-scale)); opacity: .75; cursor: pointer; user-select: none;
+}
+.mm-push-check input { cursor: pointer; accent-color: rgb(var(--accent-rgb, 120, 140, 255)); }
+.mm-field { display: flex; flex-direction: column; gap: 4px; }
+.mm-label { font-size: 12px; opacity: .6; }
+.mm-label code { font-size: 11px; opacity: .9; }
+.mm-input {
+  padding: 7px 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, .14);
+  background: rgba(255, 255, 255, .04); color: inherit; font-size: 12px;
+  font-family: inherit; outline: none;
+}
+.mm-input:focus { border-color: rgba(var(--accent-rgb, 120, 140, 255), .55); }
+.mm-textarea { resize: vertical; min-height: 64px; line-height: 1.5; }
+.mm-state { font-size: 11px; opacity: .55; }
+.mm-tip { font-size: 11px; opacity: .45; line-height: 1.5; }
 </style>

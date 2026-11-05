@@ -58,7 +58,19 @@ export interface RunLogEntry {
 
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const r = await fetch(BASE + path, { headers: { 'Content-Type': 'application/json', ...opts.headers }, ...opts })
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+  if (!r.ok) {
+    // 优先展示后端 detail（同步/推送失败原因都靠它），读不到再退回状态码
+    const text = await r.text().catch(() => '')
+    let detail: unknown = text
+    try {
+      const j = JSON.parse(text)
+      detail = j?.detail ?? j?.message ?? text
+    } catch {
+      /* 非 JSON 响应，保留原文 */
+    }
+    if (detail && typeof detail === 'object') detail = JSON.stringify(detail)
+    throw new Error(`${r.status} ${String(detail || r.statusText)}`)
+  }
   if (r.status === 204) return undefined as T
   return r.json()
 }
@@ -321,14 +333,14 @@ export const api = {
       req<{ ok: boolean; content: string }>(`/extensions/${encodeURIComponent(id)}/file?path=` + encodeURIComponent(path)),
   },
   market: {
-    kinds: () => req<{ kinds: Array<{ key: string; label: string; count: number }>; updated_at?: string }>('/market/kinds'),
+    kinds: () => req<{ kinds: Array<{ key: string; label: string; count: number }>; updated_at?: string; needs_sync?: boolean }>('/market/kinds'),
     items: (kind?: string, q?: string) => {
       // 用 URLSearchParams 统一拼接：kind 为空（推荐分类）时直接拼 "&q=" 会得到 /items&q=... → 404
       const params = new URLSearchParams()
       if (kind) params.set('kind', kind)
       if (q) params.set('q', q)
       const qs = params.toString()
-      return req<{ kind: string; total: number; items: any[]; updated_at?: string }>(
+      return req<{ kind: string; total: number; items: any[]; updated_at?: string; needs_sync?: boolean }>(
         '/market/items' + (qs ? `?${qs}` : '')
       )
     },
@@ -338,7 +350,14 @@ export const api = {
       ),
     install: (kind: string, id: string) =>
       req<any>('/market/install', { method: 'POST', body: JSON.stringify({ kind, id }) }),
-    publish: (kind: string, id: string) =>
-      req<any>('/market/publish', { method: 'POST', body: JSON.stringify({ kind, id }) }),
+    publish: (kind: string, id: string, push = false) =>
+      req<any>('/market/publish', { method: 'POST', body: JSON.stringify({ kind, id, push }) }),
+    config: () => req<any>('/market/config'),
+    saveConfig: (data: any) =>
+      req<any>('/market/config', { method: 'PUT', body: JSON.stringify(data) }),
+    sync: (force = true) =>
+      req<any>('/market/sync', { method: 'POST', body: JSON.stringify({ force }) }),
+    push: (message?: string) =>
+      req<any>('/market/push', { method: 'POST', body: JSON.stringify({ message }) }),
   }
 }

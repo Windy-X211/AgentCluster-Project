@@ -43,4 +43,6 @@ Thumbs.db
 /nul
 # Launch mode preference (client/web)
 .launch_mode.txt
+# 市场资源已独立为 AgentCluster-Market 仓库；本地 market/ 是其 clone 工作副本（见 market/README.md）
+/market/
 

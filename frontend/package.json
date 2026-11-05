@@ -11,7 +11,8 @@
         "electron": "electron . --prod",
         "electron:dev": "concurrently -k \"npm:dev\" \"cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 electron .\"",
         "electron:start": "electron . --prod",
-        "electron:build": "cross-env ELECTRON=1 vite build && node -e \"try{require('electron-builder');}catch(e){console.error('electron-builder not installed. Run: npm install --save-dev electron-builder');process.exit(1);}\" && electron-builder --win --x64"
+        "market:ensure": "node scripts/ensure-market.mjs",
+        "electron:build": "node scripts/ensure-market.mjs && cross-env ELECTRON=1 vite build && node -e \"try{require('electron-builder');}catch(e){console.error('electron-builder not installed. Run: npm install --save-dev electron-builder');process.exit(1);}\" && electron-builder --win --x64"
     },
     "dependencies": {
         "@aiden0z/pptx-renderer": "^1.3.0",

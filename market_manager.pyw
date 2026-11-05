@@ -5,6 +5,8 @@
 - 浏览 / 搜索 / 按分类与安装状态筛选 market/ 中的资源
 - 把市场资源安装到本机（用户数据目录 %LOCALAPPDATA%\\AgentCluster）
 - 把本机已有资源发布到市场
+- 从远程市场仓库同步（大陆镜像多源回退）
+- 把本地市场改动提交并推送到远程仓库
 - 删除市场条目（不影响本机已安装副本）
 - 打开市场目录
 
@@ -12,8 +14,10 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -27,6 +31,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 try:
     import core.store as store
+    from core import market_sync
     from api import market
 except Exception as _e:  # 依赖缺失时给出可读提示，而不是闪退
     _root = tk.Tk()
@@ -67,6 +72,7 @@ class MarketManager(tk.Tk):
         self.items: list[dict] = []
         self.item_map: dict[str, dict] = {}
         self._search_job: str | None = None
+        self._task: str | None = None
 
         self.keyword = tk.StringVar()
         self.uninstalled_only = tk.BooleanVar(value=False)
@@ -93,6 +99,9 @@ class MarketManager(tk.Tk):
         ttk.Label(top, text="🛒 市场管理", font=("Microsoft YaHei UI", 15, "bold")).pack(side="left")
         ttk.Label(top, text="浏览、安装、发布与删除市场资源", foreground="#777").pack(side="left", padx=10)
         ttk.Button(top, text="刷新", command=self.refresh).pack(side="right")
+        ttk.Button(top, text="设置", command=self.open_settings).pack(side="right", padx=(0, 6))
+        ttk.Button(top, text="推送远程", command=self.push_remote).pack(side="right", padx=(0, 6))
+        ttk.Button(top, text="同步市场", command=self.sync_remote).pack(side="right", padx=(0, 6))
 
         body = ttk.Frame(self, padding=(12, 0, 12, 0))
         body.pack(fill="both", expand=True)
@@ -213,6 +222,8 @@ class MarketManager(tk.Tk):
             key = f"{m.get('kind')}:{m.get('id')}"
             self.item_map[key] = m
             desc = (m.get("description") or "").replace("\n", " ").strip()
+            if m.get("kind") == "canvas" and m.get("agent_count"):
+                desc = f"含 {m['agent_count']} 个智能体" + (f" · {desc}" if desc else "")
             if len(desc) > 90:
                 desc = desc[:90] + "…"
             kind_label = market.KIND_LABEL.get(m.get("kind"), m.get("kind", ""))
@@ -312,6 +323,78 @@ class MarketManager(tk.Tk):
         except Exception as e:
             messagebox.showerror("打开失败", str(e))
 
+    # ---------------- 远程仓库（同步下载 / 推送上传） ----------------
+    def _run_bg(self, label: str, fn, on_ok) -> None:
+        """耗时的网络 / git 操作放后台线程，完成后回主线程刷新界面。"""
+        if getattr(self, "_task", None):
+            messagebox.showinfo("请稍候", f"正在执行「{self._task}」，请等待完成。")
+            return
+        self._task = label
+        self.status.set(f"{label}中，请稍候…")
+        self.update_idletasks()
+
+        def worker() -> None:
+            try:
+                result = fn()
+            except Exception as exc:  # noqa: BLE001
+                msg = _err_text(exc)
+                self.after(0, lambda m=msg: self._finish(label, m, None, on_ok))
+                return
+            self.after(0, lambda r=result: self._finish(label, None, r, on_ok))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish(self, label: str, err, result, on_ok) -> None:
+        self._task = None
+        if err:
+            self.status.set(f"{label}失败：{err}")
+            messagebox.showerror(f"{label}失败", err)
+            return
+        try:
+            on_ok(result)
+        except Exception as e:
+            self.status.set(f"{label}失败：{_err_text(e)}")
+            messagebox.showerror(f"{label}失败", _err_text(e))
+
+    def sync_remote(self) -> None:
+        if not market_sync.market_ready():
+            if not messagebox.askyesno(
+                "同步市场", "本机还没有市场资源，是否现在从远程仓库（大陆镜像）下载？",
+            ):
+                return
+
+        def done(r: dict) -> None:
+            if r.get("up_to_date"):
+                tip = "市场已是最新，无需下载。"
+            else:
+                tip = (f"同步完成：新增 {r.get('added', 0)} 项，"
+                       f"更新 {r.get('changed', 0)} 项，"
+                       f"保留本地未推送 {r.get('kept_local', 0)} 项。\n"
+                       f"来源：{r.get('mirror')}")
+            self.status.set(tip.splitlines()[0])
+            self.refresh()
+            messagebox.showinfo("同步完成", tip)
+
+        self._run_bg("同步市场", lambda: market_sync.sync_market(force=True), done)
+
+    def push_remote(self) -> None:
+        if not messagebox.askyesno(
+            "推送远程", "把本地 market/ 的改动提交并推送到远程仓库？\n镜像只加速下载，推送走官方地址。",
+        ):
+            return
+
+        def done(r: dict) -> None:
+            tip = r.get("message") or "已推送到远程仓库"
+            if r.get("commit"):
+                tip += f"\n提交：{r['commit']}"
+            self.status.set(tip.splitlines()[0])
+            messagebox.showinfo("推送完成", tip)
+
+        self._run_bg("推送远程", lambda: market_sync.push_market(), done)
+
+    def open_settings(self) -> None:
+        SettingsDialog(self)
+
     # ---------------- 发布 ----------------
     def open_publish(self) -> None:
         PublishDialog(self, on_done=self.refresh)
@@ -327,6 +410,7 @@ class PublishDialog(tk.Toplevel):
         self.on_done = on_done
         self.items: list[dict] = []
         self._job: str | None = None
+        self.push_var = tk.BooleanVar(value=True)
 
         if ICON_FILE.exists():
             try:
@@ -368,6 +452,9 @@ class PublishDialog(tk.Toplevel):
         ttk.Label(foot, textvariable=self.status, foreground="#666", font=FONT_SMALL).pack(side="left")
         ttk.Button(foot, text="关闭", command=self.destroy).pack(side="right")
         ttk.Button(foot, text="发布到市场", command=self.publish_selected).pack(side="right", padx=8)
+        ttk.Checkbutton(
+            foot, text="发布后推送到远程仓库", variable=self.push_var,
+        ).pack(side="right", padx=(0, 12))
 
         self.after(80, self.load_publishable)
 
@@ -408,16 +495,102 @@ class PublishDialog(tk.Toplevel):
         ):
             return
         try:
-            r = market.publish({"kind": kind, "id": it.get("id")})
+            r = market.publish({"kind": kind, "id": it.get("id"),
+                                "push": bool(self.push_var.get())})
             item = r.get("item", {})
+            tip = f"已发布到市场：\n{item.get('name', name)}"
+            if r.get("push_error"):
+                tip += f"\n\n已写入本地 market/，但推送远程失败：\n{r['push_error']}"
+            elif r.get("push"):
+                tip += "\n\n已推送到远程仓库。"
             self.status.set(f"已发布：{item.get('name', name)}")
-            messagebox.showinfo("发布成功", f"已发布到市场：\n{item.get('name', name)}", parent=self)
+            messagebox.showinfo("发布成功", tip, parent=self)
             try:
                 self.on_done()
             except Exception:
                 pass
         except Exception as e:
             messagebox.showerror("发布失败", _err_text(e), parent=self)
+
+
+class SettingsDialog(tk.Toplevel):
+    """市场远程仓库配置：仓库地址 / 分支 / 镜像模板。"""
+
+    def __init__(self, master) -> None:
+        super().__init__(master)
+        self.title("市场远程仓库设置")
+        self.geometry("660x470")
+        self.transient(master)
+        self.grab_set()
+        if ICON_FILE.exists():
+            try:
+                self.iconbitmap(str(ICON_FILE))
+            except Exception:
+                pass
+
+        cfg = market_sync.get_config()
+        try:
+            state = market_sync.repo_state()
+        except Exception:
+            state = {}
+
+        self.repo_var = tk.StringVar(value=cfg["repo_url"])
+        self.branch_var = tk.StringVar(value=cfg["branch"])
+
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="仓库地址（上传推送目标）").pack(anchor="w")
+        ttk.Entry(frame, textvariable=self.repo_var).pack(fill="x", pady=(4, 10))
+
+        ttk.Label(frame, text="分支").pack(anchor="w")
+        ttk.Entry(frame, textvariable=self.branch_var, width=24).pack(anchor="w", pady=(4, 10))
+
+        ttk.Label(
+            frame, text="镜像源（每行一个，{url} 为占位符；末尾自动回退官方地址）", font=FONT_SMALL,
+        ).pack(anchor="w")
+        self.mirrors_text = tk.Text(frame, height=4, font=FONT_SMALL, wrap="none")
+        self.mirrors_text.pack(fill="x", pady=(4, 8))
+        self.mirrors_text.insert("1.0", "\n".join(cfg["mirrors"]))
+
+        if not state.get("is_repo"):
+            repo_tip = "未初始化（首次推送时自动创建）"
+        elif state.get("dirty"):
+            repo_tip = f"已初始化 · {state.get('dirty_files')} 个未提交改动"
+        else:
+            repo_tip = "已初始化 · 无未提交改动"
+        state_text = (
+            f"本地仓库：{state.get('path')}\n"
+            f"状态：{repo_tip}　分支：{state.get('branch') or cfg['branch']}"
+        )
+        ttk.Label(frame, text=state_text, foreground="#666", font=FONT_SMALL,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+        ttk.Label(
+            frame, text="下载（同步）走镜像加速；上传（推送）需要访问官方仓库，镜像一般只读、不支持 push。",
+            foreground="#888", font=FONT_SMALL, wraplength=620, justify="left",
+        ).pack(anchor="w")
+
+        foot = ttk.Frame(frame)
+        foot.pack(fill="x", side="bottom", pady=(12, 0))
+        ttk.Button(foot, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(foot, text="保存", command=self.save).pack(side="right", padx=8)
+
+        _center(self)
+
+    def save(self) -> None:
+        mirrors = [ln.strip() for ln in
+                   self.mirrors_text.get("1.0", "end").splitlines() if ln.strip()]
+        try:
+            market_sync.save_config({
+                "repo_url": self.repo_var.get().strip(),
+                "branch": self.branch_var.get().strip(),
+                "mirrors": mirrors,
+            })
+        except Exception as e:
+            messagebox.showerror("保存失败", _err_text(e), parent=self)
+            return
+        messagebox.showinfo("已保存", "市场远程仓库配置已更新。", parent=self)
+        self.destroy()
 
 
 def _enable_dpi_awareness() -> None:
@@ -442,8 +615,14 @@ def _self_check() -> int:
     store.init_store()
     kinds = market.list_kinds()
     items = market.list_items("", "")
+    cfg = market_sync.get_config()
+    state = market_sync.repo_state()
     print(f"data root : {store.ROOT}")
     print(f"market    : {market.MARKET_ROOT}")
+    print(f"repo      : {cfg['repo_url']}  branch={cfg['branch']}")
+    print(f"mirrors   : {' | '.join(cfg['mirrors'])}")
+    print(f"git       : is_repo={state.get('is_repo')} dirty={state.get('dirty_files')} "
+          f"remote={state.get('remote')}")
     for k in kinds["kinds"]:
         print(f"  {k['key']:10s} {k['label']:6s} {k['count']}")
     print(f"total items: {items['total']}")
@@ -453,6 +632,14 @@ def _self_check() -> int:
 def main() -> int:
     if "--check" in sys.argv:
         return _self_check()
+    if "--sync" in sys.argv:
+        store.init_store()
+        print(json.dumps(market_sync.sync_market(force=True), ensure_ascii=False, indent=2))
+        return 0
+    if "--push" in sys.argv:
+        store.init_store()
+        print(json.dumps(market_sync.push_market(), ensure_ascii=False, indent=2))
+        return 0
     _enable_dpi_awareness()
     try:
         app = MarketManager()

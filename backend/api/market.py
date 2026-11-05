@@ -1,9 +1,10 @@
 """市场（Market）API —— 统一管理智能体 / 画布 / 背景 / 技能 / 插件 / 功能拓展资源。
 
-市场资源仓库固定在项目根目录 ``market/``（随程序分发、可提交 git），
-用户数据根 ``store.ROOT`` 在项目外，二者严格分离：
+市场资源独立托管在远程仓库（默认 ``AgentCluster-Market``），本地 ``market/``
+是它的 git 工作副本；主源码仓库不再跟踪该目录（见 .gitignore）。
+用户数据根 ``store.ROOT`` 在项目外，三者职责严格分离：
 
-  market/
+  market/                          ← 独立仓库工作副本（下载安装 / 发布上传）
     index.json                     ← 统一索引（所有资源的元数据）
     agents/<slug>/agent.json
     canvases/<slug>/canvas.json
@@ -17,7 +18,11 @@
   GET  /api/market/kinds                 分类及数量
   GET  /api/market/publishable?kind=     可发布的本机资源列表
   POST /api/market/install               从市场安装 {kind, id}
-  POST /api/market/publish               把本机资源发布到市场 {kind, id}
+  POST /api/market/publish               把本机资源发布到市场 {kind, id, push?}
+  GET  /api/market/config                远程仓库与镜像配置 + 本地 git 状态
+  PUT  /api/market/config                保存仓库地址 / 镜像模板 / 分支
+  POST /api/market/sync                  从远程同步市场（多镜像回退）
+  POST /api/market/push                  提交并推送本地市场改动
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,6 +38,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 import core.store as store
+from core import market_sync
 
 router = APIRouter()
 
@@ -54,6 +61,10 @@ KIND_LABEL = dict(KIND_ORDER)
 _EXCLUDE_DIRS = {"__pycache__", "_webengine_profile", "node_modules", ".git", ".pytest_cache", ".runtime"}
 _EXCLUDE_SUFFIX = {".pyc", ".pyo", ".log", ".bak", ".tmp"}
 _EXCLUDE_FILES = {".DS_Store", "Thumbs.db"}
+
+# 同步是耗时网络操作，同一时刻只允许一个
+_sync_lock = threading.Lock()
+_push_lock = threading.Lock()
 
 
 # ==============================================================
@@ -222,6 +233,7 @@ def list_kinds():
     return {
         "kinds": [{"key": k, "label": label, "count": counts.get(k, 0)} for k, label in KIND_ORDER],
         "updated_at": _load_index().get("updated_at"),
+        "needs_sync": not market_sync.market_ready(),
     }
 
 
@@ -251,7 +263,59 @@ def list_items(kind: str = "", q: str = ""):
         "total": len(items),
         "items": items,
         "updated_at": _load_index().get("updated_at"),
+        "needs_sync": not market_sync.market_ready(),
     }
+
+
+# ==============================================================
+# 远程仓库配置 / 同步 / 推送
+# ==============================================================
+@router.get("/config")
+def get_config():
+    return {
+        **market_sync.get_config(),
+        "state": market_sync.repo_state(),
+        "market_root": str(MARKET_ROOT),
+        "market_ready": market_sync.market_ready(),
+    }
+
+
+@router.put("/config")
+def update_config(payload: dict):
+    try:
+        return {"ok": True, "config": market_sync.save_config(payload or {})}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/sync")
+def sync(payload: dict | None = None):
+    """从远程市场仓库同步（多镜像自动回退）。阻塞调用，前端需加载态。"""
+    payload = payload or {}
+    force = bool(payload.get("force"))
+    if not _sync_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有同步任务进行中，请稍候")
+    try:
+        return market_sync.sync_market(force=force)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _sync_lock.release()
+
+
+@router.post("/push")
+def push(payload: dict | None = None):
+    """提交并推送本地 market/ 改动到远程仓库（官方地址，镜像不支持 push）。"""
+    payload = payload or {}
+    message = str(payload.get("message") or "").strip() or None
+    if not _push_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有推送任务进行中，请稍候")
+    try:
+        return market_sync.push_market(message)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _push_lock.release()
 
 
 # ==============================================================
@@ -485,12 +549,21 @@ def publish(payload: dict):
     if not local_id:
         raise HTTPException(400, "缺少资源 id")
     if kind == "agent":
-        return _publish_agent(local_id)
-    if kind == "canvas":
-        return _publish_canvas(local_id)
-    if kind in ("background", "skill", "plugin", "extension"):
-        return _publish_directory(kind, local_id)
-    raise HTTPException(400, f"不支持的资源类型：{kind}")
+        result = _publish_agent(local_id)
+    elif kind == "canvas":
+        result = _publish_canvas(local_id)
+    elif kind in ("background", "skill", "plugin", "extension"):
+        result = _publish_directory(kind, local_id)
+    else:
+        raise HTTPException(400, f"不支持的资源类型：{kind}")
+
+    # 可选：发布后立即提交并推送到远程市场仓库（失败不回滚本地发布）
+    if payload.get("push"):
+        try:
+            result["push"] = market_sync.push_market(f"publish {kind}/{local_id}")
+        except Exception as e:
+            result["push_error"] = str(e)
+    return result
 
 
 def _save_item(item: dict) -> dict:
