@@ -12,8 +12,11 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-# 将插件目录加入 sys.path 以导入 tool 模块
-_PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent / "AppData" / "plugins" / "github_connector"
+# 将插件目录加入 sys.path 以导入 tool 模块（用户数据根已迁出项目，优先取运行时安装目录）
+from core.store import ROOT as STORE_ROOT
+_PLUGIN_DIR = STORE_ROOT / "plugins" / "github_connector"
+if not _PLUGIN_DIR.exists():
+    _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent / "market" / "plugins" / "github_connector"
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 

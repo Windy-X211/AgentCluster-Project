@@ -1,15 +1,9 @@
-/AppData/*
-!/AppData/plugins/
-!/AppData/skills/
-!/AppData/backgrounds/
-!/AppData/agents/
-!/AppData/extensions/
-/AppData/agents/*
-!/AppData/agents/8.json
-!/AppData/agents/24.json
-!/AppData/agents/27.json
-!/AppData/agents/38.json
-/AppData/plugins/changzheng_machine/
+# 用户数据已迁出项目（默认 %LOCALAPPDATA%\AgentCluster）；项目内残留的旧目录/迁移备份不纳入版本库
+/AppData/
+/AppData.backup-*/
+/AppData.migrated-*/
+# 自定义存储位置（机器相关）
+/.storage_location
 /outputs/
 /.trae
 /.arts
@@ -49,11 +43,4 @@ Thumbs.db
 /nul
 # Launch mode preference (client/web)
 .launch_mode.txt
-# 功能拓展运行时生成文件（可能包含本地 token / 私有服务器地址）
-/AppData/extensions/*/token.txt
-/AppData/extensions/*/settings.json
-/AppData/extensions/*/servers.json
-# 拓展正式目录是安装时从 _builtin 下载源拷贝生成的，仓库只保留下载源与清单
-/AppData/extensions/*/
-!/AppData/extensions/_builtin/
-/AppData/extensions/installed.json
+

@@ -8,6 +8,7 @@ export default createRouter({
     { path: '/settings', component: () => import('@/views/Settings.vue') },
     { path: '/capabilities', component: () => import('@/views/CapabilityManagement.vue') },
     { path: '/extensions', component: () => import('@/views/ExtensionManagement.vue') },
+    { path: '/market', component: () => import('@/views/Market.vue') },
     { path: '/plugins', redirect: '/capabilities' }  // 向后兼容旧链接
   ]
 })

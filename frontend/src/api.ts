@@ -319,5 +319,26 @@ export const api = {
     uninstall: (id: string) => req<any>(`/extensions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     file: (id: string, path: string) =>
       req<{ ok: boolean; content: string }>(`/extensions/${encodeURIComponent(id)}/file?path=` + encodeURIComponent(path)),
+  },
+  market: {
+    kinds: () => req<{ kinds: Array<{ key: string; label: string; count: number }>; updated_at?: string }>('/market/kinds'),
+    items: (kind?: string, q?: string) => {
+      // 用 URLSearchParams 统一拼接：kind 为空（推荐分类）时直接拼 "&q=" 会得到 /items&q=... → 404
+      const params = new URLSearchParams()
+      if (kind) params.set('kind', kind)
+      if (q) params.set('q', q)
+      const qs = params.toString()
+      return req<{ kind: string; total: number; items: any[]; updated_at?: string }>(
+        '/market/items' + (qs ? `?${qs}` : '')
+      )
+    },
+    publishable: (kind: string) =>
+      req<{ kind: string; items: Array<{ id: string; name: string; description?: string }> }>(
+        `/market/publishable?kind=${encodeURIComponent(kind)}`
+      ),
+    install: (kind: string, id: string) =>
+      req<any>('/market/install', { method: 'POST', body: JSON.stringify({ kind, id }) }),
+    publish: (kind: string, id: string) =>
+      req<any>('/market/publish', { method: 'POST', body: JSON.stringify({ kind, id }) }),
   }
 }

@@ -13,8 +13,10 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-EXT_ROOT = ROOT / "AppData" / "extensions"
+from core.store import ROOT as STORE_ROOT
+EXT_ROOT = STORE_ROOT / "extensions"
+if not EXT_ROOT.exists():
+    EXT_ROOT = Path(__file__).resolve().parent.parent.parent / "market" / "extensions"
 
 
 def _load_ext_module(ext_id: str):

@@ -40,12 +40,15 @@ router = APIRouter()
 
 # —— 存储根 ——
 EXT_ROOT = _store.ROOT / "extensions"
-MARKET_FILE = EXT_ROOT / "extensions_market.json"
 INSTALLED_FILE = EXT_ROOT / "installed.json"
 
-# 市场清单里指向的「内置拓展源」目录：仓库自带、随程序分发
+# 市场资源仓库（项目内、随程序分发）：拓展源与统一索引都在这里
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+MARKET_ROOT = _PROJECT_ROOT / "market"
+MARKET_FILE = MARKET_ROOT / "index.json"
+
 # 市场清单中 source == "builtin" 的拓展，从该目录拷贝安装
-_BUILTIN_SRC = Path(__file__).resolve().parent.parent.parent / "AppData" / "extensions" / "_builtin"
+_BUILTIN_SRC = MARKET_ROOT / "extensions"
 
 # renderer.js 等前端文件大小上限（防读巨型文件打满内存）
 _MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -72,8 +75,27 @@ def _write_json(path: Path, data: Any) -> None:
 
 
 def _load_market() -> list[dict]:
-    """读取市场清单。若不存在则回退空清单。"""
+    """读取市场清单。
+
+    统一索引 ``market/index.json`` 中 ``kind == "extension"`` 的条目即拓展清单；
+    兼容旧版 ``AppData/extensions/extensions_market.json`` 的结构。
+    """
     data = _read_json(MARKET_FILE, None)
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        out: list[dict] = []
+        for it in data["items"]:
+            if it.get("kind") != "extension":
+                continue
+            meta = {k: v for k, v in it.items()
+                    if k not in ("kind", "dir", "updated_at")}
+            # index 用 ext_type 存 manifest.type，转回市场清单的 type 字段
+            meta["type"] = it.get("ext_type") or it.get("type") or "hybrid"
+            meta.setdefault("source", "builtin")
+            out.append(meta)
+        return out
+    # —— 旧版清单兜底 ——
+    legacy = EXT_ROOT / "extensions_market.json"
+    data = _read_json(legacy, None)
     if isinstance(data, dict) and isinstance(data.get("extensions"), list):
         return data["extensions"]
     if isinstance(data, list):

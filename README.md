@@ -18,7 +18,7 @@ AgentCluster 是一个 **Windows 本地优先** 的多智能体编排平台，�
 - **内置文件浏览器**：浏览 / 编辑 / 重命名 / 复制 / 删除工作区文件
 - **一键运行**：直接运行脚本文件，Python 交互式控制台支持实时输入 / 停止
 - **回收站**：删除文件进入回收站，可恢复或彻底清理
-- **快照备份**：写文件自动留存快照，误改可回溯（`AppData/file_backups/`）
+- **快照备份**：写文件自动留存快照，误改可回溯（`<数据目录>/file_backups/`）
 
 ### 🤝 A2A 消息协议
 - **自研 a2a-lite 协议**：结构化信封消息系统（`backend/core/a2a.py`）
@@ -27,12 +27,12 @@ AgentCluster 是一个 **Windows 本地优先** 的多智能体编排平台，�
 
 ### 🔧 能力扩展
 1. **命令工具**：文件读写 / 替换 / 查找、命令执行、长运行进程后台化与探活
-2. **技能系统**：小说创作、角色扮演、Web 演示页面生成（内置 + `AppData/skills/`）
+2. **技能系统**：小说创作、角色扮演、Web 演示页面生成（内置 + `<数据目录>/skills/`）
 3. **插件生态**：浏览器控制、SMTP 邮件、HTTP 请求（Dify 兼容清单）
 ### 🧩 组织与治理
 - **智能体分组**：左侧分组管理，支持拖拽排序
-- **规则系统**：按画布隔离的规章制度，注入成员上下文（`AppData/rules/`）
-- **参数预设**：模型参数预设一键套用（`AppData/param_presets/`）
+- **规则系统**：按画布隔离的规章制度，注入成员上下文（`<数据目录>/rules/`）
+- **参数预设**：模型参数预设一键套用（`<数据目录>/param_presets/`）
 - **存储位置可切换**：一键迁移 / 接管数据根目录
 
 ### 🎯 智能感知的运行时
@@ -100,7 +100,7 @@ npm install
 ### 5. 配置环境变量（可选）
 
 ```bash
-# 设置模型 API 密钥（编辑 AppData/settings.json）
+# 设置模型 API 密钥（编辑用户数据目录下的 settings.json）
 # 或在启动前设置环境变量
 set OPENAI_API_KEY=your-api-key
 set BASE_URL=https://api.openai.com/v1
@@ -248,7 +248,7 @@ npm run dev
 │ - 插件：browser_control / SMTP / HTTP   │
 │ - 技能：小说创作 / 角色扮演 / Web 演示  │
 │ - 规划：MCP 外部服务器接入 + 插件市场    │
-│ - 存储：AppData JSON + Fernet 加密      │
+│ - 存储：本地 JSON + Fernet 加密      │
 └─────────────────────────────────────────┘
 ```
 
@@ -337,26 +337,26 @@ npm run dev
 │   ├── vite.config.ts
 │   └── package.json
 │
-├── AppData/                    # 用户数据存储（可切换位置）
-│   ├── settings.json           # 全局设置
-│   ├── mcp_servers.json        # MCP 服务器配置（预留，待接通）
-│   ├── agents/                 # 智能体配置
-│   ├── agent_groups/           # 智能体分组
-│   ├── canvases/               # 画布配置 + 工作区文件
-│   ├── conversations/          # 对话记录
-│   ├── rules/                  # 规章制度
-│   ├── workflows/              # 工作流状态（plan/spec/goal）
-│   ├── file_backups/           # 文件快照备份
-│   ├── skills/                 # 技能包（SKILL.md）
-│   ├── plugins/                # 插件（manifest / tool.yaml / tool.py）
-│   ├── model_interfaces/       # 模型接口配置
-│   ├── param_presets/          # 参数预设
-│   └── _legacy/                # 迁移前的旧格式数据
+├── market/                     # 市场资源仓库（随程序分发，提交 git）
+│   ├── index.json              # 统一资源索引（智能体/画布/背景/技能/插件/功能拓展）
+│   ├── agents/                 # 智能体资源
+│   ├── canvases/               # 画布资源
+│   ├── backgrounds/            # 背景资源
+│   ├── skills/                 # 技能资源
+│   ├── plugins/                # 插件资源
+│   └── extensions/             # 功能拓展资源
+│
+├── AppData.backup-*/           # 首次迁移后保留的旧数据副本（可手动删除）
 │
 ├── start.bat                   # Windows 一键启动（自动选 pythonw / python）
 ├── start_tray.py               # 系统托盘启动器（单实例 + 健康检查 + 菜单）
+├── market_manager.pyw          # 独立市场管理程序（Tkinter，浏览/搜索/安装/发布/删除）
+├── market_manager.bat          # 双击启动市场管理程序（不依赖主程序）
 └── .agentcluster.pid           # 运行时 PID 文件
 ```
+
+> 用户数据默认存放在项目之外（Windows：`%LOCALAPPDATA%\AgentCluster`），不再随项目目录提交到 git。
+> 项目内若残留旧的 `AppData/`，首次启动会自动迁移到上述目录，并把旧目录改名为 `AppData.backup-<时间戳>` 保留副本。
 
 ## 🎬 演示
 
@@ -377,7 +377,7 @@ npm run dev
 启动器会自动探测 8870 / 5173，冲突时会换端口；托盘状态栏显示 ⚠️ 时请检查 `tray_startup.log` / `debug.log`。
 
 **Q：数据能搬到别的机器吗？**  
-把整个 `AppData/` 目录拷走即可（含加密密钥在 `backend/.runtime/`，一起拷）。也可以在「设置 → 存储位置」一键迁移数据根目录。
+把整个用户数据目录拷走即可（Windows 默认 `%LOCALAPPDATA%\AgentCluster`；含加密密钥在 `backend/.runtime/`，一起拷）。也可以在「设置 → 存储位置」切换数据根目录。项目内的旧 `AppData/` 首次启动会自动迁移并改名为 `AppData.backup-<时间戳>` 保留副本，确认无误后可手动删除。
 
 ## 🤝 贡献
 
