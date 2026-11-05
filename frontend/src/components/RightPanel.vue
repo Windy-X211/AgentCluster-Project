@@ -3355,7 +3355,7 @@ onBeforeUnmount(() => {
         <span>画布列表</span>
         <span class="conv-count">{{ canvases.list.length }}</span>
         <span class="flex-spacer"></span>
-        <button class="btn sm ghost" @click="canvases.create()" title="新建画布">+</button>
+        <button class="btn sm add-canvas-btn" @click="canvases.create()" title="新建画布">+</button>
       </div>
       <div class="cv-list" v-show="!canvasesCollapsed">
         <div v-for="c in canvases.list" :key="c.id"
@@ -4124,6 +4124,9 @@ onBeforeUnmount(() => {
 .canvases-pane { padding: 4px 0; flex-shrink: 0; }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
+.section-title .add-canvas-btn { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: calc(16px * var(--font-scale)); font-weight: 500; line-height: 1; color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.10); border: 1px solid rgba(var(--accent-rgb), 0.26); border-radius: 7px; cursor: pointer; transition: background .2s ease, border-color .2s ease, color .2s ease; }
+.section-title .add-canvas-btn:hover { background: rgba(var(--accent-rgb), 0.20); border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent-light); }
+.section-title .add-canvas-btn:active { background: rgba(var(--accent-rgb), 0.28); }
 .cv-list { padding: 2px 4px; max-height: 180px; overflow-y: auto; }
 .cv-item { padding: 6px 10px; border-radius: 8px; font-size: calc(12px * var(--font-scale)); cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 6px; position: relative; }
 .cv-item:hover { background: rgba(var(--surface-rgb), 0.05); }
@@ -4139,9 +4142,9 @@ onBeforeUnmount(() => {
 .cv-item .cv-count { font-size: calc(11px * var(--font-scale)); flex-shrink: 0; font-family: Consolas, monospace; padding: 1px 6px; border-radius: 999px; background: rgba(var(--accent2-rgb), 0.15); color: var(--purple-ink); border: 1px solid rgba(var(--accent2-rgb), 0.3); line-height: 1.5; font-weight: 600; }
 .cv-item .cv-running { flex-shrink: 0; font-size: calc(10px * var(--font-scale)); color: #4ade80; line-height: 1; animation: cvPulse 1.2s ease-in-out infinite; }
 @keyframes cvPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
-.cv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; color: rgba(var(--text-rgb), 0.7); }
+.cv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; color: rgba(var(--text-rgb), 0.7); display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin: -6px -8px -6px -2px; border-radius: 50%; cursor: pointer; line-height: 1; }
 .cv-item:hover .del { opacity: .6; }
-.cv-item .del:hover { opacity: 1; color: #ff9090; }
+.cv-item .del:hover { opacity: 1; color: #ff9090; background: rgba(232, 92, 92, 0.14); }
 .cv-rename { width: 100%; font-size: calc(12px * var(--font-scale)); padding: 2px 6px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.3); border: 1px solid rgba(var(--accent-rgb), 0.4); color: rgb(var(--text-rgb)); }
 .divider { height: 1px; flex-shrink: 0; background: rgba(var(--surface-rgb), 0.08); margin: 4px 10px; }
 

@@ -11,3 +11,5 @@
 *.woff2 binary
 *.ttf binary
 *.eot binary
+*.bat text eol=crlf
+*.cmd text eol=crlf
