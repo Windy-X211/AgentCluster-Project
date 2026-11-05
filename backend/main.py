@@ -22,9 +22,9 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是「集群编排师」，一位资深的 AI
 1. **先理解再动手**：用户说「帮我搭一个产品研发集群」，你先把这个角色团队想清楚，列出需要哪些智能体、各自职责、协作顺序。
 2. **先查能力清单**：动手之前先调用 `cluster.list_capabilities`，看看系统里当前有哪些命令、技能、插件可用。这一步非常重要——你需要根据每个智能体的职责，从能力清单里挑选合适的工具分配给它。
 3. **一次一个工具调用**：按顺序调用 cluster.* 工具。通常的工作流是：
-   - 先 `cluster.list_canvases` 看有没有同名画布（避免重复）
+   - 先 `cluster.search_canvases` 搜一下有没有同名画布（避免重复）
    - `cluster.create_canvas` 新建画布
-   - 对每个角色：`cluster.list_agents` 看是否已有 → 没有则 `cluster.create_agent` 创建（**一定要写好 system_prompt，定义清楚角色的口吻、原则、边界；同时一定要根据角色职责从能力清单中选择 commands / skills / plugins 配置进去，不要留空**）
+   - 对每个角色：`cluster.search_agents` 搜一下是否已有同名/同职责 → 没有则 `cluster.create_agent` 创建（**一定要写好 system_prompt，定义清楚角色的口吻、原则、边界；同时一定要根据角色职责从能力清单中选择 commands / skills / plugins 配置进去，不要留空**）
    - `cluster.add_node` 把智能体加到画布上
    - `cluster.connect` 把节点按协作顺序连起来（A→B 表示 B 依赖 A 的产出）
 4. **修改也直接来**：用户说「把 XX 智能体的提示词改一下」「给它加个浏览器能力」「让 A 直接汇报给 C」，你直接调 cluster.update_agent / add_node / connect。涉及能力变更时先 `cluster.list_capabilities` 确认当前有哪些可用。
@@ -82,6 +82,16 @@ ORCHESTRATOR_CAPABILITY_CMDS = [
     "cluster.list_capabilities",
 ]
 
+# 智能体信息查看（查看指定智能体的完整配置，支持批量）
+ORCHESTRATOR_AGENT_VIEW_CMDS = [
+    "cluster.get_agent",
+]
+
+# 搜索能力（按特征关键字搜索智能体/画布/会话）
+ORCHESTRATOR_SEARCH_CMDS = [
+    "cluster.search_agents", "cluster.search_canvases", "cluster.search_conversations",
+]
+
 # 会话 / 运行管理命令（新建/编辑/继续会话、停止智能体、查看运行态与对话记录）
 ORCHESTRATOR_RUNTIME_CMDS = [
     "cluster.create_conversation", "cluster.update_conversation", "cluster.continue_conversation",
@@ -98,7 +108,7 @@ def _ensure_orchestrator():
         ):
             # 已存在 → 确保规章制度 / 分组工具 / 能力查询工具可用
             cmds = a.get("commands") or []
-            missing = [c for c in ORCHESTRATOR_RULE_CMDS + ORCHESTRATOR_GROUP_CMDS + ORCHESTRATOR_CAPABILITY_CMDS + ORCHESTRATOR_RUNTIME_CMDS if c not in cmds]
+            missing = [c for c in ORCHESTRATOR_RULE_CMDS + ORCHESTRATOR_GROUP_CMDS + ORCHESTRATOR_CAPABILITY_CMDS + ORCHESTRATOR_AGENT_VIEW_CMDS + ORCHESTRATOR_SEARCH_CMDS + ORCHESTRATOR_RUNTIME_CMDS if c not in cmds]
             if missing:
                 a["commands"] = cmds + missing
                 upsert("agents", a)
@@ -112,9 +122,9 @@ def _ensure_orchestrator():
         "interface_id": None,
         # 默认加载全部 cluster.* 命令 —— 这是编排师的核心能力
         "commands": [
-            "cluster.list_agents", "cluster.list_capabilities",
+            "cluster.get_agent", "cluster.search_agents", "cluster.list_capabilities",
             "cluster.create_agent", "cluster.update_agent", "cluster.delete_agent",
-            "cluster.list_canvases", "cluster.create_canvas", "cluster.delete_canvas", "cluster.get_canvas",
+            "cluster.create_canvas", "cluster.delete_canvas", "cluster.get_canvas", "cluster.search_canvases",
             "cluster.add_node", "cluster.remove_node", "cluster.connect", "cluster.disconnect",
             # 规章制度（按画布隔离）
             *ORCHESTRATOR_RULE_CMDS,

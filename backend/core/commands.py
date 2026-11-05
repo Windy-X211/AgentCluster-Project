@@ -598,24 +598,35 @@ WORKDIR_CTX: ContextVar[str | None] = ContextVar("workdir", default=None)
 BACKUP_CTX: ContextVar[dict | None] = ContextVar("backup_ctx", default=None)
 
 
+_DEFAULT_WORKDIR_CACHE: dict = {"path": None, "at": 0.0}
+
+
 def _effective_workdir() -> str | None:
-    """返回当前生效的工作区绝对路径（没有则返回 None）。"""
-    # 1) 画布模式注入的 workdir
+    """返回当前生效的工作区绝对路径（没有则返回 None）。
+
+    性能优化：移除每次调用都 open/write/close 的 debug 日志（多智能体并行时
+    会产生上百次磁盘争用，是卡顿根因之一）；settings.default_workdir 用
+    短 TTL 缓存，避免每次 fallback 都触发 store.load（JSON 读盘）。
+    """
+    # 1) 画布模式注入的 workdir（ContextVar，零成本）
     wd = WORKDIR_CTX.get()
-    try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "wd_debug.log"), "a", encoding="utf-8") as _f:
-            _f.write(f"{time.time():.3f} _effective_workdir ctx={wd!r} isdir={os.path.isdir(wd) if wd else None} cwd={os.getcwd()}\n")
-    except Exception:
-        pass
     if wd and os.path.isdir(wd):
         return wd
-    # 2) 兜底：settings 里的 default_workdir（独立对话模式）
+    # 2) 兜底：settings 里的 default_workdir（短 TTL 缓存 2s，避免频繁读盘）
     try:
+        now = time.time()
+        cached = _DEFAULT_WORKDIR_CACHE
+        if cached["path"] and (now - cached["at"]) < 2.0:
+            if os.path.isdir(cached["path"]):
+                return cached["path"]
         from core.store import load
         s = load("settings") or {}
         dwd = s.get("default_workdir")
         if dwd and os.path.isdir(dwd):
+            _DEFAULT_WORKDIR_CACHE = {"path": dwd, "at": now}
             return dwd
+        # 目录失效 → 清缓存
+        _DEFAULT_WORKDIR_CACHE = {"path": None, "at": now}
     except Exception:
         pass
     return None
@@ -1822,15 +1833,16 @@ COMMAND_CN_LABELS = {
     "cmd.bg_list": "📋 后台进程",
     "cmd.bg_stop": "🛑 停止进程",
     "cmd.bg_log": "📜 进程日志",
-    "cluster.list_agents": "👥 列出智能体",
+    "cluster.get_agent": "🔍 查看智能体",
+    "cluster.search_agents": "🔎 搜索智能体",
     "cluster.list_capabilities": "🧩 查询可用能力",
     "cluster.create_agent": "🤖 创建智能体",
     "cluster.update_agent": "✏️ 更新智能体",
     "cluster.delete_agent": "🗑 删除智能体",
-    "cluster.list_canvases": "🎨 列出画布",
+    "cluster.get_canvas": "👁 查看画布",
+    "cluster.search_canvases": "🔎 搜索画布",
     "cluster.create_canvas": "🌟 创建画布",
     "cluster.delete_canvas": "🗑 删除画布",
-    "cluster.get_canvas": "👁 查看画布",
     "cluster.add_node": "📌 添加节点",
     "cluster.remove_node": "❌ 移除节点",
     "cluster.connect": "🔗 连接节点",
@@ -1850,6 +1862,7 @@ COMMAND_CN_LABELS = {
     "cluster.stop_agent": "🛑 停止智能体",
     "cluster.list_running": "📡 查看运行中",
     "cluster.list_conversations": "🗂 列出会话",
+    "cluster.search_conversations": "🔎 搜索会话",
     "cluster.get_conversation": "🗨️ 查看对话记录",
     "cluster.handoff": "🤝 A2A 移交",
     "cluster.send_message": "📨 发送消息",
@@ -2037,9 +2050,10 @@ def _find_agent(name_or_id):
         if a: return a
     except Exception:
         pass
-    for a in load("agents"):
-        if a.get("name") == name_or_id or (name_or_id in a.get("name", "")):
-            return a
+    if isinstance(name_or_id, str):
+        for a in load("agents"):
+            if a.get("name") == name_or_id or (name_or_id in a.get("name", "")):
+                return a
     return None
 
 
@@ -2056,8 +2070,30 @@ def _find_canvas(name_or_id):
     return None
 
 
+# 允许 agent / canvas get/search 命令 select 的字段名（白名单模式，写错静默忽略）
+_AGENT_FIELDS = {
+    "id", "name", "description", "system_prompt", "model",
+    "commands", "skills", "plugins", "trigger", "tags", "enabled",
+    "group_id", "group_name", "max_tool_rounds", "created_at",
+}
+_CANVAS_FIELDS = {
+    "id", "name", "description", "nodes", "edges", "nodes_count", "edges_count", "created_at",
+}
+
+
+def _pick_fields(item: dict, fields: list | None, allowed: set) -> dict:
+    """字段投影：fields=None/空 → 原样返回；否则仅保留 allowed ∩ fields 里的 key"""
+    if not fields:
+        return item
+    keep = [f for f in fields if f in allowed and f in item]
+    return {f: item[f] for f in keep}
+
+
 def cmd_cluster_list_agents() -> dict:
-    items = _load_all("agents")
+    """列出所有智能体（兼容别名：等价于 cluster.search_agents() 空 keyword）。
+    已合并入 cluster.search_agents，新调用请改用 search_agents（支持关键字过滤、字段投影、排序）。"""
+    r = cmd_cluster_search_agents()
+    # 把 search 返回的 agents 数组转为 list_agents 的简要格式
     return {"agents": [{
         "id": a.get("id"),
         "name": a.get("name"),
@@ -2065,7 +2101,72 @@ def cmd_cluster_list_agents() -> dict:
         "commands": a.get("commands", []),
         "skills": a.get("skills", []),
         "plugins": a.get("plugins", []),
-    } for a in items]}
+    } for a in r.get("agents", [])]}
+
+
+def cmd_cluster_get_agent(agents: list | None = None, fields: list | None = None) -> dict:
+    """查看一个或多个智能体的信息（支持批量、支持字段投影）。
+    agents 元素可以是 id 或名称（支持模糊匹配）。fields 可选：只返回指定字段，如 ["id","name","system_prompt"]；
+    不传则返回完整对象。"""
+    if not agents:
+        return {"error": "请通过 agents 参数传入要查看的智能体 id 或名称列表（支持批量）"}
+    if not isinstance(agents, list):
+        agents = [agents]
+    found, not_found = [], []
+    for key in agents:
+        a = _find_agent(key)
+        if not a:
+            not_found.append(key)
+            continue
+        g = _get_by("agent_groups", a.get("group_id")) if a.get("group_id") else None
+        enriched = {**a, "group_name": g.get("name") if g else None}
+        found.append(_pick_fields(enriched, fields, _AGENT_FIELDS))
+    if not found:
+        return {"error": f"未找到智能体：{not_found}", "agents": [], "not_found": not_found}
+    return {"agents": found, "not_found": not_found}
+
+
+def cmd_cluster_search_agents(keyword: str | None = None, fields: list | None = None,
+                               limit: int | None = None, match_in: list | None = None) -> dict:
+    """按特征搜索智能体。keyword 支持多个（用空格/逗号/中文顿号分隔，任一命中即召回），大小写不敏感。
+    默认在 name / description / system_prompt / model / tags / commands / skills / plugins 里搜索；
+    可以传 match_in 数组限定搜索范围（如 ["system_prompt", "name"]）。
+    fields 可选：只返回指定字段。limit 可选：最多返回条数。"""
+    all_kw = []
+    if keyword:
+        for sep in (" ", ",", "，", "、"):
+            keyword = keyword.replace(sep, " ")
+        for k in keyword.split():
+            k = k.strip()
+            if k:
+                all_kw.append(k.lower())
+    allowed_match = {"name", "description", "system_prompt", "model",
+                     "tags", "commands", "skills", "plugins"}
+    match_scope = set(match_in) & allowed_match if match_in else allowed_match
+    hits = []
+    for a in _load_all("agents"):
+        text_parts = []
+        if "name" in match_scope: text_parts.append(str(a.get("name", "")))
+        if "description" in match_scope: text_parts.append(str(a.get("description", "")))
+        if "system_prompt" in match_scope: text_parts.append(str(a.get("system_prompt", "")))
+        if "model" in match_scope: text_parts.append(str(a.get("model", "")))
+        if "tags" in match_scope: text_parts.append(" ".join(str(t) for t in a.get("tags", [])))
+        if "commands" in match_scope: text_parts.append(" ".join(str(c) for c in a.get("commands", [])))
+        if "skills" in match_scope: text_parts.append(" ".join(str(s) for s in a.get("skills", [])))
+        if "plugins" in match_scope: text_parts.append(" ".join(str(p) for p in a.get("plugins", [])))
+        haystack = " ".join(text_parts).lower()
+        score = 0
+        for kw in all_kw:
+            c = haystack.count(kw)
+            if c: score += c
+        if not all_kw or score > 0:
+            g = _get_by("agent_groups", a.get("group_id")) if a.get("group_id") else None
+            enriched = {**a, "group_name": g.get("name") if g else None, "_score": score}
+            hits.append(_pick_fields(enriched, fields, _AGENT_FIELDS | {"_score"}))
+    hits.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    if limit:
+        hits = hits[:limit]
+    return {"total": len(hits), "keyword": keyword, "agents": hits}
 
 
 def cmd_cluster_create_agent(name: str, description: str = "", system_prompt: str = "",
@@ -2112,29 +2213,54 @@ def cmd_cluster_update_agent(agent_id: int, name: str | None = None,
     return {"ok": True, "agent": cur}
 
 
-def cmd_cluster_delete_agent(agent_id: int) -> dict:
-    # 同时从所有画布的 nodes / edges 里清掉
+def _delete_agent_one(agent_id) -> dict:
+    """删除单个智能体（agent_id 支持 id 或名称），并从所有画布的 nodes / edges 里清掉。"""
+    a = _find_agent(agent_id)
+    if not a:
+        return {"agent_id": agent_id, "ok": False, "error": f"agent {agent_id} not found"}
+    aid = a["id"]
     canvases = _load_all("canvases")
     changed = 0
     for c in canvases:
         prev = len(c.get("nodes", []))
-        c["nodes"] = [n for n in c.get("nodes", []) if n.get("agent_id") != agent_id]
+        c["nodes"] = [n for n in c.get("nodes", []) if n.get("agent_id") != aid]
         if len(c["nodes"]) != prev:
             changed += 1
             remaining_ids = {n["id"] for n in c["nodes"]}
             c["edges"] = [e for e in c.get("edges", []) if e.get("from_node") in remaining_ids and e.get("to_node") in remaining_ids]
             _save_all("canvases", canvases)
-    ok = _delete_by("agents", agent_id)
-    return {"ok": ok, "cleaned_from_canvases": changed}
+    ok = _delete_by("agents", aid)
+    return {"agent_id": aid, "name": a.get("name"), "ok": ok, "cleaned_from_canvases": changed}
+
+
+def cmd_cluster_delete_agent(agent_id=None, agent_ids: list | None = None) -> dict:
+    """删除智能体，支持批量：agent_ids 传数组（元素可以是 id 或名称），agent_id 传单个，两者可同时使用。"""
+    targets = list(agent_ids or [])
+    if agent_id is not None:
+        targets.append(agent_id)
+    if not targets:
+        return {"error": "请通过 agent_id（单个）或 agent_ids（数组，批量）指定要删除的智能体"}
+    results = [_delete_agent_one(t) for t in targets]
+    deleted = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+    return {
+        "ok": not failed,
+        "count": len(deleted),
+        "deleted": deleted,
+        "failed": failed,
+        "cleaned_from_canvases": sum(r.get("cleaned_from_canvases", 0) for r in deleted),
+    }
 
 
 def cmd_cluster_list_canvases() -> dict:
-    items = _load_all("canvases")
+    """列出所有画布（兼容别名：等价于 cluster.search_canvases() 空 keyword）。
+    已合并入 cluster.search_canvases，新调用请改用 search_canvases（支持关键字过滤、字段投影、排序）。"""
+    r = cmd_cluster_search_canvases()
     return {"canvases": [{
         "id": c.get("id"), "name": c.get("name"), "description": c.get("description", ""),
-        "nodes_count": len(c.get("nodes", [])),
-        "edges_count": len(c.get("edges", [])),
-    } for c in items]}
+        "nodes_count": c.get("nodes_count", 0),
+        "edges_count": c.get("edges_count", 0),
+    } for c in r.get("canvases", [])]}
 
 
 def cmd_cluster_create_canvas(name: str, description: str = "") -> dict:
@@ -2151,16 +2277,75 @@ def cmd_cluster_delete_canvas(canvas_id: int) -> dict:
     return {"ok": _delete_by("canvases", canvas_id)}
 
 
-def cmd_cluster_get_canvas(canvas_id: int | str) -> dict:
+def cmd_cluster_get_canvas(canvas_id: int | str, fields: list | None = None) -> dict:
+    """查看画布详细内容（支持字段投影）。fields 可选：只返回指定字段，如 ["id","name","nodes"]；
+    不传则返回完整画布（节点含 agent_name 补充）。支持的字段见 cluster.search_canvases 说明。"""
     c = _find_canvas(canvas_id)
     if not c: return {"error": f"canvas {canvas_id} not found"}
-    # 给每个 node 补上 agent 名称方便 LLM 理解
     agent_map = {a["id"]: a["name"] for a in _load_all("agents")}
     enriched = {
         **c,
         "nodes": [{**n, "agent_name": agent_map.get(n["agent_id"], "?")} for n in c.get("nodes", [])],
+        "nodes_count": len(c.get("nodes", [])),
+        "edges_count": len(c.get("edges", [])),
     }
-    return {"canvas": enriched}
+    return {"canvas": _pick_fields(enriched, fields, _CANVAS_FIELDS)}
+
+
+def cmd_cluster_search_canvases(keyword: str | None = None, fields: list | None = None,
+                                limit: int | None = None, match_in: list | None = None) -> dict:
+    """按特征搜索画布。keyword 支持多个（空格/逗号/中文顿号分隔，任一命中即召回），大小写不敏感。
+    默认在 name / description / 画布关联的规章制度 / 节点所包含的智能体名称 里搜索；
+    可传 match_in 数组限定范围，可选值：name / description / rules / agents_in_canvas。
+    fields 可选：只返回指定字段（id / name / description / nodes_count / edges_count / created_at / nodes / edges）。
+    limit 可选：最多返回条数。"""
+    all_kw = []
+    if keyword:
+        for sep in (" ", ",", "，", "、"):
+            keyword = keyword.replace(sep, " ")
+        for k in keyword.split():
+            k = k.strip()
+            if k:
+                all_kw.append(k.lower())
+    allowed_match = {"name", "description", "rules", "agents_in_canvas"}
+    match_scope = set(match_in) & allowed_match if match_in else allowed_match
+    # 预先准备 rules 和 agent_name 映射
+    rules_by_canvas: dict[int, list[str]] = {}
+    if "rules" in match_scope:
+        for r in _load_all("rules"):
+            cid = r.get("canvas_id")
+            if cid is None: continue
+            rules_by_canvas.setdefault(cid, []).append(str(r.get("content", "")))
+    agent_map = {a["id"]: a["name"] for a in _load_all("agents")} if "agents_in_canvas" in match_scope else {}
+    hits = []
+    for c in _load_all("canvases"):
+        text_parts = []
+        if "name" in match_scope: text_parts.append(str(c.get("name", "")))
+        if "description" in match_scope: text_parts.append(str(c.get("description", "")))
+        if "rules" in match_scope:
+            for r_content in rules_by_canvas.get(c["id"], []):
+                text_parts.append(r_content)
+        if "agents_in_canvas" in match_scope:
+            for n in c.get("nodes", []):
+                aname = agent_map.get(n.get("agent_id"), "")
+                if aname: text_parts.append(aname)
+        haystack = " ".join(text_parts).lower()
+        score = 0
+        for kw in all_kw:
+            cnt = haystack.count(kw)
+            if cnt: score += cnt
+        if not all_kw or score > 0:
+            enriched = {
+                **c,
+                "nodes_count": len(c.get("nodes", [])),
+                "edges_count": len(c.get("edges", [])),
+                "_score": score,
+            }
+            hits.append(_pick_fields(enriched, fields, _CANVAS_FIELDS | {"_score"}))
+    hits.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    if limit:
+        hits = hits[:limit]
+    return {"total": len(hits), "keyword": keyword, "canvases": hits}
 
 
 def cmd_cluster_add_node(canvas_id: int | str, agent_id: int | str,
@@ -2630,6 +2815,78 @@ def cmd_cluster_list_running() -> dict:
     return {"running": out, "count": len(out)}
 
 
+def cmd_cluster_search_conversations(keyword: str | None = None,
+                                      kinds: list | None = None,
+                                      limit: int | None = None) -> dict:
+    """按特征关键字搜索会话。keyword 支持多个（空格/逗号/中文顿号分隔，任一命中即召回），大小写不敏感。
+    默认在会话 name / 最后一条消息预览（last_preview）/ 绑定的智能体名称 / 绑定的画布名称 这四类信息里搜索；
+    kinds 可限定范围，可选值：name / preview / agent_names / canvas_name。
+    limit 可选：最多返回条数；不传则按活跃时间返回全部。返回结构与 cluster.list_conversations 一致，每条附带 _score 相关度分。"""
+    from core import run_registry
+    kws = []
+    if keyword:
+        s = keyword
+        for sep in (" ", ",", "，", "、"):
+            s = s.replace(sep, " ")
+        for k in s.split():
+            k = k.strip().lower()
+            if k: kws.append(k)
+    allowed_match = {"name", "preview", "agent_names", "canvas_name"}
+    match_scope = set(kinds) & allowed_match if kinds else allowed_match
+
+    items = _load_all("conversations")
+    agent_map = _agent_display_map()
+    canvas_map = {c.get("id"): c.get("name") for c in _load_all("canvases")}
+    running_convs = {r.get("conv_id") for r in run_registry.list_running()}
+    running_pairs = {(r.get("conv_id"), r.get("agent_id")) for r in run_registry.list_running()}
+
+    hits = []
+    for c in items:
+        msgs = c.get("messages") or []
+        last_preview = ""
+        for m in reversed(msgs):
+            content = m.get("content")
+            if isinstance(content, str) and content.strip() and m.get("role") in ("user", "assistant"):
+                last_preview = content[:80].replace("\n", " ")
+                break
+        agent_names = [agent_map.get(i, f"?{i}") for i in (c.get("agent_ids") or [])]
+        canvas_name = canvas_map.get(c.get("canvas_id")) if c.get("canvas_id") else None
+
+        text_parts = []
+        if "name" in match_scope: text_parts.append(str(c.get("name", "")))
+        if "preview" in match_scope: text_parts.append(last_preview)
+        if "agent_names" in match_scope: text_parts.extend(agent_names)
+        if "canvas_name" in match_scope and canvas_name: text_parts.append(canvas_name)
+        haystack = " ".join(text_parts).lower()
+
+        score = 0
+        for kw in kws:
+            cnt = haystack.count(kw)
+            if cnt: score += cnt
+        if not kws or score > 0:
+            hits.append({
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "mode": c.get("mode", "independent"),
+                "canvas_id": c.get("canvas_id"),
+                "canvas_name": canvas_name,
+                "agent_ids": c.get("agent_ids", []),
+                "agent_names": agent_names,
+                "workdir": c.get("workdir"),
+                "execution_mode": c.get("execution_mode"),
+                "message_count": len(msgs),
+                "last_preview": last_preview,
+                "last_ts": _conv_activity_ts(c),
+                "running": c.get("id") in running_convs,
+                "running_agents": [aid for (cid, aid) in running_pairs if cid == c.get("id")],
+                "_score": score,
+            })
+    hits.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    if limit:
+        hits = hits[:limit]
+    return {"total": len(hits), "keyword": keyword, "conversations": hits}
+
+
 def cmd_cluster_list_conversations(limit: int = 50) -> dict:
     """列出会话（按活跃时间新→旧），含运行状态，供编排师了解有哪些对话、哪些正在跑。"""
     from core import run_registry
@@ -2723,43 +2980,75 @@ def cmd_cluster_get_conversation(conversation_id: int | str | None = None,
     }
 
 
-def cmd_cluster_list_capabilities() -> dict:
-    """返回系统中所有可用的命令、技能、插件清单（含描述信息），供编排师在创建智能体时主动配置能力。"""
+def cmd_cluster_list_capabilities(keyword: str | None = None,
+                                   kinds: list | None = None) -> dict:
+    """返回系统中可用的命令、技能、插件清单（含描述）。
+    keyword 可选：按关键字过滤，匹配命令名/技能名/插件名、label、description（子串匹配，大小写不敏感，多关键字可空格/逗号分隔，任一命中即保留）。
+    kinds 可选：限定返回类型，可选值 ["commands","skills","plugins"]；不传则全部返回。"""
     from plugins import list_plugins as _list_plugins
     from skills import list_skills as _list_skills
-    # 命令：从 COMMAND_GROUPS 构建按组分类的清单（排除 runtime 注入的 skill.invoke 等）
+
+    # 关键字预处理：多关键字拆开、统一小写
+    kws = []
+    if keyword:
+        s = keyword
+        for sep in (" ", ",", "，", "、"):
+            s = s.replace(sep, " ")
+        for k in s.split():
+            k = k.strip().lower()
+            if k: kws.append(k)
+
+    kinds_filter = set(kinds) & {"commands", "skills", "plugins"} if kinds else None
+
+    def _match(haystack: str) -> bool:
+        if not kws: return True
+        h = haystack.lower()
+        return any(kw in h for kw in kws)
+
+    # 命令
     commands_by_group: dict[str, list[dict]] = {}
     hidden = RUNTIME_INJECTED_COMMANDS
-    for t in COMMAND_TOOLS:
-        name = t["function"]["name"]
-        if name in hidden or not name.startswith(("file.", "workspace.", "cmd.", "cluster.", "agent.")):
-            continue
-        meta = COMMAND_META.get(name, {})
-        group = meta.get("group", "其他")
-        commands_by_group.setdefault(group, []).append({
-            "name": name,
-            "label": meta.get("label", name),
-            "description": t["function"].get("description", ""),
-            "params": meta.get("params", []),
-        })
-    # 技能：只返回 name / label / description
-    skills = _list_skills()
-    skill_list = [{
-        "name": k,
-        "label": v.get("label", k),
-        "description": v.get("description", ""),
-    } for k, v in skills.items()]
-    # 插件：只返回 name / label / description
-    plugins = _list_plugins()
-    plugin_list = [{
-        "name": k,
-        "label": v.get("label", k),
-        "description": v.get("description", ""),
-    } for k, v in plugins.items()]
+    if kinds_filter is None or "commands" in kinds_filter:
+        for t in COMMAND_TOOLS:
+            name = t["function"]["name"]
+            if name in hidden or not name.startswith(("file.", "workspace.", "cmd.", "cluster.", "agent.")):
+                continue
+            meta = COMMAND_META.get(name, {})
+            label = meta.get("label", name)
+            desc = t["function"].get("description", "")
+            params = meta.get("params", [])
+            if not _match(f"{name} {label} {desc} {' '.join(params)}"):
+                continue
+            group = meta.get("group", "其他")
+            commands_by_group.setdefault(group, []).append({
+                "name": name, "label": label, "description": desc, "params": params,
+            })
+
+    # 技能
+    skill_list: list[dict] = []
+    if kinds_filter is None or "skills" in kinds_filter:
+        for k, v in _list_skills().items():
+            label = v.get("label", k)
+            desc = v.get("description", "")
+            if not _match(f"{k} {label} {desc}"):
+                continue
+            skill_list.append({"name": k, "label": label, "description": desc})
+
+    # 插件
+    plugin_list: list[dict] = []
+    if kinds_filter is None or "plugins" in kinds_filter:
+        for k, v in _list_plugins().items():
+            label = v.get("label", k)
+            desc = v.get("description", "")
+            if not _match(f"{k} {label} {desc}"):
+                continue
+            plugin_list.append({"name": k, "label": label, "description": desc})
+
     return {
         "commands": commands_by_group,
         "skills": skill_list,
         "plugins": plugin_list,
+        "keyword": keyword,
         "_tips": [
             "创建智能体时请根据其职责从上述列表中选择合适的 commands / skills / plugins 配置进去，不要留空",
             "命令 (commands) 是内建工具，技能 (skills) 是专业工作流，插件 (plugins) 是外部功能扩展",
@@ -2773,17 +3062,68 @@ CLUSTER_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "cluster.list_agents",
-            "description": "列出系统中所有已创建的智能体及其简要信息。【不需要任何参数，留空即可】",
-            "parameters": {"type": "object", "properties": {}, "required": []}
+            "name": "cluster.get_agent",
+            "description": "查看一个或多个智能体的详细信息，支持批量传入。agents 元素可以是 id 或名称（支持模糊匹配）。fields 可选：只返回指定字段（如 ['id','name','system_prompt']），避免无关的命令/插件/提示词等冗长内容挤占上下文；不传则返回完整对象。想先搜索/筛选有哪些智能体时用 cluster.search_agents。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agents": {
+                        "type": "array",
+                        "items": {"type": ["integer", "string"]},
+                        "description": "要查看的智能体 id 或名称列表（支持批量、支持模糊匹配），如 [3, \"数据分析师\"]"
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：只返回这些字段，如 ['id','name','system_prompt','commands']。可填字段：id / name / description / system_prompt / model / commands / skills / plugins / trigger / tags / enabled / group_id / group_name / max_tool_rounds / created_at。不传=完整返回。"
+                    }
+                },
+                "required": ["agents"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.search_agents",
+            "description": "按特征关键字搜索智能体。keyword 支持多个（空格/逗号/中文顿号分隔，任一命中即召回），大小写不敏感。默认在 name / description / system_prompt / model / tags / commands / skills / plugins 全文搜索。match_in 可选限定范围（如 ['system_prompt','name']）。fields 可选只返回指定字段。limit 可选限制返回条数。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键字，多个可空格/逗号分隔"},
+                    "match_in": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["name","description","system_prompt","model","tags","commands","skills","plugins"]},
+                        "description": "可选：限定在哪些字段里搜索；不传则在全部可搜索字段里匹配"
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：只返回这些字段（同 cluster.get_agent 的 fields 参数说明）"
+                    },
+                    "limit": {"type": "integer", "description": "可选：最多返回多少条"}
+                },
+                "required": []
+            }
         }
     },
     {
         "type": "function",
         "function": {
             "name": "cluster.list_capabilities",
-            "description": "返回系统中所有可用的命令、技能、插件清单（含名称和描述）。在创建或修改智能体之前先调用此工具，了解有哪些能力可以分配给智能体，然后根据智能体的职责主动配置 commands / skills / plugins。",
-            "parameters": {"type": "object", "properties": {}, "required": []}
+            "description": "查询系统中可用的命令 / 技能 / 插件能力清单。keyword 可选：按关键字过滤（多关键字空格/逗号分隔，任一命中即保留），匹配名称/label/description；不传则返回全部。kinds 可选：限定只返回哪些类型（commands/skills/plugins），避免无关信息。在创建或修改智能体之前用它挑选合适的 commands / skills / plugins。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "可选：关键字过滤（大小写不敏感，多关键字空格/逗号分隔，任一命中即保留）"},
+                    "kinds": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["commands", "skills", "plugins"]},
+                        "description": "可选：限定返回哪些类型，如 ['commands','skills']；不传则三种都返回"
+                    }
+                },
+                "required": []
+            }
         }
     },
     {
@@ -2835,20 +3175,15 @@ CLUSTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "cluster.delete_agent",
-            "description": "删除一个智能体，并自动从所有画布中清理掉它对应的节点和连线。",
+            "description": "删除一个或多个智能体（支持批量），并自动从所有画布中清理掉它们对应的节点和连线。批量删除优先用 agent_ids 传数组；agent_id 只删单个，两者可同时使用。返回每个智能体的删除结果（含失败项）。",
             "parameters": {
                 "type": "object",
-                "properties": {"agent_id": {"type": ["integer", "string"], "description": "要删除的智能体 id 或名称"}},
-                "required": ["agent_id"]
+                "properties": {
+                    "agent_id": {"type": ["integer", "string"], "description": "要删除的单个智能体 id 或名称"},
+                    "agent_ids": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "批量删除：智能体 id 或名称数组，如 [3, 5, \"数据分析师\"]"}
+                },
+                "required": []
             }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cluster.list_canvases",
-            "description": "列出所有画布（集群编排图），每张画布显示节点/连线数量。【不需要任何参数，留空即可】",
-            "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
     {
@@ -2882,13 +3217,43 @@ CLUSTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "cluster.get_canvas",
-            "description": "查看一张画布的详细内容：节点、连线、每个节点对应的智能体名称。canvas_id 也支持传画布名称。",
+            "description": "查看一张画布的详细内容：节点、连线、每个节点对应的智能体名称。canvas_id 支持传画布名称（模糊匹配）。fields 可选：只返回指定字段（如 ['id','name','nodes_count','edges_count']），避免拿到冗长的 nodes/edges 列表；不传则返回完整画布。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "canvas_id": {"type": ["integer", "string"], "description": "画布 id 或画布名称（支持模糊匹配）"}
+                    "canvas_id": {"type": ["integer", "string"], "description": "画布 id 或画布名称（支持模糊匹配）"},
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：只返回这些字段，如 ['id','name','description','nodes_count','edges_count','created_at','nodes','edges']。不传=完整返回（nodes 内含 agent_name 补充）。"
+                    }
                 },
                 "required": ["canvas_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster.search_canvases",
+            "description": "按特征关键字搜索画布。keyword 支持多个（空格/逗号/中文顿号分隔，任一命中即召回），大小写不敏感。默认在画布 name / description / 画布关联的规章制度内容 / 画布节点所包含的智能体名称 这四类信息里搜索；match_in 可限定范围（rules 表示画布规章制度内容，agents_in_canvas 表示画布上有哪些智能体）。fields 可选只返回指定字段，limit 可选限制条数。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键字，多个可空格/逗号分隔"},
+                    "match_in": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["name","description","rules","agents_in_canvas"]},
+                        "description": "可选：限定搜索范围。name=画布名称，description=画布描述，rules=画布绑定的规章制度内容，agents_in_canvas=画布节点上的智能体名称"
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：只返回这些字段（同 cluster.get_canvas 的 fields 参数说明）"
+                    },
+                    "limit": {"type": "integer", "description": "可选：最多返回多少条"}
+                },
+                "required": []
             }
         }
     },
@@ -3166,8 +3531,28 @@ CLUSTER_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "cluster.search_conversations",
+            "description": "按特征关键字搜索会话。keyword 支持多个（空格/逗号/中文顿号分隔，任一命中即召回），大小写不敏感。默认在会话 name / 最后一条消息预览 / 会话绑定的智能体名称 / 会话绑定的画布名称 这四类信息里搜索；kinds 可限定范围（name / preview / agent_names / canvas_name）。limit 可选限制条数。返回结构与 cluster.list_conversations 一致，按相关度排序。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键字，多个可空格/逗号分隔"},
+                    "kinds": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["name", "preview", "agent_names", "canvas_name"]},
+                        "description": "可选：限定搜索范围。name=会话名，preview=最后一条消息预览，agent_names=会话成员智能体，canvas_name=会话绑定的画布"
+                    },
+                    "limit": {"type": "integer", "description": "可选：最多返回多少条"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "cluster.list_conversations",
-            "description": "列出会话（新→旧），含每个会话的名称、绑定画布、成员智能体、工作区、串/并行模式、消息数、最后预览与运行状态。用于找 conversation_id、了解有哪些对话在进行。",
+            "description": "列出会话（新→旧），含每个会话的名称、绑定画布、成员智能体、工作区、串/并行模式、消息数、最后预览与运行状态。用于找 conversation_id、了解有哪些对话在进行。需要按关键字过滤时改用 cluster.search_conversations。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3224,17 +3609,19 @@ COMMAND_GROUPS = [
     ("智能命令", ["agent.smart_search", "agent.spawn"]),
     ("命令运行", ["cmd.run", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
     ("集群编排", [
-        "cluster.list_agents", "cluster.list_capabilities",
+        "cluster.get_agent", "cluster.search_agents",
+        "cluster.list_capabilities",
         "cluster.create_agent", "cluster.update_agent", "cluster.delete_agent",
         "cluster.list_groups", "cluster.create_group", "cluster.update_group",
         "cluster.delete_group", "cluster.assign_agent_group",
-        "cluster.list_canvases", "cluster.create_canvas", "cluster.delete_canvas",
-        "cluster.get_canvas", "cluster.add_node", "cluster.remove_node",
+        "cluster.create_canvas", "cluster.delete_canvas",
+        "cluster.get_canvas", "cluster.search_canvases",
+        "cluster.add_node", "cluster.remove_node",
         "cluster.connect", "cluster.disconnect",
         "cluster.list_rules", "cluster.create_rule", "cluster.update_rule", "cluster.delete_rule",
         "cluster.create_conversation", "cluster.update_conversation", "cluster.continue_conversation",
         "cluster.stop_agent", "cluster.list_running",
-        "cluster.list_conversations", "cluster.get_conversation",
+        "cluster.list_conversations", "cluster.search_conversations", "cluster.get_conversation",
     ]),
 ]
 

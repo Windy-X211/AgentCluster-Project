@@ -172,8 +172,55 @@ def is_running(conv_id: int, agent_id: int | None = None) -> bool:
 
 
 def list_running() -> list[dict]:
+    """列出当前所有正在运行的 (conv_id, agent_id) 条目。
+
+    不仅包含有独立 RunSession 的运行，还包含 child_tasks 中正在运行的接收方
+    （cluster.send_message 串行接力时接收方作为发送方的 child_task 运行，
+    不占独立 _RUNS 键——这正是 A 停 B 起但悬浮球仍显示 A 的 bug 根因）。
+
+    当父 session 的 pump task 已 done 但 child_tasks 还在跑时，本函数不再
+    返回父 agent（它已停止运行），只返回仍在输出的 child agent。
+    去重保证同一 (conv_id, agent_id) 不会因既是独立 session 又是某父 session
+    的 child 而重复出现。"""
     _cleanup()
-    return [s.describe() for s in _RUNS.values() if s.running]
+    result: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+
+    for s in _RUNS.values():
+        if s.ended_at is not None:
+            continue
+
+        parent_running = s.task is not None and not s.task.done()
+        child_running = [ct for ct in s.child_tasks if not ct.done()]
+
+        if not parent_running and not child_running:
+            # 全部 done 但 ended_at 还没设——跳过（状态过渡态）
+            continue
+
+        # 父 agent 还在跑 → 加入独立条目
+        if parent_running:
+            key = (s.conv_id, s.agent_id)
+            if key not in seen:
+                seen.add(key)
+                result.append(s.describe())
+
+        # child_tasks 中运行中的接收方 → 也加入独立条目
+        for ct in child_running:
+            child_aid = s.child_task_agents.get(ct)
+            if child_aid is not None:
+                key = (s.conv_id, child_aid)
+                if key not in seen:
+                    seen.add(key)
+                    result.append({
+                        "conv_id": s.conv_id,
+                        "agent_id": child_aid,
+                        "running": True,
+                        "seq": 0,
+                        "started_at": s.started_at,
+                        "cancelled": False,
+                    })
+
+    return result
 
 
 def stop(conv_id: int, agent_id: int | None = None) -> bool:

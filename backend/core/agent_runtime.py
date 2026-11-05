@@ -1399,23 +1399,37 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
     # —— 注入 WORKDIR_CTX：画布有 workdir 则优先使用，否则让 commands.py 回落到 settings.default_workdir ——
     _workdir = (canvas or {}).get("workdir") if canvas else None
     _wd_probe = None  # (ok: bool, note: str)
+    _wd_token = None
     if _workdir:
         try:
             os.makedirs(_workdir, exist_ok=True)
         except Exception as e:
             _wd_probe = (False, f"目录创建失败: {e}")
         if os.path.isdir(_workdir):
-            try:
-                # 快速探测：写一个临时字节再删除
-                import tempfile, uuid
-                probe_file = os.path.join(_workdir, f".write_probe_{uuid.uuid4().hex[:8]}.tmp")
-                with open(probe_file, "w", encoding="utf-8") as pf: pf.write("ok")
-                os.remove(probe_file)
-                _wd_token = WORKDIR_CTX.set(_workdir)
+            # 宽容的写权限探测（Windows 文件锁容忍）：
+            # - 即使 probe 文件因偶发 PermissionError 写失败，仍然设置 WORKDIR_CTX
+            #   让智能体工具能正常解析路径——实际写文件时文件被锁定的概率很低；
+            # - probe 失败只作为 system prompt 里的⚠️ 提示，不阻断整个会话。
+            import uuid
+            probe_ok = False
+            probe_note = ""
+            for _attempt in range(2):  # 最多重试 2 次不同文件名
+                try:
+                    probe_file = os.path.join(_workdir, f".write_probe_{uuid.uuid4().hex[:8]}.tmp")
+                    with open(probe_file, "w", encoding="utf-8") as pf:
+                        pf.write("ok")
+                    os.remove(probe_file)
+                    probe_ok = True
+                    break
+                except Exception as e:
+                    probe_note = f"{type(e).__name__}: {e}"
+                    time.sleep(0.02)  # 短暂退让再试一次
+            _wd_token = WORKDIR_CTX.set(_workdir)
+            if probe_ok:
                 _wd_probe = (True, "")
-            except Exception as e:
-                _wd_token = None
-                _wd_probe = (False, f"写权限探测失败: {e}")
+            else:
+                # 探测失败但仍然设置 CTX——让工具至少能解析路径
+                _wd_probe = (False, f"写权限探测失败（可能 Windows 临时文件锁）：{probe_note}")
         else:
             _wd_token = None
     else:
