@@ -815,11 +815,11 @@ const agentGroupOptions = computed(() => {
         <div class="storage-loc">
           <label class="storage-loc-label" for="storageLoc">存储位置</label>
           <input id="storageLoc" class="input mono storage-loc-input" v-model="storageLocation"
-                 placeholder="默认：项目文件夹中的 AppData"
+                 placeholder="默认：%LOCALAPPDATA%\AgentCluster"
                  @blur="persistStorageLocation" @keydown.enter.prevent="persistStorageLocation" />
           <button class="btn sm ghost" @click="browseStorage" :disabled="storageSaving">浏览…</button>
         </div>
-        <div class="storage-loc-tip">默认位置为项目文件夹中的 AppData 文件夹；切换后应用会按新位置的现有数据接管</div>
+        <div class="storage-loc-tip">默认位置为用户数据目录（Windows：%LOCALAPPDATA%\AgentCluster，已在项目文件夹之外）；切换后应用会按新位置的现有数据接管</div>
         <table class="tbl" v-if="storagePaths">
           <thead><tr><th>名称</th><th>类型</th><th>相对路径</th><th>数量</th><th style="width: 120px"></th></tr></thead>
           <tbody>

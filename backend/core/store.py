@@ -20,19 +20,36 @@ fsync 策略由 AGENTCLUSTER_FSYNC 控制（见下方 FSYNC_MODE 注释），默
 写请求立即返回，后台线程补刷到磁盘，断电最多丢最近不到 1s 的写入（该文件整体回退到
 旧内容，不会损坏）；设为 sync 可恢复「先落盘再返回」的旧行为（本机 ~45ms/次，偏慢）。
 """
-import atexit, json, os, queue, tempfile, threading, glob, time
+import atexit, json, os, queue, shutil, tempfile, threading, glob, time
 from pathlib import Path
 from copy import deepcopy
+from datetime import datetime
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-ROOT_DEFAULT = _PROJECT_ROOT / "AppData"
+
+
+def _default_root() -> Path:
+    """默认存储根：项目外的用户数据目录。
+
+    Windows → ``%LOCALAPPDATA%\\AgentCluster``；其他平台 → ``~/.local/share/agentcluster``。
+    用户数据不再放进项目文件夹，避免被 git 跟踪、也避免换项目目录时丢数据。
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "AgentCluster"
+    return Path.home() / ".local" / "share" / "agentcluster"
+
+
+ROOT_DEFAULT = _default_root()
+# 旧版项目内数据目录：首次启动自动复制到 ROOT_DEFAULT，并改名保留为备份（AppData.backup-<时间戳>）
+_LEGACY_APP_DATA = _PROJECT_ROOT / "AppData"
 # 自定义存储路径记录文件，固定放在项目根目录（独立于 ROOT，避免“存储位置存在存储位置里”的套娃）。
 # 内容为相对项目根的路径（位于项目内时）或绝对路径（位于项目外时）。
 _BOOTSTRAP_FILE = _PROJECT_ROOT / ".storage_location"
 
 
 def _resolve_root() -> Path:
-    """启动时解析存储根：优先读项目根目录下的 .storage_location，无效则回退项目 AppData。"""
+    """启动时解析存储根：优先读项目根目录下的 .storage_location，无效则回退默认用户目录。"""
     try:
         if _BOOTSTRAP_FILE.exists():
             custom = _BOOTSTRAP_FILE.read_text(encoding="utf-8").strip()
@@ -241,8 +258,48 @@ def _glob_record_files(domain: str) -> list[Path]:
 # ==============================================================
 # 初始化 + 自动迁移
 # ==============================================================
+def _migrate_from_project_appdata() -> None:
+    """首次启动：把项目内旧 AppData 复制到默认用户目录，旧目录改名保留为备份。
+
+    - 仅在 ROOT 为默认用户目录、且新根尚未初始化（没有 settings.json）时执行；
+    - 复制成功后把项目内 AppData 改名为 ``AppData.backup-<时间戳>``（不删除，保留副本）；
+    - 复制失败时回退到项目内 AppData，保证程序仍可用；
+    - 用户自定义过存储位置（ROOT != 默认根）时不迁移。
+    """
+    global ROOT, LEGACY_DIR
+    if ROOT.resolve() != ROOT_DEFAULT.resolve():
+        return
+    if (ROOT / "settings.json").exists():
+        return          # 新根已初始化，无需迁移
+    if not _LEGACY_APP_DATA.exists():
+        return
+
+    backup = _PROJECT_ROOT / f"AppData.backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        shutil.copytree(_LEGACY_APP_DATA, ROOT, dirs_exist_ok=True)
+        (ROOT / ".migrated_from_project_appdata").write_text(
+            f"migrated_at={datetime.now().isoformat()}\nbackup={backup}\n", encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"[store] 迁移项目内 AppData 失败，回退旧目录：{e}")
+        ROOT = _LEGACY_APP_DATA
+        LEGACY_DIR = ROOT / "_legacy"
+        return
+
+    try:
+        _LEGACY_APP_DATA.rename(backup)
+        print(f"[store] 已迁移数据到 {ROOT}，旧目录备份为 {backup.name}")
+    except Exception as e:
+        print(f"[store] 数据已复制到 {ROOT}，但旧目录改名失败（可手动删除）：{e}")
+    try:
+        _BOOTSTRAP_FILE.unlink()
+    except Exception:
+        pass
+
+
 def init_store() -> None:
     with LOCK:
+        _migrate_from_project_appdata()
         print(f"[store] fsync mode = {FSYNC_MODE} (AGENTCLUSTER_FSYNC)")
         # 顶层目录
         ROOT.mkdir(parents=True, exist_ok=True)
