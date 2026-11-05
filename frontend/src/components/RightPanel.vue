@@ -9,6 +9,7 @@ import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
 import { api } from '@/api'
 import { API_BASE } from '@/utils/env'
 import FileViewer, { type ViewerFile } from './FileViewer.vue'
+import AgentEditDialog from './AgentEditDialog.vue'
 import VizBlock from '@/extensions/VizBlock.vue'
 import ChatBody from '@/extensions/ChatBody.vue'
 import { setExtAPIImpl } from '@/extensions/loader'
@@ -487,7 +488,9 @@ async function onChatDrop(e: DragEvent) {
 }
 const renameId = ref<number | null>(null)
 const renameVal = ref('')
-const convsCollapsed = ref(true) // 对话记录列表默认折叠（展开时浮层覆盖画布）
+// 对话记录折叠态（仅内存）：存 layout store 供 Home 布局感知——画布关闭时展开对话记录，
+// 对话区缩回为浮层留位（Home.vue gridStyle 三态）
+const convsCollapsed = computed({ get: () => layout.convsCollapsed, set: (v: boolean) => { layout.convsCollapsed = v } })
 // 对话记录浮层只属于主界面：KeepAlive 停用 Home 时 Teleport 到 body 的内容不会随页面隐藏，
 // 会残留在设置等路由页上（Vue 已知行为），因此仅在路由位于主界面时渲染浮层；返回主界面自动恢复
 const route = useRoute()
@@ -782,8 +785,17 @@ const lbImgTransform = computed(() =>
   `translate(${lbPanX.value}px, ${lbPanY.value}px) scale(${lbScale.value})`
 )
 
-// 对话列表浮层的 right 偏移量跟随右侧面板宽度变化
-const convFloatStyle = computed(() => ({ right: `${layout.rightWidth + 10}px` }))
+// 对话列表浮层的 right 偏移量：
+// - 画布打开：跟随右侧面板宽度（rightWidth + 10 视口 padding），紧贴对话区左缘覆盖画布；
+// - 画布关闭 + 浮层展开：Home 布局为浮层留 250px 固定列（浮层 240 + 10 间隙），对话区 1fr 较宽，
+//   右偏移按视口宽度动态推算（视口宽 - 左列宽 - 250 留位 - 20 列 gap - 10 视口 padding）
+const winW = ref(window.innerWidth)
+const onWinResize = () => { winW.value = window.innerWidth }
+const convFloatStyle = computed(() => {
+  if (canvases.current) return { right: `${layout.rightWidth + 10}px` }
+  const leftPx = layout.agentsCollapsed ? 36 : 240
+  return { right: `${Math.max(0, winW.value - leftPx - 280)}px` }
+})
 
 // 对话列表右键菜单
 const selMode = ref(false)
@@ -798,11 +810,28 @@ const agentTriggerEl = ref<HTMLElement | null>(null)
 const ddPopEl = ref<HTMLElement | null>(null)
 const chatPaneEl = ref<HTMLElement | null>(null)
 const ddPosStyle = ref<Record<string, string>>({})
-/** 按分组分列：第 0 列「全部」= 无组智能体；其余每列一个自定义组 */
+/** 当前会话中有对话的智能体（messages 中产出过消息的 agent_id，按首次发言顺序去重） */
+const sessionAgents = computed(() => {
+  const msgs = (convs.currentData() as any)?.messages
+  if (!Array.isArray(msgs)) return []
+  const seen = new Set<number>()
+  const out: any[] = []
+  for (const m of msgs) {
+    const id = m?.agent_id
+    if (id == null || seen.has(id)) continue
+    seen.add(id)
+    const a = agents.list.find((x: any) => x.id === id)
+    if (a) out.push(a)
+  }
+  return out
+})
+/** 按分组分列：会话含 ≥2 个智能体子会话时置顶「本会话」列；其后「未分组」= 无组智能体；其余每列一个自定义组 */
 const agentGroupsByColumn = computed(() => {
-  const out: { id: 'all' | number; name: string; agents: any[] }[] = [
-    { id: 'all', name: '全部', agents: agents.list.filter(a => a.group_id == null) }
-  ]
+  const out: { id: 'session' | 'all' | number; name: string; agents: any[] }[] = []
+  if (sessionAgents.value.length >= 2) {
+    out.push({ id: 'session', name: '本会话', agents: sessionAgents.value })
+  }
+  out.push({ id: 'all', name: '未分组', agents: agents.list.filter(a => a.group_id == null) })
   for (const g of agents.groups) {
     out.push({ id: g.id, name: g.name, agents: agents.list.filter(a => a.group_id === g.id) })
   }
@@ -840,11 +869,70 @@ function onAgentDdOutside(e: MouseEvent) {
   const tgt = e.target as Node
   if (agentTriggerEl.value && agentTriggerEl.value.contains(tgt)) return
   if (ddPopEl.value && ddPopEl.value.contains(tgt)) return
+  if (ddCtxEl.value && ddCtxEl.value.contains(tgt)) return
   agentDdOpen.value = false
 }
 function selectAgent(id: number) {
   currentAgentId.value = id
   agentDdOpen.value = false
+}
+
+// —— 下拉框智能体右键菜单（与左侧智能体列表右键同构：编辑 / 删除 / 归纳到分组） ——
+const ddCtx = ref<{ a: any; x: number; y: number } | null>(null)
+const ddCtxEl = ref<HTMLElement | null>(null)
+const ddEditing = ref<any>(null)
+/** 右键菜单位置夹紧：渲染后测量实际尺寸，确保不溢出视口（同 AgentList.clampToViewport） */
+function clampDdCtx(el: HTMLElement | null, data: { x: number; y: number } | null) {
+  if (!el || !data) return
+  const r = el.getBoundingClientRect()
+  const m = 8
+  let x = data.x, y = data.y
+  if (x + r.width > window.innerWidth - m) x = Math.max(m, window.innerWidth - r.width - m)
+  if (y + r.height > window.innerHeight - m) y = Math.max(m, window.innerHeight - r.height - m)
+  data.x = x
+  data.y = y
+}
+function onDdAgentCtx(e: MouseEvent, a: any) {
+  e.preventDefault(); e.stopPropagation()
+  ddCtx.value = { a, x: e.clientX, y: e.clientY }
+  nextTick(() => clampDdCtx(ddCtxEl.value, ddCtx.value))
+}
+function closeDdCtx() { ddCtx.value = null }
+function onDdCtxOutside(e: MouseEvent) {
+  if (!ddCtx.value) return
+  const tgt = e.target as Node
+  if (ddCtxEl.value && ddCtxEl.value.contains(tgt)) return
+  closeDdCtx()
+}
+function ddCtxEdit() {
+  if (!ddCtx.value) return
+  ddEditing.value = ddCtx.value.a
+  closeDdCtx()
+  agentDdOpen.value = false
+}
+async function ddCtxDelete() {
+  if (!ddCtx.value) return
+  const a = ddCtx.value.a
+  closeDdCtx()
+  if (window.confirm(`确定删除智能体「${a.name}」吗？其在画布上的节点与连线会一并清理。`)) {
+    await agents.remove(a.id)
+    if (currentAgentId.value === a.id) currentAgentId.value = null
+  }
+}
+async function ddCtxAssign(groupId: number | null) {
+  if (!ddCtx.value) return
+  const a = ddCtx.value.a
+  closeDdCtx()
+  await agents.assignToGroup(a.id, groupId)
+}
+async function ddCtxNewGroupAndAssign() {
+  if (!ddCtx.value) return
+  const a = ddCtx.value.a
+  closeDdCtx()
+  const name = window.prompt('请输入组名')?.trim()
+  if (!name) return
+  const g = await agents.createGroup({ name })
+  await agents.assignToGroup(a.id, g.id)
 }
 
 // —— 分组列横向滑杆：自定义底部滑块，支持拖拽 / 点击轨道翻页 ——
@@ -955,16 +1043,21 @@ watch([() => agents.list, () => agents.groups, agentGroupsByColumn], async () =>
 function onWinResizeDd() {
   if (agentDdOpen.value) { updateDdPos(); syncDdMetrics() }
   modelDdOpen.value = false
+  wdDdOpen.value = false
   if (lightboxOpen.value) clampLightboxPos()
 }
 onMounted(() => {
   document.addEventListener('mousedown', onAgentDdOutside)
   document.addEventListener('mousedown', onModelDdOutside)
+  document.addEventListener('mousedown', onDdCtxOutside)
+  document.addEventListener('mousedown', onWdDdOutside)
   window.addEventListener('resize', onWinResizeDd)
 })
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onAgentDdOutside)
   document.removeEventListener('mousedown', onModelDdOutside)
+  document.removeEventListener('mousedown', onDdCtxOutside)
+  document.removeEventListener('mousedown', onWdDdOutside)
   window.removeEventListener('resize', onWinResizeDd)
   window.removeEventListener('mousemove', onThumbMove)
   window.removeEventListener('mouseup', onThumbUp)
@@ -979,11 +1072,21 @@ const modelPosStyle = ref<Record<string, string>>({})
 
 const currentAgent = computed(() => agents.list.find((a: any) => a.id === currentAgentId.value) || null)
 
-/** 当前选中智能体的模型标签：接口名 · 具体模型名；未指定接口时用「默认」 */
+/** 当前生效接口 id：智能体未指定接口（interface_id=null）→ 跟随后端回退规则取列表第 0 个（默认接口） */
+const effectiveIfaceId = computed(() => {
+  const a = currentAgent.value
+  if (!a) return null
+  if (a.interface_id != null) return a.interface_id
+  return models.list[0]?.id ?? null
+})
+/** 是否为默认接口（列表第 0 个；所有 interface_id=null 的智能体实际使用它） */
+function isDefaultIface(id: number) { return models.list[0]?.id === id }
+
+/** 当前选中智能体的模型标签：接口名 · 具体模型名（未指定接口时按默认接口解析） */
 function currentModelLabel(): string {
   const a = currentAgent.value
   if (!a) return '选择模型'
-  const mi = models.list.find((m: any) => m.id === a.interface_id)
+  const mi = models.list.find((m: any) => m.id === effectiveIfaceId.value)
   const modelName = a.model || mi?.default_model || ''
   if (!modelName) return mi?.name || '默认'
   return `${mi?.name || '?'} · ${modelName}`
@@ -996,10 +1099,10 @@ function ifaceModelList(mi: any): string[] {
   return list
 }
 
-/** 该接口/模型是否是当前智能体正在使用的 */
+/** 该接口/模型是否是当前智能体正在使用的（未指定接口时按默认接口匹配） */
 function isModelActive(ifaceId: number, modelName: string): boolean {
   const a = currentAgent.value
-  if (!a || a.interface_id !== ifaceId) return false
+  if (!a || effectiveIfaceId.value !== ifaceId) return false
   if (a.model === modelName) return true
   if (!a.model) {
     const mi = models.list.find((m: any) => m.id === ifaceId)
@@ -1072,11 +1175,12 @@ function reasoningLevelLabel(v?: string): string {
 
 async function fetchReasoningCapabilities() {
   const a = currentAgent.value
-  if (!a || !a.interface_id) {
+  const ifaceId = effectiveIfaceId.value
+  if (!a || ifaceId == null) {
     reasoningSupported.value = false
     return
   }
-  const mi = models.list.find((m: any) => m.id === a.interface_id)
+  const mi = models.list.find((m: any) => m.id === ifaceId)
   const modelName = a.model || mi?.default_model || ''
   if (!modelName) {
     reasoningSupported.value = false
@@ -1086,7 +1190,7 @@ async function fetchReasoningCapabilities() {
   reasoningLevels.value = DEFAULT_REASONING_LEVELS
   reasoningSupported.value = true
   try {
-    const res = await api.models.detectReasoning(a.interface_id, modelName)
+    const res = await api.models.detectReasoning(ifaceId, modelName)
     if (res.status === 'confirmed' && res.options?.length) {
       reasoningLevels.value = [
         { value: 'off', label: 'Off', desc: '不启用推理' },
@@ -1117,8 +1221,120 @@ async function selectReasoningLevel(level: string) {
 // ============ 推理等级选择 end ============
 // ============ 模型快速切换下拉 end ============
 
+// ============ 工作区下拉（会话级 workdir：浏览 / 选择历史记录，✕ 移除记录） ============
+const wdDdOpen = ref(false)
+const wdTriggerEl = ref<HTMLElement | null>(null)
+const wdPopEl = ref<HTMLElement | null>(null)
+const wdPosStyle = ref<Record<string, string>>({})
+const wdHistory = ref<string[]>([])
+
+/** 当前会话的 workdir（去空白；null=未设置，运行时回退画布/全局默认） */
+const convWorkdir = computed(() => {
+  const c = convs.currentData() as any
+  return ((c?.workdir || '')).trim() || null
+})
+function toggleWdDd() { wdDdOpen.value = !wdDdOpen.value }
+/** 打开时拉取历史记录（惰性播种：旧数据缺 workspace_history 时从 画布 ∪ 会话 ∪ default_workdir 汇总） */
+async function loadWdHistory() {
+  const seed = [
+    ...canvases.list.map((c: any) => c.workdir),
+    ...convs.list.map((c: any) => c.workdir),
+    settings.data?.default_workdir,
+  ]
+  wdHistory.value = await settings.ensureWorkspaceHistory(seed)
+}
+function updateWdDdPos() {
+  const pop = wdPopEl.value
+  const trigger = wdTriggerEl.value
+  if (!pop || !trigger) return
+  const tr = trigger.getBoundingClientRect()
+  const popH = pop.offsetHeight || 260
+  let top = tr.top - popH - 6
+  if (top < 8) top = tr.bottom + 6
+  wdPosStyle.value = {
+    position: 'fixed',
+    left: tr.left + 'px',
+    width: '300px',
+    maxWidth: (window.innerWidth - tr.left - 8) + 'px',
+    top: top + 'px',
+  }
+}
+function onWdDdOutside(e: MouseEvent) {
+  if (!wdDdOpen.value) return
+  const tgt = e.target as Node
+  if (wdTriggerEl.value && wdTriggerEl.value.contains(tgt)) return
+  if (wdPopEl.value && wdPopEl.value.contains(tgt)) return
+  wdDdOpen.value = false
+}
+watch(wdDdOpen, async (open) => {
+  if (open) {
+    await loadWdHistory()
+    await nextTick()
+    updateWdDdPos()
+  }
+})
+/** 选择工作区（null=未设置）：写当前会话；选中智能体在当前画布中 → 画布工作区同步改为同值
+ *  （含清空：两边始终一致）；非 null 顺带记录到历史 */
+async function selectWorkdir(path: string | null) {
+  const c = convs.currentData() as any
+  if (!c) { wdDdOpen.value = false; return }
+  wdDdOpen.value = false
+  if (((c.workdir || '').trim() || null) !== path) {
+    await convs.update(c.id, { workdir: path })
+  }
+  if (agentInCanvas.value && canvas.value) {
+    const cvId = (canvas.value as any).id
+    try {
+      const res: any = await api.canvases.setWorkdir(cvId, path)
+      applyCanvasWorkdirLocal(cvId, res?.workdir ?? path)
+    } catch (e) { console.error('[RightPanel] 画布工作区同步失败:', e) }
+  }
+  if (path) {
+    await settings.recordWorkspace(path)
+    wdHistory.value = await settings.ensureWorkspaceHistory()
+  }
+}
+/** 移除一条工作区记录（仅删记录；不影响会话/画布当前设置——当前会话仍用它时按钮态保留） */
+async function removeWdRecord(path: string) {
+  await settings.removeWorkspaceRecord(path)
+  wdHistory.value = wdHistory.value.filter(x => x !== path)
+}
+/** 浏览…：系统文件夹选择框，选中即设置当前会话工作区并记录 */
+async function browseWdDir() {
+  try {
+    const res = await api.storage.pickFolder(convWorkdir.value || '', '选择工作区文件夹')
+    if (res?.path) await selectWorkdir(res.path)
+  } catch (e: any) {
+    alert('浏览失败：' + (e?.message || e))
+  }
+}
+// ============ 工作区下拉 end ============
+
 const conv = computed(() => convs.currentData())
 const canvas = computed(() => canvases.current)
+// —— 会话工作区与画布工作区联动（选中智能体在当前打开画布中时双向一致） ——
+/** 选中智能体是否在当前打开画布的节点中（与 newConv 画布绑定校验同源；小窗无画布恒 false） */
+const agentInCanvas = computed(() => {
+  const cv = canvas.value
+  return !!(cv && currentAgentId.value != null
+    && (cv.nodes ?? []).some((n: any) => Number(n.agent_id) === Number(currentAgentId.value)))
+})
+/** 画布工作区落到本地 store（防期间切画布串扰；与 CanvasBoard.saveWorkdir 同款更新方式） */
+function applyCanvasWorkdirLocal(cvId: number, wd: string | null) {
+  if (canvases.current?.id !== cvId) return
+  canvases.current = { ...(canvases.current as any), workdir: wd }
+  const i = canvases.list.findIndex(x => x.id === cvId)
+  if (i >= 0) canvases.list[i] = canvases.current
+}
+// 选中智能体在画布中：切智能体 / 切画布 / 切会话 / 画布工作区变化 → 会话工作区自动跟随画布值
+// （画布→会话方向；两边相等时不动作，与 CanvasBoard 的会话→画布 watch 不会形成回环）
+watch([agentInCanvas, () => canvas.value?.id, () => (canvas.value as any)?.workdir, () => convs.current], () => {
+  const cv = canvas.value
+  const cur = convs.currentData() as any
+  if (!cv || !cur || !agentInCanvas.value) return
+  const wd = ((cv.workdir || '')).trim() || null
+  if (((cur.workdir || '').trim() || null) !== wd) void convs.update(cur.id, { workdir: wd })
+})
 // 运行中对话所属的画布 id（用于画布列表显示"运行中"标志）
 const runningCanvasId = computed<number | null>(() => {
   if (convs.running) return convs.runCanvasId ?? null
@@ -2432,6 +2648,26 @@ watch(() => convs.selectedAgentId, (id) => {
   if (id != null) currentAgentId.value = id
 })
 
+// 空会话（无消息可回填）的兜底选中：设置里的默认智能体优先（与 newConv 兜底同一语义，
+// 小窗临时对话/主窗恢复空会话都同步设置选定项），未设置或已删除才退回列表第一个。
+// 本组件与 Home 同帧挂载（无 v-if 守卫），onMounted 时 Home 的并行 fetch（agents/settings）
+// 尚未返回，同步兜底会在空列表上被跳过 → 改为监听两者就绪后再兜底，执行一次即止：
+// 已有选中（如历史会话回填了 last_agent_id）则不覆盖直接停用；小窗（等 ready 才挂载）由
+// immediate 同步生效，行为与原 onMounted 版本一致
+const stopDefaultAgentFallback = watch(
+  () => [agents.list.length, settings.loaded] as const,
+  ([n, loaded]) => {
+    if (!loaded || !n) return
+    if (currentAgentId.value) { stopDefaultAgentFallback(); return }
+    const d = Number(settings.data?.default_agent_id)
+    currentAgentId.value = (Number.isFinite(d) && d > 0 && agents.list.some((a: any) => a.id === d))
+      ? d
+      : agents.list[0].id
+    stopDefaultAgentFallback()
+  },
+  { immediate: true }
+)
+
 // —— 上下文长度指示（发送按钮上方）：估算 token + 压缩线进度配色 ——
 // 数据来自 GET /conversations/{cid}/context（后端按当前智能体视角组装估算）；
 // 消息数 / 智能体 / 会话 / 流式结束都会触发节流刷新
@@ -2731,12 +2967,16 @@ async function newConv() {
       currentAgentId.value = d
     }
   }
+  // 仅当选中的智能体在当前打开画布的节点中才标记会话为该集群所属；
+  // 否则不绑定画布（未选中智能体同样不绑），工作区与串并行模式随之回退当前会话，保持归属与设置来源一致
+  const cv = canvas.value
+  const bind = cv && agentId != null && (cv.nodes ?? []).some((n: any) => Number(n.agent_id) === Number(agentId)) ? cv : null
   await convs.create({
     name: '新对话',
     agent_ids: agentId ? [agentId] : [],
-    canvas_id: canvas.value?.id ?? null,
-    workdir: canvas.value?.workdir ?? cur?.workdir ?? null,
-    execution_mode: canvas.value?.execution_mode ?? cur?.execution_mode ?? null,
+    canvas_id: bind?.id ?? null,
+    workdir: bind?.workdir ?? cur?.workdir ?? null,
+    execution_mode: bind?.execution_mode ?? cur?.execution_mode ?? null,
   })
 }
 /** 分组头「＋」：在对应集群（画布）/工作区上下文中新建对话（立即创建）。
@@ -3026,14 +3266,7 @@ onMounted(async () => {
   // 父级 Home 的 fetch 可能还没返回，这里先确保拉到列表，避免误判为空而重复新建
   if (!convs.list.length) await convs.fetch()
   convs.ensureCurrent()
-  // 空会话（无消息可回填）的兜底选中：设置里的默认智能体优先（与 newConv 兜底同一语义，
-  // 小窗临时对话/主窗恢复空会话都同步设置选定项），未设置或已删除才退回列表第一个
-  if (!currentAgentId.value && agents.list.length) {
-    const d = Number(settings.data?.default_agent_id)
-    currentAgentId.value = (Number.isFinite(d) && d > 0 && agents.list.some((a: any) => a.id === d))
-      ? d
-      : agents.list[0].id
-  }
+
   if (!convs.list.length) await newConv()
   scheduleCtxRefresh()
   // —— 注入 extAPI 给拓展渲染器 ——
@@ -3086,6 +3319,7 @@ onActivated(() => {
   document.addEventListener('click', onChatAttachClick, true)   // capture 阶段先触发，避免冒泡被吞
   document.addEventListener('keydown', onDocKey)
   window.addEventListener('keydown', onLightboxKey)
+  window.addEventListener('resize', onWinResize)   // 画布关闭态浮层定位依赖视口宽度
   nextTick(() => {
     restoreScrollPositions()
     requestAnimationFrame(restoreScrollPositions)
@@ -3105,6 +3339,7 @@ onDeactivated(() => {
   document.removeEventListener('click', onChatAttachClick, true)
   document.removeEventListener('keydown', onDocKey)
   window.removeEventListener('keydown', onLightboxKey)
+  window.removeEventListener('resize', onWinResize)
   // 浮窗拖拽 / resize / pan 期间被切走也要清干净
   window.removeEventListener('mousemove', onLbDragMove)
   window.removeEventListener('mouseup', onLbDragEnd)
@@ -3187,6 +3422,7 @@ onBeforeUnmount(() => {
           </button>
           <span class="conv-title-text">对话</span>
           <span class="conv-count">{{ convs.list.length }}</span>
+          <span class="conv-name-title" :title="conv ? convDisplayName(conv) : ''">{{ conv ? convDisplayName(conv) : '' }}</span>
           <span class="flex-spacer"></span>
           <div class="new-conv-bar">
             <button class="btn sm ghost" type="button" @click="newConv()" title="新建对话（记录本画布的用户与智能体消息）">＋ 新建</button>
@@ -3709,10 +3945,11 @@ onBeforeUnmount(() => {
                     </div>
                     <div class="dd-col-list">
                       <div v-for="a in col.agents" :key="a.id"
-                           class="dd-item"
-                           :class="{ active: currentAgentId === a.id }"
-                           @click="selectAgent(a.id)"
-                           :title="a.name">
+                            class="dd-item"
+                            :class="{ active: currentAgentId === a.id }"
+                            @click="selectAgent(a.id)"
+                            @contextmenu.prevent.stop="onDdAgentCtx($event, a)"
+                            :title="a.name">
                         <span class="dd-item-dot"></span>
                         <span class="dd-item-name">{{ a.name }}</span>
                       </div>
@@ -3728,6 +3965,26 @@ onBeforeUnmount(() => {
                 </div>
               </div>
             </Teleport>
+            <!-- 下拉框智能体右键菜单（Teleport 到 body，fixed 定位；与智能体列表右键同构） -->
+            <Teleport to="body">
+              <div v-if="ddCtx" ref="ddCtxEl" class="dd-agent-ctx glass"
+                   :style="{ left: ddCtx.x + 'px', top: ddCtx.y + 'px' }"
+                   @click.stop @contextmenu.prevent.stop>
+                <div class="dd-ctx-title">{{ ddCtx.a.name }}</div>
+                <div class="dd-ctx-item" @click="ddCtxEdit">✏️ 编辑</div>
+                <div class="dd-ctx-item danger" @click="ddCtxDelete">🗑 删除</div>
+                <div class="dd-ctx-sep"></div>
+                <div class="dd-ctx-sub">归纳到分组</div>
+                <div class="dd-ctx-item" @click="ddCtxNewGroupAndAssign">➕ 新建组…</div>
+                <div class="dd-ctx-item" @click="ddCtxAssign(null)">
+                  未分组<span v-if="ddCtx.a.group_id == null" class="dd-ctx-cur">✓</span>
+                </div>
+                <div class="dd-ctx-item" v-for="g in agents.groups" :key="g.id" @click="ddCtxAssign(g.id)">
+                  {{ g.name }}<span v-if="ddCtx.a.group_id === g.id" class="dd-ctx-cur">✓</span>
+                </div>
+              </div>
+            </Teleport>
+            <AgentEditDialog v-if="ddEditing" :agent="ddEditing" @close="ddEditing = null" />
           </div>
           <!-- 模型快速切换下拉（接口 + 具体模型，作用于当前选中智能体） -->
           <div class="model-dd">
@@ -3746,6 +4003,7 @@ onBeforeUnmount(() => {
                   <template v-for="mi in models.list" :key="mi.id">
                     <div class="model-iface-head">
                       <span class="model-iface-name" :title="mi.name">{{ mi.name }}</span>
+                      <span v-if="isDefaultIface(mi.id)" class="model-default-tag" title="默认接口：未指定接口的智能体使用它">默认</span>
                       <span class="dd-col-count">{{ ifaceModelList(mi).length }}</span>
                     </div>
                     <div v-for="mid in ifaceModelList(mi)" :key="mid"
@@ -3777,7 +4035,38 @@ onBeforeUnmount(() => {
               </div>
             </Teleport>
           </div>
-          <span class="cur-title">{{ conv ? convDisplayName(conv) : '— 未选择 —' }}</span>
+          <!-- 会话工作区下拉：浏览 / 选择记录过的工作区；✕ 移除记录 -->
+          <div class="wd-dd">
+            <button type="button" class="agent-dd-trigger wd-dd-trigger" ref="wdTriggerEl"
+                    :disabled="!conv"
+                    :title="convWorkdir ? '会话工作区：' + convWorkdir : '设置会话工作区（智能体文件生成目标；未设置时跟随画布/全局默认）'"
+                    @click.stop="toggleWdDd">
+              <span class="dd-icon">📁</span>
+              <span class="dd-name">{{ convWorkdir ? (wdBasename(convWorkdir) || convWorkdir) : '工作区' }}</span>
+              <span class="dd-chev" :class="{ open: wdDdOpen }">▾</span>
+            </button>
+            <Teleport to="body">
+              <div v-if="wdDdOpen" class="agent-dd-pop wd-dd-pop" ref="wdPopEl" :style="wdPosStyle" @click.stop>
+                <div v-if="convWorkdir" class="wd-cur" :title="convWorkdir">当前：{{ convWorkdir }}</div>
+                <div class="wd-item" :class="{ active: !convWorkdir }" title="不设置会话级工作区；运行时回退画布工作区或全局默认"
+                     @click="selectWorkdir(null)">
+                  <span class="dd-item-dot"></span>
+                  <span class="wd-item-name">未设置（跟随画布/默认）</span>
+                </div>
+                <div class="wd-sub">记录过的工作区</div>
+                <div v-for="p in wdHistory" :key="p" class="wd-item" :class="{ active: convWorkdir === p }"
+                     :title="p" @click="selectWorkdir(p)">
+                  <span class="dd-item-dot"></span>
+                  <span class="wd-item-name">{{ wdBasename(p) || p }}</span>
+                  <button type="button" class="wd-del" title="移除该工作区记录（不影响会话当前设置）"
+                          @click.stop="removeWdRecord(p)">✕</button>
+                </div>
+                <div v-if="!wdHistory.length" class="dd-empty">暂无记录，点下方「浏览…」添加</div>
+                <div class="wd-browse" @click="browseWdDir">📂 浏览…</div>
+              </div>
+            </Teleport>
+          </div>
+          <span class="flex-spacer"></span>
         </div>
         <!-- 附件预览区：从电脑拖入的文件（上传中/已就绪/失败） -->
         <div v-if="attachments.length" class="attachments-bar">
@@ -4303,7 +4592,25 @@ onBeforeUnmount(() => {
 }
 
 .row1 { display: flex; gap: 6px; align-items: center; }
-.cur-title { font-size: calc(11px * var(--font-scale)); opacity: .6; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-name-title { max-width: 300px; min-width: 0; font-size: calc(11px * var(--font-scale)); font-weight: 400; opacity: .6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* —— 会话工作区下拉 —— */
+.wd-dd { position: relative; flex-shrink: 0; display: inline-flex; align-items: center; }
+.wd-dd-trigger { max-width: 170px; }
+.wd-dd-pop { display: flex; flex-direction: column; gap: 3px; }
+.wd-cur { font-size: calc(10.5px * var(--font-scale)); padding: 4px 8px 3px; color: rgba(var(--text-rgb), .5); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px dashed rgba(var(--surface-rgb), .12); }
+.wd-sub { font-size: calc(10px * var(--font-scale)); padding: 4px 10px 2px; color: rgba(var(--text-rgb), .4); letter-spacing: 1px; }
+.wd-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 6px; cursor: pointer; transition: background .15s; user-select: none; min-width: 0;
+  &:hover { background: rgba(var(--accent-rgb), 0.18); }
+}
+.wd-item.active { background: rgba(var(--accent-rgb), 0.24); box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.4); }
+.wd-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: calc(12px * var(--font-scale)); }
+.wd-del { flex-shrink: 0; width: 18px; height: 18px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 0; border-radius: 5px; color: rgba(var(--text-rgb), .45); font-size: calc(11px * var(--font-scale)); cursor: pointer; line-height: 1; opacity: .55; transition: background .15s, color .15s, opacity .15s;
+  &:hover { opacity: 1; background: rgba(255,80,80,0.22); color: #ff9090; }
+}
+.wd-browse { padding: 7px 10px; margin-top: 2px; border-radius: 6px; font-size: calc(12px * var(--font-scale)); cursor: pointer; user-select: none; border-top: 1px solid rgba(var(--surface-rgb), 0.08); text-align: left; transition: background .15s;
+  &:hover { background: rgba(var(--accent-rgb), 0.18); }
+}
 
 /* ============ 智能体分组下拉（一组一列） ============ */
 .agent-dd { position: relative; flex-shrink: 0; display: inline-flex; align-items: center; }
@@ -4349,6 +4656,17 @@ onBeforeUnmount(() => {
   animation: ddFadeIn .12s ease-out;
 }
 @keyframes ddFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+/* —— 下拉框智能体右键菜单（与 AgentList 的 .agent-ctx 同款视觉） —— */
+.dd-agent-ctx { position: fixed; min-width: 160px; max-height: 70vh; overflow-y: auto; padding: 6px; z-index: 9999; box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5); }
+.dd-ctx-title { font-size: calc(11px * var(--font-scale)); padding: 6px 10px; color: rgba(var(--text-rgb), 0.5); text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid rgba(var(--surface-rgb), 0.08); margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dd-ctx-item { padding: 8px 12px; border-radius: 6px; font-size: calc(13px * var(--font-scale)); cursor: pointer; transition: background .15s; user-select: none; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  &:hover { background: rgba(var(--accent-rgb), 0.18); }
+  &.danger:hover { background: rgba(255,80,80,0.18); color: #ff9090; }
+}
+.dd-ctx-sep { height: 1px; background: rgba(var(--surface-rgb), 0.08); margin: 4px 0; }
+.dd-ctx-sub { font-size: calc(10px * var(--font-scale)); padding: 4px 10px; color: rgba(var(--text-rgb), 0.4); letter-spacing: 1px; }
+.dd-ctx-cur { color: var(--accent); font-size: calc(13px * var(--font-scale)); }
 
 /* 横向滚动列容器：隐藏原生滚动条，由底部滑杆接管 */
 .dd-cols-wrap {
@@ -4467,11 +4785,12 @@ onBeforeUnmount(() => {
 .model-dd-pop { max-height: min(460px, calc(100vh - 140px)); display: flex; flex-direction: column; }
 .model-iface-list { overflow-y: auto; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
 .model-iface-head {
-  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  display: flex; align-items: center; justify-content: flex-start; gap: 6px;
   padding: 6px 8px 4px; margin-top: 2px;
   border-top: 1px solid rgba(var(--surface-rgb), 0.06);
 }
 .model-iface-head:first-child { margin-top: 0; border-top: none; }
+.model-iface-head .dd-col-count { margin-left: auto; }
 .model-iface-name {
   font-size: calc(11.5px * var(--font-scale)); font-weight: 600; color: var(--purple-ink);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

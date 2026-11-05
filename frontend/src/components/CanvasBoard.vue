@@ -983,6 +983,8 @@ async function saveWorkdir() {
     const i = canvases.list.findIndex(x => x.id === canvas.value!.id)
     if (i >= 0) canvases.list[i] = canvases.current
     wdOpen.value = false
+    // 用过即记录：进入工作区历史（输入框工作区下拉数据源）
+    if (res.workdir) await settings.recordWorkspace(res.workdir)
     // 会话级记录：用户更改只更新当前激活且绑定本画布的会话
     const cur = convs.currentData()
     if (cur && (cur.canvas_id ?? null) === canvases.current!.id) {
@@ -1229,6 +1231,7 @@ defineExpose({ viewportRef, computeNodeBbox })
                   :title="runningOnThisCanvas ? '运行中：执行模式已锁定' : (canvas?.execution_mode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行')">
             {{ canvas?.execution_mode === 'parallel' ? '⇉' : '⇥' }}
           </button>
+          <button class="btn ghost close-btn collapsed-close" @click.stop="canvases.closeCurrent()" title="关闭画布（自动保存）">✕</button>
         </div>
       </template>
       <!-- 展开态：完整按钮组 -->
@@ -1270,8 +1273,8 @@ defineExpose({ viewportRef, computeNodeBbox })
           <span class="zoom-indicator" :class="{ panning: spaceDown }">
             🔍 {{ Math.round(scale * 100) }}%
           </span>
-          <button class="btn ghost" @click.stop="canvases.saveCurrent()" title="保存画布">💾</button>
-          <button class="btn ghost" @click.stop="confirmRemoveCanvas" title="删除此画布">🗑</button>
+          <button class="btn ghost" @click.stop="confirmRemoveCanvas" title="删除此画布">删除</button>
+          <button class="btn ghost close-btn" @click.stop="canvases.closeCurrent()" title="关闭画布（自动保存）">✕</button>
         </div>
       </template>
     </div>
@@ -1513,6 +1516,7 @@ defineExpose({ viewportRef, computeNodeBbox })
 .rename-input { padding: 4px 10px; width: 180px; }
 
 .zoom-indicator { font-size: calc(11px * var(--font-scale)); font-family: Consolas, monospace; opacity: .6; padding: 0 6px; }
+.close-btn:hover { background: rgba(232, 92, 92, 0.14) !important; color: #e85c5c; }
 .zoom-indicator.panning .zoom-tip { color: var(--accent-2); opacity: 1; }
 
 .edge-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
@@ -1755,6 +1759,7 @@ marker#arrow path { fill: var(--accent); }
 /* 串行/并行切换 */
 .em-collapsed { font-size: calc(14px * var(--font-scale)); padding: 0 8px; line-height: 24px; }
 .em-collapsed:hover { background: rgba(var(--accent2-rgb), 0.15); color: var(--accent2-light); }
+.collapsed-close { font-size: calc(14px * var(--font-scale)); padding: 0 8px; line-height: 24px; }
 .exec-mode-toggle { display: flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 8px; background: rgba(var(--surface-rgb), 0.04); cursor: pointer; }
 .em-label { font-size: calc(11px * var(--font-scale)); opacity: 0.45; transition: opacity 0.2s, color 0.2s; white-space: nowrap; }
 .em-label.active { opacity: 1; color: var(--accent2-light); font-weight: 500; }

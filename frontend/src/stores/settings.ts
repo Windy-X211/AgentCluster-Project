@@ -4,6 +4,7 @@ import { api } from '@/api'
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
     data: {} as any,
+    loaded: false,           // fetch() 是否已写入 data（区分「未加载」与「未设置某字段」，供就绪监听用）
     commandsMeta: {} as any,   // {name: {label, params, group?, hidden?}}
     commandGroups: [] as string[],  // 命令分组展示顺序
     skillsMeta: {} as any,     // {name: {label, description, prompt, version, triggers, tags}}
@@ -15,6 +16,7 @@ export const useSettingsStore = defineStore('settings', {
   actions: {
     async fetch() {
       this.data = await api.settings.get()
+      this.loaded = true
       const caps = await api.capabilities.all()
       this.commandsMeta = caps.commands || {}
       this.commandGroups = caps.command_groups || []
@@ -40,6 +42,36 @@ export const useSettingsStore = defineStore('settings', {
       this.pluginsMeta = caps.plugins || {}
     },
     async update(d: any) { this.data = await api.settings.update({ ...this.data, ...d }) },
+    /** 工作区历史记录（settings.workspace_history，新在前）；确保已初始化（旧数据缺字段时播种） */
+    async ensureWorkspaceHistory(seedPaths: string[] = []): Promise<string[]> {
+      let list: string[] | undefined = this.data.workspace_history
+      if (!Array.isArray(list)) {
+        const seen = new Set<string>()
+        list = []
+        for (const p of seedPaths) {
+          const v = (p || '').trim()
+          if (v && !seen.has(v)) { seen.add(v); list.push(v) }
+        }
+        await this.update({ workspace_history: list })
+      }
+      return list
+    },
+    /** 记录一个用过的工作区（置顶去重，持久化） */
+    async recordWorkspace(path: string) {
+      const v = (path || '').trim()
+      if (!v) return
+      const cur = await this.ensureWorkspaceHistory()
+      if (cur[0] === v) return
+      const list = [v, ...cur.filter((x: string) => x !== v)]
+      await this.update({ workspace_history: list })
+    },
+    /** 移除一条工作区记录（仅删记录，不影响任何会话/画布的当前设置） */
+    async removeWorkspaceRecord(path: string) {
+      const cur = await this.ensureWorkspaceHistory()
+      const list = cur.filter((x: string) => x !== path)
+      if (list.length === cur.length) return
+      await this.update({ workspace_history: list })
+    },
     applyDefaults(target: any) {
       if (!target.commands?.length) target.commands = [...(this.data.default_commands || [])]
       if (!target.skills?.length) target.skills = [...(this.data.default_skills || [])]

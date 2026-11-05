@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { api } from '@/api'
+import { useLayoutStore } from './layout'
 
 export const useCanvasStore = defineStore('canvas', {
   state: () => ({ list: [] as any[], current: null as any }),
@@ -17,9 +18,18 @@ export const useCanvasStore = defineStore('canvas', {
     async create(d: any = {}) {
       const name = d.name || `画布 ${this.list.length + 1}`
       const c = await api.canvases.create({ name, nodes: [], edges: [], ...d })
-      this.list.push(c); this.current = c; return c
+      this.list.push(c); this.current = c
+      // 新建画布成功后自动展开左侧智能体列表，方便向空画布拖入智能体
+      useLayoutStore().agentsCollapsed = false
+      return c
     },
     async saveCurrent() { if (!this.current) return; const c = await api.canvases.update(this.current.id, this.current); const i = this.list.findIndex(x => x.id === c.id); if (i >= 0) this.list[i] = c; this.current = c },
+    async closeCurrent() {
+      if (!this.current) return
+      await this.saveCurrent()
+      this.current = null
+      try { localStorage.removeItem('agent-cluster.canvas.current') } catch { /* ignore */ }
+    },
     async rename(id: number, name: string) { const c = this.list.find(x => x.id === id); if (!c) return; c.name = name; await this.saveCurrent() },
     async remove(id: number) { await api.canvases.remove(id); this.list = this.list.filter(x => x.id !== id); if (this.current?.id === id) this.current = this.list[0] || null },
     async reorder(ids: number[]) {

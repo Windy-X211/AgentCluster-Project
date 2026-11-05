@@ -157,6 +157,9 @@ DEFAULT_SETTINGS = {
     "max_tool_rounds": 50,
     # 独立对话模式（无画布）下的默认输出目录；为空则回退到进程 CWD
     "default_workdir": "",
+    # 工作区历史记录（绝对路径列表，新在前）：输入框工作区下拉的数据源；
+    # 首次由前端从 画布 workdir ∪ 会话 workdir ∪ default_workdir 播种
+    "workspace_history": [],
     # 画布运行停止时的提示音开关（完成=愉悦/错误=急促）
     "sound_enabled": True,
     # —— 历史上下文压缩：达到压缩线（模型窗口×百分比）时自动把较早历史压缩成摘要 ——

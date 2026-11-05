@@ -837,9 +837,23 @@ export const useConvStore = defineStore('conv', {
     },
     currentData() { return this.list.find(x => x.id === this.current) },
 
+    /** 会话绑定画布自动跟随：打开会话时若其绑定了画布（canvas_id）且画布仍在列表中，
+     *  自动把 canvases.current 切到该画布；未绑定或画布已删则不动当前画布。
+     *  切换后 CanvasBoard 的会话→画布 watch（cur.canvas_id === cv.id）自动衔接，
+     *  会话的工作区与串并行模式同步回画布。 */
+    _followConvCanvas(cid: number | null) {
+      if (cid == null) return
+      const cvId = (this.list.find(x => x.id === cid) as any)?.canvas_id
+      if (cvId == null) return
+      const cvs = useCanvasStore()
+      const target = cvs.list.find((x: any) => x.id === cvId)
+      if (target && cvs.current?.id !== cvId) cvs.current = target
+    },
+
     /** 统一的切换会话入口：设置 current + 按需加载完整消息历史 */
     selectConv(cid: number | null) {
       this.current = cid
+      this._followConvCanvas(cid)
       if (cid != null) void this._ensureFullMessages(cid)
     },
 
@@ -1359,6 +1373,7 @@ export const useConvStore = defineStore('conv', {
     ensureCurrent() {
       if (this.current != null && this.list.find(x => x.id === this.current)) {
         // 已有 current → 确保完整消息已加载（精简列表 fetch 后 messages 缺失）
+        this._followConvCanvas(this.current)
         void this._ensureFullMessages(this.current)
         return
       }
@@ -1366,11 +1381,13 @@ export const useConvStore = defineStore('conv', {
       try { saved = +(localStorage.getItem('agent-cluster.conversation.current') || '') || null } catch { /* ignore */ }
       if (saved != null && this.list.find(x => x.id === saved)) {
         this.current = saved
+        this._followConvCanvas(saved)
         void this._ensureFullMessages(saved)
         return
       }
       const first = this.list[0]?.id ?? null
       this.current = first
+      this._followConvCanvas(first)
       if (first != null) void this._ensureFullMessages(first)
     },
 

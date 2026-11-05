@@ -85,6 +85,11 @@ export const useLayoutStore = defineStore('layout', {
     // 放在 store 里是为了应对 KeepAlive 未命中（组件被重建）的情况。
     chatMsgScrollTop: 0,
     convListScrollTop: 0,
+    // 左侧智能体列表折叠态（仅内存，不持久化）。新建画布成功后自动展开（见 canvas store create）。
+    agentsCollapsed: true,
+    // 对话记录浮层折叠态（仅内存，不持久化）。放 store 是因为 Home 布局需感知：
+    // 画布关闭时展开对话记录，对话区要缩回为浮层留位（见 Home.vue gridStyle 三态）。
+    convsCollapsed: true,
   }),
   actions: {
     setRightWidth(v: number) {

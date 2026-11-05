@@ -712,16 +712,7 @@ function _buildTrayMenuTemplate(statusText) {
       }
     },
     { label: '🌐 用浏览器打开', click: () => shell.openExternal(IS_DEV ? DEV_URL : DEV_URL) },
-    {
-      label: '⚙ 后端健康检查', click: async () => {
-        try {
-          const res = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`, { signal: AbortSignal.timeout(1500) })
-          shell.openExternal(`http://127.0.0.1:${BACKEND_PORT}/api/health`)
-        } catch {
-          _dialogSync('后端未运行', '后端服务未启动，请先点"🚀 启动服务"')
-        }
-      }
-    },
+
     { type: 'separator' },
     {
       label: '❌ 退出程序', click: () => {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { computed, onMounted, onBeforeUnmount } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useConvStore, useLayoutStore } from '@/stores'
 import TopBar from '@/components/TopBar.vue'
@@ -16,12 +16,32 @@ const models = useModelStore()
 const settings = useSettingsStore()
 const convs = useConvStore()
 const layout = useLayoutStore()
-const leftCollapsed = ref(true)
 
 // 4 列布局：left | center | handle(6px) | right；中间是 flex 的 1fr
-const gridStyle = computed(() => ({
-  gridTemplateColumns: `${leftCollapsed.value ? 36 : 240}px minmax(0, 1fr) 6px ${layout.rightWidth}px`,
-}))
+// 画布关闭（current 为 null）时收敛为对话区布局，展开对话记录时为浮层留位：
+//   - 会话记录折叠：2 列，对话区弹性占满原画布区
+//   - 会话记录展开：3 列（left | 250px 浮层留位 | 对话区 1fr），浮层紧贴对话区左缘，
+//     与画布打开时的浮层覆盖逻辑一致（250 = 浮层 240 + 10 间隙，RightPanel convFloatStyle 同步推算）
+// 打开画布自动恢复原 4 列 + rightWidth
+const gridStyle = computed(() => {
+  const left = `${layout.agentsCollapsed ? 36 : 240}px`
+  if (!canvases.current) {
+    if (!layout.convsCollapsed) {
+      return {
+        gridTemplateColumns: `${left} 250px minmax(0, 1fr)`,
+        gridTemplateAreas: '"topbar topbar topbar" "left convgutter right"',
+      }
+    }
+    return {
+      gridTemplateColumns: `${left} minmax(0, 1fr)`,
+      gridTemplateAreas: '"topbar topbar" "left right"',
+    }
+  }
+  return {
+    gridTemplateColumns: `${left} minmax(0, 1fr) 6px ${layout.rightWidth}px`,
+    gridTemplateAreas: '"topbar topbar topbar topbar" "left center handle right"',
+  }
+})
 
 // —— 拖动调节右侧对话面板宽度 ——
 function onHandleDown(e: MouseEvent) {
@@ -80,11 +100,11 @@ onBeforeRouteLeave(() => {
 </script>
 
 <template>
-  <div class="app-root" :class="{ 'left-collapsed': leftCollapsed }" :style="gridStyle" @dblclick="onRootDblClick">
+  <div class="app-root" :class="{ 'left-collapsed': layout.agentsCollapsed }" :style="gridStyle" @dblclick="onRootDblClick">
     <TopBar class="topbar glass" />
-    <AgentList class="left glass" :collapsed="leftCollapsed" @toggle="leftCollapsed = !leftCollapsed" />
-    <MainView class="center" />
-    <div class="resize-handle" @mousedown="onHandleDown" title="拖动调整右侧面板宽度（双击复位）"></div>
+    <AgentList class="left glass" :collapsed="layout.agentsCollapsed" @toggle="layout.agentsCollapsed = !layout.agentsCollapsed" />
+    <MainView v-if="canvases.current" class="center" />
+    <div v-if="canvases.current" class="resize-handle" @mousedown="onHandleDown" title="拖动调整右侧面板宽度（双击复位）"></div>
     <RightPanel class="right" />
   </div>
 
