@@ -28,6 +28,13 @@ const toast = ref('')
 const needsSync = ref(false)
 const syncing = ref(false)
 const pushing = ref(false)
+const auth = ref<any>({ logged_in: false })
+const authLoading = ref(false)
+const loginOpen = ref(false)
+const loginUsername = ref('')
+const loginToken = ref('')
+const loginError = ref('')
+const loggingIn = ref(false)
 
 const agents = useAgentStore()
 const canvases = useCanvasStore()
@@ -141,6 +148,61 @@ function installText(m: MarketItem) {
 }
 
 // —— 远程仓库：同步下载 / 推送上传 / 镜像设置 ——
+async function loadAuth() {
+  authLoading.value = true
+  try {
+    auth.value = await api.market.auth()
+  } catch {
+    /* 未登录或网络异常时保持未登录态 */
+  } finally {
+    authLoading.value = false
+  }
+}
+
+function openLogin() {
+  loginOpen.value = true
+  loginError.value = ''
+  loginUsername.value = auth.value?.logged_in ? auth.value.username : ''
+  loginToken.value = ''
+}
+
+function closeLogin() {
+  loginOpen.value = false
+  loginToken.value = ''
+  loginError.value = ''
+  loggingIn.value = false
+}
+
+async function doLogin() {
+  const username = loginUsername.value.trim()
+  const token = loginToken.value.trim()
+  if (!username) { loginError.value = '请填写 GitHub 用户名'; return }
+  if (!token) { loginError.value = '请填写 Personal Access Token'; return }
+  loggingIn.value = true
+  loginError.value = ''
+  try {
+    auth.value = await api.market.login(username, token)
+    loginToken.value = ''
+    loginOpen.value = false
+    toast.value = `已登录 GitHub：@${auth.value.username}`
+  } catch (e) {
+    loginError.value = (e as Error).message
+  } finally {
+    loggingIn.value = false
+  }
+}
+
+async function doLogout() {
+  try {
+    await api.market.logout()
+    auth.value = { logged_in: false }
+    loginOpen.value = false
+    toast.value = '已退出 GitHub 账号'
+  } catch (e) {
+    toast.value = '退出失败：' + (e as Error).message
+  }
+}
+
 async function syncRemote() {
   if (syncing.value) return
   syncing.value = true
@@ -165,8 +227,13 @@ async function syncRemote() {
 
 async function pushRemote() {
   if (pushing.value) return
+  if (!auth.value?.logged_in) {
+    toast.value = '请先登录 GitHub 账号再推送'
+    openLogin()
+    return
+  }
   pushing.value = true
-  toast.value = '正在提交并推送到远程仓库，请稍候…'
+  toast.value = '正在使用你的 GitHub 账号推送到远程仓库，请稍候…'
   try {
     const r = await api.market.push()
     toast.value = r?.message || '已推送到远程市场仓库'
@@ -233,11 +300,13 @@ const publishable = ref<Array<{ id: string; name: string; description?: string }
 const selectedId = ref('')
 const publishing = ref(false)
 const pushAfterPublish = ref(true)
+const canPush = computed(() => !!auth.value?.logged_in)
 const uploadKinds = computed(() => kinds.value.filter(k => k.key !== 'all'))
 
 async function openUpload() {
   uploadOpen.value = true
   selectedId.value = ''
+  pushAfterPublish.value = canPush.value
   await loadPublishable()
 }
 function closeUpload() {
@@ -261,12 +330,14 @@ async function loadPublishable() {
 async function doPublish() {
   if (!selectedId.value || publishing.value) return
   publishing.value = true
+  const willPush = pushAfterPublish.value && canPush.value
   try {
-    const r = await api.market.publish(uploadKind.value, selectedId.value, pushAfterPublish.value)
+    const r = await api.market.publish(uploadKind.value, selectedId.value, willPush)
     const name = r?.item?.name || selectedId.value
     let tip = `已发布到市场：${name}`
     if (r?.push_error) tip += `（已写入本地，推送失败：${r.push_error}）`
     else if (r?.push) tip += '，已推送到远程仓库'
+    else if (!canPush.value) tip += '（未登录 GitHub，仅发布到本地市场）'
     toast.value = tip
     uploadOpen.value = false
     await loadKinds()
@@ -280,7 +351,8 @@ async function doPublish() {
 
 function onKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape') return
-  if (settingsOpen.value) closeSettings()
+  if (loginOpen.value) closeLogin()
+  else if (settingsOpen.value) closeSettings()
   else if (uploadOpen.value) closeUpload()
 }
 
@@ -291,6 +363,7 @@ function iconStyle(m: MarketItem) {
 
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
+  await loadAuth()
   await loadKinds()
   await loadItems()
 })
@@ -309,6 +382,14 @@ onBeforeUnmount(() => {
         <span class="sub">下载走大陆镜像，上传推送远程仓库</span>
       </div>
       <div class="mk-actions">
+        <button
+          v-if="!auth.logged_in" class="btn ghost gh-login"
+          :disabled="authLoading" @click="openLogin"
+        >GitHub 登录</button>
+        <button v-else class="btn ghost gh-login logged" title="GitHub 账号" @click="openLogin">
+          <img v-if="auth.avatar_url" :src="auth.avatar_url" class="gh-avatar" alt="" />
+          <span>@{{ auth.username }}</span>
+        </button>
         <button class="btn ghost" :disabled="syncing" @click="syncRemote">
           {{ syncing ? '同步中…' : '同步最新' }}
         </button>
@@ -416,9 +497,9 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="mm-foot">
-            <label class="mm-push-check">
-              <input v-model="pushAfterPublish" type="checkbox" />
-              <span>发布后推送到远程仓库</span>
+            <label class="mm-push-check" :class="{ disabled: !canPush }">
+              <input v-model="pushAfterPublish" type="checkbox" :disabled="!canPush" />
+              <span>{{ canPush ? '发布后推送到远程仓库' : '未登录 GitHub，仅发布到本地市场' }}</span>
             </label>
             <button class="btn ghost" @click="closeUpload">取消</button>
             <button class="btn primary" :disabled="!selectedId || publishing" @click="doPublish">
@@ -466,6 +547,66 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </div>
+      <div v-if="loginOpen" class="mk-modal-mask" @click.self="closeLogin">
+        <div class="mk-modal mk-modal-sm">
+          <div class="mm-head">
+            <span class="mm-title">{{ auth.logged_in ? 'GitHub 账号' : 'GitHub 登录' }}</span>
+            <button class="mm-close" @click="closeLogin">✕</button>
+          </div>
+          <div class="mm-body">
+            <template v-if="auth.logged_in">
+              <div class="gh-profile">
+                <img v-if="auth.avatar_url" :src="auth.avatar_url" class="gh-avatar-lg" alt="" />
+                <div>
+                  <div class="gh-name">@{{ auth.username }}</div>
+                  <div class="gh-sub">{{ auth.name || 'GitHub 账号' }}</div>
+                </div>
+              </div>
+              <div class="mm-state">
+                市场仓库写权限：
+                <template v-if="auth.repo_permission?.checked">
+                  <span :class="auth.repo_permission.can_push ? 'gh-ok' : 'gh-bad'">
+                    {{ auth.repo_permission.can_push ? '可用' : '不可用' }}
+                  </span>
+                  <template v-if="auth.repo_permission.error"> · {{ auth.repo_permission.error }}</template>
+                </template>
+                <template v-else>未检查</template>
+              </div>
+              <div class="mm-tip">上传资源将使用该账号推送到远程市场仓库；Token 仅保存在本机，不会上传。</div>
+            </template>
+            <template v-else>
+              <label class="mm-field">
+                <span class="mm-label">GitHub 用户名</span>
+                <input v-model="loginUsername" class="mm-input" spellcheck="false"
+                  placeholder="例如 Windy-X211" autocomplete="username" />
+              </label>
+              <label class="mm-field">
+                <span class="mm-label">Personal Access Token（需要 repo 写权限）</span>
+                <input v-model="loginToken" type="password" class="mm-input"
+                  placeholder="ghp_..." autocomplete="current-password" />
+              </label>
+              <div class="mm-tip">
+                Token 仅保存在本机 <code>%LOCALAPPDATA%\AgentCluster\github_auth.json</code>，不会上传。
+                在 GitHub → Settings → Developer settings → Personal access tokens 生成并勾选
+                <code>repo</code> 权限；账号还须是市场仓库的协作者。
+              </div>
+              <div v-if="loginError" class="mm-error">{{ loginError }}</div>
+            </template>
+          </div>
+          <div class="mm-foot">
+            <template v-if="auth.logged_in">
+              <button class="btn ghost gh-danger" @click="doLogout">退出登录</button>
+              <button class="btn primary" @click="closeLogin">完成</button>
+            </template>
+            <template v-else>
+              <button class="btn ghost" @click="closeLogin">取消</button>
+              <button class="btn primary" :disabled="loggingIn" @click="doLogin">
+                {{ loggingIn ? '登录中…' : '登录' }}
+              </button>
+            </template>
+          </div>
+        </div>
+      </div>
       <div v-if="toast" class="mk-toast" @click="toast = ''">{{ toast }}</div>
     </Teleport>
   </div>
@@ -486,6 +627,9 @@ onBeforeUnmount(() => {
 .upload-btn { flex-shrink: 0; background: rgba(var(--accent-rgb, 120, 140, 255), .28); border-color: rgba(var(--accent-rgb, 120, 140, 255), .5); }
 .mk-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .mk-actions .btn { padding: 5px 12px; font-size: calc(12px * var(--font-scale)); white-space: nowrap; }
+.gh-login { display: inline-flex; align-items: center; gap: 6px; }
+.gh-login.logged { padding-left: 6px; }
+.gh-avatar { width: 18px; height: 18px; border-radius: 50%; display: block; }
 .sync-hint {
   display: flex; align-items: center; gap: 12px; padding: 10px 14px;
   border-radius: 10px; font-size: calc(12px * var(--font-scale)); flex-shrink: 0;
@@ -607,4 +751,14 @@ onBeforeUnmount(() => {
 .mm-textarea { resize: vertical; min-height: 64px; line-height: 1.5; }
 .mm-state { font-size: 11px; opacity: .55; }
 .mm-tip { font-size: 11px; opacity: .45; line-height: 1.5; }
+.mk-modal-sm { width: min(480px, 92vw); }
+.gh-profile { display: flex; align-items: center; gap: 12px; }
+.gh-avatar-lg { width: 44px; height: 44px; border-radius: 50%; display: block; }
+.gh-name { font-size: calc(14px * var(--font-scale)); font-weight: 600; }
+.gh-sub { font-size: calc(12px * var(--font-scale)); opacity: .55; margin-top: 2px; }
+.gh-ok { color: #6fcf97; }
+.gh-bad { color: #f2994a; }
+.gh-danger { color: #ff8a80; border-color: rgba(255, 138, 128, .35); }
+.mm-error { font-size: 12px; color: #ff8a80; line-height: 1.5; white-space: pre-wrap; }
+.mm-push-check.disabled { opacity: .55; cursor: not-allowed; }
 </style>

@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -30,7 +31,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from . import store
+from . import github_auth, store
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MARKET_ROOT = _PROJECT_ROOT / "market"
@@ -529,8 +530,19 @@ def ensure_repo() -> dict:
 
 
 def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
-    """把本地 market/ 的改动提交并推送到远程官方仓库。"""
+    """把本地 market/ 的改动提交并推送到远程官方仓库。
+
+    使用市场页登录的 GitHub 账号（PAT）：token 以一次性 HTTP 认证头传给 git，
+    不写入 git config / remote URL；未登录直接拒绝，不回退本机凭据。
+    """
     cfg = get_config()
+    token = github_auth.get_token()
+    if not token:
+        raise RuntimeError(
+            "尚未登录 GitHub：请先在市场页右上角登录后再上传。\n"
+            "（加速镜像只负责下载，推送需要你的 GitHub 账号有市场仓库写权限）"
+        )
+    login = github_auth.get_login() or ""
     ensure_repo()
     branch = cfg["branch"]
 
@@ -546,16 +558,28 @@ def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
     if code == 0:
         commit_id = out.strip()
 
-    code, out, err = _git(["push", "-u", "origin", branch], timeout=timeout)
+    # Basic x-access-token:<token> —— GitHub 接受 PAT 作为 HTTPS 密码
+    b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+    code, out, err = _git(
+        ["-c", f"http.extraheader=Authorization: Basic {b64}",
+         "push", "-u", "origin", branch],
+        timeout=timeout,
+    )
     if code != 0:
         detail = (err or out).strip()
         hint = ""
         if "Repository not found" in detail or "repository not found" in detail:
             hint = "\n\n远程仓库不存在：请先在 GitHub 创建空仓库，并把地址填入市场设置。"
         elif "timed out" in detail.lower() or "could not resolve" in detail.lower():
-            hint = "\n\n网络不可达：推送需要走官方 GitHub（镜像只加速下载），请检查代理/网络。"
-        elif "Authentication" in detail or "Permission" in detail or "denied" in detail:
-            hint = "\n\n认证失败：请确认本机 git 凭据或访问令牌对仓库有写权限。"
+            hint = ("\n\n网络不可达：推送需要直连官方 GitHub（镜像只加速下载），"
+                    "请检查系统代理 / 网络。")
+        elif ("403" in detail or "Authentication failed" in detail
+              or "Permission" in detail or "denied" in detail):
+            hint = (f"\n\n当前 GitHub 账号 @{login} 没有推送权限："
+                    "请联系市场维护者把该账号添加为仓库协作者，"
+                    "并确认 Token 勾选了 repo 写权限。")
+        elif "non-fast-forward" in detail or "rejected" in detail:
+            hint = "\n\n本地与远程历史分叉：请先点「同步最新」合并远程改动后再推送。"
         raise RuntimeError(f"推送失败：{detail}{hint}")
 
     return {
@@ -565,6 +589,7 @@ def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
         "pushed": True,
         "branch": branch,
         "repo_url": cfg["repo_url"],
+        "auth": login,
         "message": "已推送到远程市场仓库" if committed else "无新变更，已确认远程同步",
         "output": (out or "").strip()[:2000],
     }

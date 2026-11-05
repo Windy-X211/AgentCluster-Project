@@ -359,5 +359,9 @@ export const api = {
       req<any>('/market/sync', { method: 'POST', body: JSON.stringify({ force }) }),
     push: (message?: string) =>
       req<any>('/market/push', { method: 'POST', body: JSON.stringify({ message }) }),
+    auth: () => req<any>('/market/auth'),
+    login: (username: string, token: string) =>
+      req<any>('/market/auth', { method: 'POST', body: JSON.stringify({ username, token }) }),
+    logout: () => req<any>('/market/auth', { method: 'DELETE' }),
   }
 }

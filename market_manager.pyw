@@ -31,7 +31,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 try:
     import core.store as store
-    from core import market_sync
+    from core import github_auth, market_sync
     from api import market
 except Exception as _e:  # 依赖缺失时给出可读提示，而不是闪退
     _root = tk.Tk()
@@ -102,6 +102,8 @@ class MarketManager(tk.Tk):
         ttk.Button(top, text="设置", command=self.open_settings).pack(side="right", padx=(0, 6))
         ttk.Button(top, text="推送远程", command=self.push_remote).pack(side="right", padx=(0, 6))
         ttk.Button(top, text="同步市场", command=self.sync_remote).pack(side="right", padx=(0, 6))
+        self.gh_button = ttk.Button(top, text=self._gh_label(), command=self.open_github)
+        self.gh_button.pack(side="right", padx=(0, 6))
 
         body = ttk.Frame(self, padding=(12, 0, 12, 0))
         body.pack(fill="both", expand=True)
@@ -378,13 +380,28 @@ class MarketManager(tk.Tk):
         self._run_bg("同步市场", lambda: market_sync.sync_market(force=True), done)
 
     def push_remote(self) -> None:
+        if not github_auth.get_token():
+            messagebox.showinfo(
+                "请先登录",
+                "推送需要 GitHub 账号：请先点右上角「GitHub 登录」，\n"
+                "登录后上传将使用该账号推送到远程市场仓库。",
+                parent=self,
+            )
+            self.open_github()
+            return
+        login = github_auth.get_login() or ""
         if not messagebox.askyesno(
-            "推送远程", "把本地 market/ 的改动提交并推送到远程仓库？\n镜像只加速下载，推送走官方地址。",
+            "推送远程",
+            f"使用 GitHub 账号 @{login} 把本地 market/ 的改动提交并推送到远程仓库？\n"
+            "镜像只加速下载，推送走官方地址。",
+            parent=self,
         ):
             return
 
         def done(r: dict) -> None:
             tip = r.get("message") or "已推送到远程仓库"
+            if r.get("auth"):
+                tip += f"\n账号：@{r['auth']}"
             if r.get("commit"):
                 tip += f"\n提交：{r['commit']}"
             self.status.set(tip.splitlines()[0])
@@ -394,6 +411,23 @@ class MarketManager(tk.Tk):
 
     def open_settings(self) -> None:
         SettingsDialog(self)
+
+    # ---------------- GitHub 账号 ----------------
+    def _gh_label(self) -> str:
+        try:
+            data = github_auth.public_auth()
+            return f"@{data.get('username')}" if data.get("logged_in") else "GitHub 登录"
+        except Exception:
+            return "GitHub 登录"
+
+    def _refresh_gh(self) -> None:
+        try:
+            self.gh_button.configure(text=self._gh_label())
+        except Exception:
+            pass
+
+    def open_github(self) -> None:
+        GitHubDialog(self, on_changed=self._refresh_gh)
 
     # ---------------- 发布 ----------------
     def open_publish(self) -> None:
@@ -410,7 +444,7 @@ class PublishDialog(tk.Toplevel):
         self.on_done = on_done
         self.items: list[dict] = []
         self._job: str | None = None
-        self.push_var = tk.BooleanVar(value=True)
+        self.push_var = tk.BooleanVar(value=bool(github_auth.get_token()))
 
         if ICON_FILE.exists():
             try:
@@ -453,7 +487,10 @@ class PublishDialog(tk.Toplevel):
         ttk.Button(foot, text="关闭", command=self.destroy).pack(side="right")
         ttk.Button(foot, text="发布到市场", command=self.publish_selected).pack(side="right", padx=8)
         ttk.Checkbutton(
-            foot, text="发布后推送到远程仓库", variable=self.push_var,
+            foot,
+            text="发布后推送到远程仓库" if github_auth.get_token() else "未登录 GitHub，仅发布到本地",
+            variable=self.push_var,
+            state="normal" if github_auth.get_token() else "disabled",
         ).pack(side="right", padx=(0, 12))
 
         self.after(80, self.load_publishable)
@@ -593,6 +630,145 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
 
 
+class GitHubDialog(tk.Toplevel):
+    """GitHub 账号：未登录时填写用户名 + PAT；已登录时查看权限 / 退出。"""
+
+    def __init__(self, master, on_changed=None) -> None:
+        super().__init__(master)
+        self.on_changed = on_changed
+        self.title("GitHub 账号")
+        self.transient(master)
+        self.grab_set()
+        if ICON_FILE.exists():
+            try:
+                self.iconbitmap(str(ICON_FILE))
+            except Exception:
+                pass
+
+        self.frame = ttk.Frame(self, padding=14)
+        self.frame.pack(fill="both", expand=True)
+        self.auth = github_auth.public_auth()
+        if self.auth.get("logged_in"):
+            self._build_account()
+        else:
+            self._build_login()
+        _center(self)
+
+    def _notify(self) -> None:
+        if self.on_changed:
+            try:
+                self.on_changed()
+            except Exception:
+                pass
+
+    # ---------------- 未登录：填写凭据 ----------------
+    def _build_login(self) -> None:
+        self.geometry("560x360")
+        f = self.frame
+        ttk.Label(f, text="使用 GitHub 账号上传市场资源",
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(f, text="Token 仅保存在本机，不会上传；账号须是市场仓库协作者。",
+                  foreground="#777", font=FONT_SMALL).pack(anchor="w", pady=(2, 10))
+
+        ttk.Label(f, text="GitHub 用户名").pack(anchor="w")
+        self.user_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.user_var).pack(fill="x", pady=(4, 10))
+
+        ttk.Label(f, text="Personal Access Token（需要 repo 写权限）").pack(anchor="w")
+        self.token_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.token_var, show="*").pack(fill="x", pady=(4, 10))
+
+        ttk.Label(
+            f,
+            text="GitHub → Settings → Developer settings → Personal access tokens 生成 Token，勾选 repo。",
+            foreground="#888", font=FONT_SMALL, wraplength=520, justify="left",
+        ).pack(anchor="w")
+
+        self.status = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.status, foreground="#c0392b", font=FONT_SMALL,
+                  wraplength=520, justify="left").pack(anchor="w", pady=(6, 0))
+
+        foot = ttk.Frame(f)
+        foot.pack(fill="x", side="bottom", pady=(12, 0))
+        ttk.Button(foot, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(foot, text="登录", command=self.do_login).pack(side="right", padx=8)
+
+    def do_login(self) -> None:
+        username = self.user_var.get().strip()
+        token = self.token_var.get().strip()
+        if not username:
+            self.status.set("请填写 GitHub 用户名")
+            return
+        if not token:
+            self.status.set("请填写 Personal Access Token")
+            return
+        self.status.set("正在校验 GitHub 账号…")
+        self.update_idletasks()
+
+        def work():
+            return github_auth.save_auth(username, token,
+                                         market_sync.get_config()["repo_url"])
+
+        def done(result: dict) -> None:
+            self.auth = result
+            self._notify()
+            messagebox.showinfo("登录成功", f"已登录 GitHub：@{result.get('username')}",
+                                parent=self)
+            self.destroy()
+
+        def fail(msg: str) -> None:
+            self.status.set(msg)
+
+        self._run_async(work, done, fail)
+
+    def _run_async(self, fn, on_ok, on_err) -> None:
+        def worker() -> None:
+            try:
+                result = fn()
+            except Exception as exc:  # noqa: BLE001
+                msg = _err_text(exc)
+                self.after(0, lambda m=msg: on_err(m))
+                return
+            self.after(0, lambda r=result: on_ok(r))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------------- 已登录：查看权限 / 退出 ----------------
+    def _build_account(self) -> None:
+        self.geometry("520x310")
+        f = self.frame
+        ttk.Label(f, text=f"@{self.auth.get('username')}",
+                  font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        if self.auth.get("name"):
+            ttk.Label(f, text=str(self.auth["name"]), foreground="#777").pack(anchor="w", pady=(0, 8))
+
+        perm = self.auth.get("repo_permission") or {}
+        if perm.get("checked"):
+            text = "可用" if perm.get("can_push") else "不可用"
+            if perm.get("error"):
+                text += f"（{perm['error']}）"
+        else:
+            text = "未检查"
+        ttk.Label(f, text=f"市场仓库写权限：{text}", font=FONT_SMALL,
+                  foreground="#555").pack(anchor="w")
+        ttk.Label(
+            f, text="上传资源将使用该账号推送到远程市场仓库；Token 仅保存在本机。",
+            foreground="#888", font=FONT_SMALL, wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+        foot = ttk.Frame(f)
+        foot.pack(fill="x", side="bottom", pady=(12, 0))
+        ttk.Button(foot, text="关闭", command=self.destroy).pack(side="right")
+        ttk.Button(foot, text="退出登录", command=self.do_logout).pack(side="right", padx=8)
+
+    def do_logout(self) -> None:
+        if not messagebox.askyesno("退出登录", "清除本机保存的 GitHub 凭据？", parent=self):
+            return
+        github_auth.clear_auth()
+        self._notify()
+        self.destroy()
+
+
 def _enable_dpi_awareness() -> None:
     if os.name != "nt":
         return
@@ -623,6 +799,8 @@ def _self_check() -> int:
     print(f"mirrors   : {' | '.join(cfg['mirrors'])}")
     print(f"git       : is_repo={state.get('is_repo')} dirty={state.get('dirty_files')} "
           f"remote={state.get('remote')}")
+    auth = github_auth.public_auth()
+    print(f"github    : logged_in={auth.get('logged_in')} user={auth.get('username') or '-'}")
     for k in kinds["kinds"]:
         print(f"  {k['key']:10s} {k['label']:6s} {k['count']}")
     print(f"total items: {items['total']}")

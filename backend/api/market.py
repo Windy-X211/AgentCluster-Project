@@ -38,7 +38,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 import core.store as store
-from core import market_sync
+from core import github_auth, market_sync
 
 router = APIRouter()
 
@@ -303,11 +303,48 @@ def sync(payload: dict | None = None):
         _sync_lock.release()
 
 
+# ==============================================================
+# GitHub 账号（上传身份）
+# ==============================================================
+@router.get("/auth")
+def get_auth():
+    """当前登录状态。只返回用户名/头像/权限，不回传 token。"""
+    data = github_auth.public_auth()
+    if data.get("logged_in"):
+        data["repo_permission"] = github_auth.check_push_permission(
+            market_sync.get_config()["repo_url"]
+        )
+    return data
+
+
+@router.post("/auth")
+def login(payload: dict):
+    """用「用户名 + Personal Access Token」登录，Token 只存本机。"""
+    payload = payload or {}
+    username = str(payload.get("username") or "")
+    token = str(payload.get("token") or "")
+    try:
+        return github_auth.save_auth(username, token,
+                                     market_sync.get_config()["repo_url"])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@router.delete("/auth")
+def logout():
+    github_auth.clear_auth()
+    return {"ok": True, "logged_in": False}
+
+
 @router.post("/push")
 def push(payload: dict | None = None):
     """提交并推送本地 market/ 改动到远程仓库（官方地址，镜像不支持 push）。"""
     payload = payload or {}
     message = str(payload.get("message") or "").strip() or None
+    if not github_auth.get_token():
+        raise HTTPException(401, "请先登录 GitHub 账号后再推送")
     if not _push_lock.acquire(blocking=False):
         raise HTTPException(409, "已有推送任务进行中，请稍候")
     try:
@@ -559,10 +596,13 @@ def publish(payload: dict):
 
     # 可选：发布后立即提交并推送到远程市场仓库（失败不回滚本地发布）
     if payload.get("push"):
-        try:
-            result["push"] = market_sync.push_market(f"publish {kind}/{local_id}")
-        except Exception as e:
-            result["push_error"] = str(e)
+        if not github_auth.get_token():
+            result["push_error"] = "请先登录 GitHub 账号后再推送到远程仓库"
+        else:
+            try:
+                result["push"] = market_sync.push_market(f"publish {kind}/{local_id}")
+            except Exception as e:
+                result["push_error"] = str(e)
     return result
 
 
