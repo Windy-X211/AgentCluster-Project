@@ -252,6 +252,67 @@ function getBubbleForAgent(agentId: number) {
   return bubbleMap.value.get(agentId) ?? null
 }
 
+/**
+ * 气泡防重叠布局：为每个可见气泡决定方向（上方/下方）。
+ *
+ * 根因：气泡宽度 230px > 节点宽度 180px，固定在节点正上方水平居中，
+ * 多个智能体并行回复时，相邻节点的气泡包围盒极易相交 → 视觉重叠。
+ *
+ * 算法：按节点位置（x+y）升序贪心放置。每个气泡默认上方；若与已放置
+ * 气泡包围盒相交则尝试下方；若两方向都相交，选相交面积较小的方向，
+ * 并由 streaming 的 z-index 抬升保证流式气泡不被遮挡。
+ *
+ * 包围盒用气泡最大高度 140px 做保守预测（实际高度 ≤ 140）。
+ */
+const BUBBLE_W = 230, BUBBLE_H = 140, BUBBLE_GAP = 12
+const bubbleLayout = computed<Map<number, 'top' | 'bottom'>>(() => {
+  const layout = new Map<number, 'top' | 'bottom'>()
+  const visible = nodes.value.filter((n: any) =>
+    getBubbleForAgent(n.agent_id) && !bubbleHidden.value[n.id])
+  if (visible.length <= 1) {
+    if (visible.length === 1) layout.set(visible[0].id, 'top')
+    return layout
+  }
+  // 包围盒工厂：dir='top' 气泡在节点上方，'bottom' 在下方
+  const rect = (n: any, dir: 'top' | 'bottom') => {
+    const left = n.x + NODE_W / 2 - BUBBLE_W / 2
+    if (dir === 'top') return { l: left, r: left + BUBBLE_W, t: n.y - BUBBLE_GAP - BUBBLE_H, b: n.y - BUBBLE_GAP }
+    return { l: left, r: left + BUBBLE_W, t: n.y + NODE_H + BUBBLE_GAP, b: n.y + NODE_H + BUBBLE_GAP + BUBBLE_H }
+  }
+  const intersects = (a: any, b: any) => a.l < b.r && a.r > b.l && a.t < b.b && a.b > b.t
+  const overlapArea = (a: any, b: any) => {
+    const dx = Math.max(0, Math.min(a.r, b.r) - Math.max(a.l, b.l))
+    const dy = Math.max(0, Math.min(a.b, b.b) - Math.max(a.t, b.t))
+    return dx * dy
+  }
+  // 按位置排序，从左上到右下贪心放置，减少后续冲突
+  const ordered = [...visible].sort((a: any, b: any) => (a.x + a.y) - (b.x + b.y))
+  const placed: { id: number; r: any }[] = []
+  for (const n of ordered) {
+    const rTop = rect(n, 'top')
+    const rBot = rect(n, 'bottom')
+    const hitTop = placed.some(p => intersects(p.r, rTop))
+    const hitBot = placed.some(p => intersects(p.r, rBot))
+    let dir: 'top' | 'bottom'
+    if (!hitTop) dir = 'top'
+    else if (!hitBot) dir = 'bottom'
+    else {
+      // 两方向都冲突：选与已放置气泡总重叠面积较小者
+      const aTop = placed.reduce((s, p) => s + overlapArea(p.r, rTop), 0)
+      const aBot = placed.reduce((s, p) => s + overlapArea(p.r, rBot), 0)
+      dir = aTop <= aBot ? 'top' : 'bottom'
+    }
+    layout.set(n.id, dir)
+    placed.push({ id: n.id, r: dir === 'top' ? rTop : rBot })
+  }
+  return layout
+})
+
+/** 模板内读取气泡方向 */
+function bubbleDir(nodeId: number): 'top' | 'bottom' {
+  return bubbleLayout.value.get(nodeId) ?? 'top'
+}
+
 function clipBubble(t: string): string {
   const s = (t || '').replace(/^\s*\n+/, '').replace(/\n+\s*$/, '').replace(/\s+/g, ' ').trim()
   return s.length > 150 ? s.slice(0, 150) + '…' : s
@@ -1324,7 +1385,12 @@ defineExpose({ viewportRef, computeNodeBbox })
              @contextmenu="showCtxMenu($event, n)">
           <!-- 消息气泡：双击节点可隐藏；流式输出中也尊重用户的隐藏设置 -->
           <div v-if="getBubbleForAgent(n.agent_id) && !bubbleHidden[n.id]"
-               class="node-bubble" :class="{ streaming: getBubbleForAgent(n.agent_id)?.streaming }"
+               class="node-bubble"
+               :class="{
+                 streaming: getBubbleForAgent(n.agent_id)?.streaming,
+                 below: bubbleDir(n.id) === 'bottom',
+               }"
+               :style="{ zIndex: getBubbleForAgent(n.agent_id)?.streaming ? 9 : 6 }"
                @wheel.stop @scroll="onBubbleScroll">
             <!-- 深度思考 chunk（灰底折叠块，有区别特效） -->
             <div v-for="(chunk, ci) in getBubbleForAgent(n.agent_id)!.chunks" :key="ci"
@@ -1598,6 +1664,10 @@ marker#arrow path { fill: var(--accent); }
 .node-bubble::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: rgba(var(--accent-rgb), 0.4); }
 .node-bubble.streaming { border-color: rgba(var(--accent2-rgb), 0.65); }
 .node-bubble.streaming::after { border-top-color: rgba(var(--accent2-rgb), 0.65); }
+/* 气泡避让到节点下方时：翻转定位与箭头方向 */
+.node-bubble.below { bottom: auto; top: calc(100% + 12px); }
+.node-bubble.below::after { top: auto; bottom: 100%; border-top-color: transparent; border-bottom-color: rgba(var(--accent-rgb), 0.4); }
+.node-bubble.below.streaming::after { border-bottom-color: rgba(var(--accent2-rgb), 0.65); }
 @keyframes bubbleIn { from { opacity: 0; transform: translateX(-50%) translateY(6px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
 
 /* —— 气泡 chunk 样式 —— */

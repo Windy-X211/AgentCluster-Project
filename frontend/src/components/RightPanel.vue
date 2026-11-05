@@ -1569,17 +1569,12 @@ const renderItems = computed(() => {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result' || m2.role === 'tool') { i++; continue }
       if (m2.role === 'a2a') {
-        // 只渲染"发给当前智能体"的信封（from !== cur）；自己发出的不渲染信封卡片。
-        // 显示在左/右侧由 sideOf（设置项）决定，与"是否渲染"无关。
-        const isOwn = cur != null && m2.envelope?.from?.agent_id === cur
-        if (cur == null || isOwn) {
-          i++
-        } else {
-          children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: sideOf(m2) })
-          i++
-        }
+        // 所有 a2a 信封统一渲染为 plain 子块（消息泡泡显示文字），不再有左右侧区分
+        children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: 'left' })
+        i++
       } else {
-        children.push({ kind: 'assistant', msg: m2, idx: i, side: sideOf(m2) })
+        // 所有 assistant 子块统一 side='left'，不再按 agent 归属分左右
+        children.push({ kind: 'assistant', msg: m2, idx: i, side: 'left' })
         i++
       }
     }
@@ -1591,17 +1586,8 @@ const renderItems = computed(() => {
       if (hasTool) out.push({ type: 'turn', start, end, children, side: 'left' })
       continue
     }
-    // 按左右侧切成连续段：同侧相邻子块归入同一段
-    let g = 0
-    while (g < children.length) {
-      const side = children[g].side
-      const segStart = g === 0 ? start : children[g].idx
-      let ge = g
-      while (ge + 1 < children.length && children[ge + 1].side === side && children[ge + 1].kind === children[g].kind) ge++
-      const segEnd = ge + 1 < children.length ? children[ge + 1].idx - 1 : end
-      out.push({ type: 'turn', start: segStart, end: segEnd, children: children.slice(g, ge + 1), side })
-      g = ge + 1
-    }
+    // 全部子块统一 side='left'，不再按左右侧切段
+    out.push({ type: 'turn', start, end, children, side: 'left' })
   }
   return out
 })
@@ -2847,8 +2833,8 @@ async function send() {
   setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)
 }
 function sendStop() {
-  // 只停「下拉框选中的智能体」；画布上的停止按钮停当前会话全部
-  void convs.stopSend(currentAgentId.value)
+  // 停会话全部流式 agent（多 agent 并行/接力时，下拉框选中的 agent 不一定是正在流式的那个）
+  void convs.stopSend(null)
 }
 
 async function toggleVoiceInput() {
@@ -3661,7 +3647,7 @@ onBeforeUnmount(() => {
         <!-- ============ 消息列表 ============
              tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
              连续 a2a 信封合并成一组，默认折叠为一条摘要（两级展开） -->
-        <template v-for="it in renderItems" :key="itemKey(it)">
+<template v-for="it in renderItems" :key="itemKey(it)">
           <!-- ===== 用户消息（靠右，作为每轮智能体输出的分界） ===== -->
           <div v-if="it.type === 'user'" class="msg user" @contextmenu.prevent.stop="onMsgContextMenu($event, it.idx)">
             <div class="avatar user-avatar" :style="{ background: userAvatarGradient() }"
@@ -4123,7 +4109,7 @@ onBeforeUnmount(() => {
               </svg>
             </span>
           </button>
-          <button v-if="!convs.agentStreaming(currentAgentId)" class="btn send" @click="send" aria-label="发送消息">发送</button>
+          <button v-if="!convs.streaming" class="btn send" @click="send" aria-label="发送消息">发送</button>
           <button v-else class="btn send stop-btn" @click="sendStop" aria-label="停止输出">
             <span class="stop-icon" aria-hidden="true"></span>
           </button>
@@ -4134,8 +4120,8 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.right-panel { display: flex; flex-direction: column; overflow: hidden; }
-.canvases-pane { padding: 4px 0; }
+.right-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+.canvases-pane { padding: 4px 0; flex-shrink: 0; }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
 .cv-list { padding: 2px 4px; max-height: 180px; overflow-y: auto; }
@@ -4157,7 +4143,7 @@ onBeforeUnmount(() => {
 .cv-item:hover .del { opacity: .6; }
 .cv-item .del:hover { opacity: 1; color: #ff9090; }
 .cv-rename { width: 100%; font-size: calc(12px * var(--font-scale)); padding: 2px 6px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.3); border: 1px solid rgba(var(--accent-rgb), 0.4); color: rgb(var(--text-rgb)); }
-.divider { height: 1px; background: rgba(var(--surface-rgb), 0.08); margin: 4px 10px; }
+.divider { height: 1px; flex-shrink: 0; background: rgba(var(--surface-rgb), 0.08); margin: 4px 10px; }
 
 .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
 .chat-header { flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid rgba(var(--surface-rgb), 0.06); }
@@ -4243,7 +4229,7 @@ onBeforeUnmount(() => {
 .conv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
 
-.chat-box { flex: 1; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
+.chat-box { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
 .no-conv { text-align: center; opacity: .5; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
 /* ============ 消息容器 ============ */
@@ -4424,10 +4410,11 @@ onBeforeUnmount(() => {
   transition: border-color .15s, box-shadow .15s;
   /* 自适应宽度：短内容自然窄，长内容撑到父容器 max-width 后自动换行 */
   width: fit-content;
-  max-width: 100%;
+  max-width: 85%;               /* 不让泡泡撑满整行，留出呼吸空间 */
   box-sizing: border-box;
   word-break: break-word;
   overflow-wrap: anywhere;
+  overflow: hidden;             /* 子元素溢出（pre/table）时裁切 */
 }
 /* 当 bubble 带 .markdown class 时，由全局样式接管排版 */
 .bubble.markdown { white-space: normal; }
@@ -4460,7 +4447,7 @@ onBeforeUnmount(() => {
   padding: 6px 12px;
 }
 
-.chat-input { padding: 8px 12px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); display: flex; flex-direction: column; gap: 6px; transition: background .15s, box-shadow .15s; }
+.chat-input { flex-shrink: 0; padding: 8px 12px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); display: flex; flex-direction: column; gap: 6px; transition: background .15s, box-shadow .15s; }
 /* 拖拽文件悬停时的高亮提示 */
 .chat-input.drop-hover { background: rgba(var(--accent-rgb), 0.1); box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.45); }
 
@@ -5132,7 +5119,7 @@ onBeforeUnmount(() => {
 .bubble.markdown table {
   border-collapse: collapse; border: 1px solid rgba(var(--surface-rgb), 0.3);
   background: var(--code-tint-bg); margin: 8px 0; font-size: calc(11.5px * var(--font-scale));
-  width: max-content; max-width: 100%; border-radius: 6px; overflow: hidden;
+  width: max-content; max-width: 100%; border-radius: 6px; overflow: auto; display: block;
 }
 .bubble.markdown th, .bubble.markdown td {
   border: 1px solid rgba(var(--surface-rgb), 0.28); padding: 5px 9px;

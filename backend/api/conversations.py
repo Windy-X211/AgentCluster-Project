@@ -14,6 +14,40 @@ from core.file_backup import (
 router = APIRouter()
 
 
+def _repair_tool_calls_pairing(msgs: list) -> None:
+    """修复消息列表中 assistant@tool_calls 与 tool 消息的配对完整性。
+
+    截断/撤销/删除单条消息后，可能留下「带 tool_calls 但无对应 tool 结果」的 assistant，
+    下一轮调用 LLM 会被上游以 400 "insufficient tool messages following tool_calls message" 拒绝。
+    本函数原地剔除悬空 tool_call；若剔除后 tool_calls 为空则移除该字段。
+    """
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") != "assistant" or not isinstance(m.get("tool_calls"), list):
+            continue
+        tc_ids = {tc.get("id", "") for tc in m["tool_calls"] if isinstance(tc, dict)}
+        if not tc_ids:
+            continue
+        # 收集本条 assistant 之后、下一条 assistant 之前所有 tool 消息的 tool_call_id
+        answered: set[str] = set()
+        for j in range(i + 1, len(msgs)):
+            nj = msgs[j]
+            if not isinstance(nj, dict):
+                continue
+            r = nj.get("role")
+            if r == "assistant":
+                break
+            if r == "tool":
+                answered.add(nj.get("tool_call_id", ""))
+        unmatched = tc_ids - answered
+        if not unmatched:
+            continue
+        m["tool_calls"] = [tc for tc in m["tool_calls"] if isinstance(tc, dict) and tc.get("id", "") not in unmatched]
+        if not m["tool_calls"]:
+            m.pop("tool_calls", None)
+
+
 class ConvIn(BaseModel):
     name: str = "新对话"
     mode: str = "independent"  # independent | linked（历史字段，保留兼容）
@@ -387,6 +421,8 @@ def delete_message(cid: int, req: DeleteMsgReq):
             del msgs[req.index]
             removed += 1
 
+    # 修复配对：删除单条 tool 后，前面 assistant 的 tool_calls 可能悬空
+    _repair_tool_calls_pairing(msgs)
     conv["messages"] = msgs
     upsert("conversations", conv)
     return {"ok": True, "kept": len(msgs), "removed": removed}
@@ -406,7 +442,9 @@ def truncate_messages(cid: int, req: TruncateMsgReq):
     if req.index == -1:
         conv["messages"] = []
     else:
-        conv["messages"] = msgs[:req.index + 1]
+        kept = msgs[:req.index + 1]
+        _repair_tool_calls_pairing(kept)
+        conv["messages"] = kept
     upsert("conversations", conv)
     return {"ok": True, "kept": len(conv["messages"])}
 
@@ -430,6 +468,7 @@ def undo_from_message(cid: int, req: UndoFromMsgReq):
 
     # 1. 截断消息（删除 index 及之后所有）
     kept_msgs = msgs[:req.index]
+    _repair_tool_calls_pairing(kept_msgs)
     conv["messages"] = kept_msgs
     upsert("conversations", conv)
 
