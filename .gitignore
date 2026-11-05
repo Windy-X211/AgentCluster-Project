@@ -53,3 +53,7 @@ Thumbs.db
 /AppData/extensions/*/token.txt
 /AppData/extensions/*/settings.json
 /AppData/extensions/*/servers.json
+# 拓展正式目录是安装时从 _builtin 下载源拷贝生成的，仓库只保留下载源与清单
+/AppData/extensions/*/
+!/AppData/extensions/_builtin/
+/AppData/extensions/installed.json
