@@ -43,16 +43,17 @@ DEFAULT_REPO_URL = "https://github.com/Windy-X211/AgentCluster-Market.git"
 # {url} 会被替换成完整的官方下载地址；顺序即测速优先级（越靠前越快越稳）
 # 末尾自动追加官方地址作为兜底（见 mirror_candidates 函数）
 DEFAULT_MIRRORS = [
-    # 2026 年实测可用：多线路并发 race，不依赖单一镜像
-    "https://gh.llkk.cc/{url}",          # 实测最快，三种代理模式全通过
-    "https://gh-proxy.com/{url}",         # 最主流稳定，IEPL 专线
-    "https://ghfast.top/{url}",           # 独立线路
-    "https://ghproxy.net/{url}",          # raw/archive/git 均可用
-    "https://mirror.ghproxy.com/{url}",   # ghproxy 备用节点
+    # 2026-11-06 实测：index.json 并发 race，TOP 2 均 <1s，race 整体 ~1.7s
+    "https://gh-proxy.org/{url}",        # ~0.66s 实测最快
+    "https://gh-proxy.com/{url}",        # ~0.83s 实测次快
+    "https://ghfast.top/{url}",          # 备用 ~7s
+    "https://ghproxy.net/{url}",          # 备用 ~8s
+    "https://mirror.ghproxy.com/{url}",
     "https://gh-proxy.cn/{url}",
     "https://gh-proxy.cc/{url}",
-    "https://gh-proxy.org/{url}",
-    "https://kkgithub.com/{url}",         # KKGitHub 独立加速
+    "https://gh-proxy.1ms.run/{url}",
+    "https://ghproxy.1ms.run/{url}",
+    "https://kkgithub.com/{url}",
 ]
 DEFAULT_BRANCH = "main"
 
@@ -199,7 +200,8 @@ def mirror_candidates(url: str, mirrors: list[str] | None = None) -> list[str]:
                 continue
         else:
             out.append(tpl.rstrip("/") + "/" + url)
-    out.append(url)
+    # 不再自动追加官方 raw.githubusercontent.com 兜底——国内访问经常 8s+ 超时
+    # 会在并发 race 里占线程位拖慢整体；如需兜底请手动加进 mirrors 列表
     seen: set[str] = set()
     return [u for u in out if not (u in seen or seen.add(u))]
 
@@ -286,7 +288,11 @@ def download_file(url: str, dest: Path, *,
     # 并发数封顶 6，避免请求过多反而拖慢
     max_workers = min(len(candidates), 6)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    # ⚠️ 不能用 `with ThreadPoolExecutor()`：它会 wait=True 等所有线程结束，
+    # winner 2s 就返回但 ghproxy.net 卡 13s urlopen，整体还是 13s+。
+    # 必须显式 shutdown(wait=False, cancel_futures=True) 拿到 winner 立即返回。
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         for cand in candidates:
             tmp = dest.with_name(f"{dest.name}.part-{_safe_host(cand)}")
             tmp_by_cand[cand] = tmp
@@ -312,8 +318,12 @@ def download_file(url: str, dest: Path, *,
                     break
                 except Exception as e:
                     errors.append(f"{cand_url} → {e}")
-
-    cancel_event.set()  # 确保所有 worker 退出
+    finally:
+        cancel_event.set()
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pool.shutdown(wait=False)
 
     if winner_result is None:
         # 全源失败：清理所有 .part 文件
@@ -1057,6 +1067,61 @@ def repo_state() -> dict:
     except Exception as e:
         state["error"] = str(e)
     return state
+
+
+def pending_push_paths() -> dict:
+    """返回本地 market 中「尚未推送到远程」的路径（相对 market/）。
+
+    判定来源：
+    - 工作区未提交/未跟踪的改动（git status --porcelain）
+    - 已提交但远端分支还没有的改动（git diff --name-only origin/<branch>...HEAD）
+
+    index.json 不计入：任何条目变化都会改它，计入会让所有条目都显得未推送。
+
+    返回 ``{"known": bool, "all_pending": bool, "paths": list[str]}``：
+    - known=False：不是 git 仓库 / 未安装 git → 调用方不应标记
+    - all_pending=True：本地是仓库但没有可用的 origin/<branch> 引用
+      （从未 fetch/push 过）→ 所有条目都应视为未推送
+    """
+    result: dict = {"known": False, "all_pending": False, "paths": []}
+    if not (MARKET_ROOT / ".git").exists() or not shutil.which("git"):
+        return result
+    cfg = get_config()
+    paths: set[str] = set()
+    try:
+        code, out, _ = _git(["status", "--porcelain"], timeout=30)
+        if code != 0:
+            return result
+        for line in out.splitlines():
+            if len(line) < 4:
+                continue
+            rel = line[3:].strip()
+            if " -> " in rel:  # 重命名行：取新路径
+                rel = rel.split(" -> ", 1)[1]
+            rel = rel.strip('"').replace("\\", "/")
+            if rel and rel != "index.json":
+                paths.add(rel)
+
+        branch = cfg["branch"]
+        code, _, _ = _git(["rev-parse", "--verify", f"origin/{branch}"], timeout=20)
+        if code != 0:
+            result["known"] = True
+            result["all_pending"] = True
+            return result
+        code, out, _ = _git(["diff", "--name-only", f"origin/{branch}...HEAD"], timeout=60)
+        if code != 0:
+            result["known"] = True
+            result["all_pending"] = True
+            return result
+        for rel in out.splitlines():
+            rel = rel.strip().replace("\\", "/")
+            if rel and rel != "index.json":
+                paths.add(rel)
+    except Exception:
+        return result
+    result["known"] = True
+    result["paths"] = sorted(paths)
+    return result
 
 
 def ensure_repo() -> dict:

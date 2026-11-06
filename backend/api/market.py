@@ -783,15 +783,29 @@ def _install_extension(item: dict) -> dict:
 # ==============================================================
 @router.get("/my-items")
 def my_items(q: str = ""):
-    """返回当前登录 GitHub 用户发布的市场条目（author == login；未登录则 author == 'AgentCluster'）。"""
+    """返回「我的发布」条目。
+
+    主口径是 author == 当前登录 GitHub 用户名；额外纳入「未登录时上传
+    （author=AgentCluster）且尚未推送」的条目——否则用户之后登录，
+    这些刚上传、还没推送的资源会从「我的发布」里凭空消失。
+    未登录时返回空（前端引导登录）。
+    """
     login = github_auth.get_login()
     if not login:
-        # 未登录 —— 也可以返回 author='AgentCluster'（本机默认作者），
-        # 但这是系统保留作者，一般不是用户自己发布的。直接返回空。
         return {"kind": "all", "total": 0, "items": [], "updated_at": _load_index().get("updated_at")}
 
     all_items = list(_load_index().get("items", []))
-    items = [it for it in all_items if (it.get("author") or "") == login]
+    push_state = market_sync.pending_push_paths()
+    # 拷贝副本：_installed_state/_mark_push_state 会往条目里写临时字段，
+    # 直接改索引缓存对象会把 installed/pushed 持久化进 index.json
+    items = [dict(it) for it in all_items if (it.get("author") or "") == login]
+    if push_state.get("known") and not push_state.get("all_pending"):
+        pending = push_state.get("paths") or []
+        for it in all_items:
+            if (it.get("author") or "") != "AgentCluster":
+                continue
+            if _path_pending(_item_rel_dir(it), pending):
+                items.append(dict(it))
 
     keyword = (q or "").strip().lower()
     if keyword:
@@ -805,6 +819,7 @@ def my_items(q: str = ""):
 
     items.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
     _installed_state(items)
+    _mark_push_state(items, push_state)
     return {
         "kind": "all",
         "total": len(items),
@@ -812,6 +827,44 @@ def my_items(q: str = ""):
         "updated_at": _load_index().get("updated_at"),
         "mine": True,
     }
+
+
+def _item_rel_dir(item: dict) -> str:
+    """条目在 market/ 下的相对目录（如 agents/my-agent），取不到时返回空串。"""
+    rel = str(item.get("dir") or "").strip("/")
+    if rel:
+        return rel
+    try:
+        return _item_dir(item).relative_to(MARKET_ROOT).as_posix()
+    except Exception:
+        return ""
+
+
+def _path_pending(rel: str, pending: list[str]) -> bool:
+    if not rel:
+        return False
+    return any(p == rel or p.startswith(rel + "/") for p in pending)
+
+
+def _mark_push_state(items: list[dict], state: dict | None = None) -> None:
+    """给「我的发布」条目补充 pushed 字段（False=已发布到本地市场但未推送到远程）。
+
+    pushed=None 表示无法判断（非 git 仓库 / 未安装 git），前端不展示标记。
+    判定依据是 market/ 仓库的真实 git 状态：条目目录下有未提交改动，
+    或本地提交尚未出现在 origin/<branch> 上，即视为未推送。
+    """
+    state = state or market_sync.pending_push_paths()
+    if not state.get("known"):
+        for it in items:
+            it["pushed"] = None
+        return
+    if state.get("all_pending"):
+        for it in items:
+            it["pushed"] = False
+        return
+    pending = state.get("paths") or []
+    for it in items:
+        it["pushed"] = not _path_pending(_item_rel_dir(it), pending)
 
 
 # ==============================================================
@@ -870,7 +923,41 @@ def publishable(kind: str = ""):
     kind = (kind or "").strip()
     if kind not in {"agent", "canvas", "background", "skill", "plugin", "extension"}:
         raise HTTPException(400, f"不支持的类型：{kind}")
-    return {"kind": kind, "items": _publishable_items(kind)}
+    items = _publishable_items(kind)
+    _mark_published(kind, items)
+    return {"kind": kind, "items": items}
+
+
+def _mark_published(kind: str, items: list[dict]) -> None:
+    """标记本机资源是否已发布到市场。
+
+    智能体/画布发布后市场 id 是 slug（不等于本地 id），按 item 里的
+    origin_agent_id / origin_canvas_id 匹配，并追加名称校验——避免同步下载到的
+    条目（其 origin id 是别人机器上的本地 id）碰巧与本机 id 相同而误标「已上传」。
+    目录类（背景/技能/插件/拓展）发布 id 与本地目录名一致，直接按 id 匹配。
+    """
+    origin_key = {"agent": "origin_agent_id", "canvas": "origin_canvas_id"}.get(kind)
+    published_ids: set[str] = set()
+    published_origins: set[tuple[int, str]] = set()
+    for it in _load_index().get("items", []):
+        if it.get("kind") != kind:
+            continue
+        published_ids.add(str(it.get("id") or ""))
+        if origin_key:
+            try:
+                published_origins.add((int(it.get(origin_key)), str(it.get("name") or "")))
+            except (TypeError, ValueError):
+                pass
+    for item in items:
+        if origin_key:
+            try:
+                key = (int(item.get("id")), str(item.get("name") or ""))
+            except (TypeError, ValueError):
+                item["published"] = False
+                continue
+            item["published"] = key in published_origins
+        else:
+            item["published"] = str(item.get("id") or "") in published_ids
 
 
 def _publishable_items(kind: str) -> list[dict]:

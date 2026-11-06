@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api } from '@/api'
 import { loadExtensions } from '@/extensions/loader'
@@ -10,6 +10,8 @@ interface MarketItem {
   kind: string; id: string; name: string; description?: string
   version?: string; author?: string; icon?: string; tags?: string[]
   installed?: boolean; enabled?: boolean; preview?: string; bg_type?: string; agent_count?: number
+  // 我的发布：false=已发布到本地市场但未推送到远程；null/undefined=无法判断
+  pushed?: boolean | null
 }
 
 const KIND_ICON: Record<string, string> = {
@@ -83,7 +85,7 @@ const cacheIndicatorTitle = computed(() => {
   if (!c) return ''
   const parts = [`资源：${c.resource_human || '0 B'}`]
   if (c.has_git) parts.push(`git：${c.git_human}`)
-  if (c.has_zip_cache) parts.push(`归档缓存：${c.zip_cache_human}（首次下载后复用，24h 过期）`)
+
   parts.push('清理不影响已安装到本地的用户数据')
   return parts.join('\n')
 })
@@ -269,27 +271,34 @@ async function doLogout() {
   }
 }
 
-async function syncRemote() {
+async function syncRemote(silent: boolean) {
   if (syncing.value) return
   syncing.value = true
-  toast.value = '正在从大陆镜像同步市场，请稍候…'
+  if (!silent) toast.value = '正在从大陆镜像同步市场，请稍候…'
   try {
     const r = await api.market.sync(true)
-    if (r?.up_to_date) {
-      toast.value = '市场已是最新'
-    } else {
-      const src = r?.mirror || '官方'
-      toast.value = `同步完成：新增 ${r?.added ?? 0} 项，更新 ${r?.changed ?? 0} 项（来源：${src}）`
+    if (!silent) {
+      if (r?.up_to_date) {
+        toast.value = '市场已是最新'
+      } else {
+        const src = r?.mirror || '官方'
+        toast.value = `同步完成：新增 ${r?.added ?? 0} 项，更新 ${r?.changed ?? 0} 项（来源：${src}）`
+      }
     }
     needsSync.value = false
     await loadKinds()
     await loadItems()
   } catch (e) {
-    toast.value = '同步失败：' + (e as Error).message
+    if (!silent) toast.value = '同步失败：' + (e as Error).message
   } finally {
     syncing.value = false
   }
 }
+
+// 手动「同步最新」：显示进度与结果提示
+function manualSync() { void syncRemote(false) }
+// 打开市场时自动同步：静默执行，不弹提示（同步中按钮自会显示"同步中…"）
+function autoSyncOnOpen() { void syncRemote(true) }
 
 async function pushRemote() {
   if (pushing.value) return
@@ -303,6 +312,9 @@ async function pushRemote() {
   try {
     const r = await api.market.push()
     toast.value = r?.message || '已推送到远程市场仓库'
+    // 推送后所有条目的「未推送」状态都可能变化，刷新当前列表
+    await loadKinds()
+    await loadItems()
   } catch (e) {
     toast.value = '推送失败：' + (e as Error).message
   } finally {
@@ -384,33 +396,60 @@ async function saveSettings() {
 // —— 上传（把本机资源发布到市场）——
 const uploadOpen = ref(false)
 const uploadKind = ref('agent')
-const publishable = ref<Array<{ id: string; name: string; description?: string }>>([])
+const publishable = ref<Array<{ id: string; name: string; description?: string; published?: boolean }>>([])
+const uploadLoading = ref(false)
+// 当前列表数据实际所属的资源类型（过渡 key 用它，避免切换瞬间用新 key 重渲染旧数据造成重复闪动）
+const loadedKind = ref('')
 const selectedId = ref('')
+// 上传弹窗：只看未上传（未发布到市场）的本机资源
+const unPublishedOnly = ref(false)
+const visiblePublishable = computed(() =>
+  unPublishedOnly.value ? publishable.value.filter(p => !p.published) : publishable.value)
+// 勾选「未上传」或列表刷新后，若选中项已被过滤掉则清空选择，避免按钮指向不可见项
+watch(visiblePublishable, list => {
+  if (selectedId.value && !list.some(p => p.id === selectedId.value)) selectedId.value = ''
+})
 const publishing = ref(false)
 const canPush = computed(() => !!auth.value?.logged_in)
 const uploadKinds = computed(() => kinds.value.filter(k => k.key !== 'all'))
+// 请求序号：快速连续切换类型时丢弃过期响应，避免旧类型数据覆盖新类型
+let uploadReqSeq = 0
 
 async function openUpload() {
   uploadOpen.value = true
   selectedId.value = ''
+  publishable.value = []
+  loadedKind.value = ''
   await loadPublishable()
 }
 function closeUpload() {
   uploadOpen.value = false
   publishing.value = false
+  uploadReqSeq++ // 关闭后作废在途请求
 }
 function switchUploadKind(k: string) {
+  if (uploadKind.value === k) return
   uploadKind.value = k
   selectedId.value = ''
   void loadPublishable()
 }
 async function loadPublishable() {
-  publishable.value = []
+  const seq = ++uploadReqSeq
+  const kind = uploadKind.value
+  // 不清空旧列表：切换类型时旧内容原地淡出/新内容淡入，避免列表闪空与弹窗高度跳动
+  uploadLoading.value = true
   try {
-    const r = await api.market.publishable(uploadKind.value)
+    const r = await api.market.publishable(kind)
+    if (seq !== uploadReqSeq) return
     publishable.value = r.items || []
+    loadedKind.value = kind
   } catch (e) {
+    if (seq !== uploadReqSeq) return
+    publishable.value = []
+    loadedKind.value = ''
     toast.value = '读取本机资源失败：' + (e as Error).message
+  } finally {
+    if (seq === uploadReqSeq) uploadLoading.value = false
   }
 }
 async function doPublish() {
@@ -651,6 +690,7 @@ onMounted(async () => {
   await loadMineCount()
   await loadItems()
   fetchCacheInfo()  // 缓存概况非阻塞
+  autoSyncOnOpen()  // 打开市场时静默自动同步最新（按钮显示"同步中…"，完成不弹提示）
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
@@ -675,12 +715,12 @@ onBeforeUnmount(() => {
           <img v-if="auth.avatar_url" :src="auth.avatar_url" class="gh-avatar" alt="" />
           <span>@{{ auth.username }}</span>
         </button>
-        <button class="btn ghost" :disabled="syncing" @click="syncRemote">
+        <button class="btn ghost" :disabled="syncing" @click="manualSync">
           {{ syncing ? '同步中…' : '同步最新' }}
         </button>
         <span v-if="cacheInfo" class="cache-indicator" :title="cacheIndicatorTitle">
           💾 {{ cacheIndicatorText }}
-          <span v-if="cacheInfo.has_zip_cache" class="cache-pill" title="归档缓存">zip</span>
+
           <button class="cache-clean-btn" @click="cleanCache" :disabled="cleaningCache"
             title="清理市场缓存（保留索引和用户数据）">
             {{ cleaningCache ? '清理中…' : '清理' }}
@@ -727,7 +767,7 @@ onBeforeUnmount(() => {
 
         <div v-if="needsSync && !isMineView" class="sync-hint glass">
           <span>市场资源尚未下载到本机。使用大陆镜像一键同步最新资源：</span>
-          <button class="btn primary" :disabled="syncing" @click="syncRemote">
+          <button class="btn primary" :disabled="syncing" @click="manualSync">
             {{ syncing ? '同步中…' : '从镜像同步' }}
           </button>
         </div>
@@ -749,6 +789,8 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <span v-if="m.installed" class="mc-badge">已安装</span>
+              <span v-if="isMineView && m.pushed === false" class="mc-badge warn"
+                title="已发布到本地市场，但还没有推送到远程仓库">未推送</span>
             </div>
             <div class="mc-desc">{{ m.description || '暂无描述' }}</div>
             <div class="mc-tags">
@@ -777,13 +819,13 @@ onBeforeUnmount(() => {
     </div>
 
     <Teleport to="body">
-      <div v-if="uploadOpen" class="mk-modal-mask" @click.self="closeUpload">
-        <div class="mk-modal">
+      <div v-if="uploadOpen" class="mk-modal-mask">
+        <div class="mk-modal mk-modal-upload">
           <div class="mm-head">
             <span class="mm-title">⬆ 上传资源到市场</span>
             <button class="mm-close" @click="closeUpload">✕</button>
           </div>
-          <div class="mm-body">
+          <div class="mm-body mm-body-fixed">
             <div class="mm-tabs">
               <button
                 v-for="k in uploadKinds" :key="k.key"
@@ -791,16 +833,35 @@ onBeforeUnmount(() => {
                 @click="switchUploadKind(k.key)"
               >{{ k.label }}</button>
             </div>
-            <div class="mm-hint">从本机已有的{{ kindLabel(uploadKind) }}中选择一项发布到市场。</div>
-            <div v-if="!publishable.length" class="mm-empty">本机暂无{{ kindLabel(uploadKind) }}可发布</div>
-            <div v-else class="mm-list">
-              <label v-for="p in publishable" :key="p.id" class="mm-item" :class="{ checked: selectedId === p.id }">
-                <input v-model="selectedId" type="radio" :value="p.id" />
-                <div class="mm-item-body">
-                  <div class="mm-item-name">{{ p.name }}</div>
-                  <div class="mm-item-desc">{{ p.description || '暂无描述' }}</div>
-                </div>
+            <div class="mm-hint-row">
+              <div class="mm-hint">从本机已有的{{ kindLabel(uploadKind) }}中选择一项发布到市场。</div>
+              <label class="mm-upload-filter" title="只显示尚未发布到市场的本机资源">
+                <input v-model="unPublishedOnly" type="checkbox" />
+                <span>未上传</span>
               </label>
+            </div>
+            <!-- 固定高度的列表区：内容多少不影响弹窗尺寸，切换类型时只做淡入淡出 -->
+            <div class="mm-list-wrap" :class="{ 'is-loading': uploadLoading }">
+              <Transition name="mm-fade" mode="out-in">
+                <div v-if="uploadLoading && !publishable.length" key="loading" class="mm-empty">读取本机资源…</div>
+                <div v-else-if="!visiblePublishable.length" key="empty" class="mm-empty">
+                  {{ unPublishedOnly && publishable.length
+                    ? `本机${kindLabel(uploadKind)}已全部上传`
+                    : `本机暂无${kindLabel(uploadKind)}可发布` }}
+                </div>
+                <div v-else :key="'list-' + loadedKind" class="mm-list">
+                  <label v-for="p in visiblePublishable" :key="p.id" class="mm-item" :class="{ checked: selectedId === p.id }">
+                    <input v-model="selectedId" type="radio" :value="p.id" />
+                    <div class="mm-item-body">
+                      <div class="mm-item-name">
+                        <span>{{ p.name }}</span>
+                        <span v-if="p.published" class="mm-badge">已上传</span>
+                      </div>
+                      <div class="mm-item-desc">{{ p.description || '暂无描述' }}</div>
+                    </div>
+                  </label>
+                </div>
+              </Transition>
             </div>
           </div>
           <div class="mm-foot">
@@ -812,7 +873,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <!-- 下架确认弹窗 -->
-      <div v-if="unpublishOpen" class="mk-modal-mask" @click.self="closeUnpublish">
+      <div v-if="unpublishOpen" class="mk-modal-mask">
         <div class="mk-modal mk-modal-sm">
           <div class="mm-head">
             <span class="mm-title">⚠ 下架市场资源</span>
@@ -837,7 +898,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </div>
-      <div v-if="settingsOpen" class="mk-modal-mask" @click.self="closeSettings">
+      <div v-if="settingsOpen" class="mk-modal-mask">
         <div class="mk-modal">
           <div class="mm-head">
             <span class="mm-title">⚙ 市场远程仓库设置</span>
@@ -876,7 +937,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </div>
-      <div v-if="loginOpen" class="mk-modal-mask" @click.self="closeLogin">
+      <div v-if="loginOpen" class="mk-modal-mask">
         <div class="mk-modal mk-modal-sm">
           <div class="mm-head">
             <span class="mm-title">{{ auth.logged_in ? 'GitHub 账号' : 'GitHub 登录' }}</span>
@@ -948,7 +1009,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div v-if="toast" class="mk-toast" @click="toast = ''">{{ toast }}</div>
-      <div v-if="previewOpen" class="mk-modal-mask" @click.self="closePreview">
+      <div v-if="previewOpen" class="mk-modal-mask">
         <div class="mk-modal preview-modal">
           <div class="mm-head">
             <span class="mm-title">
@@ -1195,7 +1256,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <!-- 画布放大弹窗 -->
-      <div v-if="canvasZoomOpen && canvasThumbReady" class="mk-modal-mask" @click.self="closeCanvasZoom">
+      <div v-if="canvasZoomOpen && canvasThumbReady" class="mk-modal-mask">
         <div class="canvas-zoom-modal">
           <div class="cz-head">
             <span class="cz-title">🗺 画布详情预览</span>
@@ -1231,7 +1292,7 @@ onBeforeUnmount(() => {
             </svg>
           </div>
           <div class="cz-foot">
-            <span class="cz-tip">ESC 或点击空白处关闭</span>
+            <span class="cz-tip">ESC 或点击关闭按钮关闭</span>
             <button class="btn ghost" @click="closeCanvasZoom">关闭</button>
           </div>
         </div>
@@ -1242,7 +1303,8 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .mk-root {
-  padding: 10px 16px 16px; height: calc(100vh - var(--titlebar-h));
+  /* 顶部预留窗口最小化/最大化/关闭按钮区域，避免遮挡顶栏右侧「上传资源」等按钮 */
+  padding: 40px 16px 16px; height: calc(100vh - var(--titlebar-h));
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .mk-top {
@@ -1259,28 +1321,28 @@ onBeforeUnmount(() => {
 .gh-login.logged { padding-left: 6px; }
 .cache-indicator {
   display: inline-flex; align-items: center; gap: 6px;
-  font-size: calc(11px * var(--font-scale)); opacity: .6;
-  padding: 5px 10px; border-radius: 8px;
-  background: rgba(255, 255, 255, .04);
-  border: 1px solid rgba(255, 255, 255, .08);
+  font-size: calc(12px * var(--font-scale)); color: rgba(232, 238, 252, .92);
+  padding: 4px 10px; border-radius: 8px;
+  background: rgba(255, 255, 255, .07);
+  border: 1px solid rgba(255, 255, 255, .16);
+  white-space: nowrap;
 }
-.cache-pill {
-  font-size: calc(9px * var(--font-scale));
-  padding: 1px 5px; border-radius: 5px;
-  background: rgba(100, 120, 200, .2);
-  color: rgba(150, 170, 255, .75);
-  line-height: 1.2;
-}
+
 .cache-clean-btn {
-  font-size: calc(10px * var(--font-scale));
-  padding: 2px 8px; border-radius: 6px;
-  background: rgba(255, 255, 255, .08);
-  border: none; color: rgba(255, 255, 255, .65);
-  cursor: pointer; line-height: 1.4;
-  transition: background .15s, color .15s;
+  font-size: calc(11px * var(--font-scale));
+  padding: 2px 10px; border-radius: 6px;
+  background: rgba(var(--accent-rgb, 120, 140, 255), .2);
+  border: 1px solid rgba(var(--accent-rgb, 120, 140, 255), .5);
+  color: #d5deff;
+  cursor: pointer; line-height: 1.5;
+  transition: background .15s, color .15s, border-color .15s;
 }
-.cache-clean-btn:hover:not(:disabled) { background: rgba(255, 120, 120, .2); color: #ffc9c9; }
-.cache-clean-btn:disabled { opacity: .4; cursor: not-allowed; }
+.cache-clean-btn:hover:not(:disabled) {
+  background: rgba(255, 120, 120, .24);
+  border-color: rgba(255, 120, 120, .55);
+  color: #ffc9c9;
+}
+.cache-clean-btn:disabled { opacity: .55; cursor: not-allowed; }
 .gh-avatar { width: 18px; height: 18px; border-radius: 50%; display: block; }
 .sync-hint {
   display: flex; align-items: center; gap: 12px; padding: 10px 14px;
@@ -1345,6 +1407,7 @@ onBeforeUnmount(() => {
 .mc-title { font-weight: 600; font-size: calc(14px * var(--font-scale)); }
 .mc-sub { font-size: calc(11px * var(--font-scale)); opacity: .5; margin-top: 2px; }
 .mc-badge { font-size: 10px; padding: 2px 7px; border-radius: 8px; background: rgba(111, 207, 151, .14); color: #6fcf97; flex-shrink: 0; }
+.mc-badge.warn { background: rgba(255, 180, 120, .18); color: #ffc98a; }
 .mc-desc {
   font-size: calc(12px * var(--font-scale)); opacity: .65; line-height: 1.5; min-height: 34px;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
@@ -1616,9 +1679,28 @@ onBeforeUnmount(() => {
 .mm-tab { padding: 5px 12px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, .12); background: transparent; color: inherit; cursor: pointer; font-size: 12px; }
 .mm-tab:hover { background: rgba(255, 255, 255, .06); }
 .mm-tab.active { background: rgba(var(--accent-rgb, 120, 140, 255), .2); border-color: rgba(var(--accent-rgb, 120, 140, 255), .5); color: var(--accent-light, #9db4ff); }
-.mm-hint { font-size: 12px; opacity: .55; }
+.mm-hint-row { display: flex; align-items: center; gap: 10px; }
+.mm-hint { flex: 1; font-size: 12px; opacity: .55; }
+.mm-upload-filter {
+  display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+  font-size: calc(12px * var(--font-scale)); opacity: .8;
+  cursor: pointer; user-select: none; white-space: nowrap;
+}
+.mm-upload-filter input { cursor: pointer; accent-color: rgb(var(--accent-rgb, 120, 140, 255)); }
 .mm-empty { text-align: center; opacity: .5; padding: 30px 0; font-size: 13px; }
 .mm-list { display: flex; flex-direction: column; gap: 6px; }
+/* 上传弹窗：固定尺寸 + 固定高度列表区，切换资源类型时弹窗不跳动 */
+.mk-modal-upload { height: min(560px, 78vh); }
+.mm-body-fixed { overflow: hidden; }
+.mm-list-wrap {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column; gap: 6px;
+  transition: opacity .16s ease;
+}
+.mm-list-wrap.is-loading { opacity: .4; pointer-events: none; }
+.mm-list-wrap > .mm-empty { margin: auto 0; }
+.mm-fade-enter-active, .mm-fade-leave-active { transition: opacity .16s ease; }
+.mm-fade-enter-from, .mm-fade-leave-to { opacity: 0; }
 .mm-item {
   display: flex; align-items: flex-start; gap: 10px; padding: 9px 11px;
   border: 1px solid rgba(255, 255, 255, .1); border-radius: 8px; cursor: pointer;
@@ -1627,7 +1709,14 @@ onBeforeUnmount(() => {
 .mm-item.checked { border-color: rgba(var(--accent-rgb, 120, 140, 255), .55); background: rgba(var(--accent-rgb, 120, 140, 255), .12); }
 .mm-item input { margin-top: 3px; }
 .mm-item-body { min-width: 0; }
-.mm-item-name { font-size: 13px; font-weight: 600; }
+.mm-item-name { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+.mm-badge {
+  font-size: calc(10px * var(--font-scale)); font-weight: 400;
+  padding: 1px 6px; border-radius: 5px; line-height: 1.4; white-space: nowrap;
+  background: rgba(120, 220, 170, .16);
+  border: 1px solid rgba(120, 220, 170, .4);
+  color: #9be8c3;
+}
 .mm-item-desc { font-size: 11px; opacity: .55; margin-top: 2px; }
 .mm-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid rgba(255, 255, 255, .09); flex-shrink: 0; }
 .mm-push-check {
