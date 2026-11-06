@@ -268,6 +268,229 @@ def list_items(kind: str = "", q: str = ""):
 
 
 # ==============================================================
+# 资源预览
+# ==============================================================
+@router.get("/item/{kind}/{item_id}")
+def preview_item(kind: str, item_id: str):
+    """获取单个市场资源的详情预览：按需拉取资源目录（如未缓存），再解析。"""
+    item = _find_item(kind, item_id)
+    if not item:
+        raise HTTPException(404, f"市场中未找到资源：{kind}/{item_id}")
+
+    # 按需拉取（如果还没缓存）
+    try:
+        folder = market_sync.ensure_item_local(kind, item_id)
+    except Exception as e:
+        raise HTTPException(502, f"拉取资源失败：{e}")
+    if not folder.exists():
+        raise HTTPException(404, f"资源目录不存在：{folder}")
+
+    # 文件列表（递归，排除大文件和二进制）
+    files: list[dict] = []
+    for p in sorted(folder.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(folder).as_posix()
+        size = p.stat().st_size
+        files.append({"path": rel, "size": size})
+
+    # 按 kind 解析预览内容
+    preview = _parse_preview(item, folder)
+    return {"item": item, "files": files, "preview": preview}
+
+
+def _parse_preview(item: dict, folder: Path) -> dict:
+    """根据资源类型解析关键文件，返回结构化预览数据。"""
+    kind = item.get("kind")
+    out: dict = {"kind": kind}
+    if kind == "agent":
+        out["agent"] = _parse_agent(folder / (item.get("file") or "agent.json"))
+    elif kind == "canvas":
+        out["canvas"] = _parse_canvas(folder / (item.get("file") or "canvas.json"))
+    elif kind == "background":
+        out["background"] = _parse_background(folder / "manifest.json", folder)
+    elif kind == "skill":
+        out["skill"] = _parse_skill(folder / "SKILL.md")
+    elif kind == "plugin":
+        out["plugin"] = _parse_plugin(folder / "manifest.yaml", folder)
+    elif kind == "extension":
+        out["extension"] = _parse_extension(folder / "manifest.json", folder)
+    return out
+
+
+def _safe_read_text(path: Path, max_chars: int = 200_000) -> str:
+    try:
+        txt = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    if len(txt) > max_chars:
+        txt = txt[:max_chars] + "\n…（文件过大，已截断）"
+    return txt
+
+
+def _parse_agent(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(_safe_read_text(path))
+    except Exception:
+        return {"error": "无法解析 agent.json"}
+    return {
+        "system_prompt": raw.get("system_prompt", ""),
+        "model": raw.get("model", ""),
+        "commands": raw.get("commands", []) or [],
+        "tools": raw.get("tools", []) or [],
+        "skills": raw.get("skills", []) or [],
+        "interface_id": raw.get("interface_id"),
+        "trigger": raw.get("trigger", {}),
+        "max_tool_rounds": raw.get("max_tool_rounds"),
+        "workflow_mode": raw.get("workflow_mode", ""),
+        "perception_scope": raw.get("perception_scope", ""),
+        "reasoning_level": raw.get("reasoning_level", ""),
+        "raw_keys": sorted(raw.keys()),
+    }
+
+
+def _parse_canvas(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(_safe_read_text(path))
+    except Exception:
+        return {"error": "无法解析 canvas.json"}
+    agents = raw.get("agents") or []
+    nodes = raw.get("nodes") or []
+    edges = raw.get("edges") or []
+    agent_groups = raw.get("agent_groups") or []
+    return {
+        "execution_mode": raw.get("execution_mode", "serial"),
+        "agent_count": len(agents),
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "agent_group_count": len(agent_groups),
+        "agents": [
+            {
+                "name": a.get("name", ""),
+                "description": a.get("description", ""),
+                "model": a.get("model", ""),
+                "group_name": a.get("group_name", ""),
+                "commands": (a.get("commands") or [])[:8],
+                "tool_count": len(a.get("tools") or []),
+            }
+            for a in agents
+        ],
+        "nodes": [
+            {
+                "id": n.get("id"),
+                "agent_ref": n.get("agent_ref", ""),
+                "x": n.get("x", 0), "y": n.get("y", 0),
+            }
+            for n in nodes
+        ],
+        "edges": [
+            {
+                "from_node": e.get("from_node") or e.get("source_node"),
+                "to_node": e.get("to_node") or e.get("target_node"),
+                "type": e.get("type", ""),
+            }
+            for e in edges
+        ],
+        "nodes_raw": nodes,
+    }
+
+
+def _parse_background(manifest_path: Path, folder: Path) -> dict:
+    out: dict = {}
+    if manifest_path.exists():
+        try:
+            mf = json.loads(_safe_read_text(manifest_path))
+            out.update(mf)
+        except Exception:
+            pass
+    # 如果有 background.html，尝试内联引用
+    entry = out.get("entry") or "background.html"
+    entry_path = folder / entry
+    if entry_path.exists():
+        content = _safe_read_text(entry_path, max_chars=50_000)
+        # 只保留 <body> 或 <style> 部分
+        out["entry_file"] = entry
+        out["entry_content"] = content
+        out["entry_size"] = entry_path.stat().st_size
+    return out
+
+
+def _parse_skill(skill_md_path: Path) -> dict:
+    content = _safe_read_text(skill_md_path, max_chars=80_000)
+    fm: dict = {}
+    body = content
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end > 0:
+            fm_text = content[3:end]
+            body = content[end + 4:]
+            try:
+                import yaml
+                fm = yaml.safe_load(fm_text) or {}
+            except Exception:
+                pass
+    return {
+        "frontmatter": fm,
+        "body": body.strip(),
+        "total_chars": len(content),
+    }
+
+
+def _parse_plugin(manifest_path: Path, folder: Path) -> dict:
+    meta: dict = {}
+    if manifest_path.exists():
+        meta = _yaml_load(manifest_path) or {}
+    # 读取 tool.yaml / tool.py 作为预览
+    tool_yaml = folder / "tool.yaml"
+    tool_info: dict = {}
+    if tool_yaml.exists():
+        try:
+            import yaml as _yaml
+            tool_info = _yaml.safe_load(_safe_read_text(tool_yaml, max_chars=30_000)) or {}
+        except Exception:
+            pass
+    tool_py = folder / "tool.py"
+    tool_source = ""
+    if tool_py.exists():
+        tool_source = _safe_read_text(tool_py, max_chars=15_000)
+    return {
+        "meta": meta,
+        "tool_info": tool_info,
+        "tool_source": tool_source,
+    }
+
+
+def _parse_extension(manifest_path: Path, folder: Path) -> dict:
+    meta: dict = {}
+    if manifest_path.exists():
+        try:
+            meta = json.loads(_safe_read_text(manifest_path))
+        except Exception:
+            pass
+    # 读 README 作为说明
+    readme_content = ""
+    for name in ("README.md", "README", "readme.md"):
+        p = folder / name
+        if p.exists():
+            readme_content = _safe_read_text(p, max_chars=50_000)
+            break
+    # backend.py 作为后端代码预览
+    backend_content = ""
+    bp = folder / "backend.py"
+    if bp.exists():
+        backend_content = _safe_read_text(bp, max_chars=15_000)
+    return {
+        "meta": meta,
+        "readme": readme_content,
+        "backend_code": backend_content,
+    }
+
+
+# ==============================================================
 # 远程仓库配置 / 同步 / 推送
 # ==============================================================
 @router.get("/config")
@@ -362,9 +585,25 @@ def push(payload: dict | None = None):
 def install(payload: dict):
     kind = (payload.get("kind") or "").strip()
     item_id = _safe_id((payload.get("id") or "").strip())
+    requested_version = (payload.get("version") or "").strip()  # 可选：装指定版本
     item = _find_item(kind, item_id)
     if not item:
         raise HTTPException(404, f"市场中未找到资源：{kind}/{item_id}")
+
+    # 如果指定了旧版本，从 versions 数组里找
+    if requested_version and requested_version != item.get("version"):
+        target = next(
+            (v for v in (item.get("versions") or [])
+             if v.get("version") == requested_version), None)
+        if not target:
+            raise HTTPException(404, f"该资源不存在版本 {requested_version}")
+        item = {**target, "dir": target.get("dir") or _versioned_dir(item.get("dir", ""), requested_version)}
+
+    # 按需拉取（如未缓存）
+    try:
+        market_sync.ensure_item_local(kind, item_id, requested_version=requested_version)
+    except Exception as e:
+        raise HTTPException(502, f"拉取资源失败：{e}")
 
     if kind == "agent":
         return _install_agent(item)
@@ -375,6 +614,17 @@ def install(payload: dict):
     if kind in ("background", "skill", "plugin"):
         return _install_directory(item)
     raise HTTPException(400, f"不支持的资源类型：{kind}")
+
+
+def _versioned_dir(dir_path: str, version: str) -> str:
+    """把 ``agents/ppt`` 变成 ``agents/ppt@1.0.0``（旧版备份目录规则）。"""
+    if "@" in dir_path.split("/")[-1]:
+        return dir_path  # 已是 @version 形式
+    if not version:
+        return dir_path
+    parent, name = dir_path.rsplit("/", 1) if "/" in dir_path else ("", dir_path)
+    new_name = f"{name}@{version}"
+    return f"{parent}/{new_name}" if parent else new_name
 
 
 def _install_agent(item: dict) -> dict:
@@ -397,32 +647,72 @@ def _install_canvas(item: dict) -> dict:
         raise HTTPException(500, f"市场资源文件缺失：{src}")
     raw = json.loads(src.read_text(encoding="utf-8"))
 
-    # 市场画布内联了节点引用的智能体快照：按名称复用本地已有智能体，缺失则创建
-    local_agents = store.load("agents")
-    by_name = {a.get("name"): a.get("id") for a in local_agents}
-    ref_to_id: dict[str, int] = {}
+    # —— 第一步：先安装/复用 agent_groups（按 name 匹配，建立 group_name → 本地 group_id 映射）——
+    local_groups = store.load("agent_groups")
+    group_by_name: dict[str, int] = {g.get("name"): int(g.get("id")) for g in local_groups}
+    created_groups: list[str] = []
+    for gsnap in raw.get("agent_groups") or []:
+        gname = gsnap.get("name")
+        if not gname:
+            continue
+        if gname in group_by_name:
+            continue
+        grec = {
+            "name": gname,
+            "description": gsnap.get("description", ""),
+            "id": store.next_id("agent_groups"),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        store.upsert("agent_groups", grec)
+        group_by_name[gname] = grec["id"]
+        created_groups.append(gname)
+
+    # —— 第二步：安装智能体 ——
+    # 新版格式：画布目录下 agents/<slug>/agent.json；
+    # 旧版格式（向后兼容）：智能体快照打包在 canvas.json.agents 里。
+    # 优先读 agents/ 子目录，空时回退 canvas.json.agents。
+    agents_dir = _item_dir(item) / "agents"
+    snaps_from_dir: list[dict] = []
+    if agents_dir.is_dir():
+        for a_file in sorted(agents_dir.rglob("agent.json")):
+            try:
+                snap = json.loads(a_file.read_text(encoding="utf-8"))
+                if isinstance(snap, dict):
+                    snaps_from_dir.append(snap)
+            except Exception:
+                continue
+    agent_snaps = snaps_from_dir or (raw.get("agents") or [])
+
+    # 核心原则：**不依赖名称匹配本地任何已有智能体**。画布中每个智能体快照
+    # 一律新建（分配全新本地 id），节点里的 agent_ref 字符串翻译到新 id。
+    # 这样用户下载的画布永远拿到市场上那一套，不会意外绑到自己旧的同名智能体。
+    ref_to_id: dict[str, int] = {}  # agent_ref(name) → 新分配的本地 agent_id
     created: list[str] = []
-    for snap in raw.get("agents") or []:
+    for snap in agent_snaps:
         name = snap.get("name")
         if not name:
             continue
-        if name in by_name:
-            ref_to_id[name] = int(by_name[name])
-            continue
+        # 快照里 group_id 已被发布侧剥离；有 group_name 时映射到本地 group_id
+        new_group_id: int | None = None
+        gname = snap.get("group_name")
+        if gname:
+            new_group_id = group_by_name.get(gname)   # 可能是 None（组不存在时）
         rec = {k: v for k, v in snap.items()
-               if k not in ("id", "created_at", "sort_order", "group_id")}
+               if k not in ("id", "created_at", "sort_order", "group_id", "group_name")}
         rec["id"] = store.next_id("agents")
         rec["created_at"] = datetime.utcnow().isoformat()
+        rec["group_id"] = new_group_id
         rec.setdefault("enabled", True)
         store.upsert("agents", rec)
         ref_to_id[name] = rec["id"]
         created.append(name)
 
+    # —— 第三步：构建画布节点，把市场里的 agent_ref 翻译成新分配的本地 id ——
     nodes = []
     skipped = 0
     for n in raw.get("nodes") or []:
         ref = n.get("agent_ref")
-        aid = ref_to_id.get(ref) if ref else n.get("agent_id")
+        aid = ref_to_id.get(ref) if ref else None
         if aid is None:
             skipped += 1
             continue
@@ -441,8 +731,12 @@ def _install_canvas(item: dict) -> dict:
         "ws_pin": None,
     }
     store.upsert("canvases", rec)
-    return {"ok": True, "kind": "canvas", "id": rec["id"], "name": rec["name"],
-            "created_agents": created, "skipped_nodes": skipped}
+    return {
+        "ok": True, "kind": "canvas", "id": rec["id"], "name": rec["name"],
+        "created_agents": created,
+        "skipped_nodes": skipped,
+        "created_agent_groups": created_groups,
+    }
 
 
 def _install_directory(item: dict) -> dict:
@@ -485,11 +779,47 @@ def _install_extension(item: dict) -> dict:
 
 
 # ==============================================================
-# 删除市场资源
+# "我的发布"筛选 + 下架（删除 + 可选远程推送）
+# ==============================================================
+@router.get("/my-items")
+def my_items(q: str = ""):
+    """返回当前登录 GitHub 用户发布的市场条目（author == login；未登录则 author == 'AgentCluster'）。"""
+    login = github_auth.get_login()
+    if not login:
+        # 未登录 —— 也可以返回 author='AgentCluster'（本机默认作者），
+        # 但这是系统保留作者，一般不是用户自己发布的。直接返回空。
+        return {"kind": "all", "total": 0, "items": [], "updated_at": _load_index().get("updated_at")}
+
+    all_items = list(_load_index().get("items", []))
+    items = [it for it in all_items if (it.get("author") or "") == login]
+
+    keyword = (q or "").strip().lower()
+    if keyword:
+        def _hit(it: dict) -> bool:
+            hay = " ".join([
+                str(it.get("name", "")), str(it.get("description", "")),
+                str(it.get("id", "")), " ".join(str(t) for t in (it.get("tags") or [])),
+            ]).lower()
+            return keyword in hay
+        items = [it for it in items if _hit(it)]
+
+    items.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
+    _installed_state(items)
+    return {
+        "kind": "all",
+        "total": len(items),
+        "items": items,
+        "updated_at": _load_index().get("updated_at"),
+        "mine": True,
+    }
+
+
+# ==============================================================
+# 删除市场资源 / 下架
 # ==============================================================
 @router.delete("/items/{kind}/{item_id}")
-def delete_item(kind: str, item_id: str):
-    """删除市场条目及其资源目录（不影响本机已安装副本）。"""
+def delete_item(kind: str, item_id: str, push: bool = False):
+    """删除市场条目及其资源目录（不影响本机已安装副本）。push=True 时同时提交推送到远程仓库。"""
     item_id = _safe_id(item_id)
     item = _find_item(kind, item_id)
     if not item:
@@ -512,7 +842,24 @@ def delete_item(kind: str, item_id: str):
     data["items"] = [it for it in data.get("items", [])
                      if not (it.get("kind") == kind and it.get("id") == item_id)]
     _write_index(data)
-    return {"ok": True, "kind": kind, "id": item_id, "name": item.get("name")}
+
+    result = {"ok": True, "kind": kind, "id": item_id, "name": item.get("name")}
+
+    # 可选：推送到远程仓库（官方仓库；镜像只读不支持 push）
+    if push:
+        if not github_auth.get_token():
+            result["push_error"] = "请先登录 GitHub 账号后再远程下架"
+        else:
+            if not _push_lock.acquire(blocking=False):
+                result["push_error"] = "已有推送任务进行中，请稍候"
+            else:
+                try:
+                    result["push"] = market_sync.push_market(f"unpublish {kind}/{item_id}")
+                except Exception as e:
+                    result["push_error"] = str(e)
+                finally:
+                    _push_lock.release()
+    return result
 
 
 # ==============================================================
@@ -585,12 +932,28 @@ def publish(payload: dict):
     local_id = str(payload.get("id") or "").strip()
     if not local_id:
         raise HTTPException(400, "缺少资源 id")
+
+    # 版本号：显式指定优先，否则按同资源最新版本自动 +patch
+    requested_version = (payload.get("version") or "").strip()
+    if not requested_version:
+        idx = _load_index(force=True).get("items", [])
+        latest = next((it for it in idx
+                       if it.get("kind") == kind and it.get("id") == local_id), None)
+        # 从 versions 数组里找真正最新的
+        real_latest = None
+        if latest:
+            real_latest = latest
+            for v in (latest.get("versions") or []):
+                if _version_tuple(v.get("version", "0")) > _version_tuple(real_latest.get("version", "0")):
+                    real_latest = v
+        requested_version = _next_version(real_latest.get("version") if real_latest else None)
+
     if kind == "agent":
-        result = _publish_agent(local_id)
+        result = _publish_agent(local_id, version=requested_version)
     elif kind == "canvas":
-        result = _publish_canvas(local_id)
+        result = _publish_canvas(local_id, version=requested_version)
     elif kind in ("background", "skill", "plugin", "extension"):
-        result = _publish_directory(kind, local_id)
+        result = _publish_directory(kind, local_id, version=requested_version)
     else:
         raise HTTPException(400, f"不支持的资源类型：{kind}")
 
@@ -600,25 +963,215 @@ def publish(payload: dict):
             result["push_error"] = "请先登录 GitHub 账号后再推送到远程仓库"
         else:
             try:
-                result["push"] = market_sync.push_market(f"publish {kind}/{local_id}")
+                result["push"] = market_sync.push_market(
+                    f"publish {kind}/{local_id} v{requested_version}")
             except Exception as e:
                 result["push_error"] = str(e)
     return result
 
 
+@router.get("/item/{kind}/{item_id}/versions")
+def item_versions(kind: str, item_id: str):
+    """返回某个资源的所有历史版本（含最新）。"""
+    item = _find_item(kind, item_id)
+    if not item:
+        raise HTTPException(404, f"市场中未找到资源：{kind}/{item_id}")
+    versions = [dict(item)]
+    for v in (item.get("versions") or []):
+        versions.append(dict(v))
+    # 去重（同 version 取最新）
+    seen: dict = {}
+    for v in versions:
+        seen[v.get("version", "")] = v
+    out = sorted(seen.values(),
+                 key=lambda x: _version_tuple(x.get("version", "0")), reverse=True)
+    # 标记 latest
+    if out:
+        out[0]["latest"] = True
+    return {
+        "kind": kind,
+        "id": item_id,
+        "name": item.get("name"),
+        "latest_version": item.get("version"),
+        "total": len(out),
+        "versions": out,
+    }
+
+
+# ==============================================================
+# 缓存管理（按需拉取后的本地资源目录）
+# ==============================================================
+@router.get("/cache/overview")
+def cache_overview():
+    """返回 market/ 目录的缓存概况（空间占用、文件数、.git 状态等）。"""
+    return market_sync.market_cache_overview()
+
+
+@router.post("/cache/clean")
+def cache_clean(payload: dict | None = None):
+    """清理 market/ 目录下的资源缓存 + 独立的 archive zip 持久化缓存。
+
+    默认保留 index.json 但清除 .git 和 zip。
+    清理后资源列表/预览/安装会按需重新拉取（zip 会重新下载，约 40s）。
+    """
+    payload = payload or {}
+    preserve_index = bool(payload.get("preserve_index", True))
+    preserve_git = bool(payload.get("preserve_git", False))
+    clean_zip = bool(payload.get("clean_zip", True))
+
+    result = market_sync.clean_market_cache(
+        preserve_index=preserve_index, preserve_git=preserve_git,
+    )
+    if clean_zip:
+        result["zip"] = market_sync.clean_zip_cache()
+        result["freed_bytes"] += result["zip"].get("freed_bytes", 0)
+    result["overview_after"] = market_sync.market_cache_overview()
+    return result
+
+
+@router.get("/cache/item/{kind}/{item_id}")
+def cache_item_status(kind: str, item_id: str):
+    """查询单个资源在本地的缓存状态。"""
+    status = market_sync.get_item_cache_status(kind, item_id)
+    return status
+
+
 def _save_item(item: dict) -> dict:
-    """把一条市场资源写入索引（同 kind + id 视为更新，其余条目原样保留）。"""
+    """把一条市场资源写入索引。
+
+    同 kind + id 已存在时：
+    - 如果 version 相同（同版本重复发布）→ 原地覆盖（简单更新）
+    - 如果 version 不同（新版本）→ 旧条目作为历史挂到 ``versions`` 数组里，
+      旧目录改名追加 ``@<旧version>`` 后缀保留；新条目替换到顶层作为最新
+    """
     data = _load_index(force=True)
-    items = [it for it in data.get("items", [])
-             if not (it.get("kind") == item.get("kind") and it.get("id") == item.get("id"))]
-    items.append(item)
+    items = data.get("items", [])
+    existing = next((it for it in items
+                     if it.get("kind") == item.get("kind") and it.get("id") == item.get("id")), None)
+
+    if not existing:
+        items.append(item)
+    elif existing.get("version") == item.get("version"):
+        # 同版本原地覆盖
+        idx = items.index(existing)
+        items[idx] = item
+    else:
+        # 新版本 → 旧版挂 versions，旧目录改名保留
+        _archive_old_version(existing, item)
+        idx = items.index(existing)
+        # 顶层：只保留最新条目；versions 数组挂在它上面
+        merged = {**item}
+        merged["versions"] = _merge_versions_list(existing, merged)
+        items[idx] = merged
+
     items.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
     data["items"] = items
     _write_index(data)
     return item
 
 
-def _publish_agent(local_id: str) -> dict:
+def _archive_old_version(old: dict, new: dict) -> None:
+    """把旧版本目录 ``xxx/ppt`` 改名成 ``xxx/ppt@1.0.0`` 备份，供用户选旧版安装。"""
+    old_dir = old.get("dir")
+    new_dir = new.get("dir")
+    if not old_dir or old_dir == new_dir:
+        return
+    old_version = old.get("version", "old")
+    src = MARKET_ROOT / old_dir
+    if src.exists() and src.is_dir():
+        backup = src.parent / f"{src.name}@{old_version}"
+        try:
+            src.rename(backup)
+        except OSError:
+            # 目标已存在或其他异常 → 直接删除，旧版内容丢弃（索引里还留着条目指向它）
+            import shutil as _sh
+            _sh.rmtree(src, ignore_errors=True)
+
+
+def _merge_versions_list(old_item: dict, new_item: dict) -> list:
+    """把旧条目和它自带的 versions 数组合并，再追加当前 latest。
+
+    历史条目的 dir 会自动改写为 ``原 dir@version`` 形式（匹配 _archive_old_version 的备份规则）。
+    """
+    versions: list = []
+    # 旧条目上的 versions（可能已被多次追加）
+    for v in (old_item.get("versions") or []):
+        vv = dict(v)
+        _ensure_versioned_dir(vv)
+        versions.append(vv)
+    # 旧条目本身（现在成了历史）
+    old_entry = {k: v for k, v in old_item.items()
+                 if k not in ("versions",)}
+    if old_entry.get("version"):
+        _ensure_versioned_dir(old_entry, base_dir=new_item.get("dir"))
+        versions.append(old_entry)
+    # 新版本条目作为最新
+    new_entry = {k: v for k, v in new_item.items()
+                 if k not in ("versions",)}
+    if new_entry.get("version"):
+        versions.append(new_entry)
+    # 按版本倒序（最新在前）
+    def _ver_key(v: dict) -> tuple:
+        return _version_tuple(v.get("version", "0"))
+    versions.sort(key=_ver_key, reverse=True)
+    return versions
+
+
+def _ensure_versioned_dir(v: dict, base_dir: str | None = None) -> None:
+    """确保历史条目的 dir 指向 ``@version`` 备份目录。"""
+    vver = v.get("version") or ""
+    vdir = v.get("dir") or ""
+    if vdir and vver and "@" not in vdir.rsplit("/", 1)[-1]:
+        v["dir"] = _versioned_dir(vdir, vver)
+    elif not vdir and base_dir and vver:
+        v["dir"] = _versioned_dir(base_dir, vver)
+
+
+def _version_tuple(v: str) -> tuple:
+    """把 '1.2.3' 拆成 (1,2,3)，非数字段放后面避免异常。"""
+    parts = []
+    for p in str(v).split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(p)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _next_version(latest_version: str | None) -> str:
+    """给定最新版本号，默认自动递增 patch：1.0.0 → 1.0.1。"""
+    if not latest_version:
+        return "1.0.0"
+    parts = [0, 0, 0]
+    for i, p in enumerate(str(latest_version).split(".")[:3]):
+        try:
+            parts[i] = int(p)
+        except ValueError:
+            parts[i] = 0
+    parts[2] += 1
+    return ".".join(str(x) for x in parts)
+
+
+def _safe_author() -> str:
+    """取当前登录 GitHub 账号作为作者；未登录时回退为 AgentCluster。"""
+    return github_auth.get_login() or "AgentCluster"
+
+
+# 发布到市场时要剥掉的智能体私有字段（模型配置因人而异，不应传播）
+_AGENT_PRIVATE_FIELDS = (
+    "id", "created_at", "sort_order", "group_id", "group_name",
+    "model", "model_interface_id", "interface_id",
+)
+
+
+def _strip_agent_private(agent: dict) -> dict:
+    """剥离智能体里不该上市场的字段（模型名、接口 id 等本地配置）。"""
+    return {k: v for k, v in agent.items() if k not in _AGENT_PRIVATE_FIELDS}
+
+
+def _publish_agent(local_id: str, version: str = "1.0.0") -> dict:
     try:
         aid = int(local_id)
     except ValueError:
@@ -629,12 +1182,14 @@ def _publish_agent(local_id: str) -> dict:
     slug = _slugify(agent.get("name", ""), f"agent-{aid}")
     dest = MARKET_ROOT / "agents" / slug
     dest.mkdir(parents=True, exist_ok=True)
+    # 剥离模型/接口等本地私有配置（不同用户模型接口不同，不应传播）
+    stripped = _strip_agent_private(agent)
     (dest / "agent.json").write_text(
-        json.dumps(agent, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(stripped, ensure_ascii=False, indent=2), encoding="utf-8")
     item = {
         "kind": "agent", "id": slug, "name": agent.get("name", slug),
-        "description": agent.get("description", ""), "version": "1.0.0",
-        "author": "AgentCluster", "icon": "🤖",
+        "description": agent.get("description", ""), "version": version,
+        "author": _safe_author(), "icon": "🤖",
         "tags": [str(t) for t in (agent.get("tags") or [])],
         "dir": f"agents/{slug}", "file": "agent.json", "updated_at": _now(),
         "origin_agent_id": aid,
@@ -643,7 +1198,7 @@ def _publish_agent(local_id: str) -> dict:
     return {"ok": True, "item": item}
 
 
-def _publish_canvas(local_id: str) -> dict:
+def _publish_canvas(local_id: str, version: str = "1.0.0") -> dict:
     try:
         cid = int(local_id)
     except ValueError:
@@ -653,45 +1208,102 @@ def _publish_canvas(local_id: str) -> dict:
         raise HTTPException(404, f"本机画布不存在：{cid}")
 
     agents = {a.get("id"): a for a in store.load("agents")}
-    refs: list[dict] = []
-    seen: set[int] = set()
+    agent_groups = {g.get("id"): g for g in store.load("agent_groups")}
+
+    # —— 收集画布引用的智能体 + 分组 ——
+    seen_agent_ids: set[int] = set()
+    group_ids_seen: set[int] = set()
     nodes = []
     for n in canvas.get("nodes") or []:
         a = agents.get(n.get("agent_id"))
         ref = a.get("name") if a else "未知智能体"
         nodes.append({"id": n.get("id"), "agent_ref": ref,
                       "x": n.get("x", 0), "y": n.get("y", 0)})
-        if a and n.get("agent_id") not in seen:
-            seen.add(n.get("agent_id"))
-            refs.append({k: v for k, v in a.items()
-                         if k not in ("id", "created_at", "sort_order", "group_id")})
+        if a and n.get("agent_id") not in seen_agent_ids:
+            seen_agent_ids.add(n.get("agent_id"))
+            gid = a.get("group_id")
+            if gid is not None and gid in agent_groups:
+                group_ids_seen.add(gid)
 
+    # —— 画布目录：canvas.json + agents/*/agent.json + agent_groups.json ——
     slug = _slugify(canvas.get("name", ""), f"canvas-{cid}")
     dest = MARKET_ROOT / "canvases" / slug
+    # 先清理旧格式（重新发布覆盖）
+    if dest.exists():
+        try:
+            shutil.rmtree(dest)
+        except OSError:
+            pass
     dest.mkdir(parents=True, exist_ok=True)
-    payload = {
+
+    # 1. canvas.json —— 只存画布结构（节点/连线/模式），不含智能体快照
+    canvas_payload = {
         "name": canvas.get("name") or slug,
         "description": canvas.get("description", ""),
         "nodes": nodes,
         "edges": canvas.get("edges") or [],
         "execution_mode": canvas.get("execution_mode", "serial"),
-        "agents": refs,
+        # 保留 agents 快照字段（旧版画布兼容 + 便于预览端无额外 IO）
+        "agents": [],
+        "agent_groups": [],
     }
+
+    # 2. agents/<slug>/agent.json —— 每个智能体独立子目录
+    agents_dir = dest / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    agent_snapshots: list[dict] = []  # 也塞进 canvas.json.agents 便于预览
+    for agent_id in sorted(seen_agent_ids):
+        a = agents.get(agent_id)
+        if not a:
+            continue
+        snap = _strip_agent_private(a)
+        gid = a.get("group_id")
+        if gid is not None and gid in agent_groups:
+            snap["group_name"] = agent_groups[gid].get("name", "")
+        agent_snapshots.append(snap)
+
+        # 每个智能体写独立子目录
+        agent_slug = _slugify(a.get("name", ""), f"agent-{agent_id}")
+        a_dir = agents_dir / agent_slug
+        a_dir.mkdir(exist_ok=True)
+        (a_dir / "agent.json").write_text(
+            json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 3. agent_groups.json —— 分组快照独立文件（画布内节点不会引用分组 id，只是描述性信息）
+    groups_payload: list[dict] = []
+    for gid in sorted(group_ids_seen):
+        g = agent_groups.get(gid)
+        if g:
+            groups_payload.append({
+                "name": g.get("name"),
+                "description": g.get("description", ""),
+            })
+    if groups_payload:
+        (dest / "agent_groups.json").write_text(
+            json.dumps(groups_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # canvas.json 里也塞一份 agents/agent_groups（方便无额外 IO 就能解析）
+    canvas_payload["agents"] = agent_snapshots
+    canvas_payload["agent_groups"] = groups_payload
     (dest / "canvas.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(canvas_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
     item = {
-        "kind": "canvas", "id": slug, "name": payload["name"],
-        "description": payload["description"], "version": "1.0.0",
-        "author": "AgentCluster", "icon": "🗺",
-        "tags": [f"{len(nodes)} 节点"], "dir": f"canvases/{slug}",
+        "kind": "canvas", "id": slug, "name": canvas_payload["name"],
+        "description": canvas_payload["description"], "version": version,
+        "author": _safe_author(), "icon": "🗺",
+        "tags": [f"{len(nodes)} 节点", f"{len(agent_snapshots)} 智能体"],
+        "dir": f"canvases/{slug}",
         "file": "canvas.json", "updated_at": _now(), "origin_canvas_id": cid,
-        "agent_count": len(refs),
+        "agent_count": len(agent_snapshots),
+        "agent_group_count": len(groups_payload),
+        "has_agents_dir": True,
     }
     _save_item(item)
     return {"ok": True, "item": item}
 
 
-def _publish_directory(kind: str, local_id: str) -> dict:
+def _publish_directory(kind: str, local_id: str, version: str = "1.0.0") -> dict:
     folder = {"background": "backgrounds", "skill": "skills",
               "plugin": "plugins", "extension": "extensions"}[kind]
     src = store.ROOT / folder / local_id
@@ -699,7 +1311,7 @@ def _publish_directory(kind: str, local_id: str) -> dict:
         raise HTTPException(404, f"本机资源不存在：{src}")
 
     item: dict = {"kind": kind, "id": local_id, "dir": f"{folder}/{local_id}",
-                  "updated_at": _now(), "version": "1.0.0", "author": "AgentCluster"}
+                  "updated_at": _now(), "version": version, "author": _safe_author()}
 
     if kind == "background":
         mf = src / "manifest.json"
@@ -713,7 +1325,7 @@ def _publish_directory(kind: str, local_id: str) -> dict:
         item.update(name=fm.get("label") or fm.get("name") or local_id,
                     description=str(fm.get("description", "")).split("\n")[0][:300],
                     version=str(fm.get("version", "1.0.0")),
-                    author=fm.get("author", "AgentCluster"), icon="🧠",
+                    author=fm.get("author", _safe_author()), icon="🧠",
                     tags=[str(t) for t in (fm.get("tags") or [])],
                     label=fm.get("label"), skill_name=fm.get("name", local_id))
     elif kind == "plugin":
@@ -721,7 +1333,7 @@ def _publish_directory(kind: str, local_id: str) -> dict:
         item.update(name=_localized(meta.get("label")) or local_id,
                     description=_localized(meta.get("description")),
                     version=str(meta.get("version", "1.0.0")),
-                    author=meta.get("author", "AgentCluster"),
+                    author=meta.get("author", _safe_author()),
                     icon=meta.get("icon") or "🔧",
                     tags=[str(t) for t in (meta.get("tags") or [])])
     else:  # extension
@@ -729,7 +1341,7 @@ def _publish_directory(kind: str, local_id: str) -> dict:
         meta = json.loads(mf.read_text(encoding="utf-8")) if mf.exists() else {}
         item.update(name=meta.get("name", local_id), description=meta.get("description", ""),
                     version=str(meta.get("version", "1.0.0")),
-                    author=meta.get("author", "AgentCluster"),
+                    author=meta.get("author", _safe_author()),
                     icon=meta.get("icon") or "🧩",
                     tags=[str(t) for t in (meta.get("tags") or [])],
                     ext_type=meta.get("type"), source="builtin",
