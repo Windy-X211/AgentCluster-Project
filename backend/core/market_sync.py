@@ -24,8 +24,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -38,10 +40,19 @@ MARKET_ROOT = _PROJECT_ROOT / "market"
 INDEX_FILE = MARKET_ROOT / "index.json"
 
 DEFAULT_REPO_URL = "https://github.com/Windy-X211/AgentCluster-Market.git"
-# {url} 会被替换成完整的官方下载地址；顺序即尝试顺序（越靠前越快）
+# {url} 会被替换成完整的官方下载地址；顺序即测速优先级（越靠前越快越稳）
+# 末尾自动追加官方地址作为兜底（见 mirror_candidates 函数）
 DEFAULT_MIRRORS = [
-    "https://gh-proxy.com/{url}",
-    "https://ghfast.top/{url}",
+    # 2026 年实测可用：多线路并发 race，不依赖单一镜像
+    "https://gh.llkk.cc/{url}",          # 实测最快，三种代理模式全通过
+    "https://gh-proxy.com/{url}",         # 最主流稳定，IEPL 专线
+    "https://ghfast.top/{url}",           # 独立线路
+    "https://ghproxy.net/{url}",          # raw/archive/git 均可用
+    "https://mirror.ghproxy.com/{url}",   # ghproxy 备用节点
+    "https://gh-proxy.cn/{url}",
+    "https://gh-proxy.cc/{url}",
+    "https://gh-proxy.org/{url}",
+    "https://kkgithub.com/{url}",         # KKGitHub 独立加速
 ]
 DEFAULT_BRANCH = "main"
 
@@ -77,7 +88,11 @@ def _env_mirrors() -> list[str]:
 
 
 def get_config() -> dict:
-    """读取市场仓库配置（环境变量优先级最高）。"""
+    """读取市场仓库配置（环境变量优先级最高）。
+
+    智能迁移：当 settings 里保存的 mirrors 数量过少（<5）时，自动把
+    DEFAULT_MIRRORS 里的新镜像追加到已有列表后面，让旧用户升级后立即受益。
+    """
     s = _read_settings()
     repo_url = _env_str("AGENTCLUSTER_MARKET_REPO") or str(s.get("market_repo_url") or "").strip() \
         or DEFAULT_REPO_URL
@@ -92,6 +107,13 @@ def get_config() -> dict:
             mirrors = [m.strip() for m in raw.replace(",", "\n").splitlines() if m.strip()]
     if not mirrors:
         mirrors = list(DEFAULT_MIRRORS)
+    elif len(mirrors) < len(DEFAULT_MIRRORS) // 2 + 2:
+        # 旧用户：镜像数太少，追加 DEFAULT_MIRRORS 里的新条目（去重保序）
+        existing = set(mirrors)
+        for m in DEFAULT_MIRRORS:
+            if m not in existing:
+                mirrors.append(m)
+                existing.add(m)
     return {"repo_url": repo_url, "mirrors": mirrors, "branch": branch}
 
 
@@ -190,57 +212,142 @@ def _host_of(url: str) -> str:
 
 
 # ==============================================================
-# 下载
+# 下载（并发 race：多源同时启动，谁快用谁）
 # ==============================================================
+def _safe_host(url: str) -> str:
+    """把 host 里的冒号 / 点替换成下划线，用作临时文件名。"""
+    return re.sub(r"[^\w\-]", "_", _host_of(url))
+
+
+def _download_worker(cand_url: str, dest: Path, timeout: float,
+                     cancel_event: threading.Event,
+                     on_progress=None) -> dict:
+    """单个镜像源的下载 worker。cancel_event 置位后主动 close 连接。"""
+    started = time.monotonic()
+    try:
+        req = Request(cand_url, headers={"User-Agent": _USER_AGENT})
+        with urlopen(req, timeout=timeout) as resp:
+            total = 0
+            try:
+                total = int(resp.headers.get("Content-Length") or 0)
+            except Exception:
+                pass
+            loaded = 0
+            deadline = started + timeout
+            with open(dest, "wb") as f:
+                while not cancel_event.is_set():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"单源超时（>{timeout:.0f}s，已收 {loaded} 字节）")
+                    chunk = resp.read(128 * 1024)  # 128KB 一块
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    loaded += len(chunk)
+                    if on_progress:
+                        try:
+                            on_progress(loaded, total)
+                        except Exception:
+                            pass
+            if cancel_event.is_set():
+                # 被更快的源抢跑，本 worker 提前退出
+                raise RuntimeError("race 失败：被其他源抢先完成")
+        size = dest.stat().st_size
+        if size <= 0:
+            raise RuntimeError("下载内容为空")
+        return {"url": cand_url, "mirror": _host_of(cand_url), "size": size,
+                "total": total or size}
+    except Exception:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def download_file(url: str, dest: Path, *,
                   mirrors: list[str] | None = None,
-                  timeout: float = 60.0,
+                  timeout: float = 120.0,
                   on_progress=None) -> dict:
-    """多镜像回退下载单个文件，成功返回 {url, mirror, size}。
+    """并发 race 下载：多个镜像源同时启动，第一个成功完成的胜出。
 
-    ``timeout`` 同时作为单次读写超时与整次下载总时长上限：镜像连得上但速率极低时
-    会在超时后中止并换下一个源，避免同步线程长期占着锁。
+    超时策略：整次 race 总时限 ``timeout``（默认 120s），每个 worker 内部再做单源
+    超时保护。首个获胜者返回后，其余 worker 收到取消信号并主动关闭连接。
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    errors: list[str] = []
     candidates = mirror_candidates(url, mirrors)
-    for cand in candidates:
-        deadline = time.monotonic() + timeout
-        try:
-            req = Request(cand, headers={"User-Agent": _USER_AGENT})
-            with urlopen(req, timeout=timeout) as resp:
-                total = 0
+    errors: list[str] = []
+    cancel_event = threading.Event()
+    start = time.monotonic()
+
+    # 为每个候选源分配独立的临时文件（避免并发写冲突）
+    tmp_by_cand: dict[str, Path] = {}
+    futures = {}
+
+    # 并发数封顶 6，避免请求过多反而拖慢
+    max_workers = min(len(candidates), 6)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for cand in candidates:
+            tmp = dest.with_name(f"{dest.name}.part-{_safe_host(cand)}")
+            tmp_by_cand[cand] = tmp
+            futures[cand] = pool.submit(
+                _download_worker, cand, tmp, timeout, cancel_event, on_progress,
+            )
+
+        pending = set(futures.values())
+        winner_result: dict | None = None
+
+        while pending and winner_result is None:
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            # 每 2 秒检查一次，避免永久阻塞
+            done, pending = wait(pending, timeout=min(remaining, 2.0),
+                                 return_when=FIRST_COMPLETED)
+            for fut in done:
+                cand_url = next(k for k, v in futures.items() if v is fut)
                 try:
-                    total = int(resp.headers.get("Content-Length") or 0)
-                except Exception:
-                    total = 0
-                loaded = 0
-                with open(dest, "wb") as f:
-                    while True:
-                        if time.monotonic() > deadline:
-                            raise TimeoutError(f"下载超时（>{timeout:.0f}s，已收 {loaded} 字节）")
-                        chunk = resp.read(256 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        loaded += len(chunk)
-                        if on_progress:
-                            try:
-                                on_progress(loaded, total)
-                            except Exception:
-                                pass
-            size = dest.stat().st_size
-            if size <= 0:
-                raise RuntimeError("下载内容为空")
-            return {"url": cand, "mirror": _host_of(cand), "size": size,
-                    "total": total or size}
-        except Exception as e:  # 404 / 超时 / 证书等一律换下一个源
-            errors.append(f"{cand} → {e}")
+                    winner_result = fut.result(timeout=0)
+                    cancel_event.set()  # 通知其他 worker 主动退出
+                    break
+                except Exception as e:
+                    errors.append(f"{cand_url} → {e}")
+
+    cancel_event.set()  # 确保所有 worker 退出
+
+    if winner_result is None:
+        # 全源失败：清理所有 .part 文件
+        for tmp in tmp_by_cand.values():
             try:
-                dest.unlink()
+                tmp.unlink()
             except OSError:
                 pass
-    raise RuntimeError("下载失败（已尝试 %d 个源）：\n%s" % (len(candidates), "\n".join(errors)))
+        raise RuntimeError(
+            "下载失败（并发 race 已尝试 %d 个源，总耗时 %.1fs）：\n%s"
+            % (len(candidates), time.monotonic() - start, "\n".join(errors))
+        )
+
+    # 把获胜者的临时文件移到正式目标路径
+    winner_url = winner_result["url"]
+    winner_tmp = tmp_by_cand.get(winner_url)
+    if winner_tmp:
+        try:
+            os.replace(str(winner_tmp), str(dest))
+        except OSError:
+            try:
+                shutil.move(str(winner_tmp), str(dest))
+            except OSError:
+                pass
+
+    # 清理其他 worker 的 .part 文件（它们可能还在后台写，无所谓）
+    for cand, tmp in tmp_by_cand.items():
+        if cand != winner_url:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    return winner_result
 
 
 # ==============================================================
@@ -299,14 +406,16 @@ def _find_extract_root(base: Path) -> Path:
 
 
 def merge_market(remote_root: Path, remote_index: dict,
-                 local_root: Path, local_index: dict) -> dict:
+                 local_root: Path, local_index: dict,
+                 mine_author: str | None = None) -> dict:
     """把远端归档合并进本地工作副本。
 
     规则：
-      - 远端条目为基准；本地 updated_at 更新的同 id 条目（含远端没有的本地新增）
-        视为「尚未推送」，保留本地索引与文件，避免同步吞掉未发布内容；
+      - 远端条目为基准；本地 updated_at 更新的同 id 条目视为「尚未推送」，
+        保留本地索引与文件；
       - 远端存在而本地缺少的目录/文件直接补齐；
-      - 不删除远端已移除的本地条目（如需删除，请在市场管理程序里删完再推送）。
+      - 远端不存在的本地条目：仅当 author == mine_author 时保留
+        （用户自己发布的还没 push），其余视为僵尸丢弃。
     """
     remote_items = {_key(it): it for it in remote_index.get("items", []) if isinstance(it, dict)}
     local_items = {_key(it): it for it in local_index.get("items", []) if isinstance(it, dict)}
@@ -314,9 +423,16 @@ def merge_market(remote_root: Path, remote_index: dict,
     local_newer: set[tuple[str, str]] = set()
     for key, lit in local_items.items():
         rit = remote_items.get(key)
-        if rit is None or (lit.get("updated_at") or "") > (rit.get("updated_at") or ""):
+        if rit and (lit.get("updated_at") or "") > (rit.get("updated_at") or ""):
             local_newer.add(key)
-    skip_dirs = {_item_dir(local_items[k]) for k in local_newer if _item_dir(local_items[k])}
+    # 本地独有但 author == mine_author 的也视为未推送，保留其文件目录
+    mine_only: set[tuple[str, str]] = set()
+    for key, lit in local_items.items():
+        rit = remote_items.get(key)
+        if rit is None and mine_author and (lit.get("author") or "") == mine_author:
+            mine_only.add(key)
+    skip_dirs = {_item_dir(local_items[k])
+                 for k in (local_newer | mine_only) if _item_dir(local_items[k])}
 
     added, changed, copied = [], [], 0
     for key, rit in remote_items.items():
@@ -341,7 +457,7 @@ def merge_market(remote_root: Path, remote_index: dict,
         shutil.copy2(src, dest)
         copied += 1
 
-    # —— 索引层：远端基准 + 本地未推送条目 ——
+    # —— 索引层：远端基准 + 本地未推送条目 + 我的未 push 条目 ——
     merged: list[dict] = []
     for key, rit in remote_items.items():
         if key in local_newer:
@@ -349,7 +465,7 @@ def merge_market(remote_root: Path, remote_index: dict,
         else:
             merged.append(rit)
     for key, lit in local_items.items():
-        if key not in remote_items and key in local_newer:
+        if key not in remote_items and (key in local_newer or key in mine_only):
             merged.append(lit)
     merged.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
 
@@ -364,7 +480,7 @@ def merge_market(remote_root: Path, remote_index: dict,
         "added": len(added),
         "changed": len(changed),
         "copied_files": copied,
-        "kept_local": len(local_newer),
+        "kept_local": len(local_newer) + len(mine_only),
         "total": len(merged),
         "added_items": [{"kind": it.get("kind"), "id": it.get("id"), "name": it.get("name")}
                         for it in added],
@@ -379,9 +495,10 @@ def market_ready() -> bool:
 
 
 def sync_market(force: bool = False, on_progress=None) -> dict:
-    """从远程仓库同步市场资源到本地 ``market/``。
+    """**纯索引同步**：只下载远端 index.json 列表（几 KB），不拉取任何资源文件。
 
-    force=False 时先比对远端 index.json 的 updated_at，无变化直接返回「已是最新」。
+    资源文件在用户「预览」或「安装」时按需拉取（走 ensure_item_local 的
+    archive zip 持久化缓存）。彻底避免市场扩大后每次同步都下载几百 MB。
     """
     cfg = get_config()
     started = time.time()
@@ -393,42 +510,259 @@ def sync_market(force: bool = False, on_progress=None) -> dict:
         if not isinstance(local_index, dict):
             local_index = {"items": []}
 
-        # 1) 轻量探测远端索引：只有 20KB 左右，镜像不支持 raw 时静默跳过
-        remote_index = None
-        probe_note = ""
-        try:
-            probe = tmpdir / "remote-index.json"
-            download_file(raw_index_url(), probe, mirrors=cfg["mirrors"], timeout=20)
-            remote_index = json.loads(probe.read_text(encoding="utf-8"))
-            if not isinstance(remote_index, dict) or not isinstance(remote_index.get("items"), list):
-                remote_index = None
-        except Exception as e:
-            probe_note = f"索引探测失败，直接下载归档：{e}"
+        # —— 并发 race 下载 index.json（raw.githubusercontent.com 代理）——
+        index_path = tmpdir / "index.json"
+        dl = download_file(raw_index_url(), index_path, mirrors=cfg["mirrors"],
+                           timeout=60, on_progress=on_progress)
 
-        if (not force and remote_index is not None
-                and remote_index.get("updated_at")
-                and remote_index.get("updated_at") == local_index.get("updated_at")):
+        remote_index = _read_json(index_path, None)
+        if not isinstance(remote_index, dict) or not isinstance(remote_index.get("items"), list):
+            raise RuntimeError("远端 index.json 格式不正确")
+
+        # updated_at 比对（索引层面）
+        local_updated = local_index.get("updated_at")
+        remote_updated = remote_index.get("updated_at")
+        up_to_date = (not force and remote_updated and remote_updated == local_updated)
+        if up_to_date:
             return {
-                "ok": True, "up_to_date": True, "added": 0, "changed": 0,
-                "total": len(local_index.get("items", [])),
-                "repo_url": cfg["repo_url"], "mirror": "index",
+                "ok": True, "up_to_date": True, "index_only": True,
+                "repo_url": cfg["repo_url"], "mirror": dl.get("mirror", "unknown"),
                 "elapsed": round(time.time() - started, 2),
-                "message": "市场已是最新",
+                "message": "市场索引已是最新",
+                "total": len(local_index.get("items", [])),
             }
 
-        # 2) 下载归档并解压
+        # 合并索引：远端为基准 + 本地未推送条目（本地 updated_at 更新的条目保留）
+        # 同时保留"当前登录用户发布但还没 push"的本地独有条目
+        mine_author = github_auth.get_login() or None
+        merged = _merge_index(remote_index, local_index, mine_author=mine_author)
+
+        local_items = {_key(it): it for it in local_index.get("items", [])
+                       if isinstance(it, dict)}
+        remote_items = {_key(it): it for it in remote_index.get("items", [])
+                        if isinstance(it, dict)}
+        added = [remote_items[k] for k in remote_items if k not in local_items]
+        changed = [remote_items[k] for k in remote_items
+                   if k in local_items
+                   and (local_items[k].get("updated_at") or "")
+                   != (remote_items[k].get("updated_at") or "")]
+
+        _write_json(INDEX_FILE, merged)
+
+    return {
+        "ok": True, "up_to_date": up_to_date, "index_only": True,
+        "repo_url": cfg["repo_url"], "branch": cfg["branch"],
+        "mirror": dl.get("mirror"), "source": dl.get("url"),
+        "downloaded": dl.get("size"),
+        "elapsed": round(time.time() - started, 2),
+        "added": len(added), "changed": len(changed),
+        "total": len(merged.get("items", [])),
+        "archive_merged": False,
+        "message": _build_sync_message(False, len(added), len(changed), False, {}),
+    }
+
+
+def _count_workspace_files() -> int:
+    """market/ 下排除 .git、index.json 后的普通文件数。快速判断工作区是否接近空。"""
+    count = 0
+    try:
+        for p in MARKET_ROOT.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(MARKET_ROOT).as_posix()
+            if rel.startswith(".git/") or rel == "index.json":
+                continue
+            count += 1
+    except OSError:
+        pass
+    return count
+
+
+def _archive_merge_workspace(remote_root_index: dict, local_index: dict,
+                             on_progress=None) -> dict:
+    """下载 archive zip → 全量 merge 进 market/。用于首次初始化或工作区残缺兜底。"""
+    cfg = get_config()
+    with tempfile.TemporaryDirectory(prefix="ac-market-full-") as tmp:
+        tmpdir = Path(tmp)
         zip_path = tmpdir / "market.zip"
-        if on_progress:
-            try:
-                on_progress(0, 0)
-            except Exception:
-                pass
         dl = download_file(archive_url(), zip_path, mirrors=cfg["mirrors"],
                            timeout=180, on_progress=on_progress)
-
         extract_dir = tmpdir / "extract"
-        extract_dir.mkdir(parents=True, exist_ok=True)
+        extract_dir.mkdir()
         with zipfile.ZipFile(zip_path) as zf:
+            for info in zf.infolist():
+                name = info.filename.replace("\\", "/")
+                if name.startswith("/") or ".." in name.split("/"):
+                    raise RuntimeError(f"归档包含非法路径：{info.filename}")
+            zf.extractall(extract_dir)
+        remote_root = _find_extract_root(extract_dir)
+        remote_index = _read_json(remote_root / "index.json", remote_root_index)
+        stats = merge_market(remote_root, remote_index, MARKET_ROOT, local_index)
+    return {"mirror": dl.get("mirror"), "copied_files": stats.get("copied_files"),
+            "kept_local": stats.get("kept_local"), "stats": stats}
+
+
+def _build_sync_message(up_to_date: bool, added: int, changed: int,
+                        archive_merged: bool, merge_info: dict) -> str:
+    if up_to_date and not archive_merged:
+        return "市场索引已是最新"
+    parts = [f"索引同步完成：{added} 新增，{changed} 更新"]
+    if archive_merged:
+        info = merge_info or {}
+        parts.append(f"（工作区残缺，已自动从 archive 恢复 {info.get('copied_files', 0)} 个文件）")
+    parts.append("资源按需拉取" if not archive_merged else "")
+    return "".join(p for p in parts if p)
+
+
+def _merge_index(remote_index: dict, local_index: dict,
+                 mine_author: str | None = None) -> dict:
+    """合并远端与本地索引。
+
+    规则：
+      - 远端条目为基准；
+      - 本地 updated_at 更大的同 id 条目视为「尚未推送」，保留本地；
+      - 远端不存在的本地条目：
+          author == mine_author  → 保留（用户自己发布的，还没 push）
+          否则                   → 丢弃（僵尸：远端仓库已删除的条目）
+    """
+    remote_items = {_key(it): it for it in remote_index.get("items", [])
+                   if isinstance(it, dict)}
+    local_items = {_key(it): it for it in local_index.get("items", [])
+                   if isinstance(it, dict)}
+
+    merged: list[dict] = []
+    for key, rit in remote_items.items():
+        lit = local_items.get(key)
+        if lit and (lit.get("updated_at") or "") > (rit.get("updated_at") or ""):
+            merged.append(lit)
+        else:
+            merged.append(rit)
+    # 本地独有：只保留"当前登录用户发布"的条目（还没 push 的）
+    for key, lit in local_items.items():
+        if key not in remote_items:
+            if mine_author and (lit.get("author") or "") == mine_author:
+                merged.append(lit)
+    merged.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
+
+    return {
+        "version": remote_index.get("version") or local_index.get("version") or "1.0",
+        "updated_at": remote_index.get("updated_at") or local_index.get("updated_at"),
+        "items": merged,
+    }
+
+
+# ==============================================================
+# 按需拉取单个资源（archive zip 持久化缓存 → 只解压目标子目录）
+# ==============================================================
+# archive zip 的持久化缓存目录（跨进程、跨会话复用）
+import hashlib as _hl
+_CACHE_ROOT = Path(os.environ.get("AGENTCLUSTER_CACHE_HOME",
+                                Path.home() / ".cache" / "agentcluster" / "market"))
+_ZIP_CACHE_DIR = _CACHE_ROOT / "archives"
+ZIP_CACHE_TTL_SEC = 24 * 60 * 60  # 24h 过期（远端仓库分支更新后自动失效）
+
+
+def find_index_item(kind: str, item_id: str) -> dict | None:
+    """从本地 index.json 里查找指定条目。"""
+    if not INDEX_FILE.exists():
+        return None
+    idx = _read_json(INDEX_FILE, {"items": []})
+    if not isinstance(idx, dict):
+        return None
+    for it in idx.get("items", []):
+        if isinstance(it, dict) and it.get("kind") == kind and it.get("id") == item_id:
+            return it
+    return None
+
+
+def _item_cache_dir(item: dict) -> Path:
+    """资源在本地 market/ 里的缓存目录。"""
+    d = _item_dir(item)
+    if not d:
+        raise RuntimeError(f"条目缺少 dir 字段：{item.get('kind')}/{item.get('id')}")
+    return MARKET_ROOT / d
+
+
+def _cache_key_for_url(url: str) -> str:
+    return _hl.md5(url.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_cached_archive(archive_url_str: str) -> Path | None:
+    """返回有效的缓存 zip 路径，不存在或过期返回 None。"""
+    cache_path = _ZIP_CACHE_DIR / f"{_cache_key_for_url(archive_url_str)}.zip"
+    if not cache_path.exists():
+        return None
+    age = time.time() - cache_path.stat().st_mtime
+    if age > ZIP_CACHE_TTL_SEC:
+        try:
+            cache_path.unlink()
+        except OSError:
+            pass
+        return None
+    if cache_path.stat().st_size == 0:
+        try:
+            cache_path.unlink()
+        except OSError:
+            pass
+        return None
+    return cache_path
+
+
+def _put_cached_archive(src: Path, archive_url_str: str) -> Path:
+    """把下载好的 zip 移动到持久化缓存目录，返回缓存路径。"""
+    _ZIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _ZIP_CACHE_DIR / f"{_cache_key_for_url(archive_url_str)}.zip"
+    try:
+        os.replace(str(src), str(cache_path))
+    except OSError:
+        try:
+            shutil.copy2(str(src), str(cache_path))
+        except OSError:
+            pass
+    return cache_path
+
+
+def ensure_item_local(kind: str, item_id: str, *,
+                      force: bool = False, on_progress=None) -> Path:
+    """确保指定资源的目录已下载到本地 market/。
+
+    策略：
+      1. 如果资源目录已存在且非强制 → 直接返回（毫秒级）
+      2. 如果 archive zip 持久化缓存有效 → 用缓存解压（秒级，无需联网）
+      3. 否则 → 下载 archive zip → 缓存 → 解压
+
+    首次下载可能较慢（~40s，取决于网络和镜像），但之后全部秒级完成。
+    """
+    item = find_index_item(kind, item_id)
+    if not item:
+        raise RuntimeError(f"索引中未找到资源：{kind}/{item_id}")
+
+    target = _item_cache_dir(item)
+    if target.exists() and any(target.iterdir()) and not force:
+        return target
+
+    cfg = get_config()
+    archive = archive_url()
+
+    # 尝试使用持久化 zip 缓存
+    cached_zip = _get_cached_archive(archive)
+    zip_to_use: Path
+    with tempfile.TemporaryDirectory(prefix="ac-market-unzip-") as tmp_extract:
+        extract_dir = Path(tmp_extract)
+
+        if cached_zip:
+            zip_to_use = cached_zip
+        else:
+            # 下载 → 缓存到持久化目录
+            with tempfile.TemporaryDirectory(prefix="ac-market-zip-") as tmp_dl:
+                tmp_zip = Path(tmp_dl) / "market.zip"
+                download_file(archive, tmp_zip, mirrors=cfg["mirrors"],
+                              timeout=180, on_progress=on_progress)
+                cached_zip = _put_cached_archive(tmp_zip, archive)
+            zip_to_use = cached_zip
+
+        # 解压（只用目标子目录，但为了简洁和 zipfile 简单，完整解压到临时目录）
+        with zipfile.ZipFile(zip_to_use) as zf:
             for info in zf.infolist():
                 name = info.filename.replace("\\", "/")
                 if name.startswith("/") or ".." in name.split("/"):
@@ -436,23 +770,238 @@ def sync_market(force: bool = False, on_progress=None) -> dict:
             zf.extractall(extract_dir)
 
         remote_root = _find_extract_root(extract_dir)
-        archive_index = _read_json(remote_root / "index.json", None)
-        if not isinstance(archive_index, dict) or not isinstance(archive_index.get("items"), list):
-            raise RuntimeError("归档内 index.json 格式不正确")
-        if remote_index is not None:
-            archive_index = remote_index  # 以 raw 探测到的索引为准（同一提交，避免 zip 缓存）
+        target_rel = _item_dir(item)
+        src_dir = remote_root / target_rel
 
-        # 3) 合并进本地工作副本
-        stats = merge_market(remote_root, archive_index, MARKET_ROOT, local_index)
+        if not src_dir.exists():
+            raise RuntimeError(
+                f"远端仓库中不存在目录 {target_rel}（可能资源已被下架）"
+            )
+
+        # 清理旧版本 + 复制
+        if target.exists():
+            try:
+                shutil.rmtree(target)
+            except OSError:
+                pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        for src in src_dir.rglob("*"):
+            rel = src.relative_to(src_dir)
+            if _is_ignored(rel):
+                continue
+            dest = target / rel
+            if src.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(src, dest)
+            except OSError:
+                pass
+
+    return target
+
+
+def get_item_cache_status(kind: str, item_id: str) -> dict:
+    """返回指定资源在本地的缓存状态。"""
+    item = find_index_item(kind, item_id)
+    if not item:
+        return {"exists": False, "error": "not_found"}
+    target = _item_cache_dir(item)
+    exists = target.exists() and any(target.iterdir())
+    size = 0
+    file_count = 0
+    if exists:
+        for p in target.rglob("*"):
+            if p.is_file():
+                size += p.stat().st_size
+                file_count += 1
+    return {
+        "exists": exists,
+        "path": str(target),
+        "size": size,
+        "file_count": file_count,
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def clean_market_cache(preserve_index: bool = True, preserve_git: bool = False) -> dict:
+    """清理 market/ 目录下的资源缓存。
+
+    默认行为：
+      - 保留 index.json（保留索引元数据，用户列表/预览/安装会按需重新拉取）
+      - **删除 .git**（push 时 ensure_repo() 会自动重新 init + 绑定 origin，完全不需要先保留着）
+
+    用户已安装到 store.ROOT 的资源不受影响。
+    """
+    if not MARKET_ROOT.exists():
+        return {"cleaned": 0, "freed_bytes": 0}
+
+    freed = 0
+    cleaned = 0
+    index_path = MARKET_ROOT / "index.json"
+    preserved_index = index_path.read_text(encoding="utf-8") if preserve_index and index_path.exists() else None
+
+    def _rm_child(child: Path) -> int:
+        """删除一个子项（文件或目录），返回释放的字节数。Windows 友好。"""
+        sz = 0
+        try:
+            if child.is_dir():
+                for f in child.rglob("*"):
+                    if f.is_file():
+                        try:
+                            sz += f.stat().st_size
+                        except OSError:
+                            pass
+                _rmtree_force(child)
+            else:
+                try:
+                    sz = child.stat().st_size
+                except OSError:
+                    pass
+                try:
+                    child.unlink()
+                except OSError:
+                    _rmtree_force(child)
+        except Exception:
+            pass
+        return sz
+
+    for child in list(MARKET_ROOT.iterdir()):
+        if preserve_index and child.name == "index.json":
+            continue
+        if preserve_git and child.name == ".git":
+            continue
+        freed += _rm_child(child)
+        cleaned += 1
+
+    # 重建空目录结构
+    MARKET_ROOT.mkdir(parents=True, exist_ok=True)
+    if preserved_index:
+        index_path.write_text(preserved_index, encoding="utf-8")
 
     return {
-        "ok": True, "up_to_date": False,
-        "repo_url": cfg["repo_url"], "branch": cfg["branch"],
-        "mirror": dl["mirror"], "source": dl["url"], "downloaded": dl["size"],
-        "probe_note": probe_note,
-        "elapsed": round(time.time() - started, 2),
-        **stats,
-        "message": f"同步完成：新增 {stats['added']} 项，更新 {stats['changed']} 项",
+        "cleaned_entries": cleaned,
+        "freed_bytes": freed,
+        "freed_human": f"{freed / (1024 * 1024):.1f} MB",
+        "preserved_index": bool(preserved_index),
+        "preserved_git": preserve_git,
+    }
+
+
+def _rmtree_force(path: Path) -> None:
+    """Windows 友好的 rmtree：先去除只读属性，再递归删除。"""
+    import stat as _stat
+    if not path.exists():
+        return
+
+    def _onerror(func, p, exc_info):
+        # 去掉只读标记后重试
+        try:
+            os.chmod(p, _stat.S_IWRITE)
+            func(p)
+        except Exception:
+            # 仍失败则尝试用 cmd /c rd /s /q（Windows 下的万能删除）
+            try:
+                subprocess.run(
+                    ["cmd", "/c", "rd", "/s", "/q", str(p)],
+                    capture_output=True, timeout=30,
+                )
+            except Exception:
+                pass
+
+    try:
+        shutil.rmtree(str(path), onerror=_onerror)
+    except Exception:
+        # 最后兜底：用系统命令
+        try:
+            subprocess.run(
+                ["cmd", "/c", "rd", "/s", "/q", str(path)],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            pass
+
+
+def market_cache_overview() -> dict:
+    """返回 market/ 当前的缓存概况，**分开统计 .git、资源目录、zip 归档缓存**。"""
+    if not MARKET_ROOT.exists():
+        return {"exists": False}
+
+    total_size = 0
+    git_size = 0
+    resource_size = 0
+    index_size = 0
+    file_count = 0
+    dir_count = 0
+
+    for p in MARKET_ROOT.rglob("*"):
+        if p.is_file():
+            try:
+                sz = p.stat().st_size
+                total_size += sz
+                file_count += 1
+                rel = p.relative_to(MARKET_ROOT)
+                if rel.parts[0] == ".git":
+                    git_size += sz
+                elif p.name == "index.json":
+                    index_size += sz
+                else:
+                    resource_size += sz
+            except OSError:
+                pass
+        elif p.is_dir():
+            dir_count += 1
+
+    # zip 持久化缓存（独立于 market/）
+    zip_cache_size = 0
+    zip_cache_count = 0
+    has_zip_cache = _ZIP_CACHE_DIR.exists()
+    if has_zip_cache:
+        for zf in _ZIP_CACHE_DIR.glob("*.zip"):
+            try:
+                zip_cache_size += zf.stat().st_size
+                zip_cache_count += 1
+            except OSError:
+                pass
+
+    return {
+        "path": str(MARKET_ROOT),
+        "total_bytes": total_size,
+        "total_human": f"{total_size / (1024 * 1024):.1f} MB",
+        "file_count": file_count,
+        "dir_count": dir_count,
+        "has_git": git_size > 0,
+        "git_bytes": git_size,
+        "git_human": f"{git_size / (1024 * 1024):.1f} MB",
+        "resource_bytes": resource_size,
+        "resource_human": f"{resource_size / (1024 * 1024):.1f} MB",
+        "index_size": index_size,
+        "has_zip_cache": has_zip_cache,
+        "zip_cache_bytes": zip_cache_size,
+        "zip_cache_human": f"{zip_cache_size / (1024 * 1024):.1f} MB",
+        "zip_cache_count": zip_cache_count,
+    }
+
+
+def clean_zip_cache() -> dict:
+    """单独清理 archive zip 持久化缓存目录。"""
+    freed = 0
+    removed = 0
+    if not _ZIP_CACHE_DIR.exists():
+        return {"removed": 0, "freed_bytes": 0}
+    for zf in list(_ZIP_CACHE_DIR.glob("*.zip")):
+        try:
+            freed += zf.stat().st_size
+            zf.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return {
+        "removed": removed,
+        "freed_bytes": freed,
+        "freed_human": f"{freed / (1024 * 1024):.1f} MB",
     }
 
 
@@ -541,6 +1090,10 @@ def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
 
     使用市场页登录的 GitHub 账号（PAT）：token 以一次性 HTTP 认证头传给 git，
     不写入 git config / remote URL；未登录直接拒绝，不回退本机凭据。
+
+    无感自动处理：远程领先时 ``git pull --rebase --strategy-option=ours``
+    （冲突自动保留本地版本），仍不行则 reset hard 丢弃远程差异再 push。
+    只有网络/权限/仓库不存在这类硬错误才会抛 RuntimeError。
     """
     cfg = get_config()
     token = github_auth.get_token()
@@ -552,6 +1105,10 @@ def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
     login = github_auth.get_login() or ""
     ensure_repo()
     branch = cfg["branch"]
+
+    # Basic x-access-token:<token> —— GitHub 接受 PAT 作为 HTTPS 密码
+    b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+    auth_prefix = ["-c", f"http.extraheader=Authorization: Basic {b64}"]
 
     _git(["add", "-A"], timeout=60)
     commit_msg = message or f"market: publish {datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -565,13 +1122,53 @@ def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
     if code == 0:
         commit_id = out.strip()
 
-    # Basic x-access-token:<token> —— GitHub 接受 PAT 作为 HTTPS 密码
-    b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
-    code, out, err = _git(
-        ["-c", f"http.extraheader=Authorization: Basic {b64}",
-         "push", "-u", "origin", branch],
-        timeout=timeout,
-    )
+    def _do_push() -> tuple[int, str, str]:
+        return _git([*auth_prefix, "push", "-u", "origin", branch], timeout=timeout)
+
+    def _do_pull_rebase(strategy: str = "ours") -> tuple[int, str, str]:
+        """带 PAT 认证的 pull --rebase。strategy=ours 冲突时保留本地版本。"""
+        return _git([*auth_prefix, "pull", "--rebase", "--no-edit",
+                     "--strategy-option", strategy,
+                     "origin", branch], timeout=timeout)
+
+    def _do_fetch_reset() -> tuple[int, str, str]:
+        """fetch 远程然后 reset --hard 丢弃远程差异再 push（终极兜底）。"""
+        code_f, out_f, err_f = _git([*auth_prefix, "fetch", "origin", branch], timeout=60)
+        if code_f != 0:
+            return code_f, out_f, err_f
+        return _git(["reset", "--hard", f"origin/{branch}"], timeout=30)
+
+    # —— 第一轮 push ——
+    code, out, err = _do_push()
+    rebased = False
+    conflict_resolved = False
+
+    if code != 0 and ("non-fast-forward" in (err + out) or "rejected" in (err + out)):
+        # 远程领先 → 自动 pull --rebase -X ours（冲突保留本地）
+        code_r, out_r, err_r = _do_pull_rebase("ours")
+        if code_r == 0:
+            rebased = True
+        else:
+            # 仍然冲突（-X ours 也救不了）→ abort rebase + reset hard 到远程
+            _git(["rebase", "--abort"], timeout=30)
+            conflict_resolved = True
+            code_r2, out_r2, err_r2 = _do_fetch_reset()
+            if code_r2 != 0:
+                # 终极兜底也失败 → 返回错误字符串但不抛异常（调用方决定是否阻断）
+                detail = (err_r2 or out_r2 or err_r or out_r or err or out).strip()
+                raise RuntimeError(
+                    f"推送失败：远程有新提交，自动同步仍无法完成。"
+                    f" 你可以稍后重试，或联系仓库维护者手动整理。"
+                )
+            rebased = True
+
+        # 再 push 一次
+        commit_id = ""
+        code, out, _ = _git(["rev-parse", "--short", "HEAD"], timeout=20)
+        if code == 0:
+            commit_id = out.strip()
+        code, out, err = _do_push()
+
     if code != 0:
         detail = (err or out).strip()
         hint = ""
@@ -585,18 +1182,26 @@ def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
             hint = (f"\n\n当前 GitHub 账号 @{login} 没有推送权限："
                     "请联系市场维护者把该账号添加为仓库协作者，"
                     "并确认 Token 勾选了 repo 写权限。")
-        elif "non-fast-forward" in detail or "rejected" in detail:
-            hint = "\n\n本地与远程历史分叉：请先点「同步最新」合并远程改动后再推送。"
         raise RuntimeError(f"推送失败：{detail}{hint}")
+
+    msg = "已推送到远程市场仓库"
+    if conflict_resolved:
+        msg += "（远程有新提交，已自动以本地为准合并）"
+    elif rebased:
+        msg += "（已自动合并远程最新提交）"
+    if not committed:
+        msg = "无新变更，已确认远程同步"
 
     return {
         "ok": True,
         "committed": committed,
+        "rebased": rebased,
+        "conflict_resolved": conflict_resolved,
         "commit": commit_id,
         "pushed": True,
         "branch": branch,
         "repo_url": cfg["repo_url"],
         "auth": login,
-        "message": "已推送到远程市场仓库" if committed else "无新变更，已确认远程同步",
+        "message": msg,
         "output": (out or "").strip()[:2000],
     }

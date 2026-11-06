@@ -45,4 +45,6 @@ Thumbs.db
 .launch_mode.txt
 # 市场资源已独立为 AgentCluster-Market 仓库；本地 market/ 是其 clone 工作副本（见 market/README.md）
 /market/
+# market 剥离到独立仓库时的本地备份目录（时间戳后缀），仅本机保留
+/_market_backup_*/
 

@@ -334,6 +334,19 @@ export const api = {
   },
   market: {
     kinds: () => req<{ kinds: Array<{ key: string; label: string; count: number }>; updated_at?: string; needs_sync?: boolean }>('/market/kinds'),
+    preview: (kind: string, id: string) =>
+      req<{ item: any; files: Array<{ path: string; size: number }>; preview: any }>(
+        `/market/item/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`
+      ),
+    cache: {
+      overview: () => req<any>('/market/cache/overview'),
+      clean: (payload?: { preserve_index?: boolean }) =>
+        req<any>('/market/cache/clean', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload ?? {}),
+        }),
+    },
     items: (kind?: string, q?: string) => {
       // 用 URLSearchParams 统一拼接：kind 为空（推荐分类）时直接拼 "&q=" 会得到 /items&q=... → 404
       const params = new URLSearchParams()
@@ -348,8 +361,15 @@ export const api = {
       req<{ kind: string; items: Array<{ id: string; name: string; description?: string }> }>(
         `/market/publishable?kind=${encodeURIComponent(kind)}`
       ),
-    install: (kind: string, id: string) =>
-      req<any>('/market/install', { method: 'POST', body: JSON.stringify({ kind, id }) }),
+    install: (kind: string, id: string, version?: string) =>
+      req<any>('/market/install', {
+        method: 'POST',
+        body: JSON.stringify({ kind, id, ...(version ? { version } : {}) }),
+      }),
+    itemVersions: (kind: string, id: string) =>
+      req<{ kind: string; id: string; name?: string; latest_version?: string; total: number; versions: any[] }>(
+        `/market/item/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/versions`,
+      ),
     publish: (kind: string, id: string, push = false) =>
       req<any>('/market/publish', { method: 'POST', body: JSON.stringify({ kind, id, push }) }),
     config: () => req<any>('/market/config'),
@@ -363,5 +383,14 @@ export const api = {
     login: (username: string, token: string) =>
       req<any>('/market/auth', { method: 'POST', body: JSON.stringify({ username, token }) }),
     logout: () => req<any>('/market/auth', { method: 'DELETE' }),
+    myItems: (q?: string) =>
+      req<{ kind: string; total: number; items: any[]; updated_at?: string; mine?: boolean }>(
+        '/market/my-items' + (q ? '?q=' + encodeURIComponent(q) : '')
+      ),
+    deleteItem: (kind: string, id: string, push = false) =>
+      req<any>(
+        `/market/items/${encodeURIComponent(kind)}/${encodeURIComponent(id)}` + (push ? '?push=1' : ''),
+        { method: 'DELETE' },
+      ),
   }
 }
