@@ -40,8 +40,8 @@ INDEX_FILE = MARKET_ROOT / "index.json"
 DEFAULT_REPO_URL = "https://github.com/Windy-X211/AgentCluster-Market.git"
 # {url} 会被替换成完整的官方下载地址；顺序即尝试顺序（越靠前越快）
 DEFAULT_MIRRORS = [
-    "https://ghfast.top/{url}",
     "https://gh-proxy.com/{url}",
+    "https://ghfast.top/{url}",
 ]
 DEFAULT_BRANCH = "main"
 
@@ -196,11 +196,16 @@ def download_file(url: str, dest: Path, *,
                   mirrors: list[str] | None = None,
                   timeout: float = 60.0,
                   on_progress=None) -> dict:
-    """多镜像回退下载单个文件，成功返回 {url, mirror, size}。"""
+    """多镜像回退下载单个文件，成功返回 {url, mirror, size}。
+
+    ``timeout`` 同时作为单次读写超时与整次下载总时长上限：镜像连得上但速率极低时
+    会在超时后中止并换下一个源，避免同步线程长期占着锁。
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     errors: list[str] = []
     candidates = mirror_candidates(url, mirrors)
     for cand in candidates:
+        deadline = time.monotonic() + timeout
         try:
             req = Request(cand, headers={"User-Agent": _USER_AGENT})
             with urlopen(req, timeout=timeout) as resp:
@@ -212,6 +217,8 @@ def download_file(url: str, dest: Path, *,
                 loaded = 0
                 with open(dest, "wb") as f:
                     while True:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(f"下载超时（>{timeout:.0f}s，已收 {loaded} 字节）")
                         chunk = resp.read(256 * 1024)
                         if not chunk:
                             break
