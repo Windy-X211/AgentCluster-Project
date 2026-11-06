@@ -234,6 +234,11 @@ function closeLogin() {
   loggingIn.value = false
 }
 
+/** 打开 GitHub Token 页面：window.open 会被 Electron 的 setWindowOpenHandler 转交给系统浏览器 */
+function openGitHubTokens() {
+  window.open('https://github.com/settings/tokens', '_blank', 'noopener')
+}
+
 async function doLogin() {
   const username = loginUsername.value.trim()
   const token = loginToken.value.trim()
@@ -750,7 +755,7 @@ onBeforeUnmount(() => {
               <span v-for="t in (m.tags || []).slice(0, 4)" :key="t" class="tag">#{{ t }}</span>
             </div>
             <div class="mc-foot">
-              <span v-if="m.author" class="mc-author" :title="'作者：' + m.author">
+              <span v-if="m.author" class="mc-author" :title="'发布者：' + m.author">
                 <span class="mc-author-avatar">👤</span>@{{ m.author }}
               </span>
               <div class="mc-actions">
@@ -902,17 +907,28 @@ onBeforeUnmount(() => {
               <label class="mm-field">
                 <span class="mm-label">GitHub 用户名</span>
                 <input v-model="loginUsername" class="mm-input" spellcheck="false"
-                  placeholder="例如 Windy-X211" autocomplete="username" />
+                  placeholder="例如 User123" autocomplete="username" />
               </label>
+              <div v-if="loginUsername.trim()" class="gh-token-guide">
+                <div class="gh-token-guide-head">
+                  <span>已填写用户名，接下来按步骤创建 Token</span>
+                  <button type="button" class="gh-token-btn" @click="openGitHubTokens">去获取 Token ↗</button>
+                </div>
+                <ol class="gh-token-steps">
+                  <li>打开页面后点右上角 <b>Generate new token</b>，选 <b>Generate new token (classic)</b></li>
+                  <li>Note 可填 <code>AgentCluster Market</code>，Expiration 建议选 90 days</li>
+                  <li>权限勾选 <b>repo</b>（完整仓库读写，推送市场必需）</li>
+                  <li>点页面底部 <b>Generate token</b>，复制 <code>ghp_</code> 开头的 Token 粘贴到下方</li>
+                </ol>
+              </div>
               <label class="mm-field">
                 <span class="mm-label">Personal Access Token（需要 repo 写权限）</span>
                 <input v-model="loginToken" type="password" class="mm-input"
                   placeholder="ghp_..." autocomplete="current-password" />
               </label>
               <div class="mm-tip">
-                Token 仅保存在本机 <code>%LOCALAPPDATA%\AgentCluster\github_auth.json</code>，不会上传。
-                在 GitHub → Settings → Developer settings → Personal access tokens 生成并勾选
-                <code>repo</code> 权限；账号还须是市场仓库的协作者。
+                Token 仅保存在本机 <code>%LOCALAPPDATA%\AgentCluster\github_auth.json</code>，不会上传；
+                账号还须是市场仓库的协作者。
               </div>
               <div v-if="loginError" class="mm-error">{{ loginError }}</div>
             </template>
@@ -1636,6 +1652,24 @@ onBeforeUnmount(() => {
 .gh-avatar-lg { width: 44px; height: 44px; border-radius: 50%; display: block; }
 .gh-name { font-size: calc(14px * var(--font-scale)); font-weight: 600; }
 .gh-sub { font-size: calc(12px * var(--font-scale)); opacity: .55; margin-top: 2px; }
+.gh-token-guide {
+  padding: 8px 10px; border-radius: 8px;
+  background: rgba(var(--accent-rgb, 120, 140, 255), .10);
+  border: 1px solid rgba(var(--accent-rgb, 120, 140, 255), .28);
+  font-size: 11px; color: #aabce0;
+}
+.gh-token-guide-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.gh-token-steps { margin: 6px 0 0; padding-left: 16px; display: flex; flex-direction: column; gap: 3px; line-height: 1.5; }
+.gh-token-steps b { color: #dfe9ff; font-weight: 600; }
+.gh-token-steps code { font-size: 10px; opacity: .9; }
+.gh-token-btn {
+  flex-shrink: 0; padding: 4px 9px; border-radius: 6px; cursor: pointer;
+  font-size: 11px; font-family: inherit; color: #d6e4ff;
+  background: rgba(var(--accent-rgb, 120, 140, 255), .18);
+  border: 1px solid rgba(var(--accent-rgb, 120, 140, 255), .4);
+  white-space: nowrap;
+}
+.gh-token-btn:hover { background: rgba(var(--accent-rgb, 120, 140, 255), .32); }
 .gh-ok { color: #6fcf97; }
 .gh-bad { color: #f2994a; }
 .gh-danger { color: #ff8a80; border-color: rgba(255, 138, 128, .35); }

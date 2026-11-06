@@ -62,9 +62,9 @@ _EXCLUDE_DIRS = {"__pycache__", "_webengine_profile", "node_modules", ".git", ".
 _EXCLUDE_SUFFIX = {".pyc", ".pyo", ".log", ".bak", ".tmp"}
 _EXCLUDE_FILES = {".DS_Store", "Thumbs.db"}
 
-# 同步是耗时网络操作，同一时刻只允许一个
-_sync_lock = threading.Lock()
-_push_lock = threading.Lock()
+# 保护 index.json 读写 + 基于 index.json 的 git add/commit 操作
+# 任何时刻只允许一个操作修改或依赖 index.json，避免 sync/publish/push 互相覆盖
+_index_lock = threading.Lock()
 
 
 # ==============================================================
@@ -516,14 +516,14 @@ def sync(payload: dict | None = None):
     """从远程市场仓库同步（多镜像自动回退）。阻塞调用，前端需加载态。"""
     payload = payload or {}
     force = bool(payload.get("force"))
-    if not _sync_lock.acquire(blocking=False):
-        raise HTTPException(409, "已有同步任务进行中，请稍候")
+    if not _index_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有同步或发布任务进行中，请稍候")
     try:
         return market_sync.sync_market(force=force)
     except Exception as e:
         raise HTTPException(500, str(e))
     finally:
-        _sync_lock.release()
+        _index_lock.release()
 
 
 # ==============================================================
@@ -568,14 +568,14 @@ def push(payload: dict | None = None):
     message = str(payload.get("message") or "").strip() or None
     if not github_auth.get_token():
         raise HTTPException(401, "请先登录 GitHub 账号后再推送")
-    if not _push_lock.acquire(blocking=False):
-        raise HTTPException(409, "已有推送任务进行中，请稍候")
+    if not _index_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有同步或发布任务进行中，请稍候")
     try:
         return market_sync.push_market(message)
     except Exception as e:
         raise HTTPException(500, str(e))
     finally:
-        _push_lock.release()
+        _index_lock.release()
 
 
 # ==============================================================
@@ -820,46 +820,46 @@ def my_items(q: str = ""):
 @router.delete("/items/{kind}/{item_id}")
 def delete_item(kind: str, item_id: str, push: bool = False):
     """删除市场条目及其资源目录（不影响本机已安装副本）。push=True 时同时提交推送到远程仓库。"""
-    item_id = _safe_id(item_id)
-    item = _find_item(kind, item_id)
-    if not item:
-        raise HTTPException(404, f"市场中未找到资源：{kind}/{item_id}")
-
-    folder = _item_dir(item)
+    if not _index_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有同步或发布任务进行中，请稍候")
     try:
-        resolved = folder.resolve()
-        if resolved == MARKET_ROOT.resolve():
-            raise HTTPException(400, "拒绝删除市场根目录")
-        resolved.relative_to(MARKET_ROOT.resolve())
-    except HTTPException:
-        raise
-    except ValueError:
-        raise HTTPException(400, "非法资源路径")
-    if folder.exists():
-        shutil.rmtree(folder, ignore_errors=True)
+        item_id = _safe_id(item_id)
+        item = _find_item(kind, item_id)
+        if not item:
+            raise HTTPException(404, f"市场中未找到资源：{kind}/{item_id}")
 
-    data = _load_index(force=True)
-    data["items"] = [it for it in data.get("items", [])
-                     if not (it.get("kind") == kind and it.get("id") == item_id)]
-    _write_index(data)
+        folder = _item_dir(item)
+        try:
+            resolved = folder.resolve()
+            if resolved == MARKET_ROOT.resolve():
+                raise HTTPException(400, "拒绝删除市场根目录")
+            resolved.relative_to(MARKET_ROOT.resolve())
+        except HTTPException:
+            raise
+        except ValueError:
+            raise HTTPException(400, "非法资源路径")
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
 
-    result = {"ok": True, "kind": kind, "id": item_id, "name": item.get("name")}
+        data = _load_index(force=True)
+        data["items"] = [it for it in data.get("items", [])
+                         if not (it.get("kind") == kind and it.get("id") == item_id)]
+        _write_index(data)
 
-    # 可选：推送到远程仓库（官方仓库；镜像只读不支持 push）
-    if push:
-        if not github_auth.get_token():
-            result["push_error"] = "请先登录 GitHub 账号后再远程下架"
-        else:
-            if not _push_lock.acquire(blocking=False):
-                result["push_error"] = "已有推送任务进行中，请稍候"
+        result = {"ok": True, "kind": kind, "id": item_id, "name": item.get("name")}
+
+        # 可选：推送到远程仓库（官方仓库；镜像只读不支持 push）
+        if push:
+            if not github_auth.get_token():
+                result["push_error"] = "请先登录 GitHub 账号后再远程下架"
             else:
                 try:
                     result["push"] = market_sync.push_market(f"unpublish {kind}/{item_id}")
                 except Exception as e:
                     result["push_error"] = str(e)
-                finally:
-                    _push_lock.release()
-    return result
+        return result
+    finally:
+        _index_lock.release()
 
 
 # ==============================================================
@@ -900,13 +900,19 @@ def _publishable_items(kind: str) -> list[dict]:
         for d in sorted(root.iterdir()) if root.exists() else []:
             if not d.is_dir() or not (d / "SKILL.md").exists():
                 continue
-            out.append({"id": d.name, "name": d.name, "description": ""})
+            fm = _skill_frontmatter(d / "SKILL.md")
+            name = fm.get("label") or fm.get("name") or d.name
+            out.append({"id": d.name, "name": name,
+                        "description": str(fm.get("description", "")).split("\n")[0][:200]})
     elif kind == "plugin":
         root = store.ROOT / "plugins"
         for d in sorted(root.iterdir()) if root.exists() else []:
             if not d.is_dir() or not (d / "manifest.yaml").exists():
                 continue
-            out.append({"id": d.name, "name": d.name, "description": ""})
+            meta = _yaml_load(d / "manifest.yaml")
+            out.append({"id": d.name,
+                        "name": _localized(meta.get("label")) or d.name,
+                        "description": _localized(meta.get("description"))})
     elif kind == "extension":
         root = store.ROOT / "extensions"
         installed = _read_installed()
@@ -933,41 +939,46 @@ def publish(payload: dict):
     if not local_id:
         raise HTTPException(400, "缺少资源 id")
 
-    # 版本号：显式指定优先，否则按同资源最新版本自动 +patch
-    requested_version = (payload.get("version") or "").strip()
-    if not requested_version:
-        idx = _load_index(force=True).get("items", [])
-        latest = next((it for it in idx
-                       if it.get("kind") == kind and it.get("id") == local_id), None)
-        # 从 versions 数组里找真正最新的
-        real_latest = None
-        if latest:
-            real_latest = latest
-            for v in (latest.get("versions") or []):
-                if _version_tuple(v.get("version", "0")) > _version_tuple(real_latest.get("version", "0")):
-                    real_latest = v
-        requested_version = _next_version(real_latest.get("version") if real_latest else None)
+    if not _index_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有同步或发布任务进行中，请稍候")
+    try:
+        # 版本号：显式指定优先，否则按同资源最新版本自动 +patch
+        requested_version = (payload.get("version") or "").strip()
+        if not requested_version:
+            idx = _load_index(force=True).get("items", [])
+            latest = next((it for it in idx
+                           if it.get("kind") == kind and it.get("id") == local_id), None)
+            # 从 versions 数组里找真正最新的
+            real_latest = None
+            if latest:
+                real_latest = latest
+                for v in (latest.get("versions") or []):
+                    if _version_tuple(v.get("version", "0")) > _version_tuple(real_latest.get("version", "0")):
+                        real_latest = v
+            requested_version = _next_version(real_latest.get("version") if real_latest else None)
 
-    if kind == "agent":
-        result = _publish_agent(local_id, version=requested_version)
-    elif kind == "canvas":
-        result = _publish_canvas(local_id, version=requested_version)
-    elif kind in ("background", "skill", "plugin", "extension"):
-        result = _publish_directory(kind, local_id, version=requested_version)
-    else:
-        raise HTTPException(400, f"不支持的资源类型：{kind}")
-
-    # 可选：发布后立即提交并推送到远程市场仓库（失败不回滚本地发布）
-    if payload.get("push"):
-        if not github_auth.get_token():
-            result["push_error"] = "请先登录 GitHub 账号后再推送到远程仓库"
+        if kind == "agent":
+            result = _publish_agent(local_id, version=requested_version)
+        elif kind == "canvas":
+            result = _publish_canvas(local_id, version=requested_version)
+        elif kind in ("background", "skill", "plugin", "extension"):
+            result = _publish_directory(kind, local_id, version=requested_version)
         else:
-            try:
-                result["push"] = market_sync.push_market(
-                    f"publish {kind}/{local_id} v{requested_version}")
-            except Exception as e:
-                result["push_error"] = str(e)
-    return result
+            raise HTTPException(400, f"不支持的资源类型：{kind}")
+
+        # 可选：发布后立即提交并推送到远程市场仓库（失败不回滚本地发布）
+        if payload.get("push"):
+            if not github_auth.get_token():
+                result["push_error"] = "请先登录 GitHub 账号后再推送到远程仓库"
+            else:
+                try:
+                    result["push"] = market_sync.push_market(
+                        f"publish {kind}/{local_id} v{requested_version}")
+                except Exception as e:
+                    result["push_error"] = str(e)
+        return result
+    finally:
+        _index_lock.release()
 
 
 @router.get("/item/{kind}/{item_id}/versions")
@@ -1155,7 +1166,12 @@ def _next_version(latest_version: str | None) -> str:
 
 
 def _safe_author() -> str:
-    """取当前登录 GitHub 账号作为作者；未登录时回退为 AgentCluster。"""
+    """取当前登录 GitHub 账号作为**发布者**（= 上传者身份）。
+
+    注意：author 字段语义是"谁把这条资源发布到市场的"，而不是资源文件里
+    写的原始作者，所以直接取登录身份，不从资源 manifest/SKILL.md 等文件读取。
+    未登录时回退为 AgentCluster。
+    """
     return github_auth.get_login() or "AgentCluster"
 
 
@@ -1325,7 +1341,7 @@ def _publish_directory(kind: str, local_id: str, version: str = "1.0.0") -> dict
         item.update(name=fm.get("label") or fm.get("name") or local_id,
                     description=str(fm.get("description", "")).split("\n")[0][:300],
                     version=str(fm.get("version", "1.0.0")),
-                    author=fm.get("author", _safe_author()), icon="🧠",
+                    icon="🧠",
                     tags=[str(t) for t in (fm.get("tags") or [])],
                     label=fm.get("label"), skill_name=fm.get("name", local_id))
     elif kind == "plugin":
@@ -1333,7 +1349,6 @@ def _publish_directory(kind: str, local_id: str, version: str = "1.0.0") -> dict
         item.update(name=_localized(meta.get("label")) or local_id,
                     description=_localized(meta.get("description")),
                     version=str(meta.get("version", "1.0.0")),
-                    author=meta.get("author", _safe_author()),
                     icon=meta.get("icon") or "🔧",
                     tags=[str(t) for t in (meta.get("tags") or [])])
     else:  # extension
@@ -1341,7 +1356,6 @@ def _publish_directory(kind: str, local_id: str, version: str = "1.0.0") -> dict
         meta = json.loads(mf.read_text(encoding="utf-8")) if mf.exists() else {}
         item.update(name=meta.get("name", local_id), description=meta.get("description", ""),
                     version=str(meta.get("version", "1.0.0")),
-                    author=meta.get("author", _safe_author()),
                     icon=meta.get("icon") or "🧩",
                     tags=[str(t) for t in (meta.get("tags") or [])],
                     ext_type=meta.get("type"), source="builtin",
