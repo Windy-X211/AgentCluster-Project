@@ -400,14 +400,27 @@ const publishable = ref<Array<{ id: string; name: string; description?: string; 
 const uploadLoading = ref(false)
 // 当前列表数据实际所属的资源类型（过渡 key 用它，避免切换瞬间用新 key 重渲染旧数据造成重复闪动）
 const loadedKind = ref('')
-const selectedId = ref('')
+const selectedKeys = ref<string[]>([])
+const publishDone = ref(0)
+const publishTotal = ref(0)
+const selectedCount = computed(() => selectedKeys.value.length)
 // 上传弹窗：只看未上传（未发布到市场）的本机资源
 const unPublishedOnly = ref(false)
 const visiblePublishable = computed(() =>
   unPublishedOnly.value ? publishable.value.filter(p => !p.published) : publishable.value)
-// 勾选「未上传」或列表刷新后，若选中项已被过滤掉则清空选择，避免按钮指向不可见项
-watch(visiblePublishable, list => {
-  if (selectedId.value && !list.some(p => p.id === selectedId.value)) selectedId.value = ''
+// 当前可见列表是否全部已勾选（用于「全选 / 取消全选」按钮文案）
+// 列表还没切换到当前类型（加载中）时不算全选，避免旧数据造成误判
+const allVisibleSelected = computed(() =>
+  loadedKind.value === uploadKind.value &&
+  visiblePublishable.value.length > 0 &&
+  visiblePublishable.value.every(p => selectedKeys.value.includes(`${uploadKind.value}:${p.id}`)))
+// 列表刷新或勾选「未上传」后，仅移除当前类型下已被过滤掉的选中项；
+// 其他类型的勾选保持不变，切换类型时也能继续累加（列表尚未切到当前类型时不清理）
+watch([visiblePublishable, uploadKind, loadedKind], ([list, uk, lk]) => {
+  if (!selectedKeys.value.length || lk !== uk) return
+  const visible = new Set(list.map(p => `${uk}:${p.id}`))
+  const prefix = uk + ':'
+  selectedKeys.value = selectedKeys.value.filter(k => !k.startsWith(prefix) || visible.has(k))
 })
 const publishing = ref(false)
 const canPush = computed(() => !!auth.value?.logged_in)
@@ -417,20 +430,20 @@ let uploadReqSeq = 0
 
 async function openUpload() {
   uploadOpen.value = true
-  selectedId.value = ''
+  selectedKeys.value = []
   publishable.value = []
   loadedKind.value = ''
   await loadPublishable()
 }
 function closeUpload() {
+  if (publishing.value) return  // 发布进行中不关闭，避免中断批量发布
   uploadOpen.value = false
-  publishing.value = false
   uploadReqSeq++ // 关闭后作废在途请求
 }
 function switchUploadKind(k: string) {
   if (uploadKind.value === k) return
   uploadKind.value = k
-  selectedId.value = ''
+  // 不清空勾选：跨类型已选的资源保留，切回来后仍然勾着
   void loadPublishable()
 }
 async function loadPublishable() {
@@ -452,28 +465,96 @@ async function loadPublishable() {
     if (seq === uploadReqSeq) uploadLoading.value = false
   }
 }
-async function doPublish() {
-  if (!selectedId.value || publishing.value) return
-  publishing.value = true
+// 当前类型下某个本机资源的勾选 key / 选中态
+function pickValue(p: { id: string }) {
+  return `${uploadKind.value}:${p.id}`
+}
+function isPicked(p: { id: string }) {
+  return selectedKeys.value.includes(pickValue(p))
+}
+
+// 全选 / 取消全选：只作用于当前类型当前可见的列表，不影响其他类型的已选
+function toggleSelectAll() {
+  if (publishing.value) return
+  const prefix = uploadKind.value + ':'
+  if (allVisibleSelected.value) {
+    const visible = new Set(visiblePublishable.value.map(p => `${prefix}${p.id}`))
+    selectedKeys.value = selectedKeys.value.filter(k => !visible.has(k))
+    return
+  }
+  const next = new Set(selectedKeys.value)
+  for (const p of visiblePublishable.value) next.add(`${prefix}${p.id}`)
+  selectedKeys.value = [...next]
+}
+
+// 选中项 key = "kind:id"，发布时需要拆回资源类型与 id（支持跨类型批量发布）
+function parseSelectedKey(key: string): { kind: string; id: string } {
+  const i = key.indexOf(':')
+  return { kind: key.slice(0, i), id: key.slice(i + 1) }
+}
+
+// 取消已勾选（只清空选择，不关闭弹窗；关闭仍走 ✕ / ESC）
+function clearSelection() {
+  if (publishing.value) return
+  selectedKeys.value = []
+}
+
+function doPublish() {
+  if (!selectedKeys.value.length || publishing.value) return
+  const targets = selectedKeys.value.map(parseSelectedKey)
   const willPush = canPush.value  // 登录就自动推，无感
+  // 立即关闭弹窗并转入后台发布：不再占用界面等待，可继续浏览/切换分类
+  uploadOpen.value = false
+  selectedKeys.value = []
+  publishing.value = true
+  publishDone.value = 0
+  publishTotal.value = targets.length
+  void runPublishTask(targets, willPush)
+}
+
+async function runPublishTask(targets: Array<{ kind: string; id: string }>, willPush: boolean) {
+  let ok = 0
+  const failed: string[] = []
   try {
-    const r = await api.market.publish(uploadKind.value, selectedId.value, willPush)
-    const name = r?.item?.name || selectedId.value
-    let tip = `已发布：${name}`
-    if (r?.push) tip += '（已同步到远程市场）'
-    else if (r?.push_error) tip += `（远程同步稍后重试：${r.push_error.split('\n')[0].slice(0, 60)}）`
-    else if (!canPush.value) tip += '（未登录，仅发布到本地市场）'
+    // 逐个写入本地市场（不逐个推送），全部完成后再统一推送一次，避免 N 次 git commit/push
+    for (const t of targets) {
+      try {
+        await api.market.publish(t.kind, t.id, false)
+        ok++
+      } catch (e) {
+        failed.push(`${t.kind}/${t.id}：${(e as Error).message}`)
+      }
+      publishDone.value++
+    }
+    let tip = ok > 0 ? `已发布 ${ok} 项` : '发布失败'
+    if (failed.length) {
+      const first = failed[0].split('\n')[0].slice(0, 60)
+      tip += `，${failed.length} 项失败：${first}`
+    }
+    if (ok > 0 && willPush) {
+      try {
+        await api.market.push()
+        tip += '（已同步到远程市场）'
+      } catch (e) {
+        tip += `（远程同步稍后重试：${(e as Error).message.split('\n')[0].slice(0, 60)}）`
+      }
+    } else if (ok > 0) {
+      tip += '（未登录，仅发布到本地市场）'
+    }
     toast.value = tip
-    uploadOpen.value = false
-    await loadKinds()
-    await loadMineCount()
-    if (activeKind.value === 'all' || activeKind.value === uploadKind.value || isMineView.value) await loadItems()
-  } catch (e) {
-    toast.value = '发布失败：' + (e as Error).message
+    if (ok > 0) {
+      const kindsDone = new Set(targets.map(t => t.kind))
+      await loadKinds()
+      await loadMineCount()
+      if (activeKind.value === 'all' || isMineView.value || kindsDone.has(activeKind.value)) await loadItems()
+    }
   } finally {
     publishing.value = false
+    publishDone.value = 0
+    publishTotal.value = 0
   }
 }
+
 
 // —— 下架（删除自己发布的市场资源）——
 const unpublishOpen = ref(false)
@@ -730,7 +811,9 @@ onBeforeUnmount(() => {
           {{ pushing ? '推送中…' : '推送远程' }}
         </button>
         <button class="btn ghost" @click="openSettings">设置</button>
-        <button class="btn primary upload-btn" @click="openUpload">上传资源</button>
+        <button class="btn primary upload-btn" :disabled="publishing" @click="openUpload">
+          {{ publishing ? `上传中 ${publishDone}/${publishTotal}…` : '上传资源' }}
+        </button>
       </div>
     </div>
 
@@ -834,11 +917,17 @@ onBeforeUnmount(() => {
               >{{ k.label }}</button>
             </div>
             <div class="mm-hint-row">
-              <div class="mm-hint">从本机已有的{{ kindLabel(uploadKind) }}中选择一项发布到市场。</div>
+              <div class="mm-hint">从本机已有的{{ kindLabel(uploadKind) }}中选择资源发布到市场，可跨类型多选。</div>
               <label class="mm-upload-filter" title="只显示尚未发布到市场的本机资源">
                 <input v-model="unPublishedOnly" type="checkbox" />
                 <span>未上传</span>
               </label>
+              <button
+                class="mm-select-all"
+                :disabled="!visiblePublishable.length || publishing || uploadLoading || loadedKind !== uploadKind"
+                :title="allVisibleSelected ? '取消当前列表的全部勾选' : '勾选当前列表中的全部资源'"
+                @click="toggleSelectAll"
+              >{{ allVisibleSelected ? '取消全选' : '全选' }}</button>
             </div>
             <!-- 固定高度的列表区：内容多少不影响弹窗尺寸，切换类型时只做淡入淡出 -->
             <div class="mm-list-wrap" :class="{ 'is-loading': uploadLoading }">
@@ -850,8 +939,8 @@ onBeforeUnmount(() => {
                     : `本机暂无${kindLabel(uploadKind)}可发布` }}
                 </div>
                 <div v-else :key="'list-' + loadedKind" class="mm-list">
-                  <label v-for="p in visiblePublishable" :key="p.id" class="mm-item" :class="{ checked: selectedId === p.id }">
-                    <input v-model="selectedId" type="radio" :value="p.id" />
+                  <label v-for="p in visiblePublishable" :key="p.id" class="mm-item" :class="{ checked: isPicked(p) }">
+                    <input v-model="selectedKeys" type="checkbox" :value="pickValue(p)" />
                     <div class="mm-item-body">
                       <div class="mm-item-name">
                         <span>{{ p.name }}</span>
@@ -865,9 +954,13 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="mm-foot">
-            <button class="btn ghost" @click="closeUpload">取消</button>
-            <button class="btn primary" :disabled="!selectedId || publishing" @click="doPublish">
-              {{ publishing ? '发布中…' : '发布到市场' }}
+            <button class="btn ghost" :disabled="!selectedCount || publishing" @click="clearSelection">
+              取消勾选{{ selectedCount ? `（${selectedCount}）` : '' }}
+            </button>
+            <button class="btn primary" :disabled="!selectedCount || publishing" @click="doPublish">
+              {{ publishing
+                ? `发布中 ${publishDone}/${publishTotal}…`
+                : (selectedCount ? `发布到市场（${selectedCount}）` : '发布到市场') }}
             </button>
           </div>
         </div>
@@ -1687,6 +1780,20 @@ onBeforeUnmount(() => {
   cursor: pointer; user-select: none; white-space: nowrap;
 }
 .mm-upload-filter input { cursor: pointer; accent-color: rgb(var(--accent-rgb, 120, 140, 255)); }
+.mm-select-all {
+  display: inline-flex; align-items: center; flex-shrink: 0;
+  font-size: calc(12px * var(--font-scale));
+  padding: 2px 10px; border-radius: 6px; white-space: nowrap;
+  background: rgba(255, 255, 255, .07);
+  border: 1px solid rgba(255, 255, 255, .18);
+  color: rgba(232, 238, 252, .9); cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.mm-select-all:hover:not(:disabled) {
+  background: rgba(var(--accent-rgb, 120, 140, 255), .2);
+  border-color: rgba(var(--accent-rgb, 120, 140, 255), .5);
+}
+.mm-select-all:disabled { opacity: .45; cursor: not-allowed; }
 .mm-empty { text-align: center; opacity: .5; padding: 30px 0; font-size: 13px; }
 .mm-list { display: flex; flex-direction: column; gap: 6px; }
 /* 上传弹窗：固定尺寸 + 固定高度列表区，切换资源类型时弹窗不跳动 */
