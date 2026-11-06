@@ -1,0 +1,2 @@
+
+PROBE_RESULT {"displays":[{"id":661377041,"scaleFactor":1,"size":{"width":1920,"height":1080},"bounds":{"x":0,"y":0,"width":1920,"height":1080},"physicalGuess":{"w":1920,"h":1080},"workAreaSize":{"width":1920,"height":1032}}],"sources":[{"id":"screen:0:0","display_id":"","requested":{"w":1920,"h":1080},"actual":{"width":1920,"height":1080},"ratioReq":1.77778,"ratioAct":1.77778}]}
