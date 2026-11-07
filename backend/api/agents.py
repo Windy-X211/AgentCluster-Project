@@ -24,6 +24,7 @@ class AgentIn(BaseModel):
     workflow_mode: str = "none"  # "none"(默认) | "plan" | "spec" | "goal" —— Trae Work 式工作流模式
     sort_order: int | None = None  # 列表排序权重；None=未排序，按 id 兜底排到末尾
     group_id: int | None = None  # 所属分组 id；None=未分组（在"全部"组中）
+    avatar_color: str | None = None  # 自定义头像色（#rrggbb）；None=跟随默认配色，""=清除自定义
 
 
 class ReorderReq(BaseModel):
@@ -76,6 +77,25 @@ def get_agent(aid: int):
     return get_by("agents", aid) or HTTPException(404, "not found")
 
 
+class AvatarColorReq(BaseModel):
+    color: str = ""  # #rrggbb；空串 = 清除自定义色，回到默认配色
+
+
+@router.put("/{aid}/avatar-color")
+def set_avatar_color(aid: int, body: AvatarColorReq):
+    """单独设置智能体的自定义头像色（画布调色板 → 选色 → 点节点时调用）。
+
+    不走 AgentIn 全量更新，避免把提示词等其它字段一起覆盖。
+    """
+    cur = get_by("agents", aid)
+    if not cur: raise HTTPException(404, "not found")
+    c = (body.color or "").strip().lower()
+    if c and not (c.startswith("#") and len(c) == 7):
+        raise HTTPException(400, "颜色格式应为 #rrggbb")
+    cur["avatar_color"] = c
+    return upsert("agents", cur)
+
+
 @router.put("/{aid}")
 def update_agent(aid: int, a: AgentIn):
     cur = get_by("agents", aid)
@@ -90,6 +110,11 @@ def update_agent(aid: int, a: AgentIn):
     sort_order_val = d.pop("sort_order", None)
     if sort_order_val is not None:
         cur["sort_order"] = sort_order_val
+    # avatar_color 同理：仅在请求体里显式出现时才改，避免局部更新把自定义头像色抹掉
+    if "avatar_color" in a.model_fields_set:
+        cur["avatar_color"] = d.pop("avatar_color") or ""
+    else:
+        d.pop("avatar_color", None)
     cur.update(d)
     cur["id"] = aid
     return upsert("agents", cur)

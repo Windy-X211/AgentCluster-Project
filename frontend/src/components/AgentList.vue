@@ -2,7 +2,7 @@
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useAgentStore, useSettingsStore, useModelStore } from '@/stores'
 import { toolLabel } from '@/stores/conversation'
-import { getAvatarGradient } from '@/utils/avatar'
+import { agentAvatarGradient } from '@/utils/avatar'
 import AgentEditDialog from './AgentEditDialog.vue'
 
 const props = defineProps<{ collapsed: boolean }>()
@@ -393,7 +393,7 @@ function onGroupDrop(e: DragEvent, g: any) {
             @contextmenu.prevent="onCtx($event, a)">
             <span v-if="activeGroupId === 'all' && a.group_id != null" class="group-badge" :title="groupNameOf(a.group_id)">{{ groupNameOf(a.group_id) }}</span>
             <div class="row">
-              <div class="avatar" :style="{ background: (settings.data.avatar_mode === 'unified') ? 'linear-gradient(135deg, var(--accent), var(--accent-2))' : getAvatarGradient(a.id) }">{{ (a.name || '?').slice(0, 1).toUpperCase() }}</div>
+              <div class="avatar" :style="{ background: agentAvatarGradient(a, settings.data.avatar_mode) }">{{ (a.name || '?').slice(0, 1).toUpperCase() }}</div>
               <div class="meta">
                 <div class="name">{{ a.name }}</div>
                 <div class="desc" v-if="a.description">{{ a.description }}</div>

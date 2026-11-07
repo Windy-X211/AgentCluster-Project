@@ -5,7 +5,7 @@ import { useRoute } from 'vue-router'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
 import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
 import { renderChatMarkdown } from '@/utils/markdown'
-import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
+import { getAvatarGradient, getAvatarInitial, agentAvatarGradient } from '@/utils/avatar'
 import { api } from '@/api'
 import { API_BASE } from '@/utils/env'
 import FileViewer, { type ViewerFile } from './FileViewer.vue'
@@ -1972,11 +1972,14 @@ function turnAvatar(turn: any): string {
 
 function turnAvatarGradient(turn: any): string {
   const mode = settings.data.avatar_mode || 'differentiated'
+  const ch = turn?.children?.find((c: any) => c.kind === 'assistant')
+  const agentId = ch?.msg?.agent_id || turnName(turn) || '智能体'
+  // 用户在画布调色板里指定过的自定义色优先于「统一/差异化」两种全局风格
+  const agent = typeof agentId === 'number' ? agents.list.find((a: any) => a.id === agentId) : null
+  if (agent?.avatar_color) return agentAvatarGradient(agent, mode)
   if (mode === 'unified') {
     return 'linear-gradient(135deg, var(--accent), var(--accent-2))'
   }
-  const ch = turn?.children?.find((c: any) => c.kind === 'assistant')
-  const agentId = ch?.msg?.agent_id || turnName(turn) || '智能体'
   return getAvatarGradient(agentId)
 }
 

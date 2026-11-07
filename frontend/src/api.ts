@@ -103,6 +103,7 @@ export const api = {
     list: () => req<any[]>('/agents'),
     create: (d: any) => req('/agents', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
+    setAvatarColor: (id: number, color: string) => req(`/agents/${id}/avatar-color`, { method: 'PUT', body: JSON.stringify({ color }) }),
     remove: (id: number) => req(`/agents/${id}`, { method: 'DELETE' }),
     reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },

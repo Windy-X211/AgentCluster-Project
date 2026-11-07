@@ -4,7 +4,7 @@ import { useCanvasStore, useAgentStore, useConvStore, useSettingsStore } from '@
 import { api } from '@/api'
 import { toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, type ToolCallPhase } from '@/stores/conversation'
 import { renderMarkdown } from '@/utils/markdown'
-import { getAvatarGradient, getAvatarRgb, getPaletteRgbPool, generateRgb } from '@/utils/avatar'
+import { getAvatarGradient, getAvatarRgb, getPaletteRgbPool, generateRgb, agentAvatarGradient, hexToRgbString } from '@/utils/avatar'
 
 const canvases = useCanvasStore()
 const agents = useAgentStore()
@@ -12,6 +12,7 @@ const convs = useConvStore()
 const settings = useSettingsStore()
 import AgentEditDialog from './AgentEditDialog.vue'
 import RulesDialog from './RulesDialog.vue'
+import ColorSpectrumPopover from './ColorSpectrumPopover.vue'
 
 // —— 对外广播的坐标契约：全局 WorkspaceOverlay 只消费这些，不自行推断画布位置 ——
 const emit = defineEmits<{
@@ -110,13 +111,97 @@ const browsing = ref(false)
 const editingAgent = ref<any>(null)
 
 // 头像渐变色（根据avatar_mode决定）—— 统一用 agent_id 作为 hash 种子，与对话区保持一致
+// 用户在画布调色板里手动指定过颜色的智能体，其自定义色优先于「统一/差异化」两种全局风格
 const avatarGradient = computed(() => {
   const mode = settings.data.avatar_mode || 'differentiated'
-  if (mode === 'unified') {
-    return (agentId: number) => 'linear-gradient(135deg, var(--accent), var(--accent-2))'
+  return (agentId: number) => {
+    const a = agentById(agentId)
+    if (a?.avatar_color) return agentAvatarGradient(a, mode)
+    if (mode === 'unified') {
+      return 'linear-gradient(135deg, var(--accent), var(--accent-2))'
+    }
+    return getAvatarGradient(agentId)
   }
-  return (agentId: number) => getAvatarGradient(agentId)
 })
+
+// —— 画布调色板：选中颜色 → 点击智能体节点 → 改该智能体的头像颜色 ——
+// pickedColor: null = 未选色；'' = 恢复默认配色；'#rrggbb' = 指定色
+// 浮窗即「配色模式」的开关：关闭浮窗 = 退出配色（待应用色一并清除）
+const paletteOpen = ref(false)
+// 折叠态 / 展开态两处按钮互斥渲染，共用同一个 ref
+const paletteAnchor = ref<HTMLElement | null>(null)
+const palettePos = ref({ x: 0, y: 0 })
+// 用户是否手动拖动过浮窗（拖过则下次打开沿用其位置，而不是回到按钮下方）
+const palettePosUserSet = ref(false)
+const pickedColor = ref<string | null>(null)
+// 上次选过的颜色：浮窗关闭后待应用态被清除，但重新打开时色谱仍停在上次的位置
+const lastPickedColor = ref<string | null>(null)
+// 悬停预览：选色后鼠标悬停节点头像时实时预览该色
+const hoverNodeId = ref<number | null>(null)
+// 刚应用完颜色的时间戳：避免紧接着的双击误触发「编辑智能体 / 切换泡泡」
+let colorAppliedAt = 0
+
+// 打开/关闭调色板浮窗（首次定位在按钮下方；用户拖动过则沿用其位置）
+function togglePalette() {
+  if (paletteOpen.value) { closePalette(); return }
+  if (!palettePosUserSet.value) {
+    const el = paletteAnchor.value
+    const r = el?.getBoundingClientRect()
+    palettePos.value = { x: r ? r.left : 16, y: r ? r.bottom + 8 : 56 }
+  }
+  paletteOpen.value = true
+}
+// 浮窗被拖动 → 记住新位置（下次打开沿用）
+function onPaletteMoved(pos: { x: number; y: number }) {
+  palettePos.value = pos
+  palettePosUserSet.value = true
+}
+// 选色（无需确认，实时生效）：进入「待应用」状态，等待用户点击智能体节点
+function onColorChanged(hex: string) {
+  pickedColor.value = hex || ''
+  lastPickedColor.value = hex || ''
+  hoverNodeId.value = null
+}
+// 关闭浮窗 = 停止配色：一并清除待应用色，点节点恢复正常行为
+function closePalette() {
+  paletteOpen.value = false
+  cancelPickedColor()
+}
+// 浮窗自身发出的关闭事件（✕ / 底部「关闭」）
+function onPaletteClosed() {
+  closePalette()
+}
+// 取消「待应用」状态
+function cancelPickedColor() {
+  if (pickedColor.value === null) return
+  pickedColor.value = null
+  hoverNodeId.value = null
+}
+// 选色后点击节点：把颜色写到该智能体上（持久化到后端）
+async function applyColorToNode(node: any) {
+  const color = pickedColor.value
+  if (color === null) return
+  const a = agentById(node.agent_id)
+  if (!a) return
+  colorAppliedAt = Date.now()
+  try {
+    await agents.setAvatarColor(a.id, color)
+    showToast(color
+      ? `已将「${a.name}」的头像色改为 ${color.toUpperCase()}`
+      : `已恢复「${a.name}」的默认头像色`)
+  } catch (e: any) {
+    showToast('设置头像颜色失败：' + (e?.message || e))
+  }
+}
+// 节点头像背景：选色待应用时，悬停的节点实时预览该色
+function nodeAvatarBg(node: any): string {
+  if (pickedColor.value !== null && hoverNodeId.value === node.id) {
+    return pickedColor.value
+      ? agentAvatarGradient({ avatar_color: pickedColor.value })
+      : avatarGradient.value(node.agent_id)
+  }
+  return avatarGradient.value(node.agent_id)
+}
 
 // 触发设置
 const triggerDlg = ref(false)
@@ -403,6 +488,8 @@ function nodeState(agentId: number): 'speaking' | 'calling' | 'waiting' | null {
 // 规则：同一个智能体引出的所有连线同色；不同智能体引出的线不同色。
 // 基础色仍取身份色（与头像同源），再与主题强调色混合以适配配色方案；
 // 同一画布内若多个源智能体撞色，则依次顺延到调色板中未占用的色，保证「异源异色」。
+// 用户手动指定过头像色的智能体：连线跟随其自定义色（保持"头像与连线同源"），
+// 且该色优先占位，其余智能体顺延时避开它。
 const edgeSourceColors = computed(() => {
   const map = new Map<number, string>()
   if ((settings.data.avatar_mode || 'differentiated') === 'unified') return map
@@ -415,8 +502,17 @@ const edgeSourceColors = computed(() => {
   const sorted = [...srcAgents].sort((a, b) => a - b)
   const pool = getPaletteRgbPool()
   const used = new Set<string>()
+  // ① 自定义头像色的智能体先占位（显式设置优先，不参与顺延改写）
   for (const aid of sorted) {
-    // 先用该智能体自己的身份色；被占用则顺延取调色板中首个未用色
+    const custom = agentById(aid)?.avatar_color
+    if (!custom) continue
+    const rgb = hexToRgbString(custom)
+    used.add(rgb)
+    map.set(aid, rgb)
+  }
+  // ② 其余按身份色分配；被占用则顺延取调色板中首个未用色
+  for (const aid of sorted) {
+    if (map.has(aid)) continue
     let color = getAvatarRgb(aid)
     if (used.has(color)) {
       const free = pool.find(c => !used.has(c))
@@ -750,6 +846,11 @@ const onKeyDown = (e: KeyboardEvent) => {
     return
   }
   if (e.code === 'Escape' && !editable) {
+    // Esc = 彻底退出调色（关浮窗 + 清待应用色）
+    if (paletteOpen.value || pickedColor.value !== null) {
+      closePalette()
+      return
+    }
     if (lasso.value) { lasso.value = null; return }
     clearSelection()
     closeMenus()
@@ -783,6 +884,8 @@ function startDrag(e: MouseEvent, node: any) {
   if ((e.target as HTMLElement).closest('.ctx-action, button, label, input')) return
   if (spaceDown.value || e.button !== 0) return
   if (e.shiftKey) return   // Shift 拖动交给画布套索
+  // 已选色待应用：点击节点 = 把颜色应用到该智能体（不进入拖拽）
+  if (pickedColor.value !== null) { applyColorToNode(node); return }
   const c = clientToCanvas(e.clientX, e.clientY)
   const withCtrl = e.ctrlKey || e.metaKey
   const inSelection = selectedNodeIds.value.has(node.id)
@@ -1212,6 +1315,8 @@ function toggleBubble(node: any) {
 function onNodeDblClick(e: MouseEvent, node: any) {
   const t = e.target as HTMLElement | null
   if (t?.closest('button, input, label, a')) return
+  // 刚用「点击节点」上色：紧接着的双击不要再触发编辑/切换泡泡，避免误操作
+  if (Date.now() - colorAppliedAt < 400) return
   // 头像：切换消息泡泡（与双击气泡本身一致）
   if (t?.closest('.avatar')) { toggleBubble(node); return }
   openAgentEdit(node)
@@ -2111,7 +2216,11 @@ defineExpose({ viewportRef, computeNodeBbox })
       <template v-if="toolbarCollapsed">
         <div class="toolbar-left collapsed-bar">
           <button class="btn ghost collapse-btn" @click.stop="toolbarCollapsed = false" title="展开工具栏">▾</button>
-          <span class="canvas-mini" :title="'当前画布：' + canvas?.name">🎨 {{ canvas?.name }}</span>
+          <button class="btn ghost palette-btn" ref="paletteAnchor"
+                  @click.stop="togglePalette" @mousedown.stop
+                  :class="{ active: paletteOpen }"
+                  title="选择颜色后点击智能体节点，即可更改该智能体的头像颜色">🎨</button>
+          <span class="canvas-mini" :title="'当前画布：' + canvas?.name">{{ canvas?.name }}</span>
         </div>
         <div class="toolbar-right">
           <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
@@ -2131,6 +2240,10 @@ defineExpose({ viewportRef, computeNodeBbox })
       <template v-else>
         <div class="toolbar-left">
           <button class="btn ghost collapse-btn" @click.stop="toolbarCollapsed = true" title="折叠工具栏">▸</button>
+          <button class="btn ghost palette-btn" ref="paletteAnchor"
+                  @click.stop="togglePalette" @mousedown.stop
+                  :class="{ active: paletteOpen }"
+                  title="选择颜色后点击智能体节点，即可更改该智能体的头像颜色">🎨</button>
           <template v-if="renameEdit">
             <input class="input sm rename-input" :value="renameValue" @input="renameValue = ($event.target as HTMLInputElement).value"
                    @keydown.enter.prevent="commitRename" @keydown.esc="renameEdit = false"
@@ -2175,6 +2288,17 @@ defineExpose({ viewportRef, computeNodeBbox })
 
     <!-- 执行模式切换 / 选区 / 剪贴板提示 -->
     <div v-if="toast" class="exec-mode-toast">{{ toast.msg }}</div>
+
+    <!-- 色谱浮窗（调色板按钮）：Teleport 到 body，避免被画布缩放层裁剪 -->
+    <Teleport to="body">
+      <ColorSpectrumPopover
+        v-if="paletteOpen"
+        :pos="palettePos"
+        :initial="lastPickedColor"
+        @change="onColorChanged"
+        @close="onPaletteClosed"
+        @update:pos="onPaletteMoved" />
+    </Teleport>
 
     <!-- 平移层（transform 纯平移） + 缩放层（CSS zoom 布局级缩放，文字始终矢量清晰） -->
     <div class="pan-layer" :style="{ transform: vTransform }">
@@ -2240,6 +2364,8 @@ defineExpose({ viewportRef, computeNodeBbox })
              :style="{ left: n.x + 'px', top: n.y + 'px' }"
              @mousedown="startDrag($event, n)"
              @mouseup="endLink($event, n.id)"
+             @mouseenter="hoverNodeId = n.id"
+             @mouseleave="hoverNodeId = null"
              @dblclick="onNodeDblClick($event, n)"
              @contextmenu="showCtxMenu($event, n)">
           <!-- 消息气泡：双击气泡可隐藏；流式输出中也尊重用户的隐藏设置 -->
@@ -2277,7 +2403,7 @@ defineExpose({ viewportRef, computeNodeBbox })
             </div>
           </div>
           <div class="node-head">
-            <div class="avatar" :style="{ background: avatarGradient(n.agent_id) }"
+            <div class="avatar" :style="{ background: nodeAvatarBg(n) }"
                  title="双击显示/隐藏消息泡泡"
                  @dblclick.stop="toggleBubble(n)">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
             <div class="name">{{ agentById(n.agent_id)?.name || '未知' }}</div>
@@ -2504,6 +2630,9 @@ defineExpose({ viewportRef, computeNodeBbox })
 .canvas-mini { font-size: calc(12px * var(--font-scale)); font-weight: 500; opacity: .8; padding: 4px 8px; border-radius: 6px; }
 .canvas-mini:hover { background: rgba(var(--surface-rgb), 0.06); }
 .collapse-btn { width: 26px; height: 26px; padding: 0; font-size: calc(13px * var(--font-scale)); flex-shrink: 0; }
+/* 调色板按钮：选中颜色待应用时高亮，提示用户下一步去点节点 */
+.palette-btn { width: 26px; height: 26px; padding: 0; font-size: calc(13px * var(--font-scale)); flex-shrink: 0; }
+.palette-btn.active { background: rgba(var(--accent-rgb), 0.22); border-color: rgba(var(--accent-rgb), 0.5); }
 .canvas-name { font-size: calc(14px * var(--font-scale)); font-weight: 600; cursor: text; padding: 4px 8px; border-radius: 6px; transition: background .15s; }
 .canvas-name:hover { background: rgba(var(--surface-rgb), 0.06); }
 .canvas-meta { font-size: calc(11px * var(--font-scale)); opacity: .72; font-family: Consolas, monospace; }
