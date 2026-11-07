@@ -58,6 +58,27 @@ function patchStreamingMarkdown(text: string): string {
     result += '\n\\]'
   }
 
+  // 5. 修复流式中未闭合的行内公式 $...$：只看最后一行（生成中的公式必在末尾），
+  //    单 $ 为奇数且其后的内容"像 LaTeX"（含 \命令 或 ^/_ 上下标）才补闭合；
+  //    特征要求可避免把货币金额（"$5 和 $1"）误补成公式
+  const nlIdx = result.lastIndexOf('\n')
+  const tailLine = result.slice(nlIdx + 1)
+  const singleDollarCount = (tailLine.replace(/\$\$/g, '').match(/\$/g) || []).length
+  if (singleDollarCount % 2 === 1) {
+    const tail = tailLine.slice(tailLine.lastIndexOf('$') + 1)
+    if (/(\\[a-zA-Z]+|[_^])/.test(tail)) {
+      result += '$'
+    }
+  }
+
+  // 6. 修复流式中未闭合的行内公式 \(...\)：同上，仅在末尾且像 LaTeX 时补 \)
+  if ((tailLine.match(/\\\(/g) || []).length > (tailLine.match(/\\\)/g) || []).length) {
+    const tail = tailLine.slice(tailLine.lastIndexOf('\\(') + 2)
+    if (/(\\[a-zA-Z]+|[_^])/.test(tail)) {
+      result += '\\)'
+    }
+  }
+
   return result
 }
 
@@ -160,6 +181,49 @@ function extractMathSegments(src: string): { text: string; segs: MathSeg[] } {
   return { text: out, segs }
 }
 
+/** 判断 TeX 是否为"流式截断"形态：末尾悬空 token（不完整命令/开括号/上下标）或花括号未配平。
+ *  截断形态走剥尾重试（渲染已到达的部分），避免 KaTeX 红色 error 逐帧闪烁。 */
+function looksTruncated(tex: string): boolean {
+  if (/\\[a-zA-Z]*$/.test(tex)) return true
+  if (/[_^]$/.test(tex)) return true
+  let depth = 0
+  for (const c of tex) {
+    if (c === '{') depth++
+    else if (c === '}') depth--
+  }
+  if (depth > 0) return true
+  let paren = 0
+  for (const c of tex) {
+    if (c === '[') paren++
+    else if (c === ']') paren--
+  }
+  return paren > 0
+}
+
+/** 单条公式渲染：完整公式正常渲染（真实语法错误才显示 KaTeX 红标）；
+ *  截断公式剥掉末尾悬空 token 重试，渲染出"已生成的部分"，等下一帧补全。 */
+function renderTex(tex: string, display: boolean): string {
+  const opts = { throwOnError: true, displayMode: display } as const
+  if (!looksTruncated(tex)) {
+    try {
+      return katex.renderToString(tex, opts)
+    } catch {
+      return katex.renderToString(tex, { ...opts, throwOnError: false })
+    }
+  }
+  let t = tex.trimEnd()
+  for (let i = 0; i < 14 && t; i++) {
+    try {
+      return katex.renderToString(t, opts)
+    } catch {
+      const m = t.match(/(\\[a-zA-Z]+|\\[\s\S]|[\s\S])\s*$/)
+      if (!m || m.index === undefined) break
+      t = t.slice(0, m.index).trimEnd()
+    }
+  }
+  return ''
+}
+
 /** 把占位符替换回 KaTeX 渲染出的 HTML（KaTeX 输出可信，无需再过 sanitize）。 */
 function restoreMath(html: string, segs: MathSeg[]): string {
   if (!segs.length) return html
@@ -167,7 +231,7 @@ function restoreMath(html: string, segs: MathSeg[]): string {
     const seg = segs[parseInt(idxStr, 10)]
     if (!seg) return m
     try {
-      return katex.renderToString(seg.tex, { throwOnError: false, displayMode: seg.display })
+      return renderTex(seg.tex, seg.display)
     } catch {
       return escHtml(seg.tex)
     }
