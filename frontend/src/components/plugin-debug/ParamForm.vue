@@ -192,12 +192,12 @@ function onInput(name: string, e: Event) {
   padding: 9px 12px; list-style: none;
 }
 .tool-desc-summary::-webkit-details-marker { display: none; }
-.tool-desc-label { font-size: calc(11px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px; opacity: .75; color: #cfe2ff; }
+.tool-desc-label { font-size: calc(11px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px; opacity: .75; color: var(--accent-light); }
 .caret { margin-left: auto; font-size: calc(10px * var(--font-scale)); opacity: .6; transition: transform .2s; }
 .tool-desc[open] .caret { transform: rotate(180deg); }
 .tool-desc-text {
   font-family: inherit; font-size: calc(13px * var(--font-scale)); line-height: 1.6; white-space: pre-wrap; word-break: break-word;
-  color: #cfe2ff; margin: 0; padding: 0 12px 10px;
+  color: rgba(var(--text-rgb), 0.85); margin: 0; padding: 0 12px 10px;
 }
 
 .run-row { display: flex; align-items: center; gap: 10px; }

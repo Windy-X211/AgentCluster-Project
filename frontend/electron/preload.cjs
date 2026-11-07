@@ -28,6 +28,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onSplashStep: (callback) => {
     ipcRenderer.on('splash:step', (_e, text, pct) => callback(text, pct))
   },
+  // 启动中窗口：最小化 / 中止启动（内部用；✕=取消启动退出，主窗已存在时仅关画面）
+  splashMinimize: () => ipcRenderer.send('splash:minimize'),
+  splashAbort: () => ipcRenderer.send('splash:abort'),
   // 窗口控制
   window: {
     minimize: () => ipcRenderer.invoke('win:minimize'),

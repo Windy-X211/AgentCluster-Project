@@ -23,6 +23,11 @@ from core.store import get_by as _get_by
 BUF_MAX = 200000
 # 运行结束后缓冲与基底保留时长（秒），供晚到的前端补拉；超时懒清理
 FINISHED_TTL = 600.0
+# 订阅空闲心跳（秒）：LLM 慢推理期间无事件产出时定期广播，客户端据此区分
+# 「慢推理」与「死连接」（TCP 半开）；前端读空闲超时 45s = 3 个心跳周期。
+# 心跳行走 push() 占一个事件序号（前端 _runSeq 按行计数与后端 seq 严格对齐）
+HB_SEC = 15.0
+HB_LINE = ": hb"
 
 
 class RunSession:
@@ -73,7 +78,9 @@ class RunSession:
         """从 since 之后重放缓冲，再实时跟随新事件；DONE 行后结束迭代。
 
         先同步快照再注册订阅者（两者之间无 await，原子），
-        保证重放与实时推送之间不丢行、不重复。"""
+        保证重放与实时推送之间不丢行、不重复。
+        空闲超过 HB_SEC 无事件 → 广播一行心跳（占 seq），保持连接活性：
+        前端 45s 读空闲超时依赖心跳判定连接存活，避免半开连接下界面锁死。"""
         q: asyncio.Queue = asyncio.Queue()
         snap = [e for e in self.events if e[0] > since]
         self.subscribers.add(q)
@@ -83,7 +90,12 @@ class RunSession:
                 if line.strip() == "DONE":
                     return
             while True:
-                _seq, line = await q.get()
+                try:
+                    _seq, line = await asyncio.wait_for(q.get(), timeout=HB_SEC)
+                except asyncio.TimeoutError:
+                    # push 广播给所有订阅者（含本 q），下一轮迭代取到心跳行 yield 出去
+                    self.push(HB_LINE)
+                    continue
                 yield line
                 if line.strip() == "DONE":
                     return

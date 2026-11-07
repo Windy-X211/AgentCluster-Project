@@ -666,6 +666,7 @@ export const useConvStore = defineStore('conv', {
 
     _sendError: {} as Record<number, boolean>, // 会话 → 本轮 send 是否出现错误（E: 行 / 异常）
     _adopting: new Set<number>(), // 正在接管恢复的后端运行会话（防重复订阅）
+    _beforeUnloadBound: false,   // beforeunload 监听只绑一次（send 每次调用，防监听器泄漏）
   }),
   getters: {
     /** 当前会话是否正在流式（发送/停止按钮据此切换：仅当前会话在流式才显示"停止"，
@@ -971,8 +972,10 @@ export const useConvStore = defineStore('conv', {
       // 节流定时器已在后端 send 端点落库 + DONE 前 final upsert 双通道保障，
       // 前端只保留 flushCurrentNow 在关键节点（send 前 / finish 后）显式调用
     },
-    /** 绑定 window.beforeunload：关页/关标签时用同步 XHR 强制保存。幂等。 */
+    /** 绑定 window.beforeunload：关页/关标签时用同步 XHR 强制保存。幂等（只绑一次）。 */
     bindBeforeUnload() {
+      if (this._beforeUnloadBound) return
+      this._beforeUnloadBound = true
       const handler = () => {
         const ids = new Set<number>()
         if (this.current != null) ids.add(this.current)
@@ -1079,9 +1082,12 @@ export const useConvStore = defineStore('conv', {
     },
 
     /** 拉取行协议流并逐行喂给 _handleLine；返回是否以 DONE 行正常结束。
-     *  网络异常 / AbortError 向外抛出，由调用方决定重连恢复或中止收尾。
+     *  网络异常 / AbortError / 读空闲超时向外抛出，由调用方决定重连恢复或中止收尾。
      *  运行期间不做前端 PUT：落库由后端节流负责（多前端实例同时在线时避免双写竞争）。
-     *  runKey = `${cid}:${agentId}`，用于按运行隔离发言者与断连续订序号。 */
+     *  runKey = `${cid}:${agentId}`，用于按运行隔离发言者与断连续订序号。
+     *  读空闲超时（45s 无任何字节，含后端 15s 心跳）：TCP 半开连接（睡眠唤醒/网络切换/
+     *  后端阻塞但连接未断）下 reader.read() 永不 resolve → streaming 状态锁死、按钮永久
+     *  禁用、Ctrl+R 才能恢复——超时抛错走 _recoverRun 自动重连续订，自愈。 */
     async _drainEventStream(c: any, url: string, init?: RequestInit, runKey?: string): Promise<boolean> {
       const r = await fetch(url, init)
       if (!r.ok) throw new Error(await r.text().catch(() => r.statusText) || r.statusText)
@@ -1089,14 +1095,26 @@ export const useConvStore = defineStore('conv', {
       const decoder = new TextDecoder()
       let buf = ''
       let sawDone = false
+      const READ_IDLE_TIMEOUT = 45_000
+      const readWithTimeout = (): Promise<any> => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          try { reader.cancel() } catch { /* ignore */ }
+          reject(new Error('STREAM_IDLE_TIMEOUT'))
+        }, READ_IDLE_TIMEOUT)
+        reader.read().then(
+          (v: any) => { clearTimeout(timer); resolve(v) },
+          (e: any) => { clearTimeout(timer); reject(e) },
+        )
+      })
       while (true) {
-        const { done, value } = await reader.read()
+        const { done, value } = await readWithTimeout()
         if (done) break
         buf += decoder.decode(value, { stream: true })
         let idx: number
         while ((idx = buf.indexOf('\n')) !== -1) {
           const line = buf.slice(0, idx); buf = buf.slice(idx + 1)
           // 序号计数（对齐后端 session seq：从 0 订阅时第 n 行即 seq=n）→ 断连续订 since 用
+          //（心跳行 ": hb" 也占一个后端 seq，此处同步计数保持对齐）
           if (runKey) this._runSeq[runKey] = (this._runSeq[runKey] ?? 0) + 1
           if (!line.trim()) continue
           this._handleLine(c, line, runKey)
@@ -1421,29 +1439,26 @@ export const useConvStore = defineStore('conv', {
     /** 停止对话流：agentId 给定 → 只停该智能体；缺省 → 停该会话全部智能体。
      *  原设计：先 await 通知后端停止，后端成功后本地流自然会收到 STOP/DONE 行结束；
      *  后端不可达或 8s 超时 → abort 本地流兜底。
-     *  新版同步无条件 abort 本地流会导致：正常回复进行中被提前 abort → 前端 ERR_ABORTED → 对话清空。 */
+     *  新版同步无条件 abort 本地流会导致：正常回复进行中被提前 abort → 前端 ERR_ABORTED → 对话清空。
+     *  ⚠️ 兜底定时器必须先于 await 注册（旧实现注册在 await 之后：stop 请求挂死时兜底
+     *  永不触发 → 停止按钮彻底失效，界面无响应）；stop 请求本身另有 api 层 30s 超时。 */
     async stopSend(agentId?: number | null) {
       const cid = this.current
       if (cid == null) return
+      const stillStreaming = () => agentId != null
+        ? this._ctrls.has(`${cid}:${agentId}`)
+        : [...this._ctrls.keys()].some(k => k.startsWith(`${cid}:`))
+      if (stillStreaming()) {
+        setTimeout(() => {
+          if (stillStreaming()) this._abortLocal(cid, agentId)
+        }, 8000)
+      }
       try {
         // 先通知后端取消运行——后端会发出 STOP 行，前端事件流自然结束（DONE 收尾）
         await api.convs.stop(cid, agentId ?? null)
       } catch {
-        // 后端不可达 → 兜底 abort 本地流（不等后端了）
+        // 后端不可达 / stop 请求超时 → 兜底 abort 本地流（不等后端了）
         this._abortLocal(cid, agentId)
-        return
-      }
-      // 8s 后该运行仍在本地流式 → 断开订阅兜底（按 runKey 精确判定）
-      const stillStreaming = agentId != null
-        ? this._ctrls.has(`${cid}:${agentId}`)
-        : [...this._ctrls.keys()].some(k => k.startsWith(`${cid}:`))
-      if (stillStreaming) {
-        setTimeout(() => {
-          const still2 = agentId != null
-            ? this._ctrls.has(`${cid}:${agentId}`)
-            : [...this._ctrls.keys()].some(k => k.startsWith(`${cid}:`))
-          if (still2) this._abortLocal(cid, agentId)
-        }, 8000)
       }
     },
     _abortLocal(cid: number, agentId?: number | null) {

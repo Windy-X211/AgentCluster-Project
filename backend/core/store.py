@@ -21,6 +21,7 @@ fsync 策略由 AGENTCLUSTER_FSYNC 控制（见下方 FSYNC_MODE 注释），默
 旧内容，不会损坏）；设为 sync 可恢复「先落盘再返回」的旧行为（本机 ~45ms/次，偏慢）。
 """
 import atexit, json, os, queue, shutil, tempfile, threading, glob, time
+import asyncio
 from pathlib import Path
 from copy import deepcopy
 from datetime import datetime
@@ -507,6 +508,22 @@ def upsert(name: str, item, key: str = "id"):
             items.append(item)
         save(name, items)
         return item
+
+
+# 事件循环内安全落盘：json.dumps + 写盘都是同步大 IO（大会话可达数 MB），
+# 直接在 async 端点/后台任务里调用会阻塞事件循环数百毫秒 → 健康检查 1.5s 超时
+# 误报「后端崩溃」。upsert_async 把写盘放线程池，并用 asyncio.Lock 串行化——
+# 事件循环内直调本是天然串行，to_thread 后必须加锁避免并发写同一记录文件竞态。
+_ASYNC_UPSERT_LOCK: asyncio.Lock | None = None
+
+
+async def upsert_async(name: str, item, key: str = "id"):
+    """upsert 的异步安全版本（事件循环内调用；同步上下文仍用 upsert）。"""
+    global _ASYNC_UPSERT_LOCK
+    if _ASYNC_UPSERT_LOCK is None:
+        _ASYNC_UPSERT_LOCK = asyncio.Lock()
+    async with _ASYNC_UPSERT_LOCK:
+        return await asyncio.to_thread(upsert, name, item, key)
 
 
 def delete_by(name: str, value, key: str = "id") -> bool:

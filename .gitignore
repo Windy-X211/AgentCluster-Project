@@ -19,6 +19,7 @@
 **/*.pyo
 **/*.pyd
 *.log
+*.log.old
 *.pid
 *.mp4
 /.startup_status

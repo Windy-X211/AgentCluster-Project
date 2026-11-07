@@ -120,7 +120,7 @@ onBeforeUnmount(() => {
   z-index: 0;
   pointer-events: none;
   overflow: hidden;
-  background: #0a0e1a;
+  background: var(--bg-base);
 }
 .bg-fill {
   width: 100%;

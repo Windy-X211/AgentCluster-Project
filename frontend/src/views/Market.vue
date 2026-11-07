@@ -1414,10 +1414,10 @@ onBeforeUnmount(() => {
 .gh-login.logged { padding-left: 6px; }
 .cache-indicator {
   display: inline-flex; align-items: center; gap: 6px;
-  font-size: calc(12px * var(--font-scale)); color: rgba(232, 238, 252, .92);
+  font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), .9);
   padding: 4px 10px; border-radius: 8px;
-  background: rgba(255, 255, 255, .07);
-  border: 1px solid rgba(255, 255, 255, .16);
+  background: rgba(var(--surface-rgb), .07);
+  border: 1px solid rgba(var(--surface-rgb), .16);
   white-space: nowrap;
 }
 
@@ -1426,14 +1426,14 @@ onBeforeUnmount(() => {
   padding: 2px 10px; border-radius: 6px;
   background: rgba(var(--accent-rgb, 120, 140, 255), .2);
   border: 1px solid rgba(var(--accent-rgb, 120, 140, 255), .5);
-  color: #d5deff;
+  color: var(--accent-light);
   cursor: pointer; line-height: 1.5;
   transition: background .15s, color .15s, border-color .15s;
 }
 .cache-clean-btn:hover:not(:disabled) {
-  background: rgba(255, 120, 120, .24);
+  background: rgba(255, 120, 120, .18);
   border-color: rgba(255, 120, 120, .55);
-  color: #ffc9c9;
+  color: var(--red-ink);
 }
 .cache-clean-btn:disabled { opacity: .55; cursor: not-allowed; }
 .gh-avatar { width: 18px; height: 18px; border-radius: 50%; display: block; }
@@ -1453,10 +1453,10 @@ onBeforeUnmount(() => {
   color: inherit; cursor: pointer; font-size: calc(13px * var(--font-scale));
   transition: background .15s, color .15s;
 }
-.kind-item:hover { background: rgba(255, 255, 255, .06); }
+.kind-item:hover { background: rgba(var(--surface-rgb), .07); }
 .kind-item.active { background: rgba(var(--accent-rgb, 120, 140, 255), .2); color: var(--accent-light, #9db4ff); }
-.kind-item.mine { border-top: 1px dashed rgba(255, 255, 255, .1); margin-top: 4px; padding-top: 10px; }
-.kind-item.mine.active { background: rgba(255, 180, 120, .18); color: #ffc98a; }
+.kind-item.mine { border-top: 1px dashed rgba(var(--surface-rgb), .16); margin-top: 4px; padding-top: 10px; }
+.kind-item.mine.active { background: rgba(var(--accent-rgb), .18); color: var(--accent-light); }
 .kind-count { font-size: 11px; opacity: .55; }
 
 .mk-content { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; overflow: auto; }
@@ -1478,9 +1478,9 @@ onBeforeUnmount(() => {
 .filter-check {
   display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0;
   font-size: calc(12px * var(--font-scale)); opacity: .8; cursor: pointer; user-select: none;
-  padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, .1);
+  padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(var(--surface-rgb), .16);
 }
-.filter-check:hover { background: rgba(255, 255, 255, .05); }
+.filter-check:hover { background: rgba(var(--surface-rgb), .06); }
 .filter-check input { cursor: pointer; accent-color: rgb(var(--accent-rgb, 120, 140, 255)); }
 .search-scope { font-size: calc(11px * var(--font-scale)); opacity: .45; flex-shrink: 0; }
 
@@ -1491,7 +1491,7 @@ onBeforeUnmount(() => {
 .mc-icon {
   width: 38px; height: 38px; border-radius: 9px; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
-  font-size: 20px; background: rgba(255, 255, 255, .06);
+  font-size: 20px; background: rgba(var(--surface-rgb), .07);
   overflow: hidden;
 }
 .mc-icon-emoji { line-height: 1; }
@@ -1499,37 +1499,37 @@ onBeforeUnmount(() => {
 .mc-title-wrap { flex: 1; min-width: 0; }
 .mc-title { font-weight: 600; font-size: calc(14px * var(--font-scale)); }
 .mc-sub { font-size: calc(11px * var(--font-scale)); opacity: .5; margin-top: 2px; }
-.mc-badge { font-size: 10px; padding: 2px 7px; border-radius: 8px; background: rgba(111, 207, 151, .14); color: #6fcf97; flex-shrink: 0; }
-.mc-badge.warn { background: rgba(255, 180, 120, .18); color: #ffc98a; }
+.mc-badge { font-size: 10px; padding: 2px 7px; border-radius: 8px; background: rgba(111, 207, 151, .14); color: var(--success-light); flex-shrink: 0; }
+.mc-badge.warn { background: rgba(255, 180, 120, .18); color: var(--warn-ink); }
 .mc-desc {
   font-size: calc(12px * var(--font-scale)); opacity: .65; line-height: 1.5; min-height: 34px;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 .mc-tags { display: flex; flex-wrap: wrap; gap: 5px; min-height: 18px; }
-.tag { font-size: 10px; padding: 1px 7px; border-radius: 8px; background: rgba(255, 255, 255, .06); color: rgba(255, 255, 255, .55); }
+.tag { font-size: 10px; padding: 1px 7px; border-radius: 8px; background: rgba(var(--surface-rgb), .07); color: rgba(var(--text-rgb), .62); }
 .mc-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
 .mc-author {
   display: inline-flex; align-items: center; gap: 4px;
   font-size: calc(11px * var(--font-scale)); opacity: .55;
   padding: 3px 8px; border-radius: 10px;
-  background: rgba(255, 255, 255, .04);
+  background: rgba(var(--surface-rgb), .05);
   transition: opacity .15s, background .15s;
 }
-.mc-author:hover { opacity: .85; background: rgba(255, 255, 255, .08); }
+.mc-author:hover { opacity: .85; background: rgba(var(--surface-rgb), .09); }
 .mc-author-avatar {
   width: 16px; height: 16px; border-radius: 50%;
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 10px; background: rgba(var(--accent-rgb, 120, 140, 255), .25);
 }
-.act { padding: 5px 16px; border-radius: 7px; border: 1px solid rgba(255, 255, 255, .15); background: transparent; color: inherit; cursor: pointer; font-size: 12px; transition: all .15s; }
-.act:hover { background: rgba(255, 255, 255, .08); }
+.act { padding: 5px 16px; border-radius: 7px; border: 1px solid rgba(var(--surface-rgb), .18); background: transparent; color: inherit; cursor: pointer; font-size: 12px; transition: all .15s; }
+.act:hover { background: rgba(var(--surface-rgb), .08); }
 .act:disabled { opacity: .45; cursor: not-allowed; }
 .act.primary { background: rgba(var(--accent-rgb, 120, 140, 255), .2); border-color: rgba(var(--accent-rgb, 120, 140, 255), .5); color: var(--accent-light, #9db4ff); }
 .act.primary:hover:not(:disabled) { background: rgba(var(--accent-rgb, 120, 140, 255), .3); }
-.act.ghost { background: transparent; border-color: rgba(255, 255, 255, .1); color: rgba(255, 255, 255, .7); }
-.act.ghost:hover:not(:disabled) { background: rgba(255, 255, 255, .06); color: inherit; }
-.act.danger { background: rgba(230, 90, 90, .12); border-color: rgba(230, 90, 90, .45); color: #ff9c9c; }
-.act.danger:hover:not(:disabled) { background: rgba(230, 90, 90, .22); color: #ffc0c0; }
+.act.ghost { background: transparent; border-color: rgba(var(--surface-rgb), .16); color: rgba(var(--text-rgb), .75); }
+.act.ghost:hover:not(:disabled) { background: rgba(var(--surface-rgb), .07); color: inherit; }
+.act.danger { background: rgba(230, 90, 90, .12); border-color: rgba(230, 90, 90, .45); color: var(--red-ink); }
+.act.danger:hover:not(:disabled) { background: rgba(230, 90, 90, .22); color: var(--red-ink); }
 
 /* —— 预览弹窗 —— */
 .preview-modal { width: min(780px, 94vw); max-height: 86vh; }
@@ -1579,9 +1579,10 @@ onBeforeUnmount(() => {
   white-space: pre-wrap; word-break: break-all;
   max-height: 320px; overflow: auto;
 }
-.pv-code.pv-prompt { max-height: 240px; color: #d4c1ff; }
-.pv-code.pv-python { color: #a5d6ff; }
-.pv-code.pv-html { color: #ffd4a5; }
+/* 预览代码按类型着色（提示词 / Python / HTML）→ 统一强调色，减少花哨色相 */
+.pv-code.pv-prompt { max-height: 240px; color: var(--accent-light); }
+.pv-code.pv-python { color: var(--accent-light); }
+.pv-code.pv-html { color: var(--accent-light); }
 
 .pv-markdown {
   background: rgba(0, 0, 0, .2); border: 1px solid rgba(255, 255, 255, .06);
@@ -1892,7 +1893,7 @@ onBeforeUnmount(() => {
 .pv-ver-num { font-weight: 600; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #d6deff; }
 .pv-ver-tag { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
 .pv-ver-tag.latest { background: rgba(90, 200, 120, .18); color: #7fdfa0; }
-.pv-ver-tag.other-author { background: rgba(200, 170, 90, .15); color: #e8c078; }
+.pv-ver-tag.other-author { background: rgba(255, 255, 255, .07); color: rgba(255, 255, 255, .7); }
 .pv-ver-updated { margin-left: auto; font-size: 11px; opacity: .55; }
 
 /* 预览弹窗安装行 */

@@ -1,6 +1,9 @@
 """智能体集群 - FastAPI 入口"""
 import os
+import sys
 import asyncio
+import threading
+import traceback
 import zlib
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -145,14 +148,50 @@ def _ensure_orchestrator():
     upsert("agents", item)
 
 
+def _install_thread_excepthook():
+    """线程未捕获异常统一打印（默认行为只打 stderr 一行容易漏看；后台线程挂掉时
+    此前几乎无痕迹，排障只能靠猜）。打印进 stdout → electron_backend.log 可查。"""
+    def _hook(args):
+        try:
+            print(f"[thread-excp] {args.exc_type.__name__} in thread {args.thread.name}: {args.exc_value}",
+                  flush=True)
+            traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+        except Exception:
+            pass
+    threading.excepthook = _hook
+
+
+def _install_loop_exception_handler(loop: asyncio.AbstractEventLoop):
+    """事件循环异常兜底：
+    - ConnectionResetError/ConnectionAbortedError/BrokenPipeError（Windows Proactor 下
+      客户端强断触发 WinError 10054 风暴）→ 静默，此前默认 handler 刷屏数十条拖慢日志
+    - 其余异常走默认 handler（保留 traceback 可查）"""
+    def _handler(loop_, context):
+        exc = context.get("exception")
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        loop_.default_exception_handler(context)
+    loop.set_exception_handler(_handler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_store()
+    _install_thread_excepthook()
+    try:
+        init_store()
+    except Exception as e:
+        print(f"[main] FATAL 初始化存储失败：{e}", flush=True)
+        traceback.print_exc()
+        raise
     # 捕获主事件循环：cluster.* 运行管理命令（启动/停止智能体）在 worker 线程执行，
     # 需要把协程调度回本循环（run_registry.start/stop 必须在事件循环内调用）
     from core import mainloop
     mainloop.set(asyncio.get_running_loop())
-    _ensure_orchestrator()
+    _install_loop_exception_handler(asyncio.get_running_loop())
+    try:
+        _ensure_orchestrator()
+    except Exception as e:
+        print(f"[main] WARN 编排师初始化失败（不阻断启动）：{e}", flush=True)
     # 首次启动自动安装核心功能拓展（visual_interaction 等）
     try:
         from api.extensions import auto_install_first_time
@@ -901,4 +940,6 @@ def fs_run(path: str = ""):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8870")), reload=False)
+    # access_log=False：健康检查 3s 轮询 + /events 长连接全量打 access log 是日志膨胀主因
+    # （electron_backend.log 曾因此涨到 26MB）；错误/异常日志不受影响
+    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8870")), reload=False, access_log=False)

@@ -21,7 +21,7 @@ app.whenReady().then(async () => {
   } catch (e) { console.error('拉取默认智能体失败:', e.message) }
 
   const win = new BrowserWindow({
-    width: 480, height: 740, frame: false, backgroundColor: '#0a0e1a',
+    width: 480, height: 740, frame: false, backgroundColor: '#000000',
     show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: false },
   })
   await win.loadURL(`http://127.0.0.1:${PORT}/#/quickchat`)

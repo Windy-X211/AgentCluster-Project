@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import Any
-from core.store import load, upsert, delete_by, get_by, next_id, load_list_payloads
+from core.store import load, upsert, upsert_async, delete_by, get_by, next_id, load_list_payloads
 from core import run_registry
 from core.file_backup import (
     list_file_ops, restore_op, restore_range, _load_conv_ops,
@@ -241,7 +241,7 @@ async def send_message(cid: int, m: MsgIn):
         "role": "user", "content": m.content, "ts": datetime.utcnow().isoformat(),
         "to_agent_id": m.agent_id,
     })
-    upsert("conversations", conv)
+    await upsert_async("conversations", conv)
 
     # 运行与连接解耦：agent_reply 在后台任务里跑（事件缓冲 + 广播），
     # 本响应只是"订阅视图"——客户端断开（关窗/断网/刷新）不再中止运行，

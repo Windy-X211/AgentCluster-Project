@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { watch, computed } from 'vue'
 import { RouterView, useRoute } from 'vue-router'
-import { useLayoutStore, useConvStore, useCanvasStore } from '@/stores'
+import { useLayoutStore, useConvStore, useCanvasStore, FONT_FAMILIES } from '@/stores'
 import GuideManager from '@/components/guide/GuideManager.vue'
 import BackgroundLayer from '@/components/BackgroundLayer.vue'
 import WindowControls from '@/components/WindowControls.vue'
@@ -22,8 +22,14 @@ function applyTheme(t: string) {
   document.documentElement.setAttribute('data-theme', t)
 }
 
+function applyFontFamily(id: string) {
+  const f = FONT_FAMILIES.find(x => x.id === id) || FONT_FAMILIES[0]
+  document.documentElement.style.setProperty('--app-font', f.stack)
+}
+
 watch(() => layout.fontScale, applyFontScale, { immediate: true })
 watch(() => layout.theme, applyTheme, { immediate: true })
+watch(() => layout.fontFamily, applyFontFamily, { immediate: true })
 
 // 会话/画布选中项跨会话记忆：整页重载（Electron 重开窗 / 浏览器刷新）后恢复上次所在位置
 const convs = useConvStore()

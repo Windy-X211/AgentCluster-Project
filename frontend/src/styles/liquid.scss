@@ -2,53 +2,59 @@
 
 :root {
   --titlebar-h: 0px;
-  --bg-base: #0a0e1a;
-  --bg-grad-1: #1a2340;
-  --bg-grad-2: #2d1645;
-  --surface-rgb: 255, 255, 255;
-  --shadow-rgb: 0, 0, 0;
-  --text-rgb: 232, 236, 244;
-  --text: rgb(var(--text-rgb));
-  --text-dim: rgba(var(--text-rgb), 0.6);
-  --accent-rgb: 110, 168, 255;
-  --accent: rgb(var(--accent-rgb));
-  --accent2-rgb: 180, 114, 255;
-  --accent-2: rgb(var(--accent2-rgb));
-  --accent-light: #a8c8ff;
-  --accent2-light: #d4a8ff;
-  --success-light: #80e4b8;
-  --panel-bg: #1a1f30;
-  --node-bg-rgb: 20, 26, 44;
-  --accent-ink: var(--accent);
-  --purple-ink: var(--accent-2);
-  --green-ink: var(--success-light);
-  --red-ink: #ff9090;
-  --code-ink: #ffb088;
-  --font-scale: 1;
-  --code-tint-bg: rgba(var(--surface-rgb), 0.08);
-  --code-tint-strong: rgba(var(--surface-rgb), 0.12);
-  --code-tint-pre: rgba(var(--surface-rgb), 0.06);
-  --tint-soft-bg: rgba(var(--surface-rgb), 0.06);
-  --tint-input-bg: rgba(var(--surface-rgb), 0.04);
-  --glass-shadow: 0 8px 32px rgba(var(--shadow-rgb), 0.25), inset 0 1px 0 rgba(var(--surface-rgb), 0.08);
-  --popup-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
-}
-
-/* 深邃黑 */
-[data-theme="deep-black"] {
   --bg-base: #000000;
   --bg-grad-1: #080808;
   --bg-grad-2: #101010;
   --surface-rgb: 255, 255, 255;
   --shadow-rgb: 0, 0, 0;
-  --text-rgb: 215, 215, 215;
+  --text-rgb: 236, 236, 236;
+  --text: rgb(var(--text-rgb));
+  --text-dim: rgba(var(--text-rgb), 0.72);
   --accent-rgb: 110, 168, 255;
-  --accent2-rgb: 180, 114, 255;
+  --accent: rgb(var(--accent-rgb));
+  /* 第二强调色不再使用紫色，统一别名到主强调色：全站只保留一个强调色相 */
+  --accent2-rgb: var(--accent-rgb);
+  --accent-2: rgb(var(--accent2-rgb));
   --accent-light: #a8c8ff;
-  --accent2-light: #d4a8ff;
+  --accent2-light: var(--accent-light);
   --success-light: #80e4b8;
   --panel-bg: #0a0a0a;
   --node-bg-rgb: 18, 18, 22;
+  --accent-ink: var(--accent);
+  --purple-ink: var(--accent-2);
+  --green-ink: var(--success-light);
+  --red-ink: #ff9090;
+  /* 警告/提醒文字色（随主题切换，浅色主题用深琥珀保证可读） */
+  --warn-ink: #f0c060;
+  /* 代码/内联代码文字：原橙色，改为强调色浅色，去掉多余的色相 */
+  --code-ink: var(--accent-light);
+  --font-scale: 1;
+  --app-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Segoe UI Variable Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --code-tint-bg: rgba(var(--surface-rgb), 0.06);
+  --code-tint-strong: rgba(var(--surface-rgb), 0.09);
+  --code-tint-pre: rgba(var(--surface-rgb), 0.045);
+  --tint-soft-bg: rgba(var(--surface-rgb), 0.045);
+  --tint-input-bg: rgba(var(--surface-rgb), 0.03);
+  --glass-shadow: 0 8px 32px rgba(var(--shadow-rgb), 0.25), inset 0 1px 0 rgba(var(--surface-rgb), 0.08);
+  --popup-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
+}
+
+/* 银河蓝（深蓝紫渐变底；原「深邃黑」槽位，深邃黑已并入 standard） */
+[data-theme="galaxy-blue"] {
+  --bg-base: #0a0e1a;
+  --bg-grad-1: #1a2340;
+  /* 原紫蓝渐变收为同色系深蓝，背景只保留一个色相 */
+  --bg-grad-2: #141d33;
+  --surface-rgb: 255, 255, 255;
+  --shadow-rgb: 0, 0, 0;
+  --text-rgb: 236, 236, 236;
+  --accent-rgb: 110, 168, 255;
+  --accent2-rgb: var(--accent-rgb);
+  --accent-light: #a8c8ff;
+  --accent2-light: var(--accent-light);
+  --success-light: #80e4b8;
+  --panel-bg: #1a1f30;
+  --node-bg-rgb: 20, 26, 44;
 }
 
 /* 科技白 */
@@ -60,21 +66,37 @@
   --shadow-rgb: 20, 30, 50;
   --text-rgb: 12, 18, 28;
   --accent-rgb: 37, 99, 235;
-  --accent2-rgb: 124, 58, 237;
+  --accent2-rgb: var(--accent-rgb);
   --accent-light: #2563eb;
-  --accent2-light: #7c3aed;
+  --accent2-light: var(--accent-light);
   --success-light: #16a34a;
   --panel-bg: #ffffff;
-  --node-bg-rgb: 228, 236, 245;
+  --node-bg-rgb: 245, 248, 252;
   --red-ink: #dc2626;
-  --code-ink: #c2410c;
-  --code-tint-bg: #dce6f4;
-  --code-tint-strong: #c8d6ee;
-  --code-tint-pre: #dce6f4;
-  --tint-soft-bg: #f1f5fb;
-  --tint-input-bg: #f3f7fc;
+  --warn-ink: #b45309;
+  --code-ink: var(--accent-light);
+  --code-tint-bg: #e2ebf6;
+  --code-tint-strong: #cfdbef;
+  --code-tint-pre: #e2ebf6;
+  --tint-soft-bg: #f5f8fc;
+  --tint-input-bg: #f8fafc;
   --glass-shadow: 0 1px 8px rgba(20, 30, 50, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.6);
   --popup-shadow: 0 4px 20px rgba(20, 30, 50, 0.08);
+}
+
+/* 科技白：左右面板去玻璃灰底——容器背景透明露出白底，仅消息泡泡与列表卡片保留灰 */
+[data-theme="tech-white"] .left.glass,
+[data-theme="tech-white"] .right-panel.glass {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* 科技白：智能体列表卡片改用与消息泡泡一致的浅灰底（原 glass-soft 0.03 在白底上过淡） */
+[data-theme="tech-white"] .left .glass-soft {
+  background: var(--tint-soft-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 /* 护眼白（米黄） */
@@ -86,14 +108,15 @@
   --shadow-rgb: 90, 70, 30;
   --text-rgb: 70, 55, 30;
   --accent-rgb: 43, 108, 176;
-  --accent2-rgb: 139, 92, 246;
+  --accent2-rgb: var(--accent-rgb);
   --accent-light: #2b6cb0;
-  --accent2-light: #8b5cf6;
+  --accent2-light: var(--accent-light);
   --success-light: #2f855a;
   --panel-bg: #ece1c5;
-  --node-bg-rgb: 235, 225, 198;
+  --node-bg-rgb: 242, 236, 216;
   --red-ink: #c53030;
-  --code-ink: #92400e;
+  --warn-ink: #92400e;
+  --code-ink: var(--accent-light);
 }
 
 $bg-deep: var(--bg-base);
@@ -118,18 +141,27 @@ body,
   width: 100%;
 }
 
-/* 样式表加载后按主题纠正 html 底色（index.html 内联 #0a0e1a 仅用于首帧防白闪） */
+/* 样式表加载后按主题纠正 html 底色（index.html 内联 #000000 仅用于首帧防白闪） */
 html {
   background: var(--bg-base);
 }
 
 body {
-  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--app-font);
   color: $text;
   background: radial-gradient(ellipse at 20% 10%, var(--bg-grad-1) 0%, $bg-deep 60%),
     radial-gradient(ellipse at 80% 90%, var(--bg-grad-2) 0%, transparent 50%);
   background-attachment: fixed;
   overflow: hidden;
+}
+
+/* 表单控件（button/input/select/textarea）浏览器 UA 默认不继承 body 字体，统一改为继承 */
+button,
+input,
+select,
+textarea,
+option {
+  font-family: inherit;
 }
 
 // 液态玻璃通用类
@@ -159,7 +191,7 @@ body {
 }
 
 .btn {
-  background: linear-gradient(135deg, rgba(var(--accent-rgb), 0.25), rgba(var(--accent2-rgb), 0.25));
+  background: rgba(var(--accent-rgb), 0.18);
   border: 1px solid rgba(var(--surface-rgb), 0.15);
   color: $text;
   padding: 6px 14px;
@@ -244,16 +276,12 @@ option {
   color: var(--accent-light);
   border: 1px solid rgba(var(--accent-rgb), 0.3);
 
-  &.skill {
-    background: rgba(var(--accent2-rgb), 0.18);
-    color: var(--accent2-light);
-    border-color: rgba(var(--accent2-rgb), 0.3);
-  }
-
+  /* 分类标签（技能/插件）不再区分紫、绿，统一走强调色，绿色只留给真正的状态提示 */
+  &.skill,
   &.plugin {
-    background: rgba(100, 220, 160, 0.18);
-    color: var(--success-light);
-    border-color: rgba(100, 220, 160, 0.3);
+    background: rgba(var(--accent-rgb), 0.18);
+    color: var(--accent-light);
+    border-color: rgba(var(--accent-rgb), 0.3);
   }
 }
 

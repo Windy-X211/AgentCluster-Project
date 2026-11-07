@@ -292,9 +292,10 @@ function displayLabel(type: string, key: string): string {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 10px 3px 10px; border-radius: 999px; font-size: calc(12px * var(--font-scale)); cursor: default;
   border: 1px solid rgba(var(--surface-rgb), 0.15);
-  &.blue   { background: rgba(var(--accent-rgb), 0.18);  color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
-  &.purple { background: rgba(var(--accent2-rgb), 0.18); color: var(--accent2-light); border-color: rgba(var(--accent2-rgb), 0.3); }
-  &.green  { background: rgba(100,220,160,0.18); color: var(--success-light); border-color: rgba(100,220,160,0.3); }
+  /* 分类标签统一为强调色，不再按蓝 / 紫 / 绿分色 */
+  &.blue,
+  &.purple,
+  &.green  { background: rgba(var(--accent-rgb), 0.18); color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
   .x { margin-left: 4px; opacity: .7; font-weight: bold; cursor: pointer; padding: 0 2px; &:hover { opacity: 1; } }
 }
 .hint-empty { font-size: calc(12px * var(--font-scale)); opacity: .45; padding: 4px 0; }
@@ -303,7 +304,7 @@ function displayLabel(type: string, key: string): string {
 /* —— picker 弹窗 —— */
 .picker-mask {
   position: fixed; inset: 0;
-  background: rgba(var(--shadow-rgb), 0.35);
+  background: rgba(var(--shadow-rgb), 0.18);
   backdrop-filter: blur(2px);
   z-index: 2000;
   display: flex; align-items: center; justify-content: center;

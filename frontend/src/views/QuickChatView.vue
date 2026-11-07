@@ -103,7 +103,7 @@ window.addEventListener('beforeunload', () => {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: #0a0e1a;
+  background: var(--bg-base);
   overflow: hidden;
   /* 与主窗 .app-root 同款层级保护：BackgroundLayer 是 fixed + z-index:0，
      无定位的正常流内容会被背景层盖住（设置背景图时小窗内容全部变暗） */
@@ -122,7 +122,7 @@ window.addEventListener('beforeunload', () => {
   -webkit-app-region: drag;
 }
 .qc-logo { font-size: 14px; }
-.qc-title { font-size: 12.5px; color: #8b9bc0; letter-spacing: .5px; }
+.qc-title { font-size: 12.5px; color: rgba(var(--text-rgb), 0.65); letter-spacing: .5px; }
 .qc-close {
   margin-left: auto;
   -webkit-app-region: no-drag;

@@ -395,10 +395,11 @@ watch(
   outline: none;
   tab-size: 2;
 }
-.editor-text.lang-json { color: #7ee787; }
-.editor-text.lang-yaml, .editor-text.lang-yml { color: #79c0ff; }
-.editor-text.lang-md { color: #d2a8ff; }
-.editor-text.lang-py { color: #ffa657; }
+/* 代码文件按语言着色（json/yaml/md/py 四色）→ 统一强调色浅色，减少色相 */
+.editor-text.lang-json { color: var(--accent-light); }
+.editor-text.lang-yaml, .editor-text.lang-yml { color: var(--accent-light); }
+.editor-text.lang-md { color: var(--accent-light); }
+.editor-text.lang-py { color: var(--accent-light); }
 .editor-footer {
   padding: 4px 14px;
   font-size: calc(11px * var(--font-scale));

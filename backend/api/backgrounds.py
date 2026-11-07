@@ -173,9 +173,9 @@ async def upload_background(
         entry_file = main_match or saved_names[0]
 
     preview_map = {
-        "animation": "radial-gradient(circle at 50% 40%, #1a2340 0%, #050816 70%)",
-        "video": "linear-gradient(135deg, #16223a 0%, #0a0e1a 100%)",
-        "image": "linear-gradient(135deg, #16223a 0%, #0a0e1a 100%)",
+        "animation": "radial-gradient(circle at 50% 40%, #080808 0%, #000000 70%)",
+        "video": "linear-gradient(135deg, #101010 0%, #000000 100%)",
+        "image": "linear-gradient(135deg, #101010 0%, #000000 100%)",
     }
     manifest = {
         "id": bg_id,

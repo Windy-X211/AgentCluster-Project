@@ -7,9 +7,23 @@ export const FONT_SCALE_MIN = 0.85
 export const FONT_SCALE_MAX = 1.4
 export const FONT_SCALE_DEFAULT = 1.0
 export const FONT_SCALE_STEP = 0.05
-export const THEMES = ['standard', 'deep-black', 'tech-white', 'eye-care'] as const
+export const THEMES = ['standard', 'galaxy-blue', 'tech-white', 'eye-care'] as const
 export type ThemeId = typeof THEMES[number]
 export const THEME_DEFAULT: ThemeId = 'standard'
+
+// 界面字体候选（id 持久化；stack 为 CSS font-family 回退链，本机未安装的字体自动跳到下一项）
+// 「跟随系统」放在首位，即默认字体（FONT_FAMILY_DEFAULT 取首项）
+export const FONT_FAMILIES: { id: string; name: string; stack: string }[] = [
+  { id: 'system', name: '跟随系统', stack: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Segoe UI Variable Text", "PingFang SC", "Microsoft YaHei", sans-serif' },
+  { id: 'noto-sans-sc', name: '思源黑体 · Noto Sans SC', stack: '"Noto Sans SC", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif' },
+  { id: 'noto-serif-sc', name: '思源宋体 · Noto Serif SC', stack: '"Noto Serif SC", "Source Han Serif SC", "SimSun", serif' },
+  { id: 'dengxian', name: '等线 · DengXian', stack: '"DengXian", "等线", "Segoe UI", "Microsoft YaHei", sans-serif' },
+  { id: 'yahei', name: '微软雅黑 · Microsoft YaHei', stack: '"Microsoft YaHei", "微软雅黑", "Segoe UI", "PingFang SC", sans-serif' },
+  { id: 'stxihei', name: '华文细黑', stack: '"STXihei", "华文细黑", "Microsoft YaHei", sans-serif' },
+  { id: 'kaiti', name: '楷体', stack: '"KaiTi", "楷体", "STKaiti", "华文楷体", serif' },
+  { id: 'youyuan', name: '幼圆', stack: '"YouYuan", "幼圆", "Microsoft YaHei", sans-serif' },
+]
+export const FONT_FAMILY_DEFAULT: string = FONT_FAMILIES[0].id
 
 // 背景相关
 export const BG_OPACITY_MIN = 0.1
@@ -52,7 +66,14 @@ function readFontScale(): number {
 
 function readTheme(): ThemeId {
   const t = readStore()?.theme
+  // 「深邃黑」槽位已改为「银河蓝」：迁移旧持久化值
+  if (t === 'deep-black') return 'galaxy-blue'
   return (THEMES as readonly string[]).includes(t) ? t : THEME_DEFAULT
+}
+
+function readFontFamily(): string {
+  const v = readStore()?.fontFamily
+  return FONT_FAMILIES.some(f => f.id === v) ? v : FONT_FAMILY_DEFAULT
 }
 
 function readBackgroundId(): string | null {
@@ -77,6 +98,7 @@ export const useLayoutStore = defineStore('layout', {
     rightWidth: readWidth(),
     fontScale: readFontScale(),
     theme: readTheme(),
+    fontFamily: readFontFamily(),
     backgroundId: readBackgroundId(),
     backgroundOpacity: readBackgroundOpacity(),
     backgroundBlur: readBackgroundBlur(),
@@ -115,6 +137,14 @@ export const useLayoutStore = defineStore('layout', {
     },
     resetTheme() {
       this.setTheme(THEME_DEFAULT)
+    },
+    setFontFamily(id: string) {
+      const v = FONT_FAMILIES.some(f => f.id === id) ? id : FONT_FAMILY_DEFAULT
+      this.fontFamily = v
+      writeStore({ fontFamily: v })
+    },
+    resetFontFamily() {
+      this.setFontFamily(FONT_FAMILY_DEFAULT)
     },
     setBackground(id: string | null) {
       this.backgroundId = id

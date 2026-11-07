@@ -18,7 +18,30 @@
 const _fs = require('fs')
 const _path = require('path')
 const _LOG = _path.join(__dirname, '..', '..', 'electron-main.log')
-function _log(m) { try { _fs.appendFileSync(_LOG, '[' + new Date().toISOString() + '] ' + m + '\n') } catch { } }
+
+// ---- 日志轮转：单文件超 10MB 滚动为 .old（覆盖上一份），防止 appendFileSync 无限膨胀
+// （electron-main.log 曾涨到 128MB，同步追加写还会拖慢 Electron 主进程自身）
+const _LOG_ROTATE_MAX = 10 * 1024 * 1024
+let _logRotateLastCheck = 0
+function _appendLog(file, buf) {
+  try {
+    const now = Date.now()
+    if (now - _logRotateLastCheck > 60000) {
+      _logRotateLastCheck = now
+      try {
+        const st = _fs.statSync(file)
+        if (st.size > _LOG_ROTATE_MAX) {
+          const old = file + '.old'
+          try { _fs.unlinkSync(old) } catch { }
+          try { _fs.renameSync(file, old) } catch { }
+        }
+      } catch { /* 文件不存在等，忽略 */ }
+    }
+    _fs.appendFileSync(file, buf)
+  } catch { }
+}
+
+function _log(m) { try { _appendLog(_LOG, '[' + new Date().toISOString() + '] ' + m + '\n') } catch { } }
 _log('=== Electron main.cjs starting ===')
 process.on('uncaughtException', (e) => { _log('UNCAUGHT: ' + e.message); _log(e.stack || '') })
 process.on('unhandledRejection', (e) => { _log('REJECTION: ' + (e?.message || e)) })
@@ -102,6 +125,14 @@ const PRELOAD = path.join(__dirname, 'preload.cjs')
 let backendProc = null
 let distServerProc = null
 let mainWindow = null
+
+// ---- 后端 watchdog：异常退出自动重启（10 分钟窗口内最多 5 次，防死循环） ----
+// backendStopping=true 表示用户主动停止（托盘「停止全部服务」/退出程序），不重启
+let backendStopping = false
+let backendRestartCount = 0
+let backendRestartWindowStart = 0
+const BACKEND_RESTART_MAX = 5
+const BACKEND_RESTART_WINDOW_MS = 10 * 60 * 1000
 
 // ---------- 后端进程管理 ----------
 
@@ -209,6 +240,7 @@ function startBackend() {
     // ---- 端口冲突防御 ----
     // 如果 8870 已在监听，先查占用者 PID：若是我们自己上次残留的 backend，先 kill 再重启
     _killPortIfBusy(BACKEND_PORT)
+    backendStopping = false  // 主动启动（含 watchdog 重启/托盘「重启全部」）→ 清除停止标志
 
     const python = _detectPython()
     _log('startBackend: python=' + python + ' cwd=' + BACKEND_DIR)
@@ -223,10 +255,10 @@ function startBackend() {
 
     _log('Backend spawned PID=' + backendProc.pid)
 
-    // 简单日志：把 stdout/stderr 追加写文件
+    // 简单日志：把 stdout/stderr 追加写文件（带 10MB 轮转，防无限膨胀拖慢主进程）
     const logPath = path.join(BACKEND_DIR, 'electron_backend.log')
-    backendProc.stdout?.on('data', (buf) => fs.appendFileSync(logPath, buf.toString()))
-    backendProc.stderr?.on('data', (buf) => fs.appendFileSync(logPath, buf.toString()))
+    backendProc.stdout?.on('data', (buf) => _appendLog(logPath, buf))
+    backendProc.stderr?.on('data', (buf) => _appendLog(logPath, buf))
 
     backendProc.on('error', (err) => {
       _log('Backend spawn ERROR: ' + err.message)
@@ -236,6 +268,23 @@ function startBackend() {
     backendProc.on('exit', (code) => {
       _log('Backend exit code=' + code)
       backendProc = null
+      // ---- watchdog：非用户主动停止的退出（崩溃/被误杀）→ 自动重启 ----
+      if (backendStopping) return
+      const now = Date.now()
+      if (now - backendRestartWindowStart > BACKEND_RESTART_WINDOW_MS) {
+        backendRestartWindowStart = now
+        backendRestartCount = 0
+      }
+      if (backendRestartCount >= BACKEND_RESTART_MAX) {
+        _log('watchdog: 10 分钟内重启超过 ' + BACKEND_RESTART_MAX + ' 次，放弃自动重启（疑似配置/环境问题）')
+        return
+      }
+      backendRestartCount++
+      _log(`watchdog: 后端异常退出，2s 后自动重启（窗口内第 ${backendRestartCount}/${BACKEND_RESTART_MAX} 次）`)
+      setTimeout(() => {
+        if (backendStopping) return
+        startBackend().catch((e) => _log('watchdog 重启失败: ' + (e?.message || e)))
+      }, 2000)
     })
 
     // 等待端口就绪（最多 25s）
@@ -260,6 +309,9 @@ function startBackend() {
 }
 
 function stopBackend() {
+  // 主动停止标志：exit 事件据此跳过 watchdog 自动重启
+  // （托盘「停止全部服务」/「退出程序」/before-quit 都走这里）
+  backendStopping = true
   if (!backendProc) return
   try {
     backendProc.kill('SIGTERM')
@@ -359,9 +411,34 @@ function stopDistServer() {
 // ---------- 启动中特效窗口 ----------
 
 let _splashWindow = null
+let _startupAborted = false
+let _splashIpcReady = false
+
+// splash 窗口专属 IPC（与 win:* 主窗口 IPC 隔离；幂等注册，createSplash 可多次调用）
+function _registerSplashIPC() {
+  if (_splashIpcReady) return
+  _splashIpcReady = true
+  ipcMain.on('splash:minimize', (e) => {
+    BrowserWindow.fromWebContents(e.sender)?.minimize()
+  })
+  ipcMain.on('splash:abort', (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (!_splashWindow || win !== _splashWindow) return
+    // 主窗口已存在（托盘「重启全部」等场景）：仅关掉启动画面，不打断后台流程
+    if (mainWindow && !mainWindow.isDestroyed()) { closeSplash(); return }
+    // 初次启动阶段点 ✕：视为放弃启动，中止后续步骤并退出程序
+    _startupAborted = true
+    _log('用户在启动画面点击关闭，中止启动并退出程序')
+    closeSplash()
+    stopBackend()
+    stopDistServer()
+    app.quit()
+  })
+}
 
 function createSplash() {
   if (_splashWindow) return _splashWindow
+  _registerSplashIPC()
 
   // 图标路径（与原 launch_splash.py 一致）
   const iconPaths = [
@@ -387,7 +464,7 @@ function createSplash() {
     frame: false,
     transparent: true,
     alwaysOnTop: true,
-    skipTaskbar: true,
+    skipTaskbar: false,   // 保留任务栏条目：最小化后可从任务栏点回还原
     resizable: false,
     show: false,
     hasShadow: false,   // 透明窗口禁用系统阴影（DWM 阴影在透明窗上呈灰底）
@@ -408,8 +485,10 @@ html,body{margin:0;padding:0;background:transparent;width:100%;height:100%;overf
 body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:#eaf1ff;user-select:none}
  .card{position:absolute;inset:4px;border-radius:26px;background:#0f1626;border:1px solid #243450;overflow:hidden}
 .glow-top{position:absolute;left:40px;right:40px;top:34px;height:46px;background:linear-gradient(180deg,rgba(91,140,255,0.22),transparent);border-radius:8px}
-.close-x{position:absolute;right:18px;top:10px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:18px;color:#94a8cf;cursor:pointer;border-radius:8px;transition:background 0.15s}
-.close-x:hover{background:rgba(255,100,100,0.15);color:#ff9a9a}
+.win-btns{position:absolute;right:18px;top:10px;display:flex;gap:2px;z-index:10}
+.win-btn{width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:16px;color:#94a8cf;cursor:pointer;border-radius:8px;transition:background 0.15s}
+.win-btn:hover{background:rgba(148,168,207,0.18);color:#eaf1ff}
+.win-btn.close:hover{background:rgba(255,100,100,0.15);color:#ff9a9a}
 .content{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px}
 .icon-wrap{margin-bottom:18px;animation:float 3s ease-in-out infinite}
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
@@ -427,7 +506,10 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:#eaf1ff;use
 </style></head><body>
 <div class="card fade-in" id="card">
   <div class="glow-top"></div>
-  <div class="close-x" id="closeX">×</div>
+  <div class="win-btns">
+    <div class="win-btn" id="minBtn" title="最小化">&#8211;</div>
+    <div class="win-btn close" id="closeX" title="取消启动并退出">&#215;</div>
+  </div>
   <div class="content">
     <div class="icon-wrap">${iconHtml}</div>
     <div class="title">AgentCluster 启动中</div>
@@ -435,15 +517,16 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:#eaf1ff;use
     <div class="step" id="step">正在初始化启动器...</div>
     <div class="progress"><div class="progress-bar" id="bar"><div class="spinner" id="spinner"></div></div></div>
   </div>
-  <div class="bottom-text">ESC 关闭</div>
+  <div class="bottom-text">启动中可最小化 · ESC 取消启动</div>
 </div>
 <script>
-const stepEl=document.getElementById('step'),barEl=document.getElementById('bar'),spinnerEl=document.getElementById('spinner'),closeX=document.getElementById('closeX');
+const stepEl=document.getElementById('step'),barEl=document.getElementById('bar'),spinnerEl=document.getElementById('spinner'),minBtn=document.getElementById('minBtn'),closeX=document.getElementById('closeX');
 let _progress=0,_done=false;
-// ESC/右键/× 关闭
-document.addEventListener('keydown',e=>{if(e.key==='Escape')window.close()});
-document.addEventListener('contextmenu',e=>{e.preventDefault();window.close()});
-closeX.addEventListener('click',()=>window.close());
+// 最小化：收起启动画面（任务栏可还原）；✕/ESC：中止启动退出程序（主窗已存在时仅关画面）
+minBtn.addEventListener('click',()=>window.electronAPI?.splashMinimize?.());
+closeX.addEventListener('click',()=>window.electronAPI?.splashAbort?.());
+document.addEventListener('keydown',e=>{if(e.key==='Escape')window.electronAPI?.splashAbort?.()});
+document.addEventListener('contextmenu',e=>e.preventDefault());
 
 window.electronAPI?.onSplashStep?.((text,pct)=>{
   if(!text)return;
@@ -522,7 +605,7 @@ async function createMainWindow() {
     movable: true,
     fullscreenable: true,
     title: '智能体集群 AgentCluster',
-    backgroundColor: '#0a0e1a', // 与前端 --bg-base 一致，防白闪
+    backgroundColor: '#000000', // 与前端 --bg-base 一致，防白闪
     icon: _winIconPath,
     show: false,
     webPreferences: {
@@ -848,9 +931,12 @@ function _fairyWebPrefs() {
 function createFairyWin() {
   if (fairyWin && !fairyWin.isDestroyed()) return fairyWin
   const wa = screen.getPrimaryDisplay().workAreaSize
+  // 精灵窗口:透明无框,尺寸要足够装下 HOME 3D 动画。
+  // WebM 动画原始 360px 高,按 .pk 容器 max-height 160px 显示,加上发光阴影和呼吸动画,
+  // 给足 padding 避免边缘被窗口裁切。从 180×170 扩大到 260×260。
   fairyWin = new BrowserWindow({
-    width: 180, height: 170,
-    x: wa.width - 205, y: wa.height - 200,
+    width: 260, height: 260,
+    x: wa.width - 285, y: wa.height - 290,
     frame: false, transparent: true, alwaysOnTop: true,
     skipTaskbar: true, resizable: false, hasShadow: false,
     show: false,
@@ -1000,7 +1086,7 @@ function openQuickChat(shotPath) {
   }
   quickWin = new BrowserWindow({
     width: 480, height: 740, minWidth: 400, minHeight: 560,
-    frame: false, backgroundColor: '#0a0e1a',
+    frame: false, backgroundColor: '#000000',
     resizable: true, skipTaskbar: false,
     show: false,
     webPreferences: _fairyWebPrefs(),
@@ -1305,6 +1391,9 @@ app.whenReady().then(async () => {
     }
   }
 
+  // 用户已在启动画面点 ✕ 中止启动：不再继续后续阶段（quit 由 splash:abort 统一发起）
+  if (_startupAborted) return
+
   // 启动后端并等待就绪（必须在 createMainWindow 之前完成，否则 Home.vue 的 fetch 会因后端未就绪而失败）
   splashStep('正在启动后端服务...', 25)
   try {
@@ -1315,8 +1404,11 @@ app.whenReady().then(async () => {
     splashStep('后端启动超时', 55)
   }
 
+  if (_startupAborted) return
+
   try {
     splashStep('正在准备界面...', 70)
+    if (_startupAborted) return
     await createMainWindow()
     createTray()
     registerIPC()

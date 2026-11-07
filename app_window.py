@@ -215,7 +215,7 @@ def main():
             easy_drag=False,   # 关键：不让整个 window 都有 mousedown 监听
             shadow=True,
             resizable=True,
-            background_color="#0a0e1a",
+            background_color="#000000",
             js_api=_WindowApi(),
         )
 

@@ -1315,16 +1315,16 @@ function peopleTitle(row: any) {
 .ws-row-ico { flex-shrink: 0; width: 16px; text-align: center; }
 .ws-row-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ws-row.dir .ws-row-name { font-weight: 500; }
-.ws-trunc { flex-shrink: 0; font-size: calc(10px * var(--font-scale)); color: #ffd18a; padding: 0 2px; }
+.ws-trunc { flex-shrink: 0; font-size: calc(10px * var(--font-scale)); color: rgba(var(--text-rgb), 0.55); padding: 0 2px; }
 .ws-row-size { flex-shrink: 0; width: 58px; text-align: right; font-family: Consolas, monospace; font-size: calc(10.5px * var(--font-scale)); opacity: .7; }
 .ws-row-time { flex-shrink: 0; width: 76px; text-align: right; font-family: Consolas, monospace; font-size: calc(10.5px * var(--font-scale)); opacity: .5; }
 .ws-row-people { flex-shrink: 0; display: flex; gap: 4px; }
 .chip { font-size: calc(10px * var(--font-scale)); padding: 1px 6px; border-radius: 999px; background: rgba(var(--accent-rgb), 0.18); color: var(--accent-ink); border: 1px solid rgba(var(--accent-rgb), 0.3); white-space: nowrap; }
 .chip.more { background: rgba(var(--accent2-rgb), 0.18); color: var(--purple-ink); border-color: rgba(var(--accent2-rgb), 0.3); }
-.chip.none { background: transparent; color: rgba(var(--text-rgb), 0.3); border-color: transparent; }
+.chip.none { background: transparent; color: rgba(var(--text-rgb), 0.68); border-color: transparent; }
 
 .ws-rename-input {
-  flex: 1; min-width: 0; background: rgba(var(--shadow-rgb), 0.35);
+  flex: 1; min-width: 0; background: rgba(var(--shadow-rgb), 0.22);
   border: 1px solid rgba(var(--accent-rgb), 0.6); border-radius: 6px;
   color: rgb(var(--text-rgb)); font-size: calc(12px * var(--font-scale)); padding: 2px 6px; outline: none;
 }
@@ -1338,7 +1338,7 @@ function peopleTitle(row: any) {
 
 /* —— 右键菜单 —— */
 .ws-ctx { position: fixed; min-width: 210px; padding: 6px; z-index: 9999; background: rgba(var(--node-bg-rgb), 0.98); box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5); }
-.ws-ctx-title { font-size: calc(11px * var(--font-scale)); padding: 6px 10px; color: rgba(var(--text-rgb), 0.5); text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid rgba(var(--surface-rgb), 0.08); margin-bottom: 4px; }
+.ws-ctx-title { font-size: calc(11px * var(--font-scale)); padding: 6px 10px; color: rgba(var(--text-rgb), 0.68); text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid rgba(var(--surface-rgb), 0.08); margin-bottom: 4px; }
 .ws-ctx-item { padding: 8px 12px; border-radius: 6px; font-size: calc(13px * var(--font-scale)); cursor: pointer; transition: background .15s; }
 .ws-ctx-item:hover { background: rgba(var(--accent-rgb), 0.18); }
 .ws-ctx-item.danger:hover { background: rgba(255, 80, 80, 0.18); color: #ff9090; }
@@ -1371,7 +1371,7 @@ function peopleTitle(row: any) {
 .ws-edit-float-head:active { cursor: grabbing; }
 .ws-edit-float .ws-modal-foot { padding: 6px 10px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); flex-shrink: 0; }
 .ws-editor-text {
-  flex: 1; min-height: 0; margin: 0 10px; background: rgba(var(--shadow-rgb), 0.35);
+  flex: 1; min-height: 0; margin: 0 10px; background: rgba(var(--shadow-rgb), 0.22);
   border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 8px;
   color: rgb(var(--text-rgb)); font-size: calc(12.5px * var(--font-scale)); font-family: Consolas, "Courier New", monospace;
   padding: 10px; outline: none; resize: none; line-height: 1.55;
@@ -1397,7 +1397,8 @@ function peopleTitle(row: any) {
   flex: 1; min-height: 0; margin: 0 10px; overflow: auto; overflow-anchor: none;
   white-space: pre-wrap; word-break: break-word;
   background: rgba(var(--shadow-rgb), 0.45); border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 8px;
-  color: #bfe6c6; font-size: calc(12.5px * var(--font-scale)); font-family: Consolas, "Courier New", monospace;
+  /* 终端输出原为大片浅绿，改为中性文字色，绿色只保留给状态标记 */
+  color: rgba(var(--text-rgb), 0.9); font-size: calc(12.5px * var(--font-scale)); font-family: Consolas, "Courier New", monospace;
   padding: 10px; line-height: 1.55;
 }
 .ws-console-input {
@@ -1412,7 +1413,7 @@ function peopleTitle(row: any) {
 .ws-console-input input:focus { border-color: rgba(var(--accent-rgb), 0.6); }
 .ws-console-input input:disabled { opacity: .5; }
 .ws-editor-text {
-  width: 100%; height: 420px; background: rgba(var(--shadow-rgb), 0.35);
+  width: 100%; height: 420px; background: rgba(var(--shadow-rgb), 0.22);
   border: 1px solid rgba(var(--surface-rgb), 0.12); border-radius: 8px;
   color: rgb(var(--text-rgb)); font-size: calc(12.5px * var(--font-scale)); font-family: Consolas, "Courier New", monospace;
   padding: 10px; outline: none; resize: none; line-height: 1.55;
@@ -1450,7 +1451,7 @@ function peopleTitle(row: any) {
   transition: all .15s; position: relative;
 }
 .wt-card:hover { border-color: rgba(255, 150, 150, 0.6); box-shadow: 0 0 14px rgba(255, 90, 90, 0.18); }
-.wt-card.selected { border-color: #ff8a8a; box-shadow: 0 0 0 2px rgba(255, 120, 120, 0.35), 0 0 16px rgba(255, 90, 90, 0.28); background: rgba(var(--node-bg-rgb), 0.6); }
+.wt-card.selected { border-color: rgba(var(--accent-rgb), 0.7); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.3), 0 0 16px rgba(var(--accent-rgb), 0.22); background: rgba(var(--node-bg-rgb), 0.6); }
 .wt-card.done { opacity: .5; }
 .wt-card.disabled { opacity: .75; }
 .wt-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }

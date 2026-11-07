@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed } from 'vue'
+import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useAgentStore, useSettingsStore, useModelStore } from '@/stores'
 
 const props = defineProps<{ agent: any }>()
@@ -21,6 +21,31 @@ function initForm(a: any) {
   }
 }
 const form = ref<any>(initForm(props.agent))
+
+// —— 关闭确认（右上角 ✕ / ESC）：有未保存修改时三按钮确认 ——
+const initialSnapshot = ref(JSON.stringify(form.value))
+const confirmClose = ref(false)
+function isDirty() { return JSON.stringify(form.value) !== initialSnapshot.value }
+function requestClose() {
+  if (isDirty()) { confirmClose.value = true; return }
+  emit('close')
+}
+async function closeWithSave() {
+  confirmClose.value = false
+  await save()
+}
+function closeWithoutSave() {
+  confirmClose.value = false
+  emit('close')
+}
+function onKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return
+  if (confirmClose.value) { confirmClose.value = false; return }
+  if (pickerOpen.value) { closePicker(); return }
+  requestClose()
+}
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 // 联动: 选中 interface_id 后，模型下拉自动填充该接口的 models
 const currentInterface = computed(() => models.list.find((m: any) => m.id === form.value.interface_id))
@@ -45,7 +70,7 @@ const pickerOpen = ref<string | null>(null)
 const selectedKeys = ref<Set<string>>(new Set())
 const collapsedGroups = ref<Set<string>>(new Set())
 
-watch(() => props.agent, (v) => { if (v) form.value = initForm(v) })
+watch(() => props.agent, (v) => { if (v) { form.value = initForm(v); initialSnapshot.value = JSON.stringify(form.value) } })
 
 // 三种能力的"可选项"（去掉已添加的；命令同时隐藏运行时注入的常驻工具）
 const availableByType = (type: string) => {
@@ -172,9 +197,13 @@ async function remove() {
 </script>
 
 <template>
-  <div class="modal-bg">
+  <Teleport to="body">
+    <div class="modal-bg">
     <div class="modal glass">
-      <div class="modal-title">{{ form.id ? '编辑智能体' : '新建智能体' }}</div>
+      <div class="modal-head">
+        <div class="modal-title">{{ form.id ? '编辑智能体' : '新建智能体' }}</div>
+        <button class="dlg-close" @click="requestClose" title="关闭">✕</button>
+      </div>
       <div class="grid">
         <label>名称<input class="input" v-model="form.name" /></label>
         <label>描述<input class="input" v-model="form.description" /></label>
@@ -272,13 +301,15 @@ async function remove() {
       <div class="actions">
         <button class="btn ghost" v-if="form.id" @click="remove">删除</button>
         <div style="flex:1" />
-        <button class="btn ghost" @click="emit('close')">取消</button>
+
         <button class="btn" @click="save">保存</button>
       </div>
     </div>
+    </div>
+  </Teleport>
 
-    <!-- 统一能力选择器（居中弹窗） -->
-    <Teleport to="body">
+  <!-- 统一能力选择器（居中弹窗） -->
+  <Teleport to="body">
       <div v-if="pickerOpen" class="picker-mask">
         <div class="picker-popup glass">
           <div class="picker-title">
@@ -339,13 +370,31 @@ async function remove() {
         </div>
       </div>
     </Teleport>
-  </div>
+
+    <!-- 关闭确认（✕ / ESC 关闭时有未保存修改） -->
+    <Teleport to="body">
+      <div v-if="confirmClose" class="confirm-mask">
+        <div class="confirm-box glass">
+          <div class="confirm-title">未保存的修改</div>
+          <div class="confirm-text">是否保存对「{{ form.name || '未命名智能体' }}」的修改？</div>
+          <div class="confirm-actions">
+            <button class="btn ghost" @click="confirmClose = false">取消</button>
+            <button class="btn ghost" @click="closeWithoutSave">不保存</button>
+            <button class="btn" @click="closeWithSave">保存并关闭</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
 </template>
 
 <style scoped>
 .modal-bg { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.5); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
 .modal { width: 560px; max-height: 85vh; overflow-y: auto; padding: 20px; }
-.modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; margin-bottom: 16px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; }
+.modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; }
+.dlg-close { width: 26px; height: 26px; border-radius: 6px; cursor: pointer; border: 1px solid rgba(var(--surface-rgb), 0.16); background: transparent; color: rgba(var(--text-rgb), 0.75); font-size: 13px; line-height: 1; flex-shrink: 0; transition: background .15s, color .15s; }
+.dlg-close:hover { background: rgba(232, 92, 92, 0.14); color: #e85c5c; }
 
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
   label { display: flex; flex-direction: column; gap: 4px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7);
@@ -364,9 +413,10 @@ async function remove() {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 10px 3px 10px; border-radius: 999px; font-size: calc(12px * var(--font-scale)); cursor: default;
   border: 1px solid rgba(var(--surface-rgb), 0.15);
-  &.blue   { background: rgba(var(--accent-rgb), 0.18);  color: var(--accent-ink); border-color: rgba(var(--accent-rgb), 0.3); }
-  &.purple { background: rgba(var(--accent2-rgb), 0.18); color: var(--purple-ink); border-color: rgba(var(--accent2-rgb), 0.3); }
-  &.green  { background: rgba(100,220,160,0.18); color: var(--green-ink); border-color: rgba(100,220,160,0.3); }
+  /* 命令 / 技能 / 插件三类标签统一为强调色，不再用蓝、紫、绿三色区分 */
+  &.blue,
+  &.purple,
+  &.green  { background: rgba(var(--accent-rgb), 0.18); color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
   .x { margin-left: 4px; opacity: .7; font-weight: bold; cursor: pointer; padding: 0 2px; &:hover { opacity: 1; } }
 }
 .hint-empty { font-size: calc(12px * var(--font-scale)); opacity: .45; padding: 4px 0; }
@@ -417,4 +467,11 @@ async function remove() {
 .pi-key { font-family: Consolas, monospace; font-size: calc(11px * var(--font-scale)); opacity: .55; margin-top: 1px; }
 .pi-desc { font-size: calc(11px * var(--font-scale)); opacity: .6; margin-top: 3px; }
 .picker-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); }
+
+/* 关闭确认弹窗（z-index 3000 盖过主弹窗 1000 与能力选择器 2000） */
+.confirm-mask { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.45); backdrop-filter: blur(2px); z-index: 3000; display: flex; align-items: center; justify-content: center; }
+.confirm-box { width: 340px; padding: 18px; box-shadow: 0 20px 60px rgba(var(--shadow-rgb), 0.6); animation: pickerIn .2s ease; }
+.confirm-title { font-size: calc(14px * var(--font-scale)); font-weight: 600; margin-bottom: 6px; }
+.confirm-text { font-size: calc(12.5px * var(--font-scale)); opacity: .75; margin-bottom: 14px; word-break: break-all; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
 </style>

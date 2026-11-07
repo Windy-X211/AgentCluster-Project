@@ -754,20 +754,58 @@ function toggleRun() {
   else convs.startRun(canvas.value.id)
 }
 
+// —— 执行模式：运行时允许用户先切换图标/UI，待画布停止后再真正生效 ——
+type ExecMode = 'serial' | 'parallel'
+const pendingExecMode = ref<ExecMode | null>(null)
+const displayExecMode = computed<ExecMode>(() => {
+  if (runningOnThisCanvas.value && pendingExecMode.value) return pendingExecMode.value
+  return (canvas.value?.execution_mode as ExecMode) || 'parallel'
+})
+
+// —— 极简 toast（仅用于"停止运行后生效"提示） ——
+const execModeToast = ref<{ msg: string; id: number } | null>(null)
+let _toastSeq = 0
+function showExecModeToast(msg: string) {
+  const id = ++_toastSeq
+  execModeToast.value = { msg, id }
+  setTimeout(() => {
+    if (execModeToast.value?.id === id) execModeToast.value = null
+  }, 2400)
+}
+
+async function applyExecMode(mode: ExecMode) {
+  if (!canvas.value) return
+  canvas.value.execution_mode = mode
+  await canvases.saveCurrent()
+  const cur = convs.currentData()
+  if (cur && (cur.canvas_id ?? null) === canvas.value.id) {
+    await convs.update(cur.id, { execution_mode: mode })
+  }
+}
+
+// 运行态结束时：若存在待生效的模式，则立即应用
+watch(runningOnThisCanvas, (running, wasRunning) => {
+  if (wasRunning && !running && pendingExecMode.value && canvas.value) {
+    const mode = pendingExecMode.value
+    pendingExecMode.value = null
+    applyExecMode(mode)
+  }
+})
+
 // 串行/并行切换开关
 async function toggleExecMode() {
   if (!canvas.value) return
+  const curMode: ExecMode = (canvas.value.execution_mode as ExecMode) || 'parallel'
+  const next: ExecMode = curMode === 'parallel' ? 'serial' : 'parallel'
+
   if (runningOnThisCanvas.value) {
-    // 运行期间锁定执行模式，禁止切换
+    // 运行期间：只记录"待生效"的模式，UI 立即切换图标，真正的写入等到运行停止后
+    pendingExecMode.value = next
+    showExecModeToast(`已切换为「${next === 'parallel' ? '并行' : '串行'}」模式，画布停止运行后生效`)
     return
   }
-  canvas.value.execution_mode = canvas.value.execution_mode === 'parallel' ? 'serial' : 'parallel'
-  await canvases.saveCurrent()
-  // 会话级记录：与工作区同语义，只更新当前激活且绑定本画布的会话
-  const cur = convs.currentData()
-  if (cur && (cur.canvas_id ?? null) === canvas.value.id) {
-    await convs.update(cur.id, { execution_mode: canvas.value.execution_mode })
-  }
+  pendingExecMode.value = null
+  await applyExecMode(next)
 }
 
 // —— 画布命名 ——
@@ -1288,9 +1326,10 @@ defineExpose({ viewportRef, computeNodeBbox })
             <span v-if="runningOnThisCanvas" class="stop-icon" aria-hidden="true"></span>
             <template v-else>▶</template>
           </button>
-          <button class="btn ghost em-collapsed" @click.stop="toggleExecMode" :disabled="runningOnThisCanvas"
-                  :title="runningOnThisCanvas ? '运行中：执行模式已锁定' : (canvas?.execution_mode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行')">
-            {{ canvas?.execution_mode === 'parallel' ? '⇉' : '⇥' }}
+          <button class="btn ghost em-collapsed" @click.stop="toggleExecMode"
+                  :class="{ pending: !!pendingExecMode }"
+                  :title="displayExecMode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行'">
+            {{ displayExecMode === 'parallel' ? '⇉' : '⇥' }}
           </button>
           <button class="btn ghost close-btn collapsed-close" @click.stop="canvases.closeCurrent()" title="关闭画布（自动保存）">✕</button>
         </div>
@@ -1316,14 +1355,15 @@ defineExpose({ viewportRef, computeNodeBbox })
             <template v-if="runningOnThisCanvas"><span class="stop-icon" aria-hidden="true"></span>停止</template>
             <template v-else>▶ 运行</template>
           </button>
-          <div class="exec-mode-toggle" @click.stop :class="{ disabled: runningOnThisCanvas }"
-               :title="runningOnThisCanvas ? '运行中：执行模式已锁定' : (canvas?.execution_mode === 'parallel' ? '并行：发送后继续运行' : '串行：阻塞等待对方回信')">
-            <span class="em-label" :class="{ active: canvas?.execution_mode !== 'parallel' }">串行</span>
+          <div class="exec-mode-toggle" @click.stop="toggleExecMode"
+               :class="{ pending: !!pendingExecMode }"
+               :title="displayExecMode === 'parallel' ? '并行：发送后继续运行' : '串行：阻塞等待对方回信'">
+            <span class="em-label" :class="{ active: displayExecMode !== 'parallel' }">串行</span>
             <label class="em-switch">
-              <input type="checkbox" :checked="canvas?.execution_mode === 'parallel'" :disabled="runningOnThisCanvas" @change="toggleExecMode" @click.stop />
+              <input type="checkbox" :checked="displayExecMode === 'parallel'" @click.stop />
               <span class="em-slider"></span>
             </label>
-            <span class="em-label" :class="{ active: canvas?.execution_mode === 'parallel' }">并行</span>
+            <span class="em-label" :class="{ active: displayExecMode === 'parallel' }">并行</span>
           </div>
           <button class="btn ghost" :class="{ activeWd: !!canvas?.workdir }"
                   @click.stop="wdPath = canvas?.workdir || ''; wdOpen = true"
@@ -1339,6 +1379,9 @@ defineExpose({ viewportRef, computeNodeBbox })
         </div>
       </template>
     </div>
+
+    <!-- 执行模式切换提示（仅在运行时用户手动切换模式后短暂出现） -->
+    <div v-if="execModeToast" class="exec-mode-toast">{{ execModeToast.msg }}</div>
 
     <!-- 平移层（transform 纯平移） + 缩放层（CSS zoom 布局级缩放，文字始终矢量清晰） -->
     <div class="pan-layer" :style="{ transform: vTransform }">
@@ -1361,13 +1404,13 @@ defineExpose({ viewportRef, computeNodeBbox })
           <g v-if="dragging && (snapGuides.x.length || snapGuides.y.length)" class="snap-guides" pointer-events="none">
             <line v-for="gx in snapGuides.x" :key="'gx-' + gx"
                   :x1="gx" :y1="-9999" :x2="gx" :y2="9999"
-                  stroke="#b472ff" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
+                  stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
             <line v-for="gy in snapGuides.y" :key="'gy-' + gy"
                   :x1="-9999" :y1="gy" :x2="9999" :y2="gy"
-                  stroke="#b472ff" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
+                  stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
           </g>
           <defs>
-            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#6ea8ff" /></marker>
+            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" style="fill: var(--accent)" /></marker>
           </defs>
         </svg>
 
@@ -1578,24 +1621,24 @@ defineExpose({ viewportRef, computeNodeBbox })
 .collapse-btn { width: 26px; height: 26px; padding: 0; font-size: calc(13px * var(--font-scale)); flex-shrink: 0; }
 .canvas-name { font-size: calc(14px * var(--font-scale)); font-weight: 600; cursor: text; padding: 4px 8px; border-radius: 6px; transition: background .15s; }
 .canvas-name:hover { background: rgba(var(--surface-rgb), 0.06); }
-.canvas-meta { font-size: calc(11px * var(--font-scale)); opacity: .5; font-family: Consolas, monospace; }
+.canvas-meta { font-size: calc(11px * var(--font-scale)); opacity: .72; font-family: Consolas, monospace; }
 .rename-input { padding: 4px 10px; width: 180px; }
 
-.zoom-indicator { font-size: calc(11px * var(--font-scale)); font-family: Consolas, monospace; opacity: .6; padding: 0 6px; }
+.zoom-indicator { font-size: calc(11px * var(--font-scale)); font-family: Consolas, monospace; opacity: .78; padding: 0 6px; }
 .close-btn:hover { background: rgba(232, 92, 92, 0.14) !important; color: #e85c5c; }
 .zoom-indicator.panning .zoom-tip { color: var(--accent-2); opacity: 1; }
 
 .edge-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
-.edge { fill: none; stroke: var(--accent); stroke-width: 2; pointer-events: stroke; cursor: pointer; stroke-dasharray: 8 6; transition: stroke .3s, stroke-width .3s, filter .3s; }
+.edge { fill: none; stroke: rgba(var(--text-rgb), 0.45); stroke-width: 2; pointer-events: stroke; cursor: pointer; stroke-dasharray: 8 6; transition: stroke .3s, stroke-width .3s, filter .3s; }
 .edge.temp { stroke: rgba(var(--accent2-rgb), 0.7); stroke-dasharray: 3,3; animation: none; }
 .edge.active { stroke: var(--accent-2); stroke-width: 2.5; filter: drop-shadow(0 0 6px rgba(var(--accent2-rgb), 0.8)); animation: edgeFlow 0.6s linear infinite; }
-.edge.dim { stroke: rgba(var(--text-rgb), 0.3); stroke-width: 1.5; stroke-dasharray: 4 4; cursor: default; animation: none; filter: grayscale(0.8); }
+.edge.dim { stroke: rgba(var(--text-rgb), 0.68); stroke-width: 1.5; stroke-dasharray: 4 4; cursor: default; animation: none; filter: grayscale(0.8); }
 .edge.active.dim { stroke: rgba(var(--accent2-rgb), 0.35); filter: grayscale(0.8) drop-shadow(0 0 4px rgba(var(--accent2-rgb), 0.2)); }
 .edge-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 .edge-hit.dim { cursor: default; }
 .edge-hit.active { cursor: pointer; }
-.edge-mid { fill: var(--accent); pointer-events: none; }
-.edge-mid.dim { fill: rgba(var(--text-rgb), 0.3); }
+.edge-mid { fill: rgba(var(--text-rgb), 0.6); pointer-events: none; }
+.edge-mid.dim { fill: rgba(var(--text-rgb), 0.68); }
 @keyframes edgeFlow { to { stroke-dashoffset: -28; } }
 .snap-guides line { stroke: var(--accent-2); }
 marker#arrow path { fill: var(--accent); }
@@ -1680,7 +1723,7 @@ marker#arrow path { fill: var(--accent); }
   padding: 3px 8px; border-radius: 6px;
   background: rgba(var(--accent2-rgb), 0.08);
   border: 1px solid rgba(var(--accent2-rgb), 0.22);
-  font-size: calc(10.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.55);
+  font-size: calc(10.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.72);
   max-width: 100%; min-width: 0;
 }
 .b-think-icon { flex-shrink: 0; font-size: calc(10.5px * var(--font-scale)); }
@@ -1697,7 +1740,7 @@ marker#arrow path { fill: var(--accent); }
 /* —— 气泡内工具行（和对话界面 tr-pill 同样式） —— */
 .b-tool-row {
   display: flex; align-items: center; gap: 5px; padding: 3px 8px;
-  border-radius: 8px; background: rgba(var(--shadow-rgb), 0.18);
+  border-radius: 8px; background: rgba(var(--shadow-rgb), 0.12);
   border: 1px solid rgba(var(--surface-rgb), 0.08);
   font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.85); user-select: none;
 }
@@ -1725,10 +1768,10 @@ marker#arrow path { fill: var(--accent); }
 .b-text.markdown li { margin: 1px 0; }
 .b-text.markdown code {
   font-family: Consolas, "Courier New", monospace; font-size: calc(10.5px * var(--font-scale));
-  background: rgba(var(--shadow-rgb), 0.3); padding: 0 3px; border-radius: 3px;
+  background: rgba(var(--shadow-rgb), 0.18); padding: 0 3px; border-radius: 3px;
 }
 .b-text.markdown pre {
-  background: rgba(var(--shadow-rgb), 0.35); border-radius: 5px; padding: 5px 7px;
+  background: rgba(var(--shadow-rgb), 0.22); border-radius: 5px; padding: 5px 7px;
   margin: 5px 0; overflow-x: auto; white-space: pre; font-size: calc(10.5px * var(--font-scale));
 }
 .b-text.markdown pre code { background: none; padding: 0; color: var(--text); }
@@ -1761,7 +1804,7 @@ marker#arrow path { fill: var(--accent); }
 
 /* 右键菜单 */
 .ctx-menu { position: fixed; min-width: 220px; padding: 6px; z-index: 9999; background: rgba(var(--node-bg-rgb), 0.98); box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5); }
-.ctx-title { font-size: calc(11px * var(--font-scale)); padding: 6px 10px; color: rgba(var(--text-rgb), 0.5); text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid rgba(var(--surface-rgb), 0.08); margin-bottom: 4px; }
+.ctx-title { font-size: calc(11px * var(--font-scale)); padding: 6px 10px; color: rgba(var(--text-rgb), 0.68); text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid rgba(var(--surface-rgb), 0.08); margin-bottom: 4px; }
 .ctx-item { padding: 8px 12px; border-radius: 6px; font-size: calc(13px * var(--font-scale)); cursor: pointer; transition: background .15s; }
 .ctx-item:hover { background: rgba(var(--accent-rgb), 0.18); }
 .ctx-item.danger:hover { background: rgba(255,80,80,0.18); color: #ff9090; }
@@ -1785,7 +1828,7 @@ marker#arrow path { fill: var(--accent); }
 .wd-row { display: flex; gap: 8px; align-items: stretch; }
 .wd-input { flex: 1; width: auto; padding: 8px 10px; font-size: calc(12.5px * var(--font-scale)); font-family: Consolas, monospace; }
 .wd-browse { flex-shrink: 0; padding: 0 12px; height: 34px; font-size: calc(12px * var(--font-scale)); }
-.wd-existing { font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.4); padding: 4px 2px; }
+.wd-existing { font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.58); padding: 4px 2px; }
 .btn.activeWd { background: rgba(100,220,160,0.15); border-color: rgba(100,220,160,0.4); color: var(--success-light); }
 .modal-body .hint { position: static; transform: none; font-size: calc(12px * var(--font-scale)); opacity: .7; line-height: 1.6; pointer-events: auto; text-align: left; max-width: none; margin: 0; padding: 0; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
@@ -1793,13 +1836,14 @@ marker#arrow path { fill: var(--accent); }
 /* 运行/停止 + 触发 */
 .run-btn.stop {
   position: relative; z-index: 1;
-  background: linear-gradient(135deg, rgba(255,90,110,0.55), rgba(255,60,80,0.55));
+  /* 停止/危险态保留红色，但改为单色平涂，去掉双色渐变 */
+  background: rgba(255, 90, 95, 0.55);
   border-color: rgba(255,140,150,0.7);
   color: rgb(var(--text-rgb));
   animation: stopBtnPulse 1.4s ease-in-out infinite;
 }
 .run-btn.stop:hover {
-  background: linear-gradient(135deg, rgba(255,90,110,0.65), rgba(255,60,80,0.65));
+  background: rgba(255, 90, 95, 0.68);
   transform: translateY(-1px) scale(1.03);
   box-shadow: 0 4px 18px rgba(255,80,100,0.45);
 }
@@ -1841,6 +1885,28 @@ marker#arrow path { fill: var(--accent); }
 .em-switch input:checked + .em-slider::before { transform: translateX(16px); }
 .em-switch:hover .em-slider { background: rgba(var(--surface-rgb), 0.25); }
 .em-switch input:checked:hover + .em-slider { background: rgba(var(--accent2-rgb), 0.75); }
+/* 运行时挂起态：图标/开关下方有一条淡色"待生效"下划线 */
+.em-collapsed.pending { border-bottom: 2px dashed rgba(var(--accent2-rgb), 0.5); padding-bottom: 0; }
+.exec-mode-toggle.pending { box-shadow: 0 0 0 1px rgba(var(--accent2-rgb), 0.4) inset; }
+/* 执行模式 toast */
+.exec-mode-toast {
+  position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+  z-index: 20; padding: 8px 14px;
+  font-size: calc(12px * var(--font-scale));
+  color: rgba(var(--text-rgb), 0.95);
+  background: rgba(var(--node-bg-rgb), 0.92);
+  border: 1px solid rgba(var(--accent2-rgb), 0.45);
+  border-radius: 20px;
+  box-shadow: 0 6px 20px rgba(var(--shadow-rgb), 0.45);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  animation: emToastIn .22s ease-out;
+  white-space: nowrap; pointer-events: none;
+}
+@keyframes emToastIn {
+  from { opacity: 0; transform: translate(-50%, -4px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
 .trigger-types { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
 .tr-opt { display: flex; gap: 8px; align-items: center; font-size: calc(13px * var(--font-scale)); cursor: pointer; color: rgba(var(--text-rgb), 0.85); }
 .modal .lbl { display: flex; flex-direction: column; gap: 6px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); margin-bottom: 10px; }
@@ -1864,10 +1930,10 @@ marker#arrow path { fill: var(--accent); }
 .b-text.markdown li { margin: 1px 0; }
 .b-text.markdown code {
   font-family: Consolas, "Courier New", monospace; font-size: calc(10.5px * var(--font-scale));
-  background: rgba(var(--shadow-rgb), 0.3); padding: 0 3px; border-radius: 3px;
+  background: rgba(var(--shadow-rgb), 0.18); padding: 0 3px; border-radius: 3px;
 }
 .b-text.markdown pre {
-  background: rgba(var(--shadow-rgb), 0.35); border-radius: 5px; padding: 5px 7px;
+  background: rgba(var(--shadow-rgb), 0.22); border-radius: 5px; padding: 5px 7px;
   margin: 5px 0; overflow-x: auto; white-space: pre; font-size: calc(10.5px * var(--font-scale));
 }
 .b-text.markdown pre code { background: none; padding: 0; color: var(--text); }

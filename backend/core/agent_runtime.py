@@ -19,7 +19,7 @@
 import json, asyncio, os, time, re, logging, threading
 from datetime import datetime
 from typing import Any
-from core.store import load, save, upsert, get_by, next_id
+from core.store import load, save, upsert, upsert_async, get_by, next_id
 import core.store as store  # 运行时访问 store.ROOT（可变，set_root() 会修改）
 from core import run_registry  # 运行期共享会话对象（并发按智能体运行的落库一致性）
 from core.llm import chat_with_failover as chat, ModelDegenerateError, ModelRepetitionError, _encode_tool_name
@@ -1600,7 +1600,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             "role": "user", "content": user_input, "ts": datetime.utcnow().isoformat(),
             "to_agent_id": agent.get("id"), "a2a_input": True,
         })
-        upsert("conversations", conv)
+        await upsert_async("conversations", conv)
 
     final_text_parts = []
     tool_history = []  # 本轮执行的工具列表（用于入库 assistant message 的 tool_calls 字段）
@@ -1651,7 +1651,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             fresh.setdefault("messages", []).append({
                 "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
             })
-            upsert("conversations", fresh)
+            await upsert_async("conversations", fresh)
             yield f"SPEAK:{target.get('id')}\n"
             yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
             child_turn = dict(turn)
@@ -1741,7 +1741,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             # 入库错误记录，给用户一个交代
             conv["messages"].append({"role": "assistant", "content": err_msg, "ts": datetime.utcnow().isoformat(),
                                       "agent_id": agent.get("id"), "error": True})
-            upsert("conversations", conv)
+            await upsert_async("conversations", conv)
             yield "DONE\n"
             return
 
@@ -1854,7 +1854,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
                 conv["messages"].append(stored)
                 yield f"F:{fast_text.strip()}\n"
-                upsert("conversations", conv)
+                await upsert_async("conversations", conv)
                 yield "DONE\n"
                 # 直接返回，不走后续的接力流程（简单问答不需要接力）
                 return
@@ -2041,7 +2041,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 "role": "assistant", "content": err_msg, "ts": datetime.utcnow().isoformat(),
                 "agent_id": agent.get("id"), "tool_history": tool_history, "error": True,
             })
-            upsert("conversations", conv)
+            await upsert_async("conversations", conv)
             yield "DONE\n"
             return
 
@@ -2052,7 +2052,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 "role": "assistant", "content": _err_saved, "ts": datetime.utcnow().isoformat(),
                 "agent_id": agent.get("id"), "error": True,
             })
-            upsert("conversations", conv)
+            await upsert_async("conversations", conv)
             yield "DONE\n"
             return
 
@@ -2443,7 +2443,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
     yield f"F:{final_text}\n"
     # 接力前先落库当前智能体产出，避免下游脏写覆盖
-    upsert("conversations", fresh_conv)
+    await upsert_async("conversations", fresh_conv)
 
 
     # ===== 消息接力：cluster.send_message 在任意 relay 层级都处理
@@ -2461,7 +2461,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 fresh.setdefault("messages", []).append({
                     "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
                 })
-                upsert("conversations", fresh)
+                await upsert_async("conversations", fresh)
                 yield f"SPEAK:{target.get('id')}\n"
                 yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
                 child_turn = dict(turn)
@@ -2483,7 +2483,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             fresh.setdefault("messages", []).append({
                 "role": "a2a", "envelope": env, "ts": datetime.utcnow().isoformat(),
             })
-            upsert("conversations", fresh)
+            await upsert_async("conversations", fresh)
             yield f"SPEAK:{target.get('id')}\n"
             yield f"A2A:{json.dumps(env, ensure_ascii=False)}\n"
             async for line in agent_reply(

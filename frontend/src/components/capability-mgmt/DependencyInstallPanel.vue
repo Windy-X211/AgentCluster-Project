@@ -243,9 +243,10 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
   font-size: calc(12px * var(--font-scale)); padding: 2px 9px; border-radius: 999px;
   background: rgba(var(--surface-rgb), 0.08); border: 1px solid rgba(var(--surface-rgb), 0.12);
 }
-.ds-chip.pip { background: rgba(80, 160, 255, 0.15); color: #8ab4ff; border-color: rgba(80, 160, 255, 0.3); }
-.ds-chip.npm { background: rgba(203, 56, 56, 0.15); color: #e09090; border-color: rgba(203, 56, 56, 0.3); }
-.ds-chip.ext { background: rgba(100, 200, 160, 0.15); color: #80d8b0; border-color: rgba(100, 200, 160, 0.3); }
+/* pip / npm / 扩展 三类来源标签统一强调色（原蓝/红/绿三色过于花哨） */
+.ds-chip.pip { background: rgba(var(--accent-rgb), 0.15); color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
+.ds-chip.npm { background: rgba(var(--accent-rgb), 0.15); color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
+.ds-chip.ext { background: rgba(var(--accent-rgb), 0.15); color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
 .ds-chip.err { background: rgba(220, 100, 100, 0.15); color: #e09090; border-color: rgba(220, 100, 100, 0.3); }
 .dep-empty { padding: 40px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }
 .dep-empty.err { color: #e08080; opacity: 1; }
@@ -269,8 +270,8 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
   background: rgba(var(--surface-rgb), 0.02); border: 1px solid rgba(var(--surface-rgb), 0.06);
   border-radius: 10px; padding: 10px; overflow: hidden;
 }
-.col-plugins { border-color: rgba(140, 180, 255, 0.18); }
-.col-skills  { border-color: rgba(200, 150, 255, 0.18); }
+.col-plugins { border-color: rgba(var(--accent-rgb), 0.18); }
+.col-skills  { border-color: rgba(var(--accent-rgb), 0.18); }
 
 .col-head {
   display: flex; align-items: center; gap: 10px; margin-bottom: 8px; padding: 4px 8px;
@@ -290,8 +291,8 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
   font-size: calc(10px * var(--font-scale)); padding: 2px 7px; border-radius: 4px;
   border: 1px solid rgba(var(--surface-rgb), 0.15); background: rgba(var(--surface-rgb), 0.06);
 }
-.dc-type.tp { color: #8ab4ff; border-color: rgba(140, 180, 255, 0.3); background: rgba(140, 180, 255, 0.1); }
-.dc-type.ts { color: #d8a8ff; border-color: rgba(200, 150, 255, 0.3); background: rgba(200, 150, 255, 0.1); }
+.dc-type.tp { color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); background: rgba(var(--accent-rgb), 0.1); }
+.dc-type.ts { color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); background: rgba(var(--accent-rgb), 0.1); }
 .dc-label { font-weight: 600; font-size: calc(13px * var(--font-scale)); }
 .dc-key { font-size: calc(10px * var(--font-scale)); opacity: .5; }
 .dc-status {
@@ -309,7 +310,7 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
 .dc-section { margin-top: 8px; }
 .dc-sec-title {
   font-size: calc(10px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px;
-  color: rgba(var(--text-rgb), 0.5); margin-bottom: 5px;
+  color: rgba(var(--text-rgb), 0.68); margin-bottom: 5px;
 }
 .dc-none { font-size: calc(11px * var(--font-scale)); opacity: .4; padding: 2px 0; }
 
@@ -333,7 +334,7 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
 .npm-badge.unavail { color: #f0c060; background: rgba(220, 180, 60, 0.1); border: 1px solid rgba(220, 180, 60, 0.3); }
 
 .dc-ext {
-  background: rgba(100, 200, 160, 0.04); border: 1px dashed rgba(100, 200, 160, 0.25);
+  background: rgba(var(--surface-rgb), 0.04); border: 1px dashed rgba(var(--surface-rgb), 0.18);
   border-radius: 7px; padding: 8px 10px; margin-top: 10px;
 }
 .ext-item { padding: 5px 0; border-bottom: 1px dashed rgba(var(--surface-rgb), 0.08); }

@@ -56,8 +56,30 @@ export interface RunLogEntry {
   status: 'ok' | 'err'
 }
 
-async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
-  const r = await fetch(BASE + path, { headers: { 'Content-Type': 'application/json', ...opts.headers }, ...opts })
+// 默认请求超时（ms）：后端挂死/连接半开时避免 await 永挂导致按钮状态锁死；
+// 长耗时端点（工具执行/市场同步/压缩/上传/Office 转换）在调用处单独传大超时
+const DEFAULT_TIMEOUT = 30_000
+
+/** 带超时的 fetch：超时 abort 并抛出可读错误；调用方自带 signal 时不套超时（交由其自行管理） */
+async function fetchT(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  if (!timeoutMs || timeoutMs <= 0 || init.signal) return fetch(url, init)
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal })
+  } catch (e: any) {
+    if (e?.name === 'AbortError') throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s）：${url}`)
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+type ReqOpts = RequestInit & { timeout?: number }
+
+async function req<T = any>(path: string, opts: ReqOpts = {}): Promise<T> {
+  const { timeout = DEFAULT_TIMEOUT, ...rest } = opts
+  const r = await fetchT(BASE + path, { headers: { 'Content-Type': 'application/json', ...rest.headers }, ...rest }, timeout)
   if (!r.ok) {
     // 优先展示后端 detail（同步/推送失败原因都靠它），读不到再退回状态码
     const text = await r.text().catch(() => '')
@@ -115,13 +137,13 @@ export const api = {
       BASE + `/canvases/${id}/file/raw?path=` + encodeURIComponent(path) + (v ? `&v=${v}` : ''),
     // 取二进制内容（xlsx/docx/pptx 等需在前端解析的类型）
     fileRaw: async (id: number, path: string): Promise<ArrayBuffer> => {
-      const r = await fetch(BASE + `/canvases/${id}/file/raw?path=` + encodeURIComponent(path))
+      const r = await fetchT(BASE + `/canvases/${id}/file/raw?path=` + encodeURIComponent(path), {}, 300_000)
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
       return r.arrayBuffer()
     },
     // Office(doc/docx/ppt) 经后端 COM 转 PDF：返回 blob URL 供 iframe 渲染（调用方负责 revoke）
     fileOfficePdf: async (id: number, path: string): Promise<string> => {
-      const r = await fetch(BASE + `/canvases/${id}/file/office-pdf?path=` + encodeURIComponent(path))
+      const r = await fetchT(BASE + `/canvases/${id}/file/office-pdf?path=` + encodeURIComponent(path), {}, 300_000)
       if (!r.ok) {
         let d: any = null
         try { d = await r.json() } catch { /* 非 JSON 错误体 */ }
@@ -130,7 +152,7 @@ export const api = {
       return URL.createObjectURL(await r.blob())
     },
     fileWrite: (id: number, path: string, content: string) =>
-      req(`/canvases/${id}/file`, { method: 'PUT', body: JSON.stringify({ path, content }) }),
+      req(`/canvases/${id}/file`, { method: 'PUT', body: JSON.stringify({ path, content }), timeout: 120_000 }),
     fileRename: (id: number, path: string, newName: string) =>
       req(`/canvases/${id}/file/rename`, { method: 'POST', body: JSON.stringify({ path, new_name: newName }) }),
     fileCopy: (id: number, src: string, destDir: string) =>
@@ -174,18 +196,18 @@ export const api = {
   fs: {
     list: (path: string) => req<any>('/fs/list?path=' + encodeURIComponent(path)),
     read: (path: string) => req<any>('/fs/read?path=' + encodeURIComponent(path)),
-    write: (path: string, content: string) => req<any>('/fs/write', { method: 'PUT', body: JSON.stringify({ path, content }) }),
+    write: (path: string, content: string) => req<any>('/fs/write', { method: 'PUT', body: JSON.stringify({ path, content }), timeout: 120_000 }),
     del: (path: string) => req<any>('/fs/delete', { method: 'DELETE', body: JSON.stringify({ path }) }),
     // —— 根级文件原始字节 / 二进制预览（供 FileViewer 预览上传附件等不属于任何画布的文件）——
     rawUrl: (path: string, v?: number) =>
       BASE + `/fs/raw?path=` + encodeURIComponent(path) + (v ? `&v=${v}` : ''),
     raw: async (path: string): Promise<ArrayBuffer> => {
-      const r = await fetch(BASE + `/fs/raw?path=` + encodeURIComponent(path))
+      const r = await fetchT(BASE + `/fs/raw?path=` + encodeURIComponent(path), {}, 300_000)
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
       return r.arrayBuffer()
     },
     officePdf: async (path: string): Promise<string> => {
-      const r = await fetch(BASE + `/fs/office-pdf?path=` + encodeURIComponent(path))
+      const r = await fetchT(BASE + `/fs/office-pdf?path=` + encodeURIComponent(path), {}, 300_000)
       if (!r.ok) {
         let d: any = null
         try { d = await r.json() } catch { /* 非 JSON 错误体 */ }
@@ -200,7 +222,7 @@ export const api = {
     list: () => req<any[]>('/conversations'),
     get: (id: number) => req<any>(`/conversations/${id}`),
     create: (d: any) => req('/conversations', { method: 'POST', body: JSON.stringify(d) }),
-    update: (id: number, d: any) => req(`/conversations/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
+    update: (id: number, d: any) => req(`/conversations/${id}`, { method: 'PUT', body: JSON.stringify(d), timeout: 120_000 }),
     remove: (id: number) => req(`/conversations/${id}`, { method: 'DELETE' }),
     runs: () => req<any>('/conversations/runs'),
     running: (id: number) => req<any>(`/conversations/${id}/running?include_base=1`),
@@ -208,7 +230,7 @@ export const api = {
     context: (id: number, agentId: number) => req<any>(`/conversations/${id}/context?agent_id=${agentId}`),
     // 手动触发历史压缩（force=true 跳过压缩线判定；返回 compressed=false 表示无可压缩区间/摘要生成失败）
     compress: (id: number, agentId: number, force = true) =>
-      req<any>(`/conversations/${id}/compress?agent_id=${agentId}&force=${force}`, { method: 'POST' }),
+      req<any>(`/conversations/${id}/compress?agent_id=${agentId}&force=${force}`, { method: 'POST', timeout: 300_000 }),
     // agentId 给定 → 只停该智能体；缺省 → 停该会话全部智能体
     stop: (id: number, agentId?: number | null) =>
       req(`/conversations/${id}/stop`, { method: 'POST', body: JSON.stringify(agentId != null ? { agent_id: agentId } : {}) }),
@@ -242,11 +264,11 @@ export const api = {
     update: (id: number, d: any) => req(`/model_interfaces/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/model_interfaces/${id}`, { method: 'DELETE' }),
     fetchModels: async (d: { url: string; api_key?: string }) => {
-      const r = await fetch(BASE + '/model_interfaces/fetch_models', {
+      const r = await fetchT(BASE + '/model_interfaces/fetch_models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(d),
-      })
+      }, 60_000)
       if (!r.ok) {
         let e: any = null
         try { e = await r.json() } catch { /* 非 JSON 错误体 */ }
@@ -265,7 +287,7 @@ export const api = {
     rawUrl: (id: string, file: string, v?: number) =>
       BASE + `/backgrounds/${encodeURIComponent(id)}/raw/${encodeURI(file)}` + (v ? `?v=${v}` : ''),
     upload: async (form: FormData) => {
-      const r = await fetch(BASE + '/backgrounds/upload', { method: 'POST', body: form })
+      const r = await fetchT(BASE + '/backgrounds/upload', { method: 'POST', body: form }, 300_000)
       if (!r.ok) {
         let d: any = null; try { d = await r.json() } catch { /* 非 JSON 错误体 */ }
         throw new Error(d?.detail || `${r.status} ${r.statusText}`)
@@ -285,14 +307,14 @@ export const api = {
     open: (path: string) => req<any>('/storage/open', { method: 'POST', body: JSON.stringify({ path }) }),
     pickFolder: (initial?: string, title?: string) =>
       req<{ path: string }>('/storage/pick_folder', { method: 'POST', body: JSON.stringify({ initial: initial || '', title: title || '' }) }),
-    setLocation: (path: string) => req<any>('/storage/set_location', { method: 'POST', body: JSON.stringify({ path }) })
+    setLocation: (path: string) => req<any>('/storage/set_location', { method: 'POST', body: JSON.stringify({ path }), timeout: 600_000 })
   },
   capabilities: {
     all: () => req<any>('/commands'),          // 返回 {commands, skills, plugins}
     commands: () => req<any>('/commands/commands'),
     plugins: () => req<any>('/commands/plugins'),
     reload: () => req<any>('/commands/reload', { method: 'POST' }),
-    run: (d: any) => req('/commands/run', { method: 'POST', body: JSON.stringify(d) }),
+    run: (d: any) => req('/commands/run', { method: 'POST', body: JSON.stringify(d), timeout: 600_000 }),
     dependencies: () => req<any>('/commands/dependencies'),
   },
   presets: {
@@ -303,16 +325,17 @@ export const api = {
   },
   pluginsDebug: {
     list: (rootDir: string) =>
-      req<PluginScanResult>('/plugins_debug/list', { method: 'POST', body: JSON.stringify({ root_dir: rootDir }) }),
+      req<PluginScanResult>('/plugins_debug/list', { method: 'POST', body: JSON.stringify({ root_dir: rootDir }), timeout: 120_000 }),
     run: (rootDir: string, pluginName: string, params: Record<string, unknown>) =>
       req<ExecutionResult>('/plugins_debug/run', {
         method: 'POST',
-        body: JSON.stringify({ root_dir: rootDir, plugin_name: pluginName, params })
+        body: JSON.stringify({ root_dir: rootDir, plugin_name: pluginName, params }),
+        timeout: 600_000,
       })
   },
   asr: {
     status: () => req<{ available: boolean }>('/asr/status'),
-    uninstall: () => req<{ ok: boolean; msg: string }>('/asr/uninstall', { method: 'DELETE' }),
+    uninstall: () => req<{ ok: boolean; msg: string }>('/asr/uninstall', { method: 'DELETE', timeout: 120_000 }),
   },
   launchMode: {
     get: () => req<{ mode: 'client' | 'web' }>('/launch_mode'),
@@ -325,7 +348,7 @@ export const api = {
   extensions: {
     list: () => req<{ market: any[]; installed: Record<string, any> }>('/extensions'),
     active: () => req<{ extensions: Array<{ id: string; manifest: any; files: Record<string, string> }> }>('/extensions/active'),
-    install: (id: string) => req<any>('/extensions/install', { method: 'POST', body: JSON.stringify({ id }) }),
+    install: (id: string) => req<any>('/extensions/install', { method: 'POST', body: JSON.stringify({ id }), timeout: 300_000 }),
     enable: (id: string) => req<any>(`/extensions/${encodeURIComponent(id)}/enable`, { method: 'POST' }),
     disable: (id: string) => req<any>(`/extensions/${encodeURIComponent(id)}/disable`, { method: 'POST' }),
     uninstall: (id: string) => req<any>(`/extensions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
@@ -365,20 +388,21 @@ export const api = {
       req<any>('/market/install', {
         method: 'POST',
         body: JSON.stringify({ kind, id, ...(version ? { version } : {}) }),
+        timeout: 300_000,
       }),
     itemVersions: (kind: string, id: string) =>
       req<{ kind: string; id: string; name?: string; latest_version?: string; total: number; versions: any[] }>(
         `/market/item/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/versions`,
       ),
     publish: (kind: string, id: string, push = false) =>
-      req<any>('/market/publish', { method: 'POST', body: JSON.stringify({ kind, id, push }) }),
+      req<any>('/market/publish', { method: 'POST', body: JSON.stringify({ kind, id, push }), timeout: 300_000 }),
     config: () => req<any>('/market/config'),
     saveConfig: (data: any) =>
       req<any>('/market/config', { method: 'PUT', body: JSON.stringify(data) }),
     sync: (force = true) =>
-      req<any>('/market/sync', { method: 'POST', body: JSON.stringify({ force }) }),
+      req<any>('/market/sync', { method: 'POST', body: JSON.stringify({ force }), timeout: 300_000 }),
     push: (message?: string) =>
-      req<any>('/market/push', { method: 'POST', body: JSON.stringify({ message }) }),
+      req<any>('/market/push', { method: 'POST', body: JSON.stringify({ message }), timeout: 300_000 }),
     auth: () => req<any>('/market/auth'),
     login: (username: string, token: string) =>
       req<any>('/market/auth', { method: 'POST', body: JSON.stringify({ username, token }) }),
@@ -390,7 +414,7 @@ export const api = {
     deleteItem: (kind: string, id: string, push = false) =>
       req<any>(
         `/market/items/${encodeURIComponent(kind)}/${encodeURIComponent(id)}` + (push ? '?push=1' : ''),
-        { method: 'DELETE' },
+        { method: 'DELETE', timeout: 300_000 },
       ),
   }
 }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
-import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, useAgentStore, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP } from '@/stores'
+import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, useAgentStore, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP, FONT_FAMILIES, FONT_FAMILY_DEFAULT } from '@/stores'
 import { api } from '@/api'
 import FileExplorerDialog from '@/components/FileExplorerDialog.vue'
 import { getAvatarGradient } from '@/utils/avatar'
@@ -19,8 +19,8 @@ function startGuide(type: 'flow' | 'region') {
 }
 
 const themeOptions = [
-  { id: 'standard', name: '标准配色-银河蓝', bg: '#0a0e1a', bgGrad: '#1a2340', text: '#e8ecf4', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
-  { id: 'deep-black', name: '深邃黑', bg: '#000000', bgGrad: '#080808', text: '#d7d7d7', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
+  { id: 'standard', name: '标准配色-深邃黑', bg: '#000000', bgGrad: '#080808', text: '#ececec', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
+  { id: 'galaxy-blue', name: '银河蓝', bg: '#0a0e1a', bgGrad: '#1a2340', text: '#ececec', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
   { id: 'tech-white', name: '科技白', bg: '#ffffff', bgGrad: '#ffffff', text: '#0c121c', accent: '#2563eb', surface: '#eef3fb' },
   { id: 'eye-care', name: '护眼白', bg: '#f4ecd6', bgGrad: '#faf3df', text: '#46371e', accent: '#2b6cb0', surface: 'rgba(90,70,30,0.1)' },
 ]
@@ -137,7 +137,7 @@ function bgThumbStyle(bg: any): any {
     return { backgroundImage: `url(${api.backgrounds.rawUrl(bg.id, bg.thumbnail)})`, backgroundSize: 'cover', backgroundPosition: 'center' }
   }
   if (bg.preview) return { background: bg.preview }
-  return { background: 'linear-gradient(135deg, #1a2340, #0a0e1a)' }
+  return { background: 'linear-gradient(135deg, #080808, #000000)' }
 }
 
 const asrUninstalling = ref(false)
@@ -211,6 +211,7 @@ async function toggleAutostart() {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', onIfaceKeydown)
   await Promise.all([models.fetch(), settings.fetch(), agents.fetch(), loadLaunchMode(), loadAutostart()])
   syncCtxSettings()
   // 存储路径
@@ -218,6 +219,7 @@ onMounted(async () => {
   storageLocation.value = storagePaths.value?.root || ''
   loadBackgrounds()
 })
+onBeforeUnmount(() => window.removeEventListener('keydown', onIfaceKeydown))
 
 function openPath(p: string) { api.storage.open(p).catch(() => {}) }
 // 将绝对路径转换为相对存储位置（root）的相对路径，供“路径”列展示
@@ -269,17 +271,95 @@ async function browseStorage() {
 }
 
 // —— 模型接口 ——
+// 接口 URL 预设（点击自动填入 URL 与名称）
+const BUILTIN_PRESETS = [
+  { name: 'DeepSeek', url: 'https://api.deepseek.com/v1' },
+  { name: '日日新', url: 'https://token.sensenova.cn/v1' },
+  { name: '火山引擎', url: 'https://ark.cn-beijing.volces.com/api/v3' },
+  { name: '阿里云百炼', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  { name: '华为云 ModelArts', url: 'https://api.modelarts-ma.mas.huawei.com/v1' },
+  { name: '本地 Ollama', url: 'http://localhost:11434/v1' },
+]
+const PRESETS_KEY = 'agent-cluster.iface.urlPresets'
+function loadCustomPresets(): { name: string; url: string }[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(PRESETS_KEY) || '[]')
+    return Array.isArray(v) ? v.filter((p: any) => p?.name && p?.url) : []
+  } catch { return [] }
+}
+const customPresets = ref<{ name: string; url: string }[]>(loadCustomPresets())
+function persistCustomPresets() { localStorage.setItem(PRESETS_KEY, JSON.stringify(customPresets.value)) }
+// 用 JS 维护 hover 态（backdrop-filter 遮罩上 CSS :hover 会粘滞不消失）
+const hoverPreset = ref<{ name: string; url: string } | 'add' | null>(null)
+function applyPreset(p: { name: string; url: string }, e?: MouseEvent) {
+  ifaceForm.value.url = p.url
+  ifaceForm.value.name = p.name
+  ;(e?.currentTarget as HTMLElement | null)?.blur()
+}
+const showPresetForm = ref(false)
+const presetName = ref('')
+const presetUrl = ref('')
+function openPresetForm() {
+  showPresetForm.value = !showPresetForm.value
+  if (showPresetForm.value) { presetName.value = ifaceForm.value.name || ''; presetUrl.value = ifaceForm.value.url || '' }
+}
+function addPreset() {
+  const n = presetName.value.trim()
+  const u = presetUrl.value.trim()
+  if (!n || !/^https?:\/\//i.test(u)) return
+  customPresets.value.push({ name: n, url: u })
+  persistCustomPresets()
+  showPresetForm.value = false
+  applyPreset({ name: n, url: u })
+}
+function removePreset(i: number) {
+  customPresets.value.splice(i, 1)
+  persistCustomPresets()
+}
+// 默认模型下拉选项：解析「可用模型」字符串
+const ifaceModelOptions = computed(() => (ifaceForm.value.models_str || '').split(',').map((s: string) => s.trim()).filter(Boolean))
 function openNew() {
-  ifaceForm.value = { name: '', url: '', api_key: '', default_model: 'gpt-4o-mini', models_str: '', models: [], description: '', windows_str: '' }
+  ifaceForm.value = { name: '', url: '', api_key: '', default_model: '', models_str: '', models: [], description: '', windows_str: '' }
   fetchMsg.value = null
+  showPresetForm.value = false; confirmClose.value = false
+  dialogBaseline.value = ifaceSnapshot()
   isEditing.value = false; showDialog.value = true
 }
 function edit(i: any) {
   ifaceForm.value = { ...i, models_str: (i.models || []).join(','), windows_str: Object.entries(i.model_windows || {}).map(([k, v]) => `${k}:${v}`).join(', ') }
   fetchMsg.value = null
+  showPresetForm.value = false; confirmClose.value = false
+  dialogBaseline.value = ifaceSnapshot()
   isEditing.value = true; showDialog.value = true
 }
-function closeDialog() { showDialog.value = false; ifaceForm.value = {} }
+function closeDialog() { showDialog.value = false; ifaceForm.value = {}; confirmClose.value = false; showPresetForm.value = false }
+// —— 弹窗关闭确认（✕ / ESC）：有未保存修改时三按钮确认 ——
+const dialogBaseline = ref('')
+const confirmClose = ref(false)
+const IFACE_FIELDS = ['name', 'url', 'api_key', 'default_model', 'models_str', 'windows_str', 'description']
+function ifaceSnapshot() {
+  const f: any = ifaceForm.value || {}
+  return JSON.stringify(IFACE_FIELDS.map(k => f[k] || ''))
+}
+function isIfaceDirty() { return ifaceSnapshot() !== dialogBaseline.value }
+function requestClose() {
+  if (isIfaceDirty()) { confirmClose.value = true; return }
+  closeDialog()
+}
+async function closeWithSave() {
+  confirmClose.value = false
+  await saveIface()
+}
+function closeWithoutSave() {
+  confirmClose.value = false
+  closeDialog()
+}
+function onIfaceKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape' || !showDialog.value) return
+  if (confirmClose.value) { confirmClose.value = false; return }
+  if (showPresetForm.value) { showPresetForm.value = false; return }
+  requestClose()
+}
 /** 窗口值解析：128000 / 128k / 1m / 2b → token 数 */
 function parseWindowTokens(v: string): number {
   const m = /^(\d+(?:\.\d+)?)\s*([kmb])?$/i.exec((v || '').trim())
@@ -299,6 +379,9 @@ async function saveIface() {
   })
   const { models_str, windows_str, ...clean } = ifaceForm.value
   clean.model_windows = mw
+  // 默认模型留空：回退第一个可用模型；仍为空则不传，由后端填默认值
+  clean.default_model = (clean.default_model || '').trim() || (clean.models || [])[0] || ''
+  if (!clean.default_model) delete clean.default_model
   if (isEditing.value) await models.update(ifaceForm.value.id, clean)
   else await models.create(clean)
   closeDialog(); await models.fetch()
@@ -346,6 +429,13 @@ const avatarMode = computed({
   get() { return settings.data.avatar_mode || 'differentiated' },
   set(v: string) { settings.update({ avatar_mode: v }) }
 })
+
+// 界面字体：走 layout store（localStorage 持久化，与主题/文字大小同模式）
+const fontFamilyId = computed({
+  get() { return layout.fontFamily },
+  set(v: string) { layout.setFontFamily(v) },
+})
+const currentFontStack = computed(() => FONT_FAMILIES.find(f => f.id === layout.fontFamily)?.stack || '')
 
 // —— 对话区显示 ——
 // 其他智能体发给当前智能体的消息：是否显示、显示在左侧还是右侧
@@ -525,13 +615,26 @@ const agentGroupOptions = computed(() => {
             </div>
             <div class="preview-item">
               <div class="preview-label">用户</div>
-              <div class="preview-avatar user" :style="{ background: 'linear-gradient(135deg, #f97316, #ec4899)' }">U</div>
+              <div class="preview-avatar user" :style="{ background: 'linear-gradient(135deg, var(--accent), var(--accent-2))' }">U</div>
             </div>
           </div>
           <div class="hint-empty" style="margin-top: 8px">
             差异化：每个智能体根据名称生成不同颜色
             <br />
             统一化：所有智能体使用统一的蓝紫色渐变
+          </div>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">界面字体</span>
+            <button class="btn sm ghost" @click="layout.resetFontFamily" :disabled="layout.fontFamily === FONT_FAMILY_DEFAULT">默认</button>
+          </div>
+          <select class="input font-select" v-model="fontFamilyId" :style="{ fontFamily: currentFontStack }">
+            <option v-for="f in FONT_FAMILIES" :key="f.id" :value="f.id" :style="{ fontFamily: f.stack }">{{ f.name }}</option>
+          </select>
+          <div class="hint-empty" style="margin-top: 8px">
+            全局正文与消息字体；未安装的字体自动回退，选择后立即生效并自动保存
           </div>
         </div>
 
@@ -630,7 +733,7 @@ const agentGroupOptions = computed(() => {
           </div>
           <div class="bg-grid">
             <div class="bg-card" :class="{ active: layout.backgroundId === null }" @click="layout.setBackground(null)">
-              <div class="bg-preview" style="background: radial-gradient(ellipse at 30% 20%, #1a2340 0%, #050816 70%)"></div>
+              <div class="bg-preview" style="background: radial-gradient(ellipse at 30% 20%, #080808 0%, #000000 70%)"></div>
               <div class="bg-name">默认渐变</div>
             </div>
             <div v-for="bg in bgList" :key="bg.id" class="bg-card" :class="{ active: layout.backgroundId === bg.id }" @click="layout.setBackground(bg.id)">
@@ -878,15 +981,31 @@ const agentGroupOptions = computed(() => {
       </div>
     </div>
 
-    <!-- 接口编辑弹窗 -->
+    <!-- 接口编辑弹窗（popup-surface 实底：glass 的 blur+saturate 采样深色遮罩，浅色主题下整窗发灰） -->
     <div class="modal-bg" v-if="showDialog">
-      <div class="modal glass">
-        <div class="modal-title">{{ isEditing ? '编辑接口' : '新建接口' }}</div>
+      <div class="modal popup-surface">
+        <div class="modal-head">
+          <div class="modal-title">{{ isEditing ? '编辑接口' : '新建接口' }}</div>
+          <button type="button" class="dlg-close" title="关闭" @click="requestClose">✕</button>
+        </div>
         <div class="grid">
+          <label class="full">
+            <span class="field-head"><span>URL</span></span>
+            <span class="iface-presets">
+              <button type="button" class="iface-preset" :class="{ hover: hoverPreset === p }" v-for="p in BUILTIN_PRESETS" :key="p.name" :title="p.url" @mouseenter="hoverPreset = p" @mouseleave="hoverPreset = null" @click="applyPreset(p, $event)">{{ p.name }}</button>
+              <button type="button" class="iface-preset" :class="{ hover: hoverPreset === p }" v-for="(p, i) in customPresets" :key="'c' + i" :title="p.url" @mouseenter="hoverPreset = p" @mouseleave="hoverPreset = null" @click="applyPreset(p, $event)">{{ p.name }}<span class="preset-x" title="删除预设" @click.stop="removePreset(i)">✕</span></button>
+              <button type="button" class="iface-preset add" :class="{ hover: hoverPreset === 'add' }" @mouseenter="hoverPreset = 'add'" @mouseleave="hoverPreset = null" @click="openPresetForm">＋预设</button>
+            </span>
+            <span v-if="showPresetForm" class="preset-form">
+              <input class="input" v-model="presetName" placeholder="预设名称" @keydown.enter="addPreset" />
+              <input class="input" v-model="presetUrl" placeholder="https://..." @keydown.enter="addPreset" />
+              <button type="button" class="btn sm ghost" @click="addPreset">添加</button>
+              <button type="button" class="dlg-close" title="取消" @click="showPresetForm = false">✕</button>
+            </span>
+            <input class="input" v-model="ifaceForm.url" placeholder="https://api.openai.com/v1" />
+          </label>
           <label>名称<input class="input" v-model="ifaceForm.name" /></label>
-          <label>URL<input class="input" v-model="ifaceForm.url" placeholder="https://api.openai.com/v1" /></label>
-          <label class="full">API Key<input class="input" v-model="ifaceForm.api_key" type="password" /></label>
-          <label>默认模型<input class="input" v-model="ifaceForm.default_model" placeholder="gpt-4o-mini" /></label>
+          <label>API Key<input class="input" v-model="ifaceForm.api_key" type="password" /></label>
           <label class="full">
             <span class="field-head">
               <span>可用模型（逗号分隔，如 gpt-4o,gpt-4o-mini,o1）</span>
@@ -895,12 +1014,34 @@ const agentGroupOptions = computed(() => {
             <input class="input" v-model="ifaceForm.models_str" />
             <span v-if="fetchMsg" class="fetch-msg" :class="fetchMsg.kind">{{ fetchMsg.text }}</span>
           </label>
-          <label class="full">上下文窗口（格式 模型:token，逗号分隔，如 gpt-4o:128k, glm-4.5:200k；未配置的模型用全局默认窗口）<input class="input" v-model="ifaceForm.windows_str" placeholder="gpt-4o:128k, o1:200k" /></label>
-          <label class="full">描述<input class="input" v-model="ifaceForm.description" /></label>
+          <label class="full">
+            <span class="field-head">
+              <span>默认模型（可选）</span>
+              <select v-if="ifaceModelOptions.length" class="input model-pick" v-model="ifaceForm.default_model">
+                <option value="">从可用模型选择</option>
+                <option v-for="m in ifaceModelOptions" :key="m" :value="m">{{ m }}</option>
+              </select>
+            </span>
+            <input class="input" v-model="ifaceForm.default_model" placeholder="留空则自动使用第一个可用模型，也可手动输入" />
+          </label>
+          <label class="full">上下文窗口（可选，格式 模型:token，逗号分隔，如 gpt-4o:128k, glm-4.5:200k；未配置的模型用全局默认窗口）<input class="input" v-model="ifaceForm.windows_str" placeholder="gpt-4o:128k, o1:200k" /></label>
+          <label class="full">描述（可选）<input class="input" v-model="ifaceForm.description" /></label>
         </div>
         <div class="actions">
-          <button class="btn ghost" @click="closeDialog">取消</button>
           <button class="btn" @click="saveIface">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 接口弹窗关闭确认 -->
+    <div class="modal-bg confirm-bg" v-if="confirmClose">
+      <div class="modal popup-surface confirm-box">
+        <div class="modal-title">未保存的修改</div>
+        <div class="confirm-text">接口信息已修改但尚未保存，是否保存后关闭？</div>
+        <div class="actions">
+          <button class="btn ghost" @click="confirmClose = false">取消</button>
+          <button class="btn ghost" @click="closeWithoutSave">不保存</button>
+          <button class="btn" @click="closeWithSave">保存并关闭</button>
         </div>
       </div>
     </div>
@@ -955,9 +1096,10 @@ const agentGroupOptions = computed(() => {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 10px 3px 10px; border-radius: 999px; font-size: calc(12px * var(--font-scale)); cursor: default;
   border: 1px solid rgba(var(--surface-rgb), 0.15);
-  &.blue   { background: rgba(var(--accent-rgb), 0.18);  color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
-  &.purple { background: rgba(var(--accent2-rgb), 0.18); color: var(--accent2-light); border-color: rgba(var(--accent2-rgb), 0.3); }
-  &.green  { background: rgba(100,220,160,0.18); color: var(--success-light); border-color: rgba(100,220,160,0.3); }
+  /* 分类标签统一为强调色，不再按蓝 / 紫 / 绿分色 */
+  &.blue,
+  &.purple,
+  &.green  { background: rgba(var(--accent-rgb), 0.18); color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
   .x { margin-left: 4px; opacity: .7; font-weight: bold; cursor: pointer; padding: 0 2px; &:hover { opacity: 1; } }
 }
 .hint-empty { font-size: calc(12px * var(--font-scale)); opacity: .45; padding: 4px 0; }
@@ -971,7 +1113,7 @@ const agentGroupOptions = computed(() => {
 .asr-desc { font-size: 13px; color: var(--text); opacity: 0.7; }
 .asr-install { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: rgba(var(--surface-rgb), 0.06); border: 1px solid rgba(var(--surface-rgb), 0.12); }
 .asr-install-label { font-size: 13px; margin-bottom: 6px; color: var(--text); opacity: 0.8; }
-.asr-cmd { font-family: monospace; font-size: 13px; padding: 6px 10px; border-radius: 6px; background: rgba(var(--shadow-rgb), 0.3); color: var(--code-ink, #ffb088); word-break: break-all; }
+.asr-cmd { font-family: monospace; font-size: 13px; padding: 6px 10px; border-radius: 6px; background: rgba(var(--shadow-rgb), 0.18); color: var(--code-ink, #ffb088); word-break: break-all; }
 .asr-note { font-size: 12px; margin-top: 6px; color: var(--text); opacity: 0.5; }
 .asr-toggle { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .asr-switch { position: relative; width: 42px; height: 24px; border-radius: 12px; border: none; cursor: pointer; background: rgba(var(--surface-rgb), 0.2); transition: background .2s; padding: 0; flex-shrink: 0; }
@@ -1051,7 +1193,7 @@ const agentGroupOptions = computed(() => {
   pointer-events: none;
 }
 .preview-avatar.user {
-  background: linear-gradient(135deg, #c47f8d, #ba71a2);
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
 }
 
 /* —— 文字大小滑块（小巧精致）—— */
@@ -1179,7 +1321,11 @@ const agentGroupOptions = computed(() => {
 .picker-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); }
 
 .modal-bg { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.5); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-.modal { width: 520px; padding: 20px; }
+.modal { width: 520px; padding: 20px; border-radius: 16px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 14px; }
+.modal-head .modal-title { margin-bottom: 0; }
+.dlg-close { width: 26px; height: 26px; border-radius: 6px; cursor: pointer; border: 1px solid rgba(var(--surface-rgb), 0.16); background: transparent; color: rgba(var(--text-rgb), 0.75); font-size: 13px; line-height: 1; flex-shrink: 0; transition: background .15s, color .15s; }
+.dlg-close:hover { background: rgba(232, 92, 92, 0.14); color: #e85c5c; }
 .modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; margin-bottom: 14px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; label { display: flex; flex-direction: column; gap: 4px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); &.full { grid-column: 1 / -1; } } }
 .field-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
@@ -1188,6 +1334,25 @@ const agentGroupOptions = computed(() => {
 .fetch-msg { font-size: calc(11px * var(--font-scale)); line-height: 1.5; word-break: break-all; }
 .fetch-msg.ok { color: var(--accent-light); }
 .fetch-msg.err { color: #e05a5a; }
+.iface-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.iface-preset {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid rgba(var(--surface-rgb), 0.16);
+  background: rgba(var(--surface-rgb), 0.06);
+  color: rgb(var(--text-rgb));
+  font-size: calc(11px * var(--font-scale));
+  cursor: pointer; outline: none;
+  transition: border-color .15s, background .15s;
+  &.hover { border-color: rgba(var(--accent-rgb), 0.55); background: rgba(var(--accent-rgb), 0.12); }
+  &.add { border-style: dashed; color: rgba(var(--text-rgb), 0.65); }
+}
+.model-pick { width: auto; flex-shrink: 0; padding: 4px 10px; font-size: calc(11px * var(--font-scale)); max-width: 60%; }
+.preset-x { font-size: calc(10px * var(--font-scale)); opacity: .55; line-height: 1; &:hover { opacity: 1; } }
+.preset-form { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; .input { flex: 1; min-width: 0; padding: 5px 10px; } .input:nth-child(2) { flex: 1.6; } .dlg-close { width: 24px; height: 24px; } }
+.confirm-bg { z-index: 1100; }
+.confirm-box { width: 400px; }
+.confirm-text { font-size: calc(13px * var(--font-scale)); line-height: 1.6; opacity: .85; margin-bottom: 4px; }
 .ctx-cfg-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 12px; label { display: flex; flex-direction: column; gap: 4px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); } .input { width: 100%; } }
 .actions-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
