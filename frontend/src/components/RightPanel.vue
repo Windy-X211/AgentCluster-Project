@@ -1589,12 +1589,17 @@ const renderItems = computed(() => {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result' || m2.role === 'tool') { i++; continue }
       if (m2.role === 'a2a') {
-        // 所有 a2a 信封统一渲染为 plain 子块（消息泡泡显示文字），不再有左右侧区分
-        children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: 'left' })
-        i++
+        // 只渲染"发给当前智能体"的信封（from !== cur）；自己发出的不渲染信封卡片。
+        // 显示在左/右侧由 sideOf（设置项）决定，与"是否渲染"无关。
+        const isOwn = cur != null && m2.envelope?.from?.agent_id === cur
+        if (cur == null || isOwn) {
+          i++
+        } else {
+          children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: sideOf(m2) })
+          i++
+        }
       } else {
-        // 所有 assistant 子块统一 side='left'，不再按 agent 归属分左右
-        children.push({ kind: 'assistant', msg: m2, idx: i, side: 'left' })
+        children.push({ kind: 'assistant', msg: m2, idx: i, side: sideOf(m2) })
         i++
       }
     }
@@ -1606,8 +1611,17 @@ const renderItems = computed(() => {
       if (hasTool) out.push({ type: 'turn', start, end, children, side: 'left' })
       continue
     }
-    // 全部子块统一 side='left'，不再按左右侧切段
-    out.push({ type: 'turn', start, end, children, side: 'left' })
+    // 按左右侧切成连续段：同侧相邻子块归入同一段
+    let g = 0
+    while (g < children.length) {
+      const side = children[g].side
+      const segStart = g === 0 ? start : children[g].idx
+      let ge = g
+      while (ge + 1 < children.length && children[ge + 1].side === side && children[ge + 1].kind === children[g].kind) ge++
+      const segEnd = ge + 1 < children.length ? children[ge + 1].idx - 1 : end
+      out.push({ type: 'turn', start: segStart, end: segEnd, children: children.slice(g, ge + 1), side })
+      g = ge + 1
+    }
   }
   return out
 })
