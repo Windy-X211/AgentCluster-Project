@@ -66,6 +66,10 @@ _EXCLUDE_FILES = {".DS_Store", "Thumbs.db"}
 # 任何时刻只允许一个操作修改或依赖 index.json，避免 sync/publish/push 互相覆盖
 _index_lock = threading.Lock()
 
+# 安装（写 agents/agent_groups/canvases 记录）串行化：
+# 保证一批资源分配到的 id 互不冲突，也不与并发安装撞号
+_install_lock = threading.Lock()
+
 
 # ==============================================================
 # 索引读写
@@ -136,6 +140,49 @@ def _slugify(text: str, fallback: str) -> str:
     return s or fallback
 
 
+def _unique_name(base: str, taken: set[str]) -> str:
+    """生成一个不与 ``taken`` 冲突的名称：重名时追加序号。
+
+    - 普通名称：游戏团队 → 游戏团队2 → 游戏团队3（跳过已占用的序号）
+    - 名称本身带数字后缀时按尾部数字递增：游戏团队2 → 游戏团队3，
+      避免出现「游戏团队22」这种别扭的名字
+    """
+    name = (base or "").strip() or "未命名"
+    if name not in taken:
+        return name
+    m = re.match(r"^(.*?)(\d+)$", name)
+    if m:
+        stem, num = m.group(1), int(m.group(2))
+        if stem:
+            i = num + 1
+            while f"{stem}{i}" in taken:
+                i += 1
+            return f"{stem}{i}"
+        # 纯数字名：直接递增（2024 → 2025）
+        i = num + 1
+        while str(i) in taken:
+            i += 1
+        return str(i)
+    i = 2
+    while f"{name}{i}" in taken:
+        i += 1
+    return f"{name}{i}"
+
+
+def _alloc_local_id(domain: str) -> int:
+    """为一个记录域分配**未被占用**的新 id。
+
+    ``store.next_id`` 返回「文件目录里最大 id + 1」，正常情况下不会撞车；
+    这里再复查一次，保证从市场安装的资源绝不会覆盖本机已有记录
+    （同名智能体不改名，但 id 必须是全新的）。
+    """
+    for _ in range(1000):
+        rid = store.next_id(domain)
+        if store.get_by(domain, rid) is None:
+            return rid
+    raise HTTPException(500, f"无法为 {domain} 分配新 id")
+
+
 def _copy_dir(src: Path, dest: Path, overwrite: bool = False) -> None:
     if dest.exists():
         if not overwrite:
@@ -179,7 +226,11 @@ def _installed_state(items: list[dict]) -> None:
     except Exception:
         canvases = []
     agent_names = {a.get("name") for a in agents}
+    # 画布安装后会加序号改名（游戏团队 → 游戏团队2），名字对不上，
+    # 因此用安装时写入的 market_id 做权威判定；名字匹配仅作旧数据的兜底。
+    canvas_market_ids = {str(c.get("market_id")) for c in canvases if c.get("market_id")}
     canvas_names = {c.get("name") for c in canvases}
+    agent_market_ids = {str(a.get("market_id")) for a in agents if a.get("market_id")}
     for it in items:
         kind, iid = it.get("kind"), it.get("id", "")
         if kind == "skill":
@@ -194,9 +245,10 @@ def _installed_state(items: list[dict]) -> None:
                 _read_installed().get(iid, {}).get("enabled")
             )
         elif kind == "agent":
-            it["installed"] = it.get("name") in agent_names
+            # 智能体安装后不改名（重名也不改名），名字匹配仍然有效
+            it["installed"] = (str(iid) in agent_market_ids) or (it.get("name") in agent_names)
         elif kind == "canvas":
-            it["installed"] = it.get("name") in canvas_names
+            it["installed"] = (str(iid) in canvas_market_ids) or (it.get("name") in canvas_names)
         else:
             it["installed"] = False
 
@@ -632,13 +684,62 @@ def _install_agent(item: dict) -> dict:
     if not src.exists():
         raise HTTPException(500, f"市场资源文件缺失：{src}")
     raw = json.loads(src.read_text(encoding="utf-8"))
-    rec = {k: v for k, v in raw.items()
-           if k not in ("id", "created_at", "sort_order", "group_id")}
-    rec["id"] = store.next_id("agents")
-    rec["created_at"] = datetime.utcnow().isoformat()
-    rec.setdefault("enabled", True)
-    store.upsert("agents", rec)
+    with _install_lock:
+        rec = {k: v for k, v in raw.items()
+               if k not in ("id", "created_at", "sort_order", "group_id", "market_id")}
+        # 名字保持市场原样（重名也不改名），但 id 必须是全新的，不能与本机已有智能体撞号
+        rec["id"] = _alloc_local_id("agents")
+        rec["created_at"] = datetime.utcnow().isoformat()
+        rec.setdefault("enabled", True)
+        rec["market_id"] = item.get("id")
+        store.upsert("agents", rec)
     return {"ok": True, "kind": "agent", "id": rec["id"], "name": rec.get("name")}
+
+
+def _canvas_agent_snapshots(item: dict, raw: dict) -> list[tuple[str, dict]]:
+    """读取画布包里的智能体快照，返回 [(唯一键, 快照), ...]。
+
+    新版格式：画布目录下 agents/<slug>/agent.json；
+    旧版格式（向后兼容）：智能体快照打包在 canvas.json.agents 里。
+
+    唯一键用于在安装时精确还原节点引用——画布内出现**同名智能体**时，
+    仅靠名字无法区分，必须靠这个键（发布侧写入 agent_key = 唯一目录名）。
+    """
+    agents_dir = _item_dir(item) / "agents"
+    snaps: list[tuple[str, dict]] = []
+    if agents_dir.is_dir():
+        for a_file in sorted(agents_dir.rglob("agent.json")):
+            try:
+                snap = json.loads(a_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(snap, dict):
+                continue
+            key = str(snap.get("agent_key") or "").strip() or a_file.parent.name
+            snaps.append((key, snap))
+    if snaps:
+        return snaps
+    for idx, snap in enumerate(raw.get("agents") or []):
+        if isinstance(snap, dict):
+            key = str(snap.get("agent_key") or "").strip() or f"idx-{idx}"
+            snaps.append((key, snap))
+    return snaps
+
+
+def _canvas_group_snapshots(item: dict, raw: dict) -> list[dict]:
+    """读取画布包里的分组快照（canvas.json 内嵌优先，其次 agent_groups.json）。"""
+    groups = [g for g in (raw.get("agent_groups") or []) if isinstance(g, dict)]
+    if groups:
+        return groups
+    gf = _item_dir(item) / "agent_groups.json"
+    if gf.exists():
+        try:
+            data = json.loads(gf.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [g for g in data if isinstance(g, dict)]
+        except Exception:
+            pass
+    return []
 
 
 def _install_canvas(item: dict) -> dict:
@@ -647,95 +748,109 @@ def _install_canvas(item: dict) -> dict:
         raise HTTPException(500, f"市场资源文件缺失：{src}")
     raw = json.loads(src.read_text(encoding="utf-8"))
 
-    # —— 第一步：先安装/复用 agent_groups（按 name 匹配，建立 group_name → 本地 group_id 映射）——
-    local_groups = store.load("agent_groups")
-    group_by_name: dict[str, int] = {g.get("name"): int(g.get("id")) for g in local_groups}
-    created_groups: list[str] = []
-    for gsnap in raw.get("agent_groups") or []:
-        gname = gsnap.get("name")
-        if not gname:
-            continue
-        if gname in group_by_name:
-            continue
-        grec = {
-            "name": gname,
-            "description": gsnap.get("description", ""),
-            "id": store.next_id("agent_groups"),
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        store.upsert("agent_groups", grec)
-        group_by_name[gname] = grec["id"]
-        created_groups.append(gname)
-
-    # —— 第二步：安装智能体 ——
-    # 新版格式：画布目录下 agents/<slug>/agent.json；
-    # 旧版格式（向后兼容）：智能体快照打包在 canvas.json.agents 里。
-    # 优先读 agents/ 子目录，空时回退 canvas.json.agents。
-    agents_dir = _item_dir(item) / "agents"
-    snaps_from_dir: list[dict] = []
-    if agents_dir.is_dir():
-        for a_file in sorted(agents_dir.rglob("agent.json")):
-            try:
-                snap = json.loads(a_file.read_text(encoding="utf-8"))
-                if isinstance(snap, dict):
-                    snaps_from_dir.append(snap)
-            except Exception:
+    with _install_lock:
+        # —— 第一步：安装智能体分组 ——
+        # 与本机重名的分组**加序号新建**（游戏 → 游戏2），不复用本地同名分组，
+        # 这样下载来的智能体归到自己的组里，不会和本地已有分组混在一起。
+        local_group_names = {str(g.get("name") or "") for g in store.load("agent_groups")}
+        group_by_name: dict[str, int] = {}    # 市场分组名 → 本地 group_id
+        renamed_groups: dict[str, str] = {}   # 市场分组名 → 本地最终名
+        created_groups: list[str] = []
+        for gsnap in _canvas_group_snapshots(item, raw):
+            gname = str(gsnap.get("name") or "").strip()
+            if not gname:
                 continue
-    agent_snaps = snaps_from_dir or (raw.get("agents") or [])
+            final_name = _unique_name(gname, local_group_names)
+            local_group_names.add(final_name)
+            grec = {
+                "name": final_name,
+                "description": gsnap.get("description", ""),
+                "id": _alloc_local_id("agent_groups"),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            store.upsert("agent_groups", grec)
+            group_by_name.setdefault(gname, grec["id"])
+            renamed_groups.setdefault(gname, final_name)
+            created_groups.append(final_name)
 
-    # 核心原则：**不依赖名称匹配本地任何已有智能体**。画布中每个智能体快照
-    # 一律新建（分配全新本地 id），节点里的 agent_ref 字符串翻译到新 id。
-    # 这样用户下载的画布永远拿到市场上那一套，不会意外绑到自己旧的同名智能体。
-    ref_to_id: dict[str, int] = {}  # agent_ref(name) → 新分配的本地 agent_id
-    created: list[str] = []
-    for snap in agent_snaps:
-        name = snap.get("name")
-        if not name:
-            continue
-        # 快照里 group_id 已被发布侧剥离；有 group_name 时映射到本地 group_id
-        new_group_id: int | None = None
-        gname = snap.get("group_name")
-        if gname:
-            new_group_id = group_by_name.get(gname)   # 可能是 None（组不存在时）
-        rec = {k: v for k, v in snap.items()
-               if k not in ("id", "created_at", "sort_order", "group_id", "group_name")}
-        rec["id"] = store.next_id("agents")
-        rec["created_at"] = datetime.utcnow().isoformat()
-        rec["group_id"] = new_group_id
-        rec.setdefault("enabled", True)
-        store.upsert("agents", rec)
-        ref_to_id[name] = rec["id"]
-        created.append(name)
+        # —— 第二步：安装智能体 ——
+        # 核心原则：**不依赖名称匹配本地任何已有智能体**。画布中每个智能体快照
+        # 一律新建（分配全新本地 id），节点里的 agent_ref 字符串翻译到新 id。
+        # 这样用户下载的画布永远拿到市场上那一套，不会意外绑到自己旧的同名智能体。
+        # 重名智能体**不改名**（名字保持市场原样），只保证 id 互不冲突。
+        key_to_id: dict[str, int] = {}      # agent_key → 新分配的本地 agent_id
+        name_to_ids: dict[str, list[int]] = {}  # agent_ref(name) → 新 id 队列（同名时按序取用）
+        created: list[str] = []
+        for key, snap in _canvas_agent_snapshots(item, raw):
+            name = str(snap.get("name") or "").strip()
+            if not name:
+                continue
+            # 快照里 group_id 已被发布侧剥离；有 group_name 时映射到本地 group_id
+            new_group_id: int | None = None
+            gname = str(snap.get("group_name") or "").strip()
+            if gname:
+                new_group_id = group_by_name.get(gname)   # 可能是 None（组不存在时）
+            rec = {k: v for k, v in snap.items()
+                   if k not in ("id", "created_at", "sort_order", "group_id",
+                                "group_name", "agent_key", "market_id")}
+            rec["id"] = _alloc_local_id("agents")
+            rec["created_at"] = datetime.utcnow().isoformat()
+            rec["group_id"] = new_group_id
+            rec.setdefault("enabled", True)
+            rec["market_canvas_id"] = item.get("id")
+            store.upsert("agents", rec)
+            key_to_id[key] = rec["id"]
+            name_to_ids.setdefault(name, []).append(rec["id"])
+            created.append(name)
 
-    # —— 第三步：构建画布节点，把市场里的 agent_ref 翻译成新分配的本地 id ——
-    nodes = []
-    skipped = 0
-    for n in raw.get("nodes") or []:
-        ref = n.get("agent_ref")
-        aid = ref_to_id.get(ref) if ref else None
-        if aid is None:
-            skipped += 1
-            continue
-        nodes.append({"id": n.get("id"), "agent_id": aid,
-                      "x": n.get("x", 0), "y": n.get("y", 0)})
+        # —— 第三步：构建画布节点，把市场里的 agent_ref 翻译成新分配的本地 id ——
+        # 优先按 agent_key 精确匹配（能区分画布内同名智能体）；
+        # 旧包没有 key 时按名字兜底：同名智能体按出现顺序依次取用，
+        # 避免所有同名节点都绑到同一个智能体上。
+        nodes = []
+        skipped = 0
+        name_cursor: dict[str, int] = {}
+        for n in raw.get("nodes") or []:
+            nkey = str(n.get("agent_key") or "").strip()
+            ref = n.get("agent_ref")
+            aid = key_to_id.get(nkey) if nkey else None
+            if aid is None and ref:
+                queue = name_to_ids.get(ref) or []
+                if queue:
+                    idx = name_cursor.get(ref, 0)
+                    aid = queue[idx] if idx < len(queue) else queue[-1]
+                    name_cursor[ref] = idx + 1
+            if aid is None:
+                skipped += 1
+                continue
+            nodes.append({"id": n.get("id"), "agent_id": aid,
+                          "x": n.get("x", 0), "y": n.get("y", 0)})
 
-    rec = {
-        "id": store.next_id("canvases"),
-        "name": raw.get("name") or item.get("name") or "市场画布",
-        "description": raw.get("description", ""),
-        "nodes": nodes,
-        "edges": raw.get("edges") or [],
-        "created_at": datetime.utcnow().isoformat(),
-        "workdir": None,
-        "execution_mode": raw.get("execution_mode", "serial"),
-        "ws_pin": None,
-    }
-    store.upsert("canvases", rec)
+        # —— 第四步：创建画布（与本机重名则加序号：游戏团队 → 游戏团队2）——
+        local_canvas_names = {str(c.get("name") or "") for c in store.load("canvases")}
+        base_name = str(raw.get("name") or item.get("name") or "市场画布").strip() or "市场画布"
+        canvas_name = _unique_name(base_name, local_canvas_names)
+
+        rec = {
+            "id": _alloc_local_id("canvases"),
+            "name": canvas_name,
+            "description": raw.get("description", ""),
+            "nodes": nodes,
+            "edges": raw.get("edges") or [],
+            "created_at": datetime.utcnow().isoformat(),
+            "workdir": None,
+            "execution_mode": raw.get("execution_mode", "serial"),
+            "ws_pin": None,
+            "market_id": item.get("id"),
+        }
+        store.upsert("canvases", rec)
+
     return {
         "ok": True, "kind": "canvas", "id": rec["id"], "name": rec["name"],
         "created_agents": created,
         "skipped_nodes": skipped,
         "created_agent_groups": created_groups,
+        "renamed_agent_groups": renamed_groups,
     }
 
 
@@ -1316,17 +1431,44 @@ def _publish_canvas(local_id: str, version: str = "1.0.0") -> dict:
     # —— 收集画布引用的智能体 + 分组 ——
     seen_agent_ids: set[int] = set()
     group_ids_seen: set[int] = set()
-    nodes = []
     for n in canvas.get("nodes") or []:
         a = agents.get(n.get("agent_id"))
-        ref = a.get("name") if a else "未知智能体"
-        nodes.append({"id": n.get("id"), "agent_ref": ref,
-                      "x": n.get("x", 0), "y": n.get("y", 0)})
         if a and n.get("agent_id") not in seen_agent_ids:
             seen_agent_ids.add(n.get("agent_id"))
             gid = a.get("group_id")
             if gid is not None and gid in agent_groups:
                 group_ids_seen.add(gid)
+
+    # —— 为每个智能体分配画布内唯一的 key ——
+    # key = 唯一目录名（同名智能体追加序号），安装时用它精确还原节点引用，
+    # 避免画布内出现两个同名智能体时节点串位。
+    agent_key_by_id: dict[int, str] = {}
+    used_keys: set[str] = set()
+    for agent_id in sorted(seen_agent_ids):
+        a = agents.get(agent_id)
+        if not a:
+            continue
+        base = _slugify(a.get("name", ""), f"agent-{agent_id}")
+        key = base
+        n = 2
+        while key in used_keys:
+            key = f"{base}-{n}"
+            n += 1
+        used_keys.add(key)
+        agent_key_by_id[agent_id] = key
+
+    # —— 画布节点：agent_ref 保留智能体名字（兼容旧包与前端预览），
+    #    agent_key 记录唯一键（安装时精确匹配）——
+    nodes = []
+    for n in canvas.get("nodes") or []:
+        a = agents.get(n.get("agent_id"))
+        ref = a.get("name") if a else "未知智能体"
+        node = {"id": n.get("id"), "agent_ref": ref,
+                "x": n.get("x", 0), "y": n.get("y", 0)}
+        key = agent_key_by_id.get(n.get("agent_id"))
+        if key:
+            node["agent_key"] = key
+        nodes.append(node)
 
     # —— 画布目录：canvas.json + agents/*/agent.json + agent_groups.json ——
     slug = _slugify(canvas.get("name", ""), f"canvas-{cid}")
@@ -1351,7 +1493,7 @@ def _publish_canvas(local_id: str, version: str = "1.0.0") -> dict:
         "agent_groups": [],
     }
 
-    # 2. agents/<slug>/agent.json —— 每个智能体独立子目录
+    # 2. agents/<key>/agent.json —— 每个智能体独立子目录
     agents_dir = dest / "agents"
     agents_dir.mkdir(exist_ok=True)
     agent_snapshots: list[dict] = []  # 也塞进 canvas.json.agents 便于预览
@@ -1363,11 +1505,12 @@ def _publish_canvas(local_id: str, version: str = "1.0.0") -> dict:
         gid = a.get("group_id")
         if gid is not None and gid in agent_groups:
             snap["group_name"] = agent_groups[gid].get("name", "")
+        # 画布内唯一键：同名智能体靠它区分（名字本身保持原样，不改名）
+        snap["agent_key"] = agent_key_by_id[agent_id]
         agent_snapshots.append(snap)
 
-        # 每个智能体写独立子目录
-        agent_slug = _slugify(a.get("name", ""), f"agent-{agent_id}")
-        a_dir = agents_dir / agent_slug
+        # 每个智能体写独立子目录（目录名 = 画布内唯一 key）
+        a_dir = agents_dir / agent_key_by_id[agent_id]
         a_dir.mkdir(exist_ok=True)
         (a_dir / "agent.json").write_text(
             json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")

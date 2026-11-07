@@ -762,7 +762,7 @@ const agentGroupOptions = computed(() => {
           </div>
           <input ref="bgFileInput" type="file" multiple style="display:none" @change="onBgFiles" />
           <div class="hint-empty" style="margin-top: 8px">
-            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见 AppData/backgrounds/spec.md
+            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见数据存储位置的 <code>backgrounds\spec.md</code>
           </div>
         </div>
       </div>
@@ -974,6 +974,20 @@ const agentGroupOptions = computed(() => {
               <td class="mono sm-cell">{{ relPath(storagePaths.plugins_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.plugins ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.plugins_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.plugins_dir)">打开</button></td>
+            </tr>
+            <tr>
+              <td>🎨 自定义背景</td>
+              <td class="tag-t">每背景一个文件夹</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.backgrounds_dir) }}</td>
+              <td class="mono">-</td>
+              <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.backgrounds_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.backgrounds_dir)">打开</button></td>
+            </tr>
+            <tr>
+              <td>🧩 功能拓展</td>
+              <td class="tag-t">每拓展一个文件夹</td>
+              <td class="mono sm-cell">{{ relPath(storagePaths.extensions_dir) }}</td>
+              <td class="mono">-</td>
+              <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.extensions_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.extensions_dir)">打开</button></td>
             </tr>
           </tbody>
         </table>

@@ -45,6 +45,25 @@ export function getAvatarGradient(nameOrId: string | number): string {
     return `linear-gradient(135deg, ${c1}, ${c2})`
 }
 
+/** 十六进制色 → [r, g, b] */
+export function hexToRgb(hex: string): [number, number, number] {
+    const h = hex.replace('#', '')
+    const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h
+    const n = parseInt(full, 16)
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+}
+
+/**
+ * 智能体身份色（画布连线用）
+ * 与头像取色同源：同一智能体在头像与连线上是同一个色相，
+ * 保证连线既能被主题调和，又能区分归属。
+ */
+export function getAvatarRgb(nameOrId: string | number): string {
+    const [c1] = getAvatarColors(nameOrId)
+    const [r, g, b] = hexToRgb(c1)
+    return `rgb(${r}, ${g}, ${b})`
+}
+
 export function getAvatarInitial(name: string | undefined | null): string {
     if (!name) return '?'
     return name.slice(0, 1).toUpperCase()

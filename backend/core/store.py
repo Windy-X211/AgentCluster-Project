@@ -685,6 +685,7 @@ def get_store_paths() -> dict:
             "skills_dir": str(ROOT / "skills"),
             "plugins_dir": str(ROOT / "plugins"),
             "backgrounds_dir": str(ROOT / "backgrounds"),
+            "extensions_dir": str(ROOT / "extensions"),
             "param_presets_dir": str(ROOT / "param_presets"),
             "agent_groups_dir": str(ROOT / "agent_groups"),
             "legacy_dir": str(LEGACY_DIR),

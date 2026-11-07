@@ -170,9 +170,15 @@ async function install(m: MarketItem, version?: string) {
   busy.value = k
   try {
     const r = await api.market.install(m.kind, m.id, version)
-    let tip = `已下载：${m.name}${version && version !== m.version ? ` v${version}` : ''}`
+    // 画布/分组与本机重名时后端会加序号（如 游戏团队 → 游戏团队2），
+    // 这里显示实际落地的名字，避免用户以为还是原名。
+    const landed = r?.name && r.name !== m.name ? r.name : m.name
+    let tip = `已下载：${landed}${version && version !== m.version ? ` v${version}` : ''}`
     if (r?.kind === 'canvas' && r?.created_agents?.length) {
       tip += `（创建智能体：${r.created_agents.join('、')}）`
+    }
+    if (r?.kind === 'canvas' && r?.created_agent_groups?.length) {
+      tip += `（创建分组：${r.created_agent_groups.join('、')}）`
     }
     if (r?.kind === 'extension' && r?.need_restart) {
       tip += '，含后端服务，重启后端后生效'
@@ -1159,7 +1165,7 @@ onBeforeUnmount(() => {
                     <defs>
                       <marker id="pv-arrow" viewBox="0 0 10 10" refX="8" refY="5"
                         markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                        <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(120,140,255,0.7)" />
+                        <path d="M 0 0 L 10 5 L 0 10 z" style="fill: rgba(var(--accent-rgb, 120, 140, 255), 0.75)" />
                       </marker>
                     </defs>
                     <g v-for="(edge, i) in canvasThumbEdges" :key="'e' + i">
@@ -1360,7 +1366,7 @@ onBeforeUnmount(() => {
               <defs>
                 <marker id="cz-arrow" viewBox="0 0 10 10" refX="8" refY="5"
                   markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-                  <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(120,140,255,0.85)" />
+                  <path d="M 0 0 L 10 5 L 0 10 z" style="fill: rgba(var(--accent-rgb, 120, 140, 255), 0.85)" />
                 </marker>
               </defs>
               <g v-for="(edge, i) in canvasThumbEdges" :key="'ze' + i">
@@ -1664,7 +1670,7 @@ onBeforeUnmount(() => {
 }
 .pv-edge-line {
   fill: none;
-  stroke: rgba(120, 140, 255, .7);
+  stroke: rgba(var(--accent-rgb, 120, 140, 255), .75);
   stroke-width: 2.5;
 }
 .pv-thumb-loading {
@@ -1724,7 +1730,7 @@ onBeforeUnmount(() => {
 }
 .cz-edge-line {
   fill: none;
-  stroke: rgba(120, 140, 255, .75);
+  stroke: rgba(var(--accent-rgb, 120, 140, 255), .8);
   stroke-width: 2.5;
 }
 .cz-foot {
