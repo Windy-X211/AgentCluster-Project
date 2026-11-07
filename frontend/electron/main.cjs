@@ -673,6 +673,54 @@ async function createMainWindow() {
   })
   mainWindow.webContents.on('did-finish-load', () => {
     _log('✅ 主窗口 did-finish-load, url=' + mainWindow.webContents.getURL())
+    const runDiag = (label) => {
+      const script = `(function(){
+        console.log('[DIAG] ====== ` + label + ` ======');
+        // 1. 扫所有 think-stream（含是否有 open 类）
+        var tss = document.querySelectorAll('.think-stream');
+        console.log('[DIAG] think-stream total=' + tss.length);
+        tss.forEach(function(ts, i){
+          var cs = getComputedStyle(ts);
+          console.log('[DIAG]   ts[' + i + '] classes=[' + String(ts.className) + '] cW=' + ts.clientWidth + ' sW=' + ts.scrollWidth +
+            ' textLen=' + (ts.textContent?.length||0) + ' parent=' + (ts.parentElement?.tagName + '.' + String(ts.parentElement?.className||'').split(' ')[0]).substring(0,50));
+        });
+        // 2. 扫 think-stream.open（已展开的折叠态）
+        var topens = document.querySelectorAll('.think-stream.open');
+        console.log('[DIAG] think-stream.open total=' + topens.length);
+        // 3. 扫 think-full（展开后的全文区）
+        var tfulls = document.querySelectorAll('.think-full');
+        console.log('[DIAG] think-full total=' + tfulls.length);
+        tfulls.forEach(function(tf, i){
+          var cs = getComputedStyle(tf);
+          console.log('[DIAG]   tf[' + i + '] cW=' + tf.clientWidth + ' sW=' + tf.scrollWidth + ' oX=' + cs.overflowX +
+            ' textLen=' + (tf.textContent?.length||0));
+        });
+        // 4. 扫 think-full-text
+        var tft = document.querySelectorAll('.think-full-text');
+        console.log('[DIAG] think-full-text total=' + tft.length);
+        tft.forEach(function(t, i){
+          var cs = getComputedStyle(t);
+          console.log('[DIAG]   tft[' + i + '] cW=' + t.clientWidth + ' sW=' + t.scrollWidth + ' oX=' + cs.overflowX +
+            ' wb=' + cs.wordBreak + ' ow=' + cs.overflowWrap + ' ws=' + cs.whiteSpace +
+            ' disp=' + cs.display + ' textLen=' + (t.textContent?.length||0) +
+            ' first80=' + (t.textContent||'').substring(0,80).replace(/\\n/g,'↵'));
+        });
+        // 5. Vue 内部状态：尝试从 __vue_app__ 找 thinkOpen
+        try {
+          var app = document.querySelector('#app');
+          if (app && app.__vue_app__) {
+            console.log('[DIAG] Vue app found');
+          } else {
+            console.log('[DIAG] no Vue app');
+          }
+        } catch(e) { console.log('[DIAG] Vue probe error: ' + e.message); }
+        return 'done ts=' + tss.length + ' topens=' + topens.length + ' tfulls=' + tfulls.length;
+      })();`;
+      mainWindow.webContents.executeJavaScript(script).catch(e => _log('[DIAG] exec error: ' + e.message))
+    }
+    setTimeout(() => runDiag('3s'), 3000)
+    setTimeout(() => runDiag('12s'), 12000)
+    setTimeout(() => runDiag('25s'), 25000)
   })
 
   // 显示策略：等 Vue 数据加载完（app:ready IPC）再 show，防白屏闪烁

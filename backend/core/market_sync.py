@@ -387,6 +387,18 @@ def _item_dir(item: dict) -> str:
     return str(item.get("dir") or "").replace("\\", "/").strip("/")
 
 
+def _has_local_content(item: dict) -> bool:
+    """条目在本机 market/ 下是否还有实际资源目录（无目录的本地独有条目是下架残留）。"""
+    d = _item_dir(item)
+    if not d:
+        return False
+    folder = MARKET_ROOT / d
+    try:
+        return folder.is_dir() and any(folder.iterdir())
+    except OSError:
+        return False
+
+
 def _is_ignored(rel: Path) -> bool:
     if any(part in _IGNORE_DIRS for part in rel.parts):
         return True
@@ -439,7 +451,9 @@ def merge_market(remote_root: Path, remote_index: dict,
     mine_only: set[tuple[str, str]] = set()
     for key, lit in local_items.items():
         rit = remote_items.get(key)
-        if rit is None and mine_author and (lit.get("author") or "") == mine_author:
+        if (rit is None and mine_author
+                and (lit.get("author") or "") == mine_author
+                and _has_local_content(lit)):
             mine_only.add(key)
     skip_dirs = {_item_dir(local_items[k])
                  for k in (local_newer | mine_only) if _item_dir(local_items[k])}
@@ -559,6 +573,10 @@ def sync_market(force: bool = False, on_progress=None) -> dict:
 
         _write_json(INDEX_FILE, merged)
 
+        # 索引快照已变化 → 旧归档缓存全部失效（整仓 zip，含资源目录结构）
+        if remote_updated and remote_updated != local_updated:
+            clean_zip_cache()
+
     return {
         "ok": True, "up_to_date": up_to_date, "index_only": True,
         "repo_url": cfg["repo_url"], "branch": cfg["branch"],
@@ -647,10 +665,11 @@ def _merge_index(remote_index: dict, local_index: dict,
             merged.append(lit)
         else:
             merged.append(rit)
-    # 本地独有：只保留"当前登录用户发布"的条目（还没 push 的）
+    # 本地独有：只保留"当前登录用户发布且仍有资源目录"的条目（还没 push 的）
     for key, lit in local_items.items():
         if key not in remote_items:
-            if mine_author and (lit.get("author") or "") == mine_author:
+            if (mine_author and (lit.get("author") or "") == mine_author
+                    and _has_local_content(lit)):
                 merged.append(lit)
     merged.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
 
@@ -693,13 +712,27 @@ def _item_cache_dir(item: dict) -> Path:
     return MARKET_ROOT / d
 
 
-def _cache_key_for_url(url: str) -> str:
-    return _hl.md5(url.encode("utf-8")).hexdigest()[:16]
+def _index_revision() -> str:
+    """本地索引对应的远端快照版本（updated_at），用于给归档缓存打版本标。"""
+    idx = _read_json(INDEX_FILE, {})
+    if not isinstance(idx, dict):
+        return ""
+    return str(idx.get("updated_at") or "")
 
 
-def _get_cached_archive(archive_url_str: str) -> Path | None:
-    """返回有效的缓存 zip 路径，不存在或过期返回 None。"""
-    cache_path = _ZIP_CACHE_DIR / f"{_cache_key_for_url(archive_url_str)}.zip"
+def _cache_key_for_url(url: str, revision: str | None = None) -> str:
+    key = url if revision is None else f"{url}|{revision}"
+    return _hl.md5(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_cached_archive(archive_url_str: str,
+                        revision: str | None = None) -> Path | None:
+    """返回有效的缓存 zip 路径，不存在或过期返回 None。
+
+    revision 绑定远端快照版本：索引 updated_at 变化后，旧归档即使未到 TTL
+    也不能再用，否则会解压出缺少新资源目录的旧快照。
+    """
+    cache_path = _ZIP_CACHE_DIR / f"{_cache_key_for_url(archive_url_str, revision)}.zip"
     if not cache_path.exists():
         return None
     age = time.time() - cache_path.stat().st_mtime
@@ -718,10 +751,11 @@ def _get_cached_archive(archive_url_str: str) -> Path | None:
     return cache_path
 
 
-def _put_cached_archive(src: Path, archive_url_str: str) -> Path:
+def _put_cached_archive(src: Path, archive_url_str: str,
+                        revision: str | None = None) -> Path:
     """把下载好的 zip 移动到持久化缓存目录，返回缓存路径。"""
     _ZIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = _ZIP_CACHE_DIR / f"{_cache_key_for_url(archive_url_str)}.zip"
+    cache_path = _ZIP_CACHE_DIR / f"{_cache_key_for_url(archive_url_str, revision)}.zip"
     try:
         os.replace(str(src), str(cache_path))
     except OSError:
@@ -730,6 +764,35 @@ def _put_cached_archive(src: Path, archive_url_str: str) -> Path:
         except OSError:
             pass
     return cache_path
+
+
+def _versioned_dir(dir_path: str, version: str) -> str:
+    """把 ``agents/ppt`` 变成 ``agents/ppt@1.0.0``（与发布端的历史目录备份规则一致）。"""
+    dir_path = str(dir_path or "").replace("\\", "/").strip("/")
+    if not dir_path or not version:
+        return dir_path
+    if "@" in dir_path.rsplit("/", 1)[-1]:
+        return dir_path
+    parent, name = dir_path.rsplit("/", 1) if "/" in dir_path else ("", dir_path)
+    new_name = f"{name}@{version}"
+    return f"{parent}/{new_name}" if parent else new_name
+
+
+def _resolve_item(kind: str, item_id: str,
+                  requested_version: str | None) -> dict:
+    """按请求版本解析索引条目；未指定版本时返回最新条目。"""
+    item = find_index_item(kind, item_id)
+    if not item:
+        raise RuntimeError(f"索引中未找到资源：{kind}/{item_id}")
+    if requested_version and requested_version != item.get("version"):
+        target = next(
+            (v for v in (item.get("versions") or [])
+             if isinstance(v, dict) and v.get("version") == requested_version), None)
+        if not target:
+            raise RuntimeError(f"该资源不存在版本 {requested_version}")
+        item = {**target,
+                "dir": target.get("dir") or _versioned_dir(item.get("dir", ""), requested_version)}
+    return item
 
 
 def ensure_item_local(kind: str, item_id: str, *,
@@ -748,9 +811,7 @@ def ensure_item_local(kind: str, item_id: str, *,
       不传时默认取最新版本；传入时会在 item.versions 数组里查找对应条目，
       用其 dir（通常带 @version 后缀）定位目录。
     """
-    item = find_index_item(kind, item_id)
-    if not item:
-        raise RuntimeError(f"索引中未找到资源：{kind}/{item_id}")
+    item = _resolve_item(kind, item_id, requested_version)
 
     # 如果指定了历史版本，从 versions 数组里找对应条目的 dir
     if requested_version and requested_version != item.get("version"):
@@ -769,64 +830,69 @@ def ensure_item_local(kind: str, item_id: str, *,
 
     cfg = get_config()
     archive = archive_url()
+    revision = _index_revision()
+    target_rel = _item_dir(item)
 
-    # 尝试使用持久化 zip 缓存
-    cached_zip = _get_cached_archive(archive)
-    zip_to_use: Path
-    with tempfile.TemporaryDirectory(prefix="ac-market-unzip-") as tmp_extract:
-        extract_dir = Path(tmp_extract)
+    def _download_archive() -> Path:
+        with tempfile.TemporaryDirectory(prefix="ac-market-zip-") as tmp_dl:
+            tmp_zip = Path(tmp_dl) / "market.zip"
+            download_file(archive, tmp_zip, mirrors=cfg["mirrors"],
+                          timeout=180, on_progress=on_progress)
+            return _put_cached_archive(tmp_zip, archive, revision=revision)
 
-        if cached_zip:
-            zip_to_use = cached_zip
-        else:
-            # 下载 → 缓存到持久化目录
-            with tempfile.TemporaryDirectory(prefix="ac-market-zip-") as tmp_dl:
-                tmp_zip = Path(tmp_dl) / "market.zip"
-                download_file(archive, tmp_zip, mirrors=cfg["mirrors"],
-                              timeout=180, on_progress=on_progress)
-                cached_zip = _put_cached_archive(tmp_zip, archive)
-            zip_to_use = cached_zip
+    def _extract_into_workspace(zip_path: Path) -> bool:
+        with tempfile.TemporaryDirectory(prefix="ac-market-unzip-") as tmp_extract:
+            extract_dir = Path(tmp_extract)
+            with zipfile.ZipFile(zip_path) as zf:
+                for info in zf.infolist():
+                    name = info.filename.replace("\\", "/")
+                    if name.startswith("/") or ".." in name.split("/"):
+                        raise RuntimeError(f"归档包含非法路径：{info.filename}")
+                zf.extractall(extract_dir)
 
-        # 解压（只用目标子目录，但为了简洁和 zipfile 简单，完整解压到临时目录）
-        with zipfile.ZipFile(zip_to_use) as zf:
-            for info in zf.infolist():
-                name = info.filename.replace("\\", "/")
-                if name.startswith("/") or ".." in name.split("/"):
-                    raise RuntimeError(f"归档包含非法路径：{info.filename}")
-            zf.extractall(extract_dir)
+            remote_root = _find_extract_root(extract_dir)
+            src_dir = remote_root / target_rel
+            if not src_dir.exists():
+                return False
 
-        remote_root = _find_extract_root(extract_dir)
-        target_rel = _item_dir(item)
-        src_dir = remote_root / target_rel
+            # 清理旧版本 + 复制
+            if target.exists():
+                try:
+                    shutil.rmtree(target)
+                except OSError:
+                    pass
+            target.parent.mkdir(parents=True, exist_ok=True)
 
-        if not src_dir.exists():
-            raise RuntimeError(
-                f"远端仓库中不存在目录 {target_rel}（可能资源已被下架）"
-            )
+            for src in src_dir.rglob("*"):
+                rel = src.relative_to(src_dir)
+                if _is_ignored(rel):
+                    continue
+                dest = target / rel
+                if src.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(src, dest)
+                except OSError:
+                    pass
+        return True
 
-        # 清理旧版本 + 复制
-        if target.exists():
-            try:
-                shutil.rmtree(target)
-            except OSError:
-                pass
-        target.parent.mkdir(parents=True, exist_ok=True)
+    zip_to_use = _get_cached_archive(archive, revision) or _download_archive()
+    if _extract_into_workspace(zip_to_use):
+        return target
 
-        for src in src_dir.rglob("*"):
-            rel = src.relative_to(src_dir)
-            if _is_ignored(rel):
-                continue
-            dest = target / rel
-            if src.is_dir():
-                dest.mkdir(parents=True, exist_ok=True)
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(src, dest)
-            except OSError:
-                pass
-
-    return target
+    # 缓存里没有目标目录：说明该 zip 是索引更新前的旧快照 → 删掉重下一次
+    try:
+        zip_to_use.unlink()
+    except OSError:
+        pass
+    zip_to_use = _download_archive()
+    if _extract_into_workspace(zip_to_use):
+        return target
+    raise RuntimeError(
+        f"远端仓库中不存在目录 {target_rel}（可能资源已被下架）"
+    )
 
 
 def get_item_cache_status(kind: str, item_id: str) -> dict:
@@ -1193,7 +1259,10 @@ def push_market(message: str | None = None, timeout: float = 240.0) -> dict:
 
     _git(["add", "-A"], timeout=60)
     commit_msg = message or f"market: publish {datetime.now():%Y-%m-%d %H:%M:%S}"
-    code, out, err = _git(["commit", "-m", commit_msg], timeout=60)
+    author = login or "market-publisher"
+    identity = ["-c", f"user.name={author}",
+                "-c", f"user.email={author}@users.noreply.github.com"]
+    code, out, err = _git([*identity, "commit", "-m", commit_msg], timeout=60)
     committed = code == 0
     if not committed and "nothing to commit" not in (out + err):
         raise RuntimeError(f"提交失败：{err or out}")

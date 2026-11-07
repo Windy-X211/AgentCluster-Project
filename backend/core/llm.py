@@ -527,11 +527,62 @@ def _sanitize_payload(payload: dict) -> None:
             # 其他未知 role（root 等罕见值）→ 降级为 user，保留 content
             m["role"] = "user"
             role = "user"
-        # assistant.tool_calls 清洗
+    # —— 第二遍：tool_calls 配对修复 + 连续性重排 ——
+    # DeepSeek 等严格网关要求：assistant(tool_calls) 之后必须「连续」紧跟全部对应 tool
+    # 结果消息。两类会被 400 拒绝的形态都要修：
+    #   a) 悬空 tool_call：assistant 发起了调用但没有对应 tool 结果
+    #      （truncate 截断 / delete_message 单删 / 崩溃恢复时序窗口）→ 剔除悬空 id
+    #   b) tool 结果之间插入非 tool 消息（用户并发输入 / 纠错反馈 / 图片 followup 等）
+    #      → 插入消息缓存到 deferred，待该 assistant 段的 tool 组收齐后按原顺序插回
+    # 合法序列（tool 组完整且连续）零改动。
+    fixed: list[dict] = []
+    pending_tool_ids: set[str] = set()
+    pending_assistant_msg: dict | None = None
+    deferred: list[dict] = []
+
+    def _flush_deferred() -> None:
+        # 把 tool 组期间被插队的消息按原顺序落回（排在 tool 组之后）
+        for dm in deferred:
+            fixed.append(dm)
+        deferred.clear()
+
+    for idx in range(len(messages)):
+        m = messages[idx]
+        if not isinstance(m, dict):
+            fixed.append({"role": "user", "content": str(m) if m else ""})
+            continue
+        role = m.get("role")
+        if not role or not isinstance(role, str):
+            m["role"] = "user"
+            role = "user"
+        elif role in _ROLE_NORMALIZE:
+            m["role"] = _ROLE_NORMALIZE[role]
+            role = m["role"]
+        elif role not in _OPENAI_ROLES:
+            m["role"] = "user"
+            role = "user"
+
+        # tool 消息：只有匹配「当前等待中」的 tool_call id 才保留在 tool 组内；
+        # 无主 / 重复引用的 tool 消息降级为 user，再按普通消息参与排序
+        if role == "tool":
+            tc_id = m.get("tool_call_id") or ""
+            if pending_assistant_msg is not None and tc_id in pending_tool_ids:
+                pending_tool_ids.discard(tc_id)
+                fixed.append(m)
+                continue
+            content = m.get("content")
+            m.clear()
+            m["role"] = "user"
+            m["content"] = content if content is not None else ""
+            role = "user"
+
+        # assistant.tool_calls：结束上一段（回溯剔除悬空 tool_call + 落回 deferred），开启新一段
         if role == "assistant" and isinstance(m.get("tool_calls"), list):
-            # 反向修复：先处理上一个 assistant 的悬空 tool_call（其 tool 结果在本轮 assistant 之前未出现）
             if pending_assistant_msg is not None and pending_tool_ids:
                 _drop_dangling_tool_calls(pending_assistant_msg, pending_tool_ids)
+            pending_assistant_msg = None
+            pending_tool_ids = set()
+            _flush_deferred()
             cleaned = []
             for j, tc in enumerate(m["tool_calls"]):
                 if not isinstance(tc, dict):
@@ -566,27 +617,23 @@ def _sanitize_payload(payload: dict) -> None:
                 pending_assistant_msg = m
             else:
                 m.pop("tool_calls", None)
-                pending_tool_ids = set()
-                pending_assistant_msg = None
-            continue
-        # tool role 消息：必须匹配到上一条 assistant 的合法 tool_call 才能保留；
-        # 否则（引用了被丢弃的空名调用 / 无主消息）降级为 user，避免网关拒绝。
-        if role == "tool":
-            tc_id = m.get("tool_call_id") or ""
-            if tc_id in pending_tool_ids:
-                # 正常匹配。标记该 tool_call 已消费，避免循环末尾误判为悬空。
-                pending_tool_ids.discard(tc_id)
-                continue
-            content = m.get("content")
-            m.clear()
-            m["role"] = "user"
-            m["content"] = content if content is not None else ""
+            fixed.append(m)
             continue
 
-    # 反向修复：循环结束后处理最后一个 assistant 的悬空 tool_call
-    # （其 tool 结果在消息历史尾部未出现，常见于 truncate 截断 / 崩溃恢复时序窗口）
+        # 其余非 tool 消息（user / 纯文本 assistant / system）：
+        # 若仍在等待 tool 结果 → 缓存（保持原顺序），待 tool 组收齐后插回；
+        # tool 组已收齐（pending 空）→ 正常落位
+        if pending_assistant_msg is not None and pending_tool_ids:
+            deferred.append(m)
+        else:
+            fixed.append(m)
+
+    # 循环结束：最后一个 assistant 的悬空 tool_call 回溯剔除（其 tool 结果在历史尾部
+    # 未出现，常见于 truncate 截断 / 崩溃恢复时序窗口），然后落回 deferred
     if pending_assistant_msg is not None and pending_tool_ids:
         _drop_dangling_tool_calls(pending_assistant_msg, pending_tool_ids)
+    _flush_deferred()
+    payload["messages"] = fixed
 
 
 async def chat(interface: dict, model: str, messages: list, stream: bool = False, tools: list | None = None,
@@ -697,7 +744,13 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                         chunk = json.loads(data)
                     except Exception:
                         continue
-                    delta = chunk["choices"][0].get("delta", {})
+                    _choices = chunk.get("choices") or []
+                    if not _choices:
+                        # 上游可能返回 choices 为空的块（usage-only 尾块 / 网关保活心跳），
+                        # 直接取 [0] 会抛 IndexError 中断整轮，这里跳过等待下一个有效块
+                        _logger.debug("LLM 流式空 choices 块，已跳过: %s", data[:200])
+                        continue
+                    delta = _choices[0].get("delta") or {}
 
                     # 深度思考模型的 reasoning 通道 — 同样过滤模型内部 token
                     # 不同上游使用的字段名不同：
@@ -835,7 +888,7 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                             yield ("tool_args_delta", {"id": entry["id"], "name": entry.get("name") or "", "delta": arg_chunk, "accumulated": entry["args"]})
 
                     # finish_reason = tool_calls 时，把完整 tool_calls 吐出去
-                    finish = chunk["choices"][0].get("finish_reason")
+                    finish = _choices[0].get("finish_reason")
                     if finish == "tool_calls":
                         # 按 index 排序
                         for idx in sorted(tc_buf.keys()):
@@ -917,7 +970,18 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
-            msg = data["choices"][0]["message"]
+            _choices = data.get("choices") or []
+            if not _choices or not isinstance(_choices[0], dict) or not isinstance(_choices[0].get("message"), dict):
+                _logger.error(
+                    "LLM 非流式响应缺少 choices/message: %s",
+                    json.dumps(data, ensure_ascii=False)[:500],
+                )
+                yield ("error", {
+                    "status": 0,
+                    "detail": "上游非流式响应缺少 choices/message（网关空响应），本轮已中止，请重试",
+                })
+                return
+            msg = _choices[0]["message"]
             # —— 非流式同样剥离正文中的文本化工具调用块，并转换成标准 tool_calls ——
             _content = msg.get("content") or ""
             if _content:

@@ -3780,7 +3780,8 @@ onBeforeUnmount(() => {
                         <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
                       </div>
                       <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full">
-                        <pre class="think-full-text">{{ stripContinueTag(ch.msg.reasoning) }}</pre>
+                        <div class="think-full-text"
+                             style="display:block;width:100%;max-width:100%;box-sizing:border-box;overflow-wrap:anywhere!important;word-break:break-word!important;white-space:pre-wrap!important;">{{ stripContinueTag(ch.msg.reasoning) }}</div>
                       </div>
 
                       <!-- 流式正文（仅流式中，带光标）—— 始终在过程框内流式显示 -->
@@ -4130,7 +4131,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.right-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+.right-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; min-width: 0; }
 .canvases-pane { padding: 4px 0; flex-shrink: 0; }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
@@ -4160,7 +4161,7 @@ onBeforeUnmount(() => {
 .cv-rename { width: 100%; font-size: calc(12px * var(--font-scale)); padding: 2px 6px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.18); border: 1px solid rgba(var(--accent-rgb), 0.4); color: rgb(var(--text-rgb)); }
 .divider { height: 1px; flex-shrink: 0; background: rgba(var(--surface-rgb), 0.08); margin: 4px 10px; }
 
-.chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
+.chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative; }
 .chat-header { flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid rgba(var(--surface-rgb), 0.06); }
 /* 对话列表浮层：贴右侧面板左边缘，覆盖在画布区域上，不压缩对话区高度 */
 .conv-float {
@@ -4244,7 +4245,7 @@ onBeforeUnmount(() => {
 .conv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
 
-.chat-box { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
+.chat-box { flex: 1; min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
 .no-conv { text-align: center; opacity: .7; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
 /* ============ 消息容器 ============ */
@@ -4283,7 +4284,7 @@ onBeforeUnmount(() => {
   background: rgba(var(--accent2-rgb), 0.08);
   border: 1px solid rgba(var(--accent2-rgb), 0.22);
   font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.65);
-  max-width: 100%; min-width: 0;
+  max-width: 100%; min-width: 0; box-sizing: border-box;
 }
 .think-stream.clickable { cursor: pointer; transition: background .15s, border-color .15s; }
 .think-stream.clickable:hover { background: rgba(var(--accent2-rgb), 0.15); border-color: rgba(var(--accent2-rgb), 0.38); }
@@ -4291,7 +4292,7 @@ onBeforeUnmount(() => {
 .think-icon { flex-shrink: 0; font-size: calc(11px * var(--font-scale)); }
 .think-text {
   flex: 1; min-width: 0;
-  overflow: hidden; white-space: nowrap;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
   font-style: italic; letter-spacing: 0.2px;
 }
 .think-cursor {
@@ -4306,10 +4307,18 @@ onBeforeUnmount(() => {
   background: rgba(var(--accent2-rgb), 0.05);
   border: 1px solid rgba(var(--accent2-rgb), 0.16);
   border-radius: 7px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 .think-full-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
   margin: 0;
-  white-space: pre-wrap; word-break: break-word;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
   font-size: calc(10.5px * var(--font-scale)); line-height: 1.5;
   color: rgba(var(--text-rgb), 0.72);
   font-family: Consolas, monospace;
@@ -4352,18 +4361,21 @@ onBeforeUnmount(() => {
   margin-top: 5px;
   max-height: 260px;
   width: 100%;
+  min-width: 0;
   background: rgba(var(--surface-rgb), 0.05);
   border: 1px dashed rgba(var(--surface-rgb), 0.28);
   border-radius: 6px;
-  overflow: hidden;
+  overflow: visible;
+  overflow-y: hidden;
   display: flex;
   flex-direction: column;
 }
 .process-body {
   flex: 1;
   min-height: 0;
+  min-width: 0;
+  box-sizing: border-box;
   overflow-y: auto;
-  overflow-x: hidden;
   padding: 8px 9px;
   display: flex;
   flex-direction: column;
@@ -5488,5 +5500,23 @@ onBeforeUnmount(() => {
 @keyframes lbFloatIn {
   from { opacity: 0; transform: scale(0.94); }
   to { opacity: 1; transform: scale(1); }
+}
+
+/* —— 修复思考框文字不完整：只对文字本身强制换行 + 容器锁宽度 —— */
+/* 关键策略：容器 overflow-x 保持 hidden（防止被长字符串撑爆），
+   文字用 overflow-wrap:anywhere 在任意位置断开换行 */
+.think-full-text {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+  overflow-wrap: anywhere !important;
+}
+/* 容器链加 min-width:0 防止 flex/grid item 撑爆 */
+.think-full, .process-body, .process-window,
+.col-wrap, .msg.assistant, .chat-box, .chat-pane, .right-panel, .right {
+  min-width: 0 !important;
 }
 </style>

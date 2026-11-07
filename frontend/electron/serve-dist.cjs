@@ -90,9 +90,13 @@ const server = http.createServer((req, res) => {
 function sendFile(res, filePath) {
   const ext = path.extname(filePath).toLowerCase()
   const mime = MIME[ext] || 'application/octet-stream'
+  // 防 Chromium 启发式缓存：每次都强制向服务器校验（HTML 完全不缓存）
+  const cacheControl = (ext === '.html')
+    ? 'no-cache, no-store, must-revalidate'
+    : 'no-cache'
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(500); res.end('Read error'); return }
-    res.writeHead(200, { 'Content-Type': mime })
+    res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': cacheControl })
     res.end(data)
   })
 }
