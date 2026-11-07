@@ -280,7 +280,13 @@ export const api = {
   },
   settings: {
     get: () => req<any>('/settings'),
-    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) })
+    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) }),
+    /** 设置全局默认工作区（空串=清除）；后端会归一化为绝对路径并自动创建目录 */
+    setDefaultWorkdir: (path: string) =>
+      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir', { method: 'PUT', body: JSON.stringify({ default_workdir: path }) }),
+    /** 读取默认工作区及其目录存在状态（设置页回显用） */
+    getDefaultWorkdir: () =>
+      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir'),
   },
   backgrounds: {
     list: () => req<any[]>('/backgrounds'),

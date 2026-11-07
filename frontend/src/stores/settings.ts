@@ -42,6 +42,16 @@ export const useSettingsStore = defineStore('settings', {
       this.pluginsMeta = caps.plugins || {}
     },
     async update(d: any) { this.data = await api.settings.update({ ...this.data, ...d }) },
+    /** 设置全局默认工作区（会话级/画布级都没设时生效）。
+     *  空串 = 清除（回退到进程 CWD）。设置成功后同步写入工作区历史，
+     *  让它出现在对话区工作区下拉里。 */
+    async setDefaultWorkdir(path: string) {
+      const v = (path || '').trim()
+      const res = await api.settings.setDefaultWorkdir(v)
+      this.data = { ...this.data, default_workdir: res?.default_workdir || '' }
+      if (res?.default_workdir) await this.recordWorkspace(res.default_workdir)
+      return res
+    },
     /** 工作区历史记录（settings.workspace_history，新在前）；确保已初始化（旧数据缺字段时播种） */
     async ensureWorkspaceHistory(seedPaths: string[] = []): Promise<string[]> {
       let list: string[] | undefined = this.data.workspace_history

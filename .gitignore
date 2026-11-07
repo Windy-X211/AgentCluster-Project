@@ -9,6 +9,8 @@
 /.arts
 /.codeartsdoer
 /.pytest_cache
+# pytest 临时目录（tmp_path 落地点，勿提交）
+**/.pytest_tmp/
 /debug.log
 /tray_debug.log
 /wd_debug.log

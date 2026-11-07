@@ -601,12 +601,40 @@ BACKUP_CTX: ContextVar[dict | None] = ContextVar("backup_ctx", default=None)
 _DEFAULT_WORKDIR_CACHE: dict = {"path": None, "at": 0.0}
 
 
+def invalidate_default_workdir_cache() -> None:
+    """清空 default_workdir 缓存——设置里改了默认工作区后立即生效（否则最多延迟 2s）。"""
+    _DEFAULT_WORKDIR_CACHE["path"] = None
+    _DEFAULT_WORKDIR_CACHE["at"] = 0.0
+
+
+def get_default_workdir() -> str | None:
+    """读取设置里的全局默认工作区（settings.default_workdir）。
+
+    与 _effective_workdir 的区别：这里**只读 settings**，不看 WORKDIR_CTX、不走缓存，
+    供 agent_runtime 判断「当前生效的工作区是否来自全局默认」时使用。
+    目录不存在时返回 None。
+    """
+    try:
+        from core.store import load
+        s = load("settings") or {}
+        dwd = (s.get("default_workdir") or "").strip()
+        if dwd and os.path.isdir(dwd):
+            return dwd
+    except Exception:
+        pass
+    return None
+
+
 def _effective_workdir() -> str | None:
     """返回当前生效的工作区绝对路径（没有则返回 None）。
 
     性能优化：移除每次调用都 open/write/close 的 debug 日志（多智能体并行时
     会产生上百次磁盘争用，是卡顿根因之一）；settings.default_workdir 用
     短 TTL 缓存，避免每次 fallback 都触发 store.load（JSON 读盘）。
+
+    注意：缓存必须**原地更新字典**。早期版本写成 `_DEFAULT_WORKDIR_CACHE = {...}`，
+    Python 会把它当成局部变量 → 读取时抛 UnboundLocalError → 被下面的
+    except 静默吞掉 → default_workdir 兜底从未真正生效（实测恒返回 None）。
     """
     # 1) 画布模式注入的 workdir（ContextVar，零成本）
     wd = WORKDIR_CTX.get()
@@ -621,12 +649,14 @@ def _effective_workdir() -> str | None:
                 return cached["path"]
         from core.store import load
         s = load("settings") or {}
-        dwd = s.get("default_workdir")
+        dwd = (s.get("default_workdir") or "").strip()
         if dwd and os.path.isdir(dwd):
-            _DEFAULT_WORKDIR_CACHE = {"path": dwd, "at": now}
+            cached["path"] = dwd
+            cached["at"] = now
             return dwd
-        # 目录失效 → 清缓存
-        _DEFAULT_WORKDIR_CACHE = {"path": None, "at": now}
+        # 目录失效 → 清缓存（原地更新，勿重新绑定名字）
+        cached["path"] = None
+        cached["at"] = now
     except Exception:
         pass
     return None

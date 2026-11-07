@@ -214,6 +214,8 @@ onMounted(async () => {
   window.addEventListener('keydown', onIfaceKeydown)
   await Promise.all([models.fetch(), settings.fetch(), agents.fetch(), loadLaunchMode(), loadAutostart()])
   syncCtxSettings()
+  // 默认工作区
+  loadDefaultWorkdir()
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
@@ -490,6 +492,58 @@ const agentGroupOptions = computed(() => {
   }
   return out
 })
+
+// —— 默认工作区（会话级 / 画布级都没设工作区时生效）——
+const defWdInput = ref('')
+const defWdSaving = ref(false)
+const defWdExists = ref<boolean | null>(null)  // null=未设置；true/false=目录是否存在
+/** 读取后端保存的默认工作区 + 目录存在状态（回显用） */
+async function loadDefaultWorkdir() {
+  try {
+    const r = await api.settings.getDefaultWorkdir()
+    defWdInput.value = r?.default_workdir || ''
+    defWdExists.value = r?.default_workdir ? !!r.exists : null
+  } catch {
+    // 后端读失败：退回用 store 里已有的值，目录状态未知
+    defWdInput.value = (settings.data?.default_workdir || '').trim()
+    defWdExists.value = null
+  }
+}
+/** 保存默认工作区（后端负责归一化绝对路径 + 自动创建目录） */
+async function persistDefaultWorkdir() {
+  const val = defWdInput.value.trim()
+  if (val === ((settings.data?.default_workdir || '').trim())) return  // 无变化不写
+  defWdSaving.value = true
+  try {
+    const r = await settings.setDefaultWorkdir(val)
+    defWdInput.value = r?.default_workdir || ''
+    defWdExists.value = r?.default_workdir ? !!r.exists : null
+    showToast(r?.default_workdir ? `默认工作区已设为 ${r.default_workdir}` : '已清空默认工作区（回退到进程目录）')
+  } catch (e: any) {
+    showToast('保存失败：' + (e?.message || e), 'err')
+    // 失败时回填后端真实值，避免输入框与实际配置不一致
+    defWdInput.value = (settings.data?.default_workdir || '').trim()
+  } finally {
+    defWdSaving.value = false
+  }
+}
+/** 浏览…：系统文件夹选择框 */
+async function browseDefaultWorkdir() {
+  try {
+    const r = await api.storage.pickFolder(defWdInput.value || '', '选择默认工作区')
+    if (r?.path) {
+      defWdInput.value = r.path
+      await persistDefaultWorkdir()
+    }
+  } catch (e: any) {
+    showToast('打开选择器失败：' + (e?.message || e), 'err')
+  }
+}
+/** 清空默认工作区 */
+async function clearDefaultWorkdir() {
+  defWdInput.value = ''
+  await persistDefaultWorkdir()
+}
 </script>
 
 <template>
@@ -578,6 +632,32 @@ const agentGroupOptions = computed(() => {
           </select>
           <div class="hint-empty" style="margin-top: 8px">
             新建对话（主窗口与临时对话小窗的「＋ 新建」）未选中智能体时，自动选中该智能体；已选中智能体时保持不变。集群 / 工作区分组内新建不预设智能体，不受此项影响。
+          </div>
+        </div>
+      </div>
+
+      <!-- 默认工作区 -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>📁 默认工作区</span>
+          <span class="hint">会话与画布都没设工作区时生效</span>
+        </div>
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">默认工作区</span>
+            <span v-if="defWdExists === true" class="tag ok-tag">目录正常</span>
+            <span v-else-if="defWdExists === false" class="tag err-tag">目录不存在</span>
+          </div>
+          <div class="storage-loc" style="margin-top: 10px">
+            <input class="input mono storage-loc-input" v-model="defWdInput"
+                   placeholder="未设置（回退到进程工作目录）"
+                   @blur="persistDefaultWorkdir" @keydown.enter.prevent="persistDefaultWorkdir" />
+            <button class="btn sm ghost" @click="browseDefaultWorkdir" :disabled="defWdSaving">浏览…</button>
+            <button class="btn sm ghost danger" v-if="defWdInput" @click="clearDefaultWorkdir" :disabled="defWdSaving">清空</button>
+          </div>
+          <div class="hint-empty" style="margin-top: 8px">
+            设置后，智能体生成的文件默认写入该目录；<b>会话级</b>与<b>画布级</b>工作区的优先级更高，会覆盖这里的设置。
+            留空则回退到程序的工作目录。保存时会自动创建不存在的目录。
           </div>
         </div>
       </div>
@@ -1066,6 +1146,11 @@ const agentGroupOptions = computed(() => {
       :initial-path="explorerInitial"
       @saved="() => { storagePaths.value = null; api.storage.paths().then(r => storagePaths.value = r).catch(() => {}) }"
     />
+
+    <!-- 操作反馈提示（showToast 的渲染节点；此前缺失导致设置页所有操作无反馈） -->
+    <Transition name="fade">
+      <div v-if="toast" class="toast" :class="toast.kind">{{ toast.msg }}</div>
+    </Transition>
   </div>
 </template>
 
@@ -1098,6 +1183,13 @@ const agentGroupOptions = computed(() => {
 .storage-loc-tip { font-size: calc(11px * var(--font-scale)); opacity: .5; margin: 6px 0 0; }
 .empty { padding: 24px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }
 .tag-t { font-size: calc(10px * var(--font-scale)); padding: 2px 8px; border-radius: 4px; background: rgba(var(--accent-rgb), 0.15); color: var(--accent-light); border: 1px solid rgba(var(--accent-rgb), 0.25); font-family: Consolas, monospace; }
+/* 默认工作区：目录状态标记 */
+.ok-tag { font-size: calc(11px * var(--font-scale)); padding: 2px 8px; border-radius: 4px; background: rgba(80, 200, 120, 0.15); color: #7fdca0; border: 1px solid rgba(80, 200, 120, 0.3); }
+.err-tag { font-size: calc(11px * var(--font-scale)); padding: 2px 8px; border-radius: 4px; background: rgba(230, 90, 90, 0.15); color: #ff9d9d; border: 1px solid rgba(230, 90, 90, 0.3); }
+/* 危险操作按钮（清空默认工作区）——全局 .btn 无 danger 变体，这里补一个 */
+.btn.sm.danger { background: rgba(255, 80, 80, 0.15); color: var(--red-ink); border-color: rgba(255, 80, 80, 0.25); }
+.btn.sm.danger:hover { background: rgba(255, 80, 80, 0.25); }
+.btn.sm.danger:disabled { opacity: .4; cursor: not-allowed; }
 
 .cap-block { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(var(--surface-rgb), 0.06); }
 .cap-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }

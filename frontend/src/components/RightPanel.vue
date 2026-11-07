@@ -1299,6 +1299,26 @@ async function removeWdRecord(path: string) {
   await settings.removeWorkspaceRecord(path)
   wdHistory.value = wdHistory.value.filter(x => x !== path)
 }
+/** 全局默认工作区（设置中心 →「📁 默认工作区」配置） */
+const globalDefaultWd = computed(() => (settings.data?.default_workdir || '').trim() || '')
+/** 把某路径设为全局默认工作区 */
+async function setAsGlobalDefault(path: string) {
+  if (!path) return
+  try {
+    await settings.setDefaultWorkdir(path)
+    wdHistory.value = await settings.ensureWorkspaceHistory()
+  } catch (e: any) {
+    console.error('[RightPanel] 设置全局默认工作区失败:', e)
+  }
+}
+/** 清除全局默认工作区 */
+async function clearGlobalDefaultWd() {
+  try {
+    await settings.setDefaultWorkdir('')
+  } catch (e: any) {
+    console.error('[RightPanel] 清除全局默认工作区失败:', e)
+  }
+}
 /** 浏览…：系统文件夹选择框，选中即设置当前会话工作区并记录 */
 async function browseWdDir() {
   try {
@@ -4049,6 +4069,20 @@ onBeforeUnmount(() => {
                      @click="selectWorkdir(null)">
                   <span class="dd-item-dot"></span>
                   <span class="wd-item-name">未设置（跟随画布/默认）</span>
+                </div>
+                <!-- 全局默认工作区（设置中心可配）：展示当前值，并可把当前会话工作区设为其默认 -->
+                <div v-if="globalDefaultWd" class="wd-sub">全局默认</div>
+                <div v-if="globalDefaultWd" class="wd-item" :title="globalDefaultWd">
+                  <span class="dd-item-dot"></span>
+                  <span class="wd-item-name">{{ wdBasename(globalDefaultWd) || globalDefaultWd }}</span>
+                  <button type="button" class="wd-del" title="清除全局默认工作区（设置中心 → 默认工作区）"
+                          @click.stop="clearGlobalDefaultWd">✕</button>
+                </div>
+                <div v-if="convWorkdir && convWorkdir !== globalDefaultWd" class="wd-item"
+                     title="把当前会话工作区设为全局默认（设置中心 → 默认工作区）"
+                     @click="setAsGlobalDefault(convWorkdir)">
+                  <span class="dd-item-dot"></span>
+                  <span class="wd-item-name">⭐ 设为全局默认</span>
                 </div>
                 <div class="wd-sub">记录过的工作区</div>
                 <div v-for="p in wdHistory" :key="p" class="wd-item" :class="{ active: convWorkdir === p }"
