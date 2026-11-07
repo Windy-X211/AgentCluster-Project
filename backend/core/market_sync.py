@@ -36,7 +36,7 @@ from urllib.request import Request, urlopen
 from . import github_auth, store
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-MARKET_ROOT = _PROJECT_ROOT / "market"
+MARKET_ROOT = _PROJECT_ROOT.parent / "market"
 INDEX_FILE = MARKET_ROOT / "index.json"
 
 DEFAULT_REPO_URL = "https://github.com/Windy-X211/AgentCluster-Market.git"
@@ -733,7 +733,8 @@ def _put_cached_archive(src: Path, archive_url_str: str) -> Path:
 
 
 def ensure_item_local(kind: str, item_id: str, *,
-                      force: bool = False, on_progress=None) -> Path:
+                      force: bool = False, on_progress=None,
+                      requested_version: str | None = None) -> Path:
     """确保指定资源的目录已下载到本地 market/。
 
     策略：
@@ -742,10 +743,25 @@ def ensure_item_local(kind: str, item_id: str, *,
       3. 否则 → 下载 archive zip → 缓存 → 解压
 
     首次下载可能较慢（~40s，取决于网络和镜像），但之后全部秒级完成。
+
+    requested_version：可选，指定要拉取的历史版本（如 "1.0.0"）。
+      不传时默认取最新版本；传入时会在 item.versions 数组里查找对应条目，
+      用其 dir（通常带 @version 后缀）定位目录。
     """
     item = find_index_item(kind, item_id)
     if not item:
         raise RuntimeError(f"索引中未找到资源：{kind}/{item_id}")
+
+    # 如果指定了历史版本，从 versions 数组里找对应条目的 dir
+    if requested_version and requested_version != item.get("version"):
+        target_entry = None
+        for v in (item.get("versions") or []):
+            if v.get("version") == requested_version:
+                target_entry = v
+                break
+        if target_entry:
+            item = {**item, "dir": target_entry.get("dir") or item.get("dir")}
+        # 找不到也不报错，用顶层 item 的 dir 兜底（可能版本未归档）
 
     target = _item_cache_dir(item)
     if target.exists() and any(target.iterdir()) and not force:

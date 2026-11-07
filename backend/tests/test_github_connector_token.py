@@ -16,7 +16,7 @@ import pytest
 from core.store import ROOT as STORE_ROOT
 _PLUGIN_DIR = STORE_ROOT / "plugins" / "github_connector"
 if not _PLUGIN_DIR.exists():
-    _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent / "market" / "plugins" / "github_connector"
+    _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent.parent / "market" / "plugins" / "github_connector"
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 

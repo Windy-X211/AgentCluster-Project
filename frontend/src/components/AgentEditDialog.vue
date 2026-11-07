@@ -204,6 +204,7 @@ async function remove() {
         <div class="modal-title">{{ form.id ? '编辑智能体' : '新建智能体' }}</div>
         <button class="dlg-close" @click="requestClose" title="关闭">✕</button>
       </div>
+      <div class="modal-body">
       <div class="grid">
         <label>名称<input class="input" v-model="form.name" /></label>
         <label>描述<input class="input" v-model="form.description" /></label>
@@ -304,6 +305,7 @@ async function remove() {
 
         <button class="btn" @click="save">保存</button>
       </div>
+      </div><!-- /.modal-body -->
     </div>
     </div>
   </Teleport>
@@ -390,8 +392,9 @@ async function remove() {
 
 <style scoped>
 .modal-bg { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.5); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-.modal { width: 560px; max-height: 85vh; overflow-y: auto; padding: 20px; }
-.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; }
+.modal { width: 560px; max-height: 85vh; padding: 20px; display: flex; flex-direction: column; overflow: hidden; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; flex-shrink: 0; }
+.modal-body { overflow-y: auto; flex: 1; min-height: 0; }
 .modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; }
 .dlg-close { width: 26px; height: 26px; border-radius: 6px; cursor: pointer; border: 1px solid rgba(var(--surface-rgb), 0.16); background: transparent; color: rgba(var(--text-rgb), 0.75); font-size: 13px; line-height: 1; flex-shrink: 0; transition: background .15s, color .15s; }
 .dlg-close:hover { background: rgba(232, 92, 92, 0.14); color: #e85c5c; }

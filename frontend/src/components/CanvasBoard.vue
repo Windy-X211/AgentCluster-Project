@@ -42,23 +42,64 @@ const tx = ref(0)
 const ty = ref(0)
 const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5, ZOOM_STEP = 1.25
 
-// 节点拖动
-const dragging = ref<{ node: any; dx: number; dy: number } | null>(null)
+// —— 画布坐标基础类型 / 连线形状 / 控制点 ——
+type Pt = { x: number; y: number }
+type EdgeShape = 'curve' | 'straight'
+type EdgeHandle = { kind: 'point' | 'insert'; index: number; x: number; y: number }
+
+// 节点拖动（group 非空时表示 Ctrl 整体拖动）
+const dragging = ref<{
+  node: any
+  dx: number
+  dy: number
+  x0: number
+  y0: number
+  group?: { node: any; x0: number; y0: number }[]
+} | null>(null)
 // 连线中
 const linking = ref<{ from: number; mouseX: number; mouseY: number } | null>(null)
 // 画布平移（左键）
 const panning = ref<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
 const spaceDown = ref(false)
 
+// 套索 / 多选
+const selectedNodeIds = ref<Set<number>>(new Set())
+const lasso = ref<{
+  x0: number; y0: number; x1: number; y1: number
+  originNodeId: number | null   // Shift+单击起点落在哪个节点上（用于点选切换）
+  moved: boolean                // 是否已超过套索拖动阈值
+  additive: boolean             // Shift+Ctrl 拖拽：连续框选（把命中节点加入现有选区）
+} | null>(null)
+// 拖动开始时备份相关连线的控制点；拖动过程中按总位移重算，避免累积误差
+let dragWaypoints: { edge: any; points: Pt[] }[] = []
+// 拖动结束后的 click 不应清空选区
+let suppressBoardClick = false
+
+// 连线控制点
+const hoveringEdgeId = ref<number | null>(null)
+const edgeDrag = ref<{ edge: any; index: number } | null>(null)
+
+// —— 撤销 / 重做：只记录画布图结构（节点 / 连线 / 默认曲直） ——
+type CanvasSnapshot = { nodes: any[]; edges: any[]; edge_shape: EdgeShape }
+const undoStack = ref<CanvasSnapshot[]>([])
+const redoStack = ref<CanvasSnapshot[]>([])
+const HISTORY_LIMIT = 50
+let pendingDragSnapshot: CanvasSnapshot | null = null
+let pendingEdgeSnapshot: CanvasSnapshot | null = null
+
 const ctxMenu = ref<{ node: any; x: number; y: number } | null>(null)
 // 画布空白区域右键菜单
 const bgMenu = ref<{ x: number; y: number } | null>(null)
+// 连线右键菜单
+const edgeMenu = ref<{ edge: any; x: number; y: number } | null>(null)
 // 消息气泡：每个节点的隐藏状态（按画布 id 持久化在画布的 meta 字段里）
 const bubbleHidden = ref<Record<number, boolean>>({})
 const renameEdit = ref(false)
 const renameValue = ref('')
 const newCanvasDialog = ref(false)
 const newCanvasName = ref('')
+// 「用选中智能体创建画布」时暂存节点/连线
+const pendingCanvasPayload = ref<{ nodes: any[]; edges: any[] } | null>(null)
 const toolbarCollapsed = ref(true)
 const rulesOpen = ref(false)
 const wdOpen = ref(false)
@@ -482,13 +523,32 @@ function applyPendingZoom() {
   syncGrid()
 }
 
-// —— 画布平移 ——
+// —— 画布平移 / 套索 ——
 // 文字始终清晰方案：平移走外层 .pan-layer 的 transform（纯 translate，不缩放纹理），
 // 缩放走内层 .viewport 的 CSS zoom（布局级缩放，浏览器按当前缩放的真实字号排版并矢量光栅化），
 // 任何 scale 下文字都是原生渲染，无需 will-change 挂载/释放的重光栅化过渡
+const PAN_IGNORE = '.canvas-toolbar, .ws-panel, .ws-trash, .ws-ctx, .ws-modal-bg, .ctx-menu, .modal-bg, .conv-float, .hint, .btn, input, label, select, textarea, button, a'
 function startPan(e: MouseEvent) {
   if (e.button !== 0) return
-  if ((e.target as HTMLElement).closest('.node, .btn, input, label, select, textarea, canvas-toolbar, .ws-panel, .ws-trash, .ws-ctx, .ws-modal-bg')) return
+  suppressBoardClick = false
+  const target = e.target as HTMLElement
+  if (target?.closest(PAN_IGNORE)) return
+  if (e.shiftKey) {
+    // Shift+左键 → 套索 / 点选；再按住 Ctrl → 连续框选（累加选区）
+    const c = clientToCanvas(e.clientX, e.clientY)
+    const nodeEl = target?.closest('.node') as HTMLElement | null
+    const rawId = nodeEl?.dataset?.nodeId
+    const idNum = rawId != null && rawId !== '' ? Number(rawId) : NaN
+    lasso.value = {
+      x0: c.x, y0: c.y, x1: c.x, y1: c.y,
+      originNodeId: Number.isFinite(idNum) ? idNum : null,
+      moved: false,
+      additive: !!(e.ctrlKey || e.metaKey),
+    }
+    e.preventDefault()
+    return
+  }
+  if (target?.closest('.node, .edge-hit, .edge-handle-hit, .edge-handle')) return
   panning.value = { sx: e.clientX, sy: e.clientY, ox: tx.value, oy: ty.value }
   e.preventDefault()
 }
@@ -497,8 +557,67 @@ function doPan(e: MouseEvent) {
   tx.value = panning.value.ox + (e.clientX - panning.value.sx)
   ty.value = panning.value.oy + (e.clientY - panning.value.sy)
   syncGrid()
+  suppressBoardClick = true
 }
 function endPan() { if (panning.value) { panning.value = null } }
+
+function updateLasso(c: Pt) {
+  const l = lasso.value
+  if (!l) return
+  const moved = l.moved || Math.hypot(c.x - l.x0, c.y - l.y0) * scale.value >= 4
+  lasso.value = { ...l, x1: c.x, y1: c.y, moved }
+}
+function finishLasso() {
+  const l = lasso.value
+  if (!l) return
+  lasso.value = null
+  const dx = l.x1 - l.x0, dy = l.y1 - l.y0
+  const moved = l.moved || Math.max(Math.abs(dx), Math.abs(dy)) * scale.value >= 4
+  if (!moved) {
+    // Shift+单击：点中节点 → 切换选中；Shift+Ctrl+单击 → 只增选不取消；点空白/连线 → 保持当前选区
+    if (l.originNodeId != null) {
+      if (l.additive) {
+        const next = new Set(selectedNodeIds.value)
+        next.add(l.originNodeId)
+        selectedNodeIds.value = next
+      } else {
+        toggleNodeSelection(l.originNodeId)
+      }
+    }
+    closeMenus()
+    return
+  }
+  const minX = Math.min(l.x0, l.x1), maxX = Math.max(l.x0, l.x1)
+  const minY = Math.min(l.y0, l.y1), maxY = Math.max(l.y0, l.y1)
+  // 左→右：完全包含才选中；右→左：碰到即选中
+  const contain = dx >= 0
+  const hits = nodes.value.filter((n: any) => contain
+    ? (n.x >= minX && n.x + NODE_W <= maxX && n.y >= minY && n.y + NODE_H <= maxY)
+    : (n.x < maxX && n.x + NODE_W > minX && n.y < maxY && n.y + NODE_H > minY))
+  if (l.additive) {
+    // Shift+Ctrl：连续框选，把本轮命中节点并入现有选区
+    const next = new Set(selectedNodeIds.value)
+    for (const n of hits) next.add(n.id)
+    selectedNodeIds.value = next
+  } else {
+    selectedNodeIds.value = new Set(hits.map((n: any) => n.id))
+  }
+  closeMenus()
+}
+const lassoRect = computed(() => {
+  const l = lasso.value
+  if (!l) return null
+  const x = Math.min(l.x0, l.x1), y = Math.min(l.y0, l.y1)
+  const contain = l.x1 >= l.x0
+  return {
+    left: `${x}px`,
+    top: `${y}px`,
+    width: `${Math.abs(l.x1 - l.x0)}px`,
+    height: `${Math.abs(l.y1 - l.y0)}px`,
+    class: contain ? 'contain' : 'touch',
+    additive: l.additive,
+  }
+})
 
 // 网格跟随平移/缩放 → 画布视觉上无限大
 const gridRef = ref<HTMLElement | null>(null)
@@ -538,18 +657,88 @@ watch(scale, (next, prev) => {
   })
 })
 
-// 监听空格
-const onKeyDown = (e: KeyboardEvent) => { if (e.code === 'Space') spaceDown.value = true }
+// —— 键盘 / 快捷键 ——
+function isEditableTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null
+  if (!el) return false
+  const tag = (el.tagName || '').toUpperCase()
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable
+}
+function hasTextSelection(): boolean {
+  const sel = window.getSelection()
+  return !!sel && !sel.isCollapsed && !!sel.toString().trim()
+}
+function isModalOpen(): boolean {
+  return newCanvasDialog.value || wdOpen.value || rulesOpen.value || triggerDlg.value || !!editingAgent.value
+}
+// 监听空格 + 画布快捷键（复制/剪切/粘贴、撤销/重做、删除）
+const onKeyDown = (e: KeyboardEvent) => {
+  const editable = isEditableTarget(e.target)
+  const modal = isModalOpen()
+  if (e.code === 'Space' && !editable) spaceDown.value = true
+  const mod = e.ctrlKey || e.metaKey
+  if (mod && !e.altKey) {
+    const k = e.key.toLowerCase()
+    // Ctrl+A 全选节点；输入框/模态框内交还系统默认的“全选文本”
+    if (k === 'a' && !e.shiftKey) {
+      if (editable || modal) return
+      e.preventDefault()
+      selectAllNodes()
+      return
+    }
+    // Ctrl+Z 撤销 / Ctrl+Y、Ctrl+Shift+Z 重做；输入框/模态框内交还系统默认行为
+    if (k === 'z' || k === 'y') {
+      if (editable || modal) return
+      e.preventDefault()
+      if (k === 'y' || e.shiftKey) redoCanvas()
+      else undoCanvas()
+      return
+    }
+    if (!e.shiftKey && (k === 'c' || k === 'x' || k === 'v')) {
+      // 输入框 / 页面文字选区 / 模态框内：交还给系统默认行为
+      if (editable || hasTextSelection() || modal) return
+      e.preventDefault()
+      if (k === 'c') copySelection()
+      else if (k === 'x') cutSelection()
+      else pasteClipboard()
+      return
+    }
+  }
+  // Delete / Backspace 删除选中的智能体；输入框 / 模态框内保持系统默认
+  if ((e.key === 'Delete' || e.key === 'Backspace') && !editable && !modal) {
+    if (e.key === 'Backspace') e.preventDefault()  // 避免浏览器后退
+    if (selectedNodeIds.value.size) {
+      e.preventDefault()
+      deleteSelectedNodes()
+    }
+    return
+  }
+  if (e.code === 'Escape' && !editable) {
+    if (lasso.value) { lasso.value = null; return }
+    clearSelection()
+    closeMenus()
+  }
+}
 const onKeyUp = (e: KeyboardEvent) => { if (e.code === 'Space') spaceDown.value = false }
 
-// —— 节点拖放 ——
+// —— 节点拖放 / 画布拖入 ——
 function onDrop(e: DragEvent) {
   e.preventDefault()
   if (!canvas.value) return
-  const data = e.dataTransfer?.getData('agent'); if (!data) return
+  const dt = e.dataTransfer
+  const dragCanvasId = dt?.getData('canvas')
+  if (dragCanvasId) {
+    // 从右侧画布列表拖入：复用该画布的节点与内部连线
+    e.stopPropagation()
+    const src = canvases.list.find((c: any) => String(c.id) === dragCanvasId)
+    if (src) importCanvasPart(src, clientToCanvas(e.clientX, e.clientY))
+    return
+  }
+  const data = dt?.getData('agent'); if (!data) return
   const agent = JSON.parse(data)
   const { x, y } = clientToCanvas(e.clientX, e.clientY)
   const nextId = Math.max(0, ...nodes.value.map((n: any) => n.id)) + 1
+  pushHistory()
   canvas.value.nodes.push({ id: nextId, agent_id: agent.id, x: x - 90, y: y - 40 })
   canvases.saveCurrent()
 }
@@ -557,28 +746,176 @@ function onDrop(e: DragEvent) {
 function startDrag(e: MouseEvent, node: any) {
   if ((e.target as HTMLElement).closest('.ctx-action, button, label, input')) return
   if (spaceDown.value || e.button !== 0) return
+  if (e.shiftKey) return   // Shift 拖动交给画布套索
   const c = clientToCanvas(e.clientX, e.clientY)
-  dragging.value = { node, dx: c.x - node.x, dy: c.y - node.y }
+  const withCtrl = e.ctrlKey || e.metaKey
+  const inSelection = selectedNodeIds.value.has(node.id)
+  const multiSelected = selectedNodeIds.value.size > 1 && inSelection
+  // 普通点击/拖动：把选区收窄到当前节点（Ctrl 保持选区，用于整体拖动）
+  if (!withCtrl) selectedNodeIds.value = new Set([node.id])
+  const group = withCtrl && multiSelected
+    ? [...selectedNodeIds.value]
+        .map(id => nodeById.value.get(id))
+        .filter((n: any) => !!n)
+        .map((n: any) => ({ node: n, x0: n.x, y0: n.y }))
+    : undefined
+  pendingDragSnapshot = snapshotCanvas()
+  // 被移动节点（组）关联的连线控制点：备份原始坐标，拖动中按总位移重算 → 控制点跟着节点走
+  const movingIds = group
+    ? new Set(group.map(s => s.node.id))
+    : new Set<number>([node.id])
+  dragWaypoints = edges.value
+    .filter((e: any) =>
+      (movingIds.has(e.from_node) || movingIds.has(e.to_node)) &&
+      Array.isArray(e.waypoints) && e.waypoints.length)
+    .map((e: any) => ({
+      edge: e,
+      points: e.waypoints.map((p: any) => ({ x: p.x, y: p.y })),
+    }))
+  dragging.value = { node, dx: c.x - node.x, dy: c.y - node.y, x0: node.x, y0: node.y, group }
+}
+/** 节点拖动时：把关联连线的控制点整体平移同样的画布位移 */
+function translateDragWaypoints(dx: number, dy: number) {
+  if ((!dx && !dy) || !dragWaypoints.length) return
+  for (const item of dragWaypoints) {
+    const wps = item.edge.waypoints
+    if (!Array.isArray(wps)) continue
+    const n = Math.min(wps.length, item.points.length)
+    for (let i = 0; i < n; i++) {
+      const p = wps[i]
+      if (!p || typeof p !== 'object') continue
+      p.x = item.points[i].x + dx
+      p.y = item.points[i].y + dy
+    }
+  }
 }
 function onMouseMove(e: MouseEvent) {
   doPan(e)
   const c = clientToCanvas(e.clientX, e.clientY)
+  if (lasso.value) { updateLasso(c); suppressBoardClick = true }
   if (dragging.value) {
+    // 第一次真正移动时才入栈：单击节点不产生空的撤销步骤
+    if (pendingDragSnapshot) { pushSnapshot(pendingDragSnapshot); pendingDragSnapshot = null }
     const nx = c.x - dragging.value.dx
     const ny = c.y - dragging.value.dy
-    const snapped = snapToEdges(dragging.value.node, nx, ny, scale.value)
-    dragging.value.node.x = snapped.x
-    dragging.value.node.y = snapped.y
+    const group = dragging.value.group
+    const exclude = group ? new Set(group.map(s => s.node.id)) : undefined
+    const snapped = snapToEdges(dragging.value.node, nx, ny, scale.value, exclude)
+    const baseX = dragging.value.x0
+    const baseY = dragging.value.y0
+    if (group) {
+      // 以被拖节点的吸附结果为准，整组按同一位移移动（相对拖动起点的总位移）
+      const dx = snapped.x - baseX
+      const dy = snapped.y - baseY
+      for (const s of group) { s.node.x = s.x0 + dx; s.node.y = s.y0 + dy }
+    } else {
+      dragging.value.node.x = snapped.x
+      dragging.value.node.y = snapped.y
+    }
+    // 连线控制点跟随节点位移
+    translateDragWaypoints(snapped.x - baseX, snapped.y - baseY)
+    suppressBoardClick = true
+  }
+  if (edgeDrag.value) {
+    if (pendingEdgeSnapshot) { pushSnapshot(pendingEdgeSnapshot); pendingEdgeSnapshot = null }
+    moveEdgeWaypoint(c)
+    suppressBoardClick = true
   }
   if (linking.value) { linking.value.mouseX = c.x; linking.value.mouseY = c.y }
 }
 function onMouseUpGlobal() {
-  endDrag(); endPan()
+  endDrag(); endPan(); finishLasso(); endEdgeDrag()
   linking.value = null
 }
 function endDrag() {
+  pendingDragSnapshot = null
+  dragWaypoints = []
   if (dragging.value) { dragging.value = null; canvases.saveCurrent() }
   snapGuides.value = { x: [], y: [] }
+}
+
+// —— 选区 ——
+function clearSelection() { selectedNodeIds.value = new Set() }
+function toggleNodeSelection(id: number) {
+  const next = new Set(selectedNodeIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedNodeIds.value = next
+}
+function selectionNodes(): any[] {
+  const ids = selectedNodeIds.value
+  return ids.size ? nodes.value.filter((n: any) => ids.has(n.id)) : []
+}
+function deleteSelectedNodes() {
+  if (!canvas.value || !selectedNodeIds.value.size) return
+  pushHistory()
+  const ids = new Set(selectedNodeIds.value)
+  canvas.value.nodes = nodes.value.filter((n: any) => !ids.has(n.id))
+  canvas.value.edges = edges.value.filter((e: any) => !ids.has(e.from_node) && !ids.has(e.to_node))
+  selectedNodeIds.value = new Set()
+  closeMenus()
+  canvases.saveCurrent()
+}
+// 点击空白 / 拖动结束后的 click：只有"没有发生拖动"的空白点击才清空选区
+function onBoardClick(e: MouseEvent) {
+  const swallow = suppressBoardClick
+  suppressBoardClick = false
+  closeMenus()
+  if (swallow) return
+  const target = e.target as HTMLElement
+  if (target?.closest('.node, .edge-hit, .edge-handle-hit, .edge-handle, .canvas-toolbar, .ctx-menu, .modal-bg, .conv-float')) return
+  // 按住 Shift 点击空白不取消选中（Shift 期间用于增选/点选切换）
+  if (e.shiftKey) return
+  clearSelection()
+}
+
+// —— 撤销 / 重做 ——
+function snapshotCanvas(): CanvasSnapshot {
+  return {
+    nodes: JSON.parse(JSON.stringify(nodes.value || [])),
+    edges: JSON.parse(JSON.stringify(edges.value || [])),
+    edge_shape: canvas.value?.edge_shape === 'straight' ? 'straight' : 'curve',
+  }
+}
+function pushSnapshot(snap: CanvasSnapshot) {
+  const last = undoStack.value[undoStack.value.length - 1]
+  if (last && JSON.stringify(last) === JSON.stringify(snap)) return
+  undoStack.value.push(snap)
+  if (undoStack.value.length > HISTORY_LIMIT) undoStack.value.shift()
+  redoStack.value = []
+}
+function pushHistory() { if (canvas.value) pushSnapshot(snapshotCanvas()) }
+function restoreSnapshot(snap: CanvasSnapshot) {
+  if (!canvas.value) return
+  canvas.value.nodes = JSON.parse(JSON.stringify(snap.nodes))
+  canvas.value.edges = JSON.parse(JSON.stringify(snap.edges))
+  canvas.value.edge_shape = snap.edge_shape
+  pendingDragSnapshot = null
+  pendingEdgeSnapshot = null
+  dragWaypoints = []
+  dragging.value = null
+  edgeDrag.value = null
+  lasso.value = null
+  selectedNodeIds.value = new Set()
+  hoveringEdgeId.value = null
+  snapGuides.value = { x: [], y: [] }
+  closeMenus()
+  canvases.saveCurrent()
+}
+function undoCanvas() {
+  if (!undoStack.value.length || !canvas.value) return
+  const prev = undoStack.value.pop()!
+  redoStack.value.push(snapshotCanvas())
+  restoreSnapshot(prev)
+  showToast('已撤销')
+}
+function redoCanvas() {
+  if (!redoStack.value.length || !canvas.value) return
+  const next = redoStack.value.pop()!
+  undoStack.value.push(snapshotCanvas())
+  if (undoStack.value.length > HISTORY_LIMIT) undoStack.value.shift()
+  restoreSnapshot(next)
+  showToast('已重做')
 }
 
 function startLink(e: MouseEvent, nodeId: number) {
@@ -589,7 +926,15 @@ function startLink(e: MouseEvent, nodeId: number) {
 function endLink(e: MouseEvent, toNodeId: number | null) {
   if (linking.value && toNodeId != null && linking.value.from !== toNodeId && canvas.value) {
     const nextId = Math.max(0, ...edges.value.map((n: any) => n.id)) + 1
-    canvas.value.edges.push({ id: nextId, from_node: linking.value.from, to_node: toNodeId, type: 'chat' })
+    pushHistory()
+    canvas.value.edges.push({
+      id: nextId,
+      from_node: linking.value.from,
+      to_node: toNodeId,
+      type: 'chat',
+      shape: canvas.value.edge_shape === 'straight' ? 'straight' : 'curve',
+      waypoints: [],
+    })
     canvases.saveCurrent()
   }
   linking.value = null
@@ -613,21 +958,203 @@ async function clampToViewport(ref: { value: { x: number; y: number } | null }, 
 // —— 右键菜单 ——
 function showCtxMenu(e: MouseEvent, node: any) {
   e.preventDefault(); e.stopPropagation()
+  // 右键未选中的节点时，先把选区收到该节点，保证复制/剪切目标明确
+  if (!selectedNodeIds.value.has(node.id)) selectedNodeIds.value = new Set([node.id])
   ctxMenu.value = { node, x: e.clientX, y: e.clientY }
   clampToViewport(ctxMenu, '.ctx-menu')
   bgMenu.value = null
+  edgeMenu.value = null
 }
 function showBgMenu(e: MouseEvent) {
   // 仅在真正空白（没有点到节点/连线/工具栏/浮层）时弹出
   const target = e.target as HTMLElement
-  if (target?.closest('.node, .edge, .edge-hit, .edge-mid, .canvas-toolbar, .hint, .canvas-mini, .collapse-btn')) return
+  if (target?.closest('.node, .edge, .edge-hit, .edge-mid, .edge-handle, .edge-handle-hit, .canvas-toolbar, .hint, .canvas-mini, .collapse-btn')) return
   if (target?.closest('.ctx-menu, .ctx-item, .modal-bg, .conv-float')) return  // 浮层自己会处理，别拦
   e.preventDefault()
   ctxMenu.value = null
+  edgeMenu.value = null
   bgMenu.value = { x: e.clientX, y: e.clientY }
   clampToViewport(bgMenu as any, '.ctx-menu')
 }
-function closeMenus() { ctxMenu.value = null; bgMenu.value = null }
+function showEdgeMenu(e: MouseEvent, edge: any) {
+  e.preventDefault(); e.stopPropagation()
+  ctxMenu.value = null
+  bgMenu.value = null
+  edgeMenu.value = { edge, x: e.clientX, y: e.clientY }
+  clampToViewport(edgeMenu as any, '.ctx-menu')
+}
+function closeMenus() { ctxMenu.value = null; bgMenu.value = null; edgeMenu.value = null }
+
+// —— 剪贴板：复制 / 剪切 / 粘贴 ——
+function copySelection(silent = false): boolean {
+  const sel = selectionNodes()
+  if (!sel.length) return false
+  const index = new Map<number, number>(sel.map((n: any, i: number) => [n.id, i]))
+  const innerEdges = edges.value.filter((e: any) => index.has(e.from_node) && index.has(e.to_node))
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const n of sel) {
+    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y)
+    maxX = Math.max(maxX, n.x + NODE_W); maxY = Math.max(maxY, n.y + NODE_H)
+  }
+  canvases.clipboard = {
+    nodes: sel.map((n: any) => ({ agent_id: n.agent_id, x: n.x, y: n.y })),
+    edges: innerEdges.map((e: any) => ({
+      from: index.get(e.from_node)!,
+      to: index.get(e.to_node)!,
+      type: e.type || 'chat',
+      shape: edgeShapeOf(e),
+      waypoints: sanitizeWaypoints(e.waypoints).map(p => ({ x: p.x, y: p.y })),
+    })),
+    bbox: { x: minX, y: minY, w: Math.max(NODE_W, maxX - minX), h: Math.max(NODE_H, maxY - minY) },
+    pasteCount: 0,
+  }
+  if (!silent) showToast(`已复制 ${sel.length} 个智能体${innerEdges.length ? `、${innerEdges.length} 条连线` : ''}`)
+  return true
+}
+function cutSelection() {
+  if (!copySelection(true)) return
+  const n = selectedNodeIds.value.size
+  deleteSelectedNodes()
+  showToast(`已剪切 ${n} 个智能体`)
+}
+function pasteClipboard(target?: Pt) {
+  const clip = canvases.clipboard
+  if (!clip || !clip.nodes.length || !canvas.value) return
+  pushHistory()
+  const cascade = (clip.pasteCount || 0) * 24
+  let baseX: number, baseY: number
+  if (target) {
+    // 菜单粘贴：落在右键位置右下方，避免与源节点完全重叠
+    baseX = target.x + 16 + cascade
+    baseY = target.y + 16 + cascade
+  } else {
+    const rect = boardRef.value?.getBoundingClientRect()
+    const center = clientToCanvas((rect?.left ?? 0) + (rect?.width ?? 800) / 2, (rect?.top ?? 0) + (rect?.height ?? 600) / 2)
+    baseX = center.x - clip.bbox.w / 2 + cascade
+    baseY = center.y - clip.bbox.h / 2 + cascade
+  }
+  const dx = baseX - clip.bbox.x
+  const dy = baseY - clip.bbox.y
+  const nextId = Math.max(0, ...nodes.value.map((n: any) => n.id)) + 1
+  let nextEdgeId = Math.max(0, ...edges.value.map((e: any) => e.id)) + 1
+  const idMap: number[] = []
+  const newIds: number[] = []
+  clip.nodes.forEach((n, i) => {
+    const id = nextId + i
+    idMap[i] = id
+    newIds.push(id)
+    canvas.value.nodes.push({ id, agent_id: n.agent_id, x: n.x + dx, y: n.y + dy })
+  })
+  for (const e of clip.edges) {
+    const from = idMap[e.from], to = idMap[e.to]
+    if (from == null || to == null || from === to) continue
+    canvas.value.edges.push({
+      id: nextEdgeId++,
+      from_node: from,
+      to_node: to,
+      type: e.type || 'chat',
+      shape: e.shape,
+      waypoints: (e.waypoints || []).map(p => ({ x: p.x + dx, y: p.y + dy })),
+    })
+  }
+  clip.pasteCount = (clip.pasteCount || 0) + 1
+  selectedNodeIds.value = new Set(newIds)
+  closeMenus()
+  canvases.saveCurrent()
+  showToast(`已粘贴 ${newIds.length} 个智能体`)
+}
+
+// —— 用选区创建画布 ——
+function uniqueCanvasName(base: string): string {
+  let name = base
+  let i = 2
+  while (canvases.list.some((c: any) => c.name === name)) name = `${base} ${i++}`
+  return name
+}
+function createCanvasFromSelection() {
+  if (!canvas.value || !selectedNodeIds.value.size) return
+  const sel = selectionNodes()
+  const index = new Map<number, number>(sel.map((n: any, i: number) => [n.id, i]))
+  const innerEdges = edges.value.filter((e: any) => index.has(e.from_node) && index.has(e.to_node))
+  pendingCanvasPayload.value = {
+    nodes: sel.map((n: any, i: number) => ({ id: i + 1, agent_id: n.agent_id, x: n.x, y: n.y })),
+    edges: innerEdges.map((e: any, i: number) => ({
+      id: i + 1,
+      from_node: index.get(e.from_node)! + 1,
+      to_node: index.get(e.to_node)! + 1,
+      type: e.type || 'chat',
+      shape: edgeShapeOf(e),
+      waypoints: sanitizeWaypoints(e.waypoints).map(p => ({ x: p.x, y: p.y })),
+    })),
+  }
+  newCanvasName.value = uniqueCanvasName(`${canvas.value.name} 副本`)
+  newCanvasDialog.value = true
+  closeMenus()
+}
+
+// —— 从画布列表拖入：复用源画布的智能体与内部连线 ——
+function importCanvasPart(src: any, drop: Pt) {
+  if (!canvas.value || !src) return
+  const srcNodes: any[] = Array.isArray(src.nodes)
+    ? src.nodes.filter((n: any) => n && n.agent_id != null && Number.isFinite(n.x) && Number.isFinite(n.y))
+    : []
+  if (!srcNodes.length) { showToast(`「${src.name || '画布'}」没有可导入的智能体`); return }
+  pushHistory()
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const n of srcNodes) {
+    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y)
+    maxX = Math.max(maxX, n.x + NODE_W); maxY = Math.max(maxY, n.y + NODE_H)
+  }
+  const bw = Math.max(NODE_W, maxX - minX), bh = Math.max(NODE_H, maxY - minY)
+  const originX = drop.x - bw / 2, originY = drop.y - bh / 2
+  const tx = originX - minX, ty = originY - minY
+
+  const byAgent = new Map<number, any>()
+  for (const n of nodes.value) byAgent.set(n.agent_id, n)
+  const idMap = new Map<number, number>()
+  const srcNodeById = new Map<number, any>()
+  for (const n of srcNodes) srcNodeById.set(n.id, n)
+  let nextNodeId = Math.max(0, ...nodes.value.map((n: any) => n.id)) + 1
+  let addedNodes = 0
+  for (const n of srcNodes) {
+    const existing = byAgent.get(n.agent_id)
+    if (existing) { idMap.set(n.id, existing.id); continue }
+    const node = { id: nextNodeId++, agent_id: n.agent_id, x: n.x + tx, y: n.y + ty }
+    canvas.value.nodes.push(node)
+    idMap.set(n.id, node.id)
+    byAgent.set(n.agent_id, node)
+    addedNodes++
+  }
+
+  const srcEdges: any[] = Array.isArray(src.edges) ? src.edges : []
+  let nextEdgeId = Math.max(0, ...edges.value.map((e: any) => e.id)) + 1
+  let addedEdges = 0
+  for (const e of srcEdges) {
+    const from = idMap.get(e.from_node), to = idMap.get(e.to_node)
+    if (from == null || to == null || from === to) continue
+    if (edges.value.some((x: any) => x.from_node === from && x.to_node === to)) continue
+    const srcFrom = srcNodeById.get(e.from_node)
+    const destFrom = nodeById.value.get(from)
+    const ddx = srcFrom && destFrom ? destFrom.x - srcFrom.x : tx
+    const ddy = srcFrom && destFrom ? destFrom.y - srcFrom.y : ty
+    const shape: EdgeShape = e.shape === 'straight' || e.shape === 'curve'
+      ? e.shape
+      : (src.edge_shape === 'straight' ? 'straight' : 'curve')
+    canvas.value.edges.push({
+      id: nextEdgeId++,
+      from_node: from,
+      to_node: to,
+      type: e.type || 'chat',
+      shape,
+      waypoints: sanitizeWaypoints(e.waypoints).map(p => ({ x: p.x + ddx, y: p.y + ddy })),
+    })
+    addedEdges++
+  }
+  canvases.saveCurrent()
+  showToast(addedNodes || addedEdges
+    ? `已从「${src.name || '画布'}」添加 ${addedNodes} 个智能体、${addedEdges} 条连线`
+    : `「${src.name || '画布'}」的智能体已全部存在，没有新增内容`)
+}
 
 // —— 工作区交互：全部 emit 给外层 MainView（全局单例 WorkspaceOverlay 持有者） ——
 function toggleWorkspace() {
@@ -636,9 +1163,14 @@ function toggleWorkspace() {
   closeMenus()
 }
 
-// 双击节点切换消息气泡显示
+// 双击消息气泡 / 节点右键菜单：显示或隐藏该节点的消息气泡
 function toggleBubble(node: any) {
   bubbleHidden.value = { ...bubbleHidden.value, [node.id]: !bubbleHidden.value[node.id] }
+}
+// 双击节点（非按钮/气泡区域）：直接打开智能体编辑
+function onNodeDblClick(e: MouseEvent, node: any) {
+  if ((e.target as HTMLElement)?.closest('button, input, label, a')) return
+  openAgentEdit(node)
 }
 function hideAllBubbles() { bubbleHidden.value = {} }  // 清空隐藏 = 全部显示
 // 所有节点都隐藏
@@ -650,13 +1182,29 @@ function hideAllBubblesForce() {
 
 async function removeNode(nodeId: number) {
   if (!canvas.value) return
+  if (!nodes.value.some((n: any) => n.id === nodeId)) return
+  pushHistory()
   canvas.value.nodes = nodes.value.filter((n: any) => n.id !== nodeId)
   canvas.value.edges = edges.value.filter((e: any) => e.from_node !== nodeId && e.to_node !== nodeId)
+  if (selectedNodeIds.value.has(nodeId)) {
+    const next = new Set(selectedNodeIds.value)
+    next.delete(nodeId)
+    selectedNodeIds.value = next
+  }
   canvases.saveCurrent(); closeMenus()
+}
+// 节点菜单里的移除：多选时移除整组
+function removeCtxSelection() {
+  const node = ctxMenu.value?.node
+  if (selectedNodeIds.value.size > 1) deleteSelectedNodes()
+  else if (node) removeNode(node.id)
 }
 function removeEdge(edgeId: number) {
   if (!canvas.value) return
+  if (!edges.value.some((e: any) => e.id === edgeId)) return
+  pushHistory()
   canvas.value.edges = edges.value.filter((e: any) => e.id !== edgeId)
+  if (edgeMenu.value?.edge?.id === edgeId) edgeMenu.value = null
   canvases.saveCurrent()
 }
 
@@ -762,14 +1310,14 @@ const displayExecMode = computed<ExecMode>(() => {
   return (canvas.value?.execution_mode as ExecMode) || 'parallel'
 })
 
-// —— 极简 toast（仅用于"停止运行后生效"提示） ——
-const execModeToast = ref<{ msg: string; id: number } | null>(null)
+// —— 极简 toast（执行模式提示 + 选区/剪贴板/导入反馈） ——
+const toast = ref<{ msg: string; id: number } | null>(null)
 let _toastSeq = 0
-function showExecModeToast(msg: string) {
+function showToast(msg: string) {
   const id = ++_toastSeq
-  execModeToast.value = { msg, id }
+  toast.value = { msg, id }
   setTimeout(() => {
-    if (execModeToast.value?.id === id) execModeToast.value = null
+    if (toast.value?.id === id) toast.value = null
   }, 2400)
 }
 
@@ -801,7 +1349,7 @@ async function toggleExecMode() {
   if (runningOnThisCanvas.value) {
     // 运行期间：只记录"待生效"的模式，UI 立即切换图标，真正的写入等到运行停止后
     pendingExecMode.value = next
-    showExecModeToast(`已切换为「${next === 'parallel' ? '并行' : '串行'}」模式，画布停止运行后生效`)
+    showToast(`已切换为「${next === 'parallel' ? '并行' : '串行'}」模式，画布停止运行后生效`)
     return
   }
   pendingExecMode.value = null
@@ -815,10 +1363,19 @@ function commitRename() {
   if (name && canvas.value?.name !== name) canvases.rename(canvas.value.id, name)
   renameEdit.value = false
 }
-function openNewCanvas() { newCanvasName.value = ''; newCanvasDialog.value = true }
-function commitNewCanvas() {
+function openNewCanvas() {
+  pendingCanvasPayload.value = null
+  newCanvasName.value = ''
+  newCanvasDialog.value = true
+}
+async function commitNewCanvas() {
   const name = newCanvasName.value.trim() || `画布 ${canvases.list.length + 1}`
-  canvases.create({ name }); newCanvasDialog.value = false
+  const payload = pendingCanvasPayload.value
+  pendingCanvasPayload.value = null
+  newCanvasDialog.value = false
+  const edgeShape: EdgeShape = canvas.value?.edge_shape === 'straight' ? 'straight' : 'curve'
+  await canvases.create({ name, edge_shape: edgeShape, ...(payload || {}) })
+  if (payload) showToast(`已用 ${payload.nodes.length} 个智能体创建画布「${name}」`)
 }
 
 // —— 路径（画布坐标）：就近锚点 + 双向线垂直偏移防交叉 ——
@@ -835,8 +1392,8 @@ const snapGuides = ref<{ x: number[]; y: number[] }>({ x: [], y: [] }) // 当前
  *   - 两条中心线 (cx/cy) 与其他节点的中心线对齐
  * 返回吸附后的 { x, y } 并填充 snapGuides。
  */
-function snapToEdges(draggingNode: any, candidateX: number, candidateY: number, scaleNow: number): { x: number; y: number } {
-  const others = nodes.value.filter((n: any) => n.id !== draggingNode.id)
+function snapToEdges(draggingNode: any, candidateX: number, candidateY: number, scaleNow: number, excludeIds?: Set<number>): { x: number; y: number } {
+  const others = nodes.value.filter((n: any) => n.id !== draggingNode.id && !excludeIds?.has(n.id))
   if (!others.length) { snapGuides.value = { x: [], y: [] }; return { x: candidateX, y: candidateY } }
 
   const w = NODE_W, h = NODE_H
@@ -988,35 +1545,204 @@ function offsetEdgePath(p0: any, c1: any, c2: any, p3: any, dist: number) {
   return smoothPath(pts)
 }
 
+// —— 连线曲直 / 控制点 ——
+function edgeShapeOf(e: any): EdgeShape {
+  if (e?.shape === 'curve' || e?.shape === 'straight') return e.shape
+  return canvas.value?.edge_shape === 'straight' ? 'straight' : 'curve'
+}
+function sanitizeWaypoints(raw: any): Pt[] {
+  if (!Array.isArray(raw)) return []
+  const out: Pt[] = []
+  for (const p of raw) {
+    const x = Number(p?.x), y = Number(p?.y)
+    if (Number.isFinite(x) && Number.isFinite(y)) out.push({ x, y })
+  }
+  return out
+}
+function ensureWaypoints(e: any): Pt[] {
+  if (!Array.isArray(e.waypoints)) e.waypoints = []
+  return e.waypoints
+}
+function hasWaypoints(e: any): boolean {
+  return Array.isArray(e?.waypoints) && e.waypoints.length > 0
+}
+
+function linePath(pts: Pt[]): string {
+  if (!pts.length) return ''
+  let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`
+  for (let i = 1; i < pts.length; i++) d += ` L ${pts[i].x.toFixed(1)} ${pts[i].y.toFixed(1)}`
+  return d
+}
+
+/** Catmull-Rom → 三次 Bézier：曲线严格穿过每个控制点（区别于采样平滑用的 smoothPath） */
+function smoothThrough(pts: Pt[]): string {
+  if (!pts.length) return ''
+  if (pts.length === 2) return linePath(pts)
+  let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i]
+    const p1 = pts[i]
+    const p2 = pts[i + 1]
+    const p3 = pts[i + 2] || p2
+    const c1x = p1.x + (p2.x - p0.x) / 6
+    const c1y = p1.y + (p2.y - p0.y) / 6
+    const c2x = p2.x - (p3.x - p1.x) / 6
+    const c2y = p2.y - (p3.y - p1.y) / 6
+    d += ` C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`
+  }
+  return d
+}
+
+/** 第 i 段（pts[i] → pts[i+1]）的中点；smooth=按 Catmull-Rom 曲线取真实中点 */
+function segmentMidpoint(pts: Pt[], i: number, smooth: boolean): Pt {
+  const p1 = pts[i], p2 = pts[i + 1]
+  if (!p1 || !p2) return { x: 0, y: 0 }
+  if (!smooth) return { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }
+  const p0 = pts[i - 1] || p1
+  const p3 = pts[i + 2] || p2
+  const c1 = { x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6 }
+  const c2 = { x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6 }
+  return cubicAt(p1, c1, c2, p2, 0.5)
+}
+
 function computeEdge(e: any) {
   const a = nodeById.value.get(e.from_node)
   const b = nodeById.value.get(e.to_node)
   if (!a || !b) return null
   const { p1, p2, horizontal } = sideAnchors(a, b)
-  let c1 = { ...p1 }, c2 = { ...p2 }
-  if (horizontal) {
-    const mx = (p1.x + p2.x) / 2
-    c1 = { x: mx, y: p1.y }
-    c2 = { x: mx, y: p2.y }
-  } else {
-    const my = (p1.y + p2.y) / 2
-    c1 = { x: p1.x, y: my }
-    c2 = { x: p2.x, y: my }
-  }
-  // 双向两条线：沿曲线法线做等距偏移（采样+平滑）→ 两条线处处平行、垂直间距恒定
+  const shape = edgeShapeOf(e)
+  const wps = sanitizeWaypoints(e.waypoints)
   const rev = hasReverseEdge(e)
-  const d = rev
-    ? offsetEdgePath(p1, c1, c2, p2, BIDIR_OFFSET)
-    : `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`
-  const mid = cubicAt(p1, c1, c2, p2, 0.5)
-  const tang = cubicTangentAt(p1, c1, c2, p2, 0.5)
-  const tlen = Math.hypot(tang.x, tang.y) || 1
-  const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
-  const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
-  return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI }
+
+  // 1) 自动曲线（无控制点）：沿用原三次曲线 + 双向避让 + 中点插入控制点
+  if (shape === 'curve' && wps.length === 0) {
+    let c1 = { ...p1 }, c2 = { ...p2 }
+    if (horizontal) {
+      const mx = (p1.x + p2.x) / 2
+      c1 = { x: mx, y: p1.y }
+      c2 = { x: mx, y: p2.y }
+    } else {
+      const my = (p1.y + p2.y) / 2
+      c1 = { x: p1.x, y: my }
+      c2 = { x: p2.x, y: my }
+    }
+    // 双向两条线：沿曲线法线做等距偏移（采样+平滑）→ 两条线处处平行、垂直间距恒定
+    const d = rev
+      ? offsetEdgePath(p1, c1, c2, p2, BIDIR_OFFSET)
+      : `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`
+    const mid = cubicAt(p1, c1, c2, p2, 0.5)
+    const tang = cubicTangentAt(p1, c1, c2, p2, 0.5)
+    const tlen = Math.hypot(tang.x, tang.y) || 1
+    const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
+    const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
+    const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: midX, y: midY }]
+    return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
+  }
+
+  // 2) 直线 / 含控制点的曲线
+  const pts: Pt[] = [p1, ...wps, p2]
+  const smooth = shape === 'curve'
+  const d = smooth ? smoothThrough(pts) : linePath(pts)
+  const handles: EdgeHandle[] = []
+  wps.forEach((p, i) => handles.push({ kind: 'point', index: i, x: p.x, y: p.y }))
+  for (let i = 0; i < pts.length - 1; i++) {
+    const m = segmentMidpoint(pts, i, smooth)
+    handles.push({ kind: 'insert', index: i, x: m.x, y: m.y })
+  }
+  const midSeg = Math.max(0, Math.floor((pts.length - 2) / 2))
+  const mid = segmentMidpoint(pts, midSeg, smooth)
+  let angle = 0
+  if (smooth) {
+    const q1 = pts[midSeg], q2 = pts[midSeg + 1]
+    const q0 = pts[midSeg - 1] || q1
+    const q3 = pts[midSeg + 2] || q2
+    const c1 = { x: q1.x + (q2.x - q0.x) / 6, y: q1.y + (q2.y - q0.y) / 6 }
+    const c2 = { x: q2.x - (q3.x - q1.x) / 6, y: q2.y - (q3.y - q1.y) / 6 }
+    const tang = cubicTangentAt(q1, c1, c2, q2, 0.5)
+    angle = Math.atan2(tang.y, tang.x) * 180 / Math.PI
+  } else {
+    angle = Math.atan2(pts[midSeg + 1].y - pts[midSeg].y, pts[midSeg + 1].x - pts[midSeg].x) * 180 / Math.PI
+  }
+  return { d, midX: mid.x, midY: mid.y, midAngle: angle, handles }
 }
 
 const edgeGeoms = computed(() => edges.value.map((e: any) => ({ e, g: computeEdge(e) })))
+
+// —— 连线控制点交互 ——
+function showEdgeHandles(e: any): boolean {
+  return hoveringEdgeId.value === e.id || edgeDrag.value?.edge?.id === e.id
+}
+function startEdgeHandleDrag(e: MouseEvent, edge: any, h: EdgeHandle) {
+  if (e.button !== 0) return
+  e.stopPropagation(); e.preventDefault()
+  const wps = ensureWaypoints(edge)
+  if (h.kind === 'insert') {
+    // 插入控制点本身就是一次修改，先入栈再 splice
+    pushHistory()
+    wps.splice(h.index, 0, { x: h.x, y: h.y })
+    edgeDrag.value = { edge, index: h.index }
+  } else {
+    // 已有控制点：第一次真正移动时才入栈，单击不产生空步骤
+    pendingEdgeSnapshot = snapshotCanvas()
+    edgeDrag.value = { edge, index: h.index }
+  }
+  closeMenus()
+}
+function moveEdgeWaypoint(c: Pt) {
+  const d = edgeDrag.value
+  if (!d) return
+  const p = ensureWaypoints(d.edge)[d.index]
+  if (!p) return
+  p.x = c.x
+  p.y = c.y
+}
+function endEdgeDrag() {
+  pendingEdgeSnapshot = null
+  if (!edgeDrag.value) return
+  edgeDrag.value = null
+  canvases.saveCurrent()
+}
+function removeWaypoint(edge: any, index: number) {
+  const wps = ensureWaypoints(edge)
+  if (index < 0 || index >= wps.length) return
+  pushHistory()
+  wps.splice(index, 1)
+  edgeDrag.value = null
+  canvases.saveCurrent()
+}
+function setEdgeShape(edge: any, shape: EdgeShape) {
+  pushHistory()
+  edge.shape = shape
+  canvases.saveCurrent()
+  closeMenus()
+}
+function setAllEdgeShapes(shape: EdgeShape) {
+  if (!canvas.value) return
+  pushHistory()
+  for (const e of (canvas.value.edges || [])) e.shape = shape
+  canvas.value.edge_shape = shape
+  canvases.saveCurrent()
+  closeMenus()
+  showToast(`已把全部连线设为${shape === 'straight' ? '直线' : '曲线'}`)
+}
+function addEdgeWaypoint(edge: any) {
+  const g = edgeGeoms.value.find((x: any) => x.e.id === edge.id)?.g
+  if (!g) return
+  const inserts = g.handles.filter((h: EdgeHandle) => h.kind === 'insert')
+  const h = inserts[Math.floor(inserts.length / 2)]
+  if (!h) return
+  pushHistory()
+  ensureWaypoints(edge).splice(h.index, 0, { x: h.x, y: h.y })
+  canvases.saveCurrent()
+  closeMenus()
+}
+function resetEdgeWaypoints(edge: any) {
+  if (!hasWaypoints(edge)) return
+  pushHistory()
+  edge.waypoints = []
+  canvases.saveCurrent()
+  closeMenus()
+}
 
 function tempPath() {
   if (!linking.value) return ''
@@ -1138,6 +1864,17 @@ function emitCanvasActivate() {
   })
 }
 watch(() => canvas.value?.id, () => {
+  // 切画布：清空选区、撤销/重做历史、悬停/拖动状态与所有菜单
+  selectedNodeIds.value = new Set()
+  lasso.value = null
+  hoveringEdgeId.value = null
+  edgeDrag.value = null
+  pendingDragSnapshot = null
+  pendingEdgeSnapshot = null
+  dragWaypoints = []
+  undoStack.value = []
+  redoStack.value = []
+  closeMenus()
   nextTick(() => { fitAll(); bubbleHidden.value = {} })
 })
 // 画布切换 / 挂载首次 → 立即广播激活（MainView 需尽早拿到 viewportEl / bbox）
@@ -1308,7 +2045,7 @@ defineExpose({ viewportRef, computeNodeBbox })
   <div class="canvas-board glass" ref="boardRef"
        @dragover.prevent @drop="onDrop" @wheel.passive="onWheel"
        @mousedown="startPan"
-       @click="closeMenus" @contextmenu="showBgMenu">
+       @click="onBoardClick" @contextmenu="showBgMenu">
     <!-- 点状网格已移除 -->
 
 
@@ -1380,17 +2117,20 @@ defineExpose({ viewportRef, computeNodeBbox })
       </template>
     </div>
 
-    <!-- 执行模式切换提示（仅在运行时用户手动切换模式后短暂出现） -->
-    <div v-if="execModeToast" class="exec-mode-toast">{{ execModeToast.msg }}</div>
+    <!-- 执行模式切换 / 选区 / 剪贴板提示 -->
+    <div v-if="toast" class="exec-mode-toast">{{ toast.msg }}</div>
 
     <!-- 平移层（transform 纯平移） + 缩放层（CSS zoom 布局级缩放，文字始终矢量清晰） -->
     <div class="pan-layer" :style="{ transform: vTransform }">
       <div class="viewport" ref="viewportRef" :style="{ zoom: scale }" @contextmenu="showBgMenu">
         <svg class="edge-layer">
-          <g v-for="item in edgeGeoms" :key="item.e.id">
+          <g v-for="item in edgeGeoms" :key="item.e.id"
+             @mouseenter="hoveringEdgeId = item.e.id"
+             @mouseleave="hoveringEdgeId = null">
             <path v-if="item.g" :d="item.g.d"
                   :class="['edge-hit', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
-                  @dblclick="removeEdge(item.e.id)" />
+                  @dblclick="removeEdge(item.e.id)"
+                  @contextmenu="showEdgeMenu($event, item.e)" />
             <path v-if="item.g" :d="item.g.d"
                   :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
                   marker-end="url(#arrow)" pointer-events="none" />
@@ -1398,6 +2138,19 @@ defineExpose({ viewportRef, computeNodeBbox })
                   :class="{ dim: isEdgeDim(item.e) }"
                   :transform="`translate(${item.g.midX},${item.g.midY}) rotate(${item.g.midAngle})`"
                   d="M -5,-4 L 5,0 L -5,4 Z" />
+            <!-- 连线控制点：悬停 / 拖动中显示。空心中点=拖动新增控制点，实心点=拖动改形、双击删除 -->
+            <g v-if="item.g && showEdgeHandles(item.e)" class="edge-handle-layer">
+              <g v-for="h in item.g.handles" :key="h.kind + '-' + h.index">
+                <circle class="edge-handle-hit" :cx="h.x" :cy="h.y" :r="10 / scale"
+                        @mousedown.stop.prevent="startEdgeHandleDrag($event, item.e, h)"
+                        @dblclick.stop="h.kind === 'point' && removeWaypoint(item.e, h.index)"
+                        @contextmenu.stop.prevent="showEdgeMenu($event, item.e)">
+                  <title>{{ h.kind === 'point' ? '拖动改变连线形状；双击删除控制点' : '拖动以在连线上添加控制点' }}</title>
+                </circle>
+                <circle class="edge-handle" :class="h.kind"
+                        :cx="h.x" :cy="h.y" :r="(h.kind === 'point' ? 4.5 : 5) / scale" />
+              </g>
+            </g>
           </g>
           <path v-if="linking" :d="tempPath()" class="edge temp" />
           <!-- 边缘对齐辅助线 -->
@@ -1415,18 +2168,20 @@ defineExpose({ viewportRef, computeNodeBbox })
         </svg>
 
         <div v-for="n in nodes" :key="n.id" class="node glass-soft"
+             :data-node-id="n.id"
              :class="{
                disabled: agentById(n.agent_id)?.enabled === false,
                speaking: nodeState(n.agent_id) === 'speaking',
                calling: nodeState(n.agent_id) === 'calling',
                waiting: nodeState(n.agent_id) === 'waiting',
+               selected: selectedNodeIds.has(n.id),
              }"
              :style="{ left: n.x + 'px', top: n.y + 'px' }"
              @mousedown="startDrag($event, n)"
              @mouseup="endLink($event, n.id)"
-             @dblclick="toggleBubble(n)"
+             @dblclick="onNodeDblClick($event, n)"
              @contextmenu="showCtxMenu($event, n)">
-          <!-- 消息气泡：双击节点可隐藏；流式输出中也尊重用户的隐藏设置 -->
+          <!-- 消息气泡：双击气泡可隐藏；流式输出中也尊重用户的隐藏设置 -->
           <div v-if="getBubbleForAgent(n.agent_id) && !bubbleHidden[n.id]"
                class="node-bubble"
                :class="{
@@ -1434,6 +2189,7 @@ defineExpose({ viewportRef, computeNodeBbox })
                  below: bubbleDir(n.id) === 'bottom',
                }"
                :style="{ zIndex: getBubbleForAgent(n.agent_id)?.streaming ? 9 : 6 }"
+               @dblclick.stop="toggleBubble(n)"
                @wheel.stop @scroll="onBubbleScroll">
             <!-- 深度思考 chunk（灰底折叠块，有区别特效） -->
             <div v-for="(chunk, ci) in getBubbleForAgent(n.agent_id)!.chunks" :key="ci"
@@ -1469,14 +2225,43 @@ defineExpose({ viewportRef, computeNodeBbox })
             <button class="btn xs ghost ctx-action" @mousedown.stop @click.stop="startLink($event, n.id)">🔗 连线</button>
           </div>
         </div>
+        <!-- 套索选框（画布坐标，随 viewport 缩放） -->
+        <div v-if="lassoRect" class="lasso-rect" :class="[lassoRect.class, { additive: lassoRect.additive }]"
+             :style="{ left: lassoRect.left, top: lassoRect.top, width: lassoRect.width, height: lassoRect.height }" />
       </div>
+    </div>
+
+    <!-- 选区提示条 -->
+    <div v-if="selectedNodeIds.size" class="selection-pill">
+      已选 {{ selectedNodeIds.size }} 个智能体 · Ctrl 拖动整体移动 · Delete 删除 · 右键复制 / 剪切 / 创建画布
     </div>
 
     <!-- 画布空白区域右键菜单 -->
     <Teleport to="body">
       <div v-if="bgMenu" class="ctx-menu glass" :style="{ left: bgMenu.x + 'px', top: bgMenu.y + 'px' }" @click.stop>
+        <template v-if="selectedNodeIds.size">
+          <div class="ctx-title">已选 {{ selectedNodeIds.size }} 个智能体</div>
+          <div class="ctx-item" @click="copySelection(); closeMenus()">📋 复制 <span class="ctx-kbd">Ctrl+C</span></div>
+          <div class="ctx-item" @click="cutSelection(); closeMenus()">✂️ 剪切 <span class="ctx-kbd">Ctrl+X</span></div>
+          <div class="ctx-item" :class="{ disabled: !canvases.clipboard }"
+               @click="canvases.clipboard && pasteClipboard(clientToCanvas(bgMenu.x, bgMenu.y))">📥 粘贴 <span class="ctx-kbd">Ctrl+V</span></div>
+          <div class="ctx-item sel-create-canvas" @click="createCanvasFromSelection()">🎨 用选中的智能体创建画布…</div>
+          <div class="ctx-divider" />
+        </template>
+        <div class="ctx-item" :class="{ disabled: !undoStack.length }" @click="undoCanvas()">↶ 撤销 <span class="ctx-kbd">Ctrl+Z</span></div>
+        <div class="ctx-item" :class="{ disabled: !redoStack.length }" @click="redoCanvas()">↷ 重做 <span class="ctx-kbd">Ctrl+Y</span></div>
+        <div class="ctx-divider" />
         <div class="ctx-title">画布</div>
         <div class="ctx-item" @click="closeMenus(); resetView()">⟳ 重置视图</div>
+        <div class="ctx-item submenu" @click.stop>
+          <div class="submenu-label">〰 连线曲直（全部连线）</div>
+          <div class="submenu-body">
+            <div class="sub-item edge-all-curve" :class="{ checked: (canvas?.edge_shape || 'curve') === 'curve' }"
+                 @click="setAllEdgeShapes('curve')">曲线（平滑）</div>
+            <div class="sub-item edge-all-straight" :class="{ checked: canvas?.edge_shape === 'straight' }"
+                 @click="setAllEdgeShapes('straight')">直线（折线）</div>
+          </div>
+        </div>
         <div class="ctx-divider" />
         <div class="ctx-item" @click="toggleWorkspace()">🗂 显示/隐藏工作区</div>
         <div class="ctx-item" @click="closeMenus(); wdPath = canvas?.workdir || ''; wdOpen = true">📁 设置工作区文件夹…</div>
@@ -1489,8 +2274,17 @@ defineExpose({ viewportRef, computeNodeBbox })
     <!-- 节点右键菜单（Teleport 到 body，fixed 定位不受画布 transform 影响） -->
     <Teleport to="body">
       <div v-if="ctxMenu" class="ctx-menu glass" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
-        <div class="ctx-title">{{ agentById(ctxMenu.node.agent_id)?.name || '未知' }}</div>
+        <div class="ctx-title">
+          {{ selectedNodeIds.size > 1 ? `已选 ${selectedNodeIds.size} 个智能体` : (agentById(ctxMenu.node.agent_id)?.name || '未知') }}
+        </div>
+        <div class="ctx-item" @click="copySelection(); closeMenus()">📋 复制 <span class="ctx-kbd">Ctrl+C</span></div>
+        <div class="ctx-item" @click="cutSelection(); closeMenus()">✂️ 剪切 <span class="ctx-kbd">Ctrl+X</span></div>
+        <div class="ctx-item" :class="{ disabled: !canvases.clipboard }"
+             @click="canvases.clipboard && pasteClipboard(clientToCanvas(ctxMenu.x, ctxMenu.y))">📥 粘贴 <span class="ctx-kbd">Ctrl+V</span></div>
+        <div class="ctx-item sel-create-canvas" @click="createCanvasFromSelection()">🎨 用选中的智能体创建画布…</div>
+        <div class="ctx-divider" />
         <div class="ctx-item" @click="openAgentEdit(ctxMenu.node)">✏️ 编辑智能体…</div>
+        <div class="ctx-item" @click="toggleBubble(ctxMenu.node); closeMenus()">💬 显示/隐藏消息泡泡</div>
         <div class="ctx-divider" />
         <div class="ctx-item submenu" @click.stop>
           <div class="submenu-label">👁 感知范围</div>
@@ -1507,7 +2301,30 @@ defineExpose({ viewportRef, computeNodeBbox })
           {{ agentById(ctxMenu.node.agent_id)?.enabled === false ? '▶ 启用' : '⏸ 停用' }}
         </div>
         <div class="ctx-divider" />
-        <div class="ctx-item danger" @click="removeNode(ctxMenu.node.id)">🗑 从此画布移除</div>
+        <div class="ctx-item danger" @click="removeCtxSelection()">
+          🗑 {{ selectedNodeIds.size > 1 ? `从画布移除选中的 ${selectedNodeIds.size} 个` : '从此画布移除' }}
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- 连线右键菜单 -->
+    <Teleport to="body">
+      <div v-if="edgeMenu" class="ctx-menu glass" :style="{ left: edgeMenu.x + 'px', top: edgeMenu.y + 'px' }" @click.stop>
+        <div class="ctx-title">连线</div>
+        <div class="ctx-item submenu" @click.stop>
+          <div class="submenu-label">〰 连线形状</div>
+          <div class="submenu-body">
+            <div class="sub-item edge-shape-curve" :class="{ checked: edgeShapeOf(edgeMenu.edge) === 'curve' }"
+                 @click="setEdgeShape(edgeMenu.edge, 'curve')">曲线（平滑）</div>
+            <div class="sub-item edge-shape-straight" :class="{ checked: edgeShapeOf(edgeMenu.edge) === 'straight' }"
+                 @click="setEdgeShape(edgeMenu.edge, 'straight')">直线（折线）</div>
+          </div>
+        </div>
+        <div class="ctx-divider" />
+        <div class="ctx-item edge-add-point" @click="addEdgeWaypoint(edgeMenu.edge)">➕ 添加控制点</div>
+        <div v-if="hasWaypoints(edgeMenu.edge)" class="ctx-item edge-reset" @click="resetEdgeWaypoints(edgeMenu.edge)">↺ 重置连线形状</div>
+        <div class="ctx-divider" />
+        <div class="ctx-item danger edge-delete" @click="removeEdge(edgeMenu.edge.id); closeMenus()">🗑 删除连线</div>
       </div>
     </Teleport>
 
@@ -1543,10 +2360,13 @@ defineExpose({ viewportRef, computeNodeBbox })
     <Teleport to="body">
       <div v-if="newCanvasDialog" class="modal-bg">
         <div class="modal glass new-cv-modal">
-          <div class="modal-title">新建画布</div>
+          <div class="modal-title">{{ pendingCanvasPayload ? '用选中的智能体创建画布' : '新建画布' }}</div>
           <label class="lbl">画布名称<input class="input" v-model="newCanvasName" placeholder="如：产品研发、营销策划" ref="r => setTimeout(() => (r as HTMLInputElement)?.focus(), 50)" /></label>
+          <div v-if="pendingCanvasPayload" class="new-cv-preview">
+            将包含 {{ pendingCanvasPayload.nodes.length }} 个智能体、{{ pendingCanvasPayload.edges.length }} 条内部连线
+          </div>
           <div class="actions">
-            <button class="btn ghost" @click="newCanvasDialog = false">取消</button>
+            <button class="btn ghost" @click="newCanvasDialog = false; pendingCanvasPayload = null">取消</button>
             <button class="btn" @click="commitNewCanvas">创建</button>
           </div>
         </div>
@@ -1554,7 +2374,9 @@ defineExpose({ viewportRef, computeNodeBbox })
     </Teleport>
 
     <div v-if="!nodes.length" class="hint">从左侧拖拽智能体到此处开始编排集群<br/>
-      <span class="hint-shortcuts">滚轮缩放 · 左键 拖动画布 · 右键节点操作 · 双击连线删除</span>
+      <span class="hint-shortcuts">滚轮缩放 · 左键拖动画布 · Shift+拖拽框选（左→右包含 / 右→左触及）· Shift+Ctrl+拖拽连续框选<br/>
+        Ctrl+拖动整体移动 · Delete/Backspace 删除选中 · Ctrl+Z 撤销 / Ctrl+Y 重做<br/>
+        双击节点编辑 · 悬停连线拖动圆点改形状 · 右键菜单 · 双击连线删除</span>
     </div>
 
     <RulesDialog :open="rulesOpen" @close="rulesOpen = false" />
@@ -1639,6 +2461,12 @@ defineExpose({ viewportRef, computeNodeBbox })
 .edge-hit.active { cursor: pointer; }
 .edge-mid { fill: rgba(var(--text-rgb), 0.6); pointer-events: none; }
 .edge-mid.dim { fill: rgba(var(--text-rgb), 0.68); }
+/* 连线控制点：命中圆透明且更大，可见圆只负责展示 */
+.edge-handle-layer { pointer-events: none; }
+.edge-handle-hit { fill: transparent; stroke: none; pointer-events: all; cursor: grab; }
+.edge-handle-hit:active { cursor: grabbing; }
+.edge-handle { fill: var(--accent-2); stroke: rgba(var(--surface-rgb), 0.95); stroke-width: 1.5; pointer-events: none; filter: drop-shadow(0 1px 3px rgba(var(--shadow-rgb), 0.5)); }
+.edge-handle.insert { fill: rgba(var(--node-bg-rgb), 0.85); stroke: var(--accent-2); stroke-dasharray: 2.5 2.5; }
 @keyframes edgeFlow { to { stroke-dashoffset: -28; } }
 .snap-guides line { stroke: var(--accent-2); }
 marker#arrow path { fill: var(--accent); }
@@ -1649,6 +2477,8 @@ marker#arrow path { fill: var(--accent); }
 .node:hover { box-shadow: 0 8px 28px rgba(var(--accent-rgb), 0.25); }
 .node:active { cursor: grabbing; }
 .node.disabled { opacity: 0.45; filter: grayscale(0.85); }
+/* 套索选中：outline 不占用 box-shadow，可与 speaking/calling 光效并存 */
+.node.selected { outline: 2px solid var(--accent-2); outline-offset: 2px; }
 .off-tag { margin-left: auto; font-size: calc(11px * var(--font-scale)); opacity: .8; }
 
 /* ====== 节点活跃状态特效 ====== */
@@ -1799,8 +2629,30 @@ marker#arrow path { fill: var(--accent); }
 .node .btn { backdrop-filter: none; -webkit-backdrop-filter: none; }
 .xs { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); }
 
-.hint { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); line-height: 1.8; max-width: 420px; z-index: 5; pointer-events: none; }
-.hint-shortcuts { display: block; margin-top: 10px; font-size: calc(11px * var(--font-scale)); opacity: .7; }
+.hint { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); line-height: 1.8; max-width: 460px; z-index: 5; pointer-events: none; }
+.hint-shortcuts { display: block; margin-top: 10px; font-size: calc(11px * var(--font-scale)); opacity: .7; line-height: 1.9; }
+
+/* 套索选框 */
+.lasso-rect { position: absolute; z-index: 8; pointer-events: none; border-radius: 2px; }
+.lasso-rect.contain { border: 1px solid rgba(var(--accent2-rgb), 0.95); background: rgba(var(--accent2-rgb), 0.10); }
+.lasso-rect.touch { border: 1px dashed rgba(var(--accent-rgb), 0.95); background: rgba(var(--accent-rgb), 0.09); }
+/* Shift+Ctrl 连续框选：加一圈外发光提示处于累加模式 */
+.lasso-rect.additive { box-shadow: 0 0 0 1px rgba(var(--accent2-rgb), 0.55), 0 0 14px rgba(var(--accent2-rgb), 0.28); }
+
+/* 选区提示条 */
+.selection-pill {
+  position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+  z-index: 15; padding: 6px 14px; white-space: nowrap; pointer-events: none;
+  font-size: calc(11.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.92);
+  background: rgba(var(--node-bg-rgb), 0.92); border: 1px solid rgba(var(--accent2-rgb), 0.45);
+  border-radius: 18px; box-shadow: 0 6px 20px rgba(var(--shadow-rgb), 0.4);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+}
+
+/* 右键菜单快捷键提示 */
+.ctx-kbd { float: right; margin-left: 14px; font-size: calc(10px * var(--font-scale)); opacity: .55; font-family: Consolas, monospace; }
+.ctx-item.disabled { opacity: .4; pointer-events: none; }
+.new-cv-preview { font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.6); margin-top: -2px; }
 
 /* 右键菜单 */
 .ctx-menu { position: fixed; min-width: 220px; padding: 6px; z-index: 9999; background: rgba(var(--node-bg-rgb), 0.98); box-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5); }

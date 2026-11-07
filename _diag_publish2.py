@@ -1,6 +1,6 @@
 import subprocess, os, json
 
-MARKET = os.path.join(os.path.dirname(__file__), 'market')
+MARKET = os.path.join(os.path.dirname(__file__), '..', 'market')
 
 def git(*args):
     return subprocess.run(['git', '-C', MARKET, *args],

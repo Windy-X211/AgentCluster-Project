@@ -2,8 +2,25 @@ import { defineStore } from 'pinia'
 import { api } from '@/api'
 import { useLayoutStore } from './layout'
 
+export type CanvasEdgeShape = 'curve' | 'straight'
+
+/** 画布内剪贴板：节点按原始绝对坐标保存，连线端点用 nodes 下标表示，粘贴时整体平移并重映射 id。 */
+export interface CanvasClipboard {
+  nodes: { agent_id: number; x: number; y: number }[]
+  edges: {
+    from: number
+    to: number
+    type: string
+    shape: CanvasEdgeShape
+    waypoints: { x: number; y: number }[]
+  }[]
+  bbox: { x: number; y: number; w: number; h: number }
+  /** 连续粘贴的级联偏移计数；重新复制时归零 */
+  pasteCount: number
+}
+
 export const useCanvasStore = defineStore('canvas', {
-  state: () => ({ list: [] as any[], current: null as any }),
+  state: () => ({ list: [] as any[], current: null as any, clipboard: null as CanvasClipboard | null }),
   actions: {
     async fetch() {
       this.list = await api.canvases.list()

@@ -43,7 +43,7 @@ from core import github_auth, market_sync
 router = APIRouter()
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-MARKET_ROOT = _PROJECT_ROOT / "market"
+MARKET_ROOT = _PROJECT_ROOT.parent / "market"
 INDEX_FILE = MARKET_ROOT / "index.json"
 
 KIND_ORDER = [

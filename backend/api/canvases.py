@@ -15,11 +15,19 @@ class Node(BaseModel):
     y: float = 0
 
 
+class EdgePoint(BaseModel):
+    """连线控制点：画布绝对坐标，顺序为 from_node → to_node。"""
+    x: float
+    y: float
+
+
 class Edge(BaseModel):
     id: int
     from_node: int
     to_node: int
     type: str = "chat"  # chat | handoff
+    shape: str = "curve"  # curve=平滑曲线 | straight=直线/折线
+    waypoints: list[EdgePoint] = Field(default_factory=list, description="用户拖拽产生的控制点；空=自动布线")
 
 
 class CanvasIn(BaseModel):
@@ -29,6 +37,7 @@ class CanvasIn(BaseModel):
     edges: list[Edge] = []
     workdir: str | None = Field(default=None, description="画布工作区文件夹绝对路径，画布中所有智能体的文件操作都在此目录下；null=无工作区")
     execution_mode: str = Field(default="serial", description="执行模式：serial=串行（智能体发送消息后停止运行，接收方开始运行）；parallel=并行（智能体发送消息后可继续运行，接收方并发启动）")
+    edge_shape: str = Field(default="curve", description="新建连线的默认曲直：curve=曲线 | straight=直线")
     sort_order: int | None = None  # 列表排序权重；None=未排序，按 id 兜底排到末尾
     ws_pin: dict | None = Field(default=None, description="工作区钉住位置（画布坐标 {x,y}），null=未钉住（浮动状态）")
 

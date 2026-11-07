@@ -10,7 +10,7 @@ import os
 import py_compile
 import shutil
 
-SRC = 'market/extensions/fairy_ball'
+SRC = '../market/extensions/fairy_ball'
 _EXT_ROOT = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'AgentCluster', 'extensions')
 DST = os.path.join(_EXT_ROOT, 'fairy_ball')
 BUILTIN = os.path.join(_EXT_ROOT, '_builtin', 'fairy_ball')

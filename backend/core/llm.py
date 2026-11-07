@@ -700,8 +700,18 @@ async def chat(interface: dict, model: str, messages: list, stream: bool = False
                     delta = chunk["choices"][0].get("delta", {})
 
                     # 深度思考模型的 reasoning 通道 — 同样过滤模型内部 token
-                    if delta.get("reasoning_content"):
-                        _rtext = _MODEL_INTERNAL_TOKEN_RE.sub("", delta["reasoning_content"])
+                    # 不同上游使用的字段名不同：
+                    #   - OpenAI / DeepSeek / GLM: reasoning_content
+                    #   - Ollama OpenAI 兼容端点: reasoning
+                    #   - 某些网关: thinking_content / thinking
+                    _reasoning_text = None
+                    for _rk in ("reasoning_content", "reasoning", "thinking_content", "thinking"):
+                        _rv = delta.get(_rk)
+                        if _rv:
+                            _reasoning_text = _rv
+                            break
+                    if _reasoning_text:
+                        _rtext = _MODEL_INTERNAL_TOKEN_RE.sub("", _reasoning_text)
                         if _rtext:
                             yield ("reasoning", _rtext)
 

@@ -1063,9 +1063,9 @@ onBeforeUnmount(() => {
                 <input v-model="loginUsername" class="mm-input" spellcheck="false"
                   placeholder="例如 User123" autocomplete="username" />
               </label>
-              <div v-if="loginUsername.trim()" class="gh-token-guide">
+              <div class="gh-token-guide">
                 <div class="gh-token-guide-head">
-                  <span>已填写用户名，接下来按步骤创建 Token</span>
+                  <span>按以下步骤创建 GitHub Token</span>
                   <button type="button" class="gh-token-btn" @click="openGitHubTokens">去获取 Token ↗</button>
                 </div>
                 <ol class="gh-token-steps">
