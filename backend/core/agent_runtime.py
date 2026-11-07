@@ -522,6 +522,72 @@ def _truncate_history_content(content: str | None, max_chars: int = HISTORY_MSG_
     return content[:max_chars] + f"...[历史消息截断，原始 {len(content)} 字符]"
 
 
+# —— tool_calls 参数回灌给 LLM 时的裁剪 ——
+# 场景：智能体用 file.write 写了一份几十万字的长文，tool_call.arguments 里带着
+# 完整文件内容。它会被原样落库，并在**之后每一轮**都作为 assistant.tool_calls
+# 回灌给模型 —— 一份 90KB 的文件 = 每轮白白烧掉 90K token，上下文迅速爆掉，
+# 上游直接返回 400，整轮失败。
+#
+# 处理：只裁剪「发给 LLM 的那份副本」里的超长字符串值（保留键结构与短值，
+# 让模型仍知道写过什么、写到哪里）；落库与前端展示的那份保持完整。
+TOOL_ARGS_LLM_MAX_CHARS = 2000   # 单个字符串值回灌给 LLM 的上限
+
+
+def _trim_tool_call_arguments(arguments: Any) -> Any:
+    """裁剪单个 tool_call 的 arguments（发给 LLM 的副本）。
+
+    arguments 是 JSON 字符串；逐个把超长的字符串值截断，保留 JSON 结构合法。
+    非字符串 / 解析失败时原样返回（宁可原样也不要把非法 JSON 传给上游）。
+    """
+    if not isinstance(arguments, str) or len(arguments) <= TOOL_ARGS_LLM_MAX_CHARS:
+        return arguments
+    try:
+        parsed = json.loads(arguments)
+    except Exception:
+        return arguments
+
+    def _shrink(v: Any) -> Any:
+        if isinstance(v, str):
+            if len(v) > TOOL_ARGS_LLM_MAX_CHARS:
+                return v[:TOOL_ARGS_LLM_MAX_CHARS] + f"...[参数截断，原始 {len(v)} 字符]"
+            return v
+        if isinstance(v, list):
+            return [_shrink(x) for x in v]
+        if isinstance(v, dict):
+            return {k: _shrink(x) for k, x in v.items()}
+        return v
+
+    try:
+        trimmed = json.dumps(_shrink(parsed), ensure_ascii=False)
+    except Exception:
+        return arguments
+    # 裁剪后仍超长（例如超大数组）→ 再整体兜底截断
+    if len(trimmed) > TOOL_ARGS_LLM_MAX_CHARS * 4:
+        trimmed = trimmed[:TOOL_ARGS_LLM_MAX_CHARS * 4] + "...[参数整体截断]"
+    return trimmed
+
+
+def _trim_tool_calls_for_llm(tool_calls: Any) -> Any:
+    """裁剪 tool_calls 列表里每个调用的超长 arguments（发给 LLM 的副本）。"""
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    out = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        fn = tc.get("function")
+        if not isinstance(fn, dict) or "arguments" not in fn:
+            out.append(tc)
+            continue
+        new_args = _trim_tool_call_arguments(fn.get("arguments"))
+        if new_args is fn.get("arguments"):
+            out.append(tc)
+        else:
+            out.append({**tc, "function": {**fn, "arguments": new_args}})
+    return out
+
+
 def _sanitize_tool_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """清洗 LLM 生成的 tool 参数。
 
@@ -586,7 +652,8 @@ def _history_llm_entry(m, mode: str, speaker_names: dict) -> dict | None:
     初始组装与运行中压缩重建共用同一转换，保证两条路径产出的 LLM 历史完全一致：
     - <continue> 标记剥离 + 超长内容截断
     - linked 集群模式给 assistant 消息标注发言者（智能体分得清谁说了什么）
-    - 保留 tool_calls / tool_call_id（工具配对历史完整回灌）"""
+    - 保留 tool_calls / tool_call_id（工具配对历史完整回灌）
+    - tool_calls 的超长参数只在此处裁剪（发给 LLM 的副本），落库/前端那份保持完整"""
     if not isinstance(m, dict):
         return None
     if m.get("role") == "a2a":
@@ -600,7 +667,7 @@ def _history_llm_entry(m, mode: str, speaker_names: dict) -> dict | None:
         if name:
             content = f"[{name}] {content}"
     entry = {"role": _m_role, "content": content}
-    if m.get("tool_calls"): entry["tool_calls"] = m["tool_calls"]
+    if m.get("tool_calls"): entry["tool_calls"] = _trim_tool_calls_for_llm(m["tool_calls"])
     if m.get("tool_call_id"): entry["tool_call_id"] = m["tool_call_id"]
     return entry
 
@@ -970,16 +1037,18 @@ def _execute_tool(name: str, arguments: dict,
 
     conv_id / tool_call_id / agent_id 可选：传入时在执行前注入 commands.BACKUP_CTX，
     让 file.* 写/删命令自动做快照备份。"""
-    import re
 
     def _fix_bare_identifiers(raw: str) -> str:
         """把 JSON 里的裸标识符值修复成字符串。
         例：{"to_agent": 总经理, "x": 123} → {"to_agent": "总经理", "x": 123}
-        策略：匹配 "key": 后面紧跟的、非引号非数字非 true/false/null 的标识符，加引号。
+
+        实现说明：这里复用 core.tool_stream_validator 的线性扫描实现，
+        不再自带正则副本。旧正则的键侧 "(?:[^\"\\\\]|\\\\.)*" 含嵌套量词，
+        在长正文参数上会灾难性回溯（12KB 实测 323ms，141KB 要 36 秒），
+        足以卡死事件循环 → 表现为「写长文件时后端 failed」。
         """
-        # 匹配模式：冒号 + 可选空格 + (非引号/非数字开头/非 null/true/false) + 逗号或 }
-        pattern = r'''("(?:[^"\\]|\\.)*"\s*:\s*)(?!")(?![0-9{\[]|null|true|false\b)([\u4e00-\u9fff\w]+)'''
-        return re.sub(pattern, r'\1"\2"', raw)
+        from core.tool_stream_validator import fix_bare_identifiers as _linear_fix
+        return _linear_fix(raw)
 
     # 注入备份上下文（如果三个都有）
     backup_token = None

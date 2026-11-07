@@ -15,6 +15,25 @@
   fatal —— 致命错误，必须立即停止累积并纠错
 
 核心目标：杜绝 "把错误的流式片段补完" —— 错了就停，停了就纠。
+
+【性能约束 —— 为什么必须增量扫描】
+本模块处在 LLM 流式回调的热路径上（llm.py: chat() → validator.feed()），
+且 feed() 是在 asyncio 事件循环里同步执行的。写长文件（file.write 的 content
+动辄几十~几百 KB）时，上游会把 arguments 切成成百上千个 chunk 逐块下发。
+
+若每次 feed 都对「已累积的全部参数」重新 join + 重新全量扫描，就是 O(n²)：
+  · "".join(args_buf)                —— 每块都重建整个字符串
+  · _check_balance(joined)           —— 每块都逐字符重扫一遍（纯 Python 循环）
+  · _BARE_IDENTIFIER_RE.search(joined) —— 每块都重扫；该正则的键侧
+    "(?:[^"\\\\]|\\\\.)*" 含嵌套量词，在含大量转义引号的正文上会灾难性回溯
+    （实测 141KB 参数单次 search 要 35 秒）
+
+实测：一份 12KB 的长文件参数，现状全量重扫累计 22 秒 —— 事件循环被占死，
+/api/health 超时 → 托盘误报「后端 FAIL」，上游流同时被拖到超时。
+（现场证据：backend/diag/stall-*.log 的主线程栈停在 tool_stream_validator.feed()）
+
+因此本模块改为**增量扫描**：跨 chunk 维护结构状态机（括号深度 / 字符串态 /
+转义位 / 值位置），每块只看新到的字符，整体 O(n)。
 """
 from __future__ import annotations
 
@@ -38,15 +57,24 @@ _SUSPICIOUS_PATTERNS: list[re.Pattern[str]] = [
     )
 ]
 
-# 裸标识符值：{"to_agent": 总经理, "x": 123} 里的 "总经理" 没加引号
-_BARE_IDENTIFIER_RE = re.compile(
-    r'''("(?:[^"\\]|\\.)*"\s*:\s*)(?!")(?![0-9{\[]|null|true|false\b)([\u4e00-\u9fff\w]+)'''
+# 裸标识符值：{"to_agent": 总经理} —— 引号缺失的值。
+# 只判定「值」侧（键侧由扫描器的字符串态天然保证），且匹配一段完整的词，
+# 语义与旧正则的值侧完全一致：
+#   不以 " 开头、不以数字/{/[ 开头、不是 null/true 字面量、
+#   "false" 需带词边界（falsex 仍算裸标识符），且整段由词字符组成。
+_BARE_VALUE_RE = re.compile(
+    r'''(?!")(?![0-9{\[]|null|true|false\b)([\u4e00-\u9fff\w]+)'''
 )
+
+# 伪协议扫描的重叠窗口大小：标记可能被切在两块之间（如 "<|chan" + "nel|>"），
+# 保留上一块尾部这么多字符与本块一起扫。固定大小 → 整体仍是 O(n)。
+_SCAN_OVERLAP = 64
 
 
 @dataclass
 class ValidationResult:
     """单次校验结果。"""
+
     level: str            # "ok" | "warn" | "fatal"
     reason: str = ""      # 致命/警告原因（人类可读，会回灌给模型）
     pattern_hit: str = "" # 命中的可疑模式（供调试）
@@ -59,6 +87,131 @@ class ValidationResult:
     @property
     def is_warn(self) -> bool:
         return self.level == "warn"
+
+
+def _is_bare_value_word(word: str) -> bool:
+    """判断一个词是否是「引号缺失的值」（裸标识符）。
+
+    与旧正则的值侧判定保持一致：
+      - 不以数字 / { / [ 开头
+      - 不是 null / true 字面量；false 需带词边界（falsex 仍算裸标识符）
+      - 整段由词字符（含汉字）组成
+    """
+    if not word:
+        return False
+    return _BARE_VALUE_RE.match(word) is not None
+
+
+class _ArgScanner:
+    """增量扫描工具参数 JSON：跨 chunk 保留状态，每块只处理新字符。
+
+    维护的状态：
+      - depth_brace / depth_bracket：当前括号深度
+      - min_depth_brace：花括号深度出现过的最小值（<0 说明出现多余的 '}'，
+        结构已不可修复 —— 对应旧实现的 _looks_beyond_repair）
+      - min_depth_bracket：方括号深度出现过的最小值（<0 只是括号不匹配，
+        旧实现对此不判 fatal）
+      - in_string / escape：字符串态与转义位。转义位必须跨 chunk 保留，
+        因为 "\\\"" 的转义引号可能正好被切在两块之间
+      - 裸标识符检测：last_was_string / after_colon / value_text
+    """
+
+    def __init__(self) -> None:
+        self.depth_brace = 0
+        self.depth_bracket = 0
+        self.min_depth_brace = 0
+        self.min_depth_bracket = 0
+        self.in_string = False
+        self.escape = False
+        # —— 裸标识符检测状态 ——
+        self.last_was_string = False  # 上一个结构性字符是刚闭合的字符串（可能是键）
+        self.after_colon = False      # 已确认「键 : 」→ 下一个是值
+        self.value_text = ""          # 正在累积的值文本
+        self.in_value = False
+        self.bare_value = False       # 已确认存在裸标识符
+
+    # —— 结构扫描 ——
+    def feed(self, text: str) -> None:
+        for c in text:
+            if self.escape:
+                self.escape = False
+                continue
+            if c == "\\":
+                self.escape = True
+                continue
+            # —— 裸标识符检测：值文本累积 ——
+            # 必须排在引号/括号处理之前：任何非词字符都终止「值」，
+            # 此时才能判定它是 true/false/null 字面量还是裸标识符。
+            if self.in_value:
+                if c.isalnum() or c == "_":
+                    self.value_text += c
+                    if len(self.value_text) > 16:
+                        # 太长不可能是 null/true/false → 立刻判定为裸标识符
+                        if _is_bare_value_word(self.value_text):
+                            self.bare_value = True
+                        self.value_text = ""
+                        self.in_value = False
+                    continue
+                # 到达分隔符 → 判定
+                if _is_bare_value_word(self.value_text):
+                    self.bare_value = True
+                self.value_text = ""
+                self.in_value = False
+                # 继续用当前分隔符走下面的逻辑
+            if self.in_string:
+                if c == '"':
+                    self.in_string = False
+                    self.last_was_string = True
+                continue
+            if c == '"':
+                self.in_string = True
+                self.last_was_string = False
+                continue
+            if c == "{":
+                self.depth_brace += 1
+            elif c == "}":
+                self.depth_brace -= 1
+                if self.depth_brace < self.min_depth_brace:
+                    self.min_depth_brace = self.depth_brace
+            elif c == "[":
+                self.depth_bracket += 1
+            elif c == "]":
+                self.depth_bracket -= 1
+                if self.depth_bracket < self.min_depth_bracket:
+                    self.min_depth_bracket = self.depth_bracket
+            if c == ":":
+                if self.last_was_string:
+                    self.after_colon = True
+                self.last_was_string = False
+                continue
+            if c.isspace():
+                continue
+            if self.after_colon:
+                self.after_colon = False
+                if c.isalpha() or "\u4e00" <= c <= "\u9fff":
+                    # 值的开头是字母/汉字 → 可能是裸标识符，也可能是 true/false/null
+                    self.in_value = True
+                    self.value_text = c
+                    continue
+                # 数字 / { / [ / " 等 → 合法值，不是裸标识符
+                self.last_was_string = False
+                continue
+            self.last_was_string = False
+
+    @property
+    def brace_broken(self) -> bool:
+        """花括号结构已不可修复（多余的 '}'）—— 对应旧 _looks_beyond_repair。"""
+        return self.min_depth_brace < 0
+
+    @property
+    def bracket_broken(self) -> bool:
+        """方括号结构不匹配（旧实现不因此判 fatal，只是不再检查裸标识符）。"""
+        return self.min_depth_bracket < 0
+
+    @property
+    def pending(self) -> bool:
+        """结构尚未闭合（还有未关的括号或未闭合的字符串）。"""
+        return self.depth_brace > 0 or self.depth_bracket > 0 or self.in_string
 
 
 class StreamingToolValidator:
@@ -83,6 +236,11 @@ class StreamingToolValidator:
         self._warned: list[str] = []
         self._fatal: str = ""
         self._stopped = False
+        # 增量扫描器（跨 chunk 保留状态）
+        self._scanner = _ArgScanner()
+        # 伪协议扫描的重叠窗口：标记可能被切在两块之间（如 "<|chan" + "nel|>")，
+        # 保留上一块尾部若干字符与本块一起扫，避免漏检。窗口固定大小 → 仍是 O(n)。
+        self._scan_tail = ""
 
     # —— 累积 + 校验 ——
     def feed(self, chunk: str) -> ValidationResult:
@@ -90,9 +248,10 @@ class StreamingToolValidator:
         if self._stopped:
             return ValidationResult("fatal", reason=self._fatal or "已停止累积")
 
-        # 1) 先做可疑模式扫描（在原始 chunk 上做，不依赖 JSON 解析）
+        # 1) 先做可疑模式扫描（带上上一块的尾部，避免标记被切在块边界时漏检）
+        scan_text = self._scan_tail + chunk
         for pat in _SUSPICIOUS_PATTERNS:
-            m = pat.search(chunk)
+            m = pat.search(scan_text)
             if m:
                 self._stopped = True
                 self._fatal = (
@@ -103,6 +262,7 @@ class StreamingToolValidator:
                 return ValidationResult(
                     "fatal", reason=self._fatal, pattern_hit=m.group(0)
                 )
+        self._scan_tail = scan_text[-_SCAN_OVERLAP:]
 
         # 2) 工具名校验（名称一旦确定就检查）
         if self.name and self.known_tools and self.name not in self.known_tools:
@@ -118,107 +278,47 @@ class StreamingToolValidator:
         # 3) 累积到 buffer
         self._args_buf.append(chunk)
 
-        # 4) 增量 JSON 平衡性检查
-        joined = "".join(self._args_buf)
-        balance = self._check_balance(joined)
-        if balance == "broken":
-            # 括号/引号错位 → 不一定是 fatal（可能下一段会补全），
-            # 但如果已经出现明显的结构破坏（如引号在键名前闭合），标记 fatal
-            if self._looks_beyond_repair(joined):
-                self._stopped = True
-                self._fatal = (
-                    f"流式 JSON 参数结构已无法修复：{joined[-120:]!r}；"
-                    f"请重新发起调用，确保 JSON 合法（字符串值必须用双引号包裹）。"
-                )
-                return ValidationResult("fatal", reason=self._fatal)
-            # 否则只警告
+        # 4) 增量 JSON 平衡性检查（O(chunk)，状态跨块保留）
+        self._scanner.feed(chunk)
+        if self._scanner.brace_broken:
+            # 花括号深度变负 → 结构已无法修复
+            self._stopped = True
+            self._fatal = (
+                f"流式 JSON 参数结构已无法修复：{self._tail(120)!r}；"
+                f"请重新发起调用，确保 JSON 合法（字符串值必须用双引号包裹）。"
+            )
+            return ValidationResult("fatal", reason=self._fatal)
+        if self._scanner.bracket_broken:
+            # 方括号不匹配：结构仍可继续（旧实现同样不判 fatal），
+            # 但这一轮不再检查裸标识符
             return ValidationResult("ok")
 
-        # 5) 裸标识符检测（{"to_agent": 总经理}）
-        if _BARE_IDENTIFIER_RE.search(joined):
-            if "bare_identifier" not in self._warned:
-                self._warned.append("bare_identifier")
-                return ValidationResult(
-                    "warn",
-                    reason="参数中检测到裸标识符值（未加引号的字符串），"
-                           "如 {\"to_agent\": 总经理} 应写成 {\"to_agent\": \"总经理\"}",
-                    pattern_hit="bare_identifier",
-                )
+        # 5) 裸标识符检测（增量：只看新到的字符，O(chunk)）
+        if self._scanner.bare_value and "bare_identifier" not in self._warned:
+            self._warned.append("bare_identifier")
+            return ValidationResult(
+                "warn",
+                reason="参数中检测到裸标识符值（未加引号的字符串），"
+                       "如 {\"to_agent\": 总经理} 应写成 {\"to_agent\": \"总经理\"}",
+                pattern_hit="bare_identifier",
+            )
 
         return ValidationResult("ok")
 
-    def _check_balance(self, s: str) -> str:
-        """粗略检查 JSON 括号/引号平衡。返回 ok / broken / pending。"""
-        depth_brace = 0   # {}
-        depth_bracket = 0 # []
-        in_string = False
-        escape = False
-        i = 0
-        while i < len(s):
-            c = s[i]
-            if escape:
-                escape = False
-                i += 1
-                continue
-            if c == "\\":
-                escape = True
-                i += 1
-                continue
-            if in_string:
-                if c == '"':
-                    in_string = False
-                i += 1
-                continue
-            if c == '"':
-                in_string = True
-            elif c == "{":
-                depth_brace += 1
-            elif c == "}":
-                depth_brace -= 1
-                if depth_brace < 0:
-                    return "broken"   # 闭合括号多于开括号 → 必坏
-            elif c == "[":
-                depth_bracket += 1
-            elif c == "]":
-                depth_bracket -= 1
-                if depth_bracket < 0:
-                    return "broken"
-            i += 1
-        if depth_brace < 0 or depth_bracket < 0:
-            return "broken"
-        return "pending" if (depth_brace > 0 or depth_bracket > 0 or in_string) else "ok"
+    @property
+    def raw_args(self) -> str:
+        return "".join(self._args_buf)
 
-    def _looks_beyond_repair(self, s: str) -> bool:
-        """判断流式 JSON 是否已经无可救药（即使再来 token 也补不成合法 JSON）。
-
-        启发式：
-          - 括号深度为负且字符串外出现两个以上连续的 } → 结构已塌
-          - 顶层出现非法字符（如 `:` 后面跟非值字符且不在字符串内）
-        """
-        # 括号深度变负 → 已经塌方
-        depth = 0
-        in_str = False
-        escape = False
-        for c in s:
-            if escape:
-                escape = False
-                continue
-            if c == "\\":
-                escape = True
-                continue
-            if in_str:
-                if c == '"':
-                    in_str = False
-                continue
-            if c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth < 0:
-                    return True
-        return False
+    def _tail(self, n: int) -> str:
+        """取累积参数末尾 n 个字符（用于错误提示），只扫尾部不重扫全文。"""
+        if not self._args_buf:
+            return ""
+        tail = ""
+        for part in reversed(self._args_buf):
+            tail = part + tail
+            if len(tail) >= n:
+                break
+        return tail[-n:]
 
     # —— 最终校验 ——
     def finalize(self) -> ValidationResult:
@@ -226,7 +326,7 @@ class StreamingToolValidator:
         if self._stopped:
             return ValidationResult("fatal", reason=self._fatal or "累积已中断")
 
-        raw = "".join(self._args_buf)
+        raw = self.raw_args
         if not raw.strip():
             # 空参数
             if self.schema and self.schema.get("required"):
@@ -242,7 +342,7 @@ class StreamingToolValidator:
         except json.JSONDecodeError as e:
             # 尝试裸标识符修复
             try:
-                fixed = _BARE_IDENTIFIER_RE.sub(r'\1"\2"', raw)
+                fixed = fix_bare_identifiers(raw)
                 args = json.loads(fixed)
             except Exception:
                 return ValidationResult(
@@ -286,9 +386,85 @@ class StreamingToolValidator:
 
         return ValidationResult("ok")
 
-    @property
-    def raw_args(self) -> str:
-        return "".join(self._args_buf)
+
+def fix_bare_identifiers(raw: str) -> str:
+    """把 JSON 里的裸标识符值修复成字符串。
+
+    例：{"to_agent": 总经理, "x": 123} → {"to_agent": "总经理", "x": 123}
+    策略：匹配 "key": 后面紧跟的、非引号非数字非 true/false/null 的标识符，加引号。
+
+    实现说明：旧实现用正则一次 sub 整个字符串，键侧 "(?:[^"\\\\]|\\\\.)*"
+    含嵌套量词，在长正文上会灾难性回溯（141KB 参数实测要 36 秒）。
+    这里改成单遍线性扫描，只在「引号闭合的键 : 值」的位置判定，整体 O(n)。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    in_string = False
+    escape = False
+    last_was_string = False
+    after_colon = False
+    while i < n:
+        c = raw[i]
+        if escape:
+            escape = False
+            out.append(c)
+            i += 1
+            continue
+        if c == "\\":
+            escape = True
+            out.append(c)
+            i += 1
+            continue
+        if in_string:
+            out.append(c)
+            if c == '"':
+                in_string = False
+                last_was_string = True
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            last_was_string = False
+            out.append(c)
+            i += 1
+            continue
+        if after_colon:
+            if c.isspace():
+                out.append(c)
+                i += 1
+                continue
+            after_colon = False
+            if c.isalpha() or "\u4e00" <= c <= "\u9fff":
+                # 收集整个词再判定（要区分 true/false/null 等字面量）
+                j = i
+                while j < n and (raw[j].isalnum() or raw[j] == "_"):
+                    j += 1
+                word = raw[i:j]
+                if _is_bare_value_word(word):
+                    out.append('"' + word + '"')
+                else:
+                    out.append(word)
+                i = j
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c == ":":
+            if last_was_string:
+                after_colon = True
+            last_was_string = False
+            out.append(c)
+            i += 1
+            continue
+        if c.isspace():
+            out.append(c)
+            i += 1
+            continue
+        last_was_string = False
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def _type_ok(value: Any, expected: str) -> bool:
