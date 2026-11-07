@@ -4,7 +4,7 @@ import { useCanvasStore, useAgentStore, useConvStore, useSettingsStore } from '@
 import { api } from '@/api'
 import { toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, type ToolCallPhase } from '@/stores/conversation'
 import { renderMarkdown } from '@/utils/markdown'
-import { getAvatarGradient, getAvatarRgb } from '@/utils/avatar'
+import { getAvatarGradient, getAvatarRgb, getPaletteRgbPool, generateRgb } from '@/utils/avatar'
 
 const canvases = useCanvasStore()
 const agents = useAgentStore()
@@ -399,23 +399,40 @@ function nodeState(agentId: number): 'speaking' | 'calling' | 'waiting' | null {
   return 'waiting'
 }
 
-// —— 连线配色：身份色（与头像同源取色）× 主题强调色 ——
-// 统一头像模式下所有智能体同色，连线也退化为纯主题色，保证整块画布只有一种色相
-function agentIdentityColor(agentId: number | undefined | null): string {
-  const mode = settings.data.avatar_mode || 'differentiated'
-  if (mode === 'unified' || agentId == null) return 'var(--accent)'
-  return getAvatarRgb(agentId)
-}
-/** 连线两端的身份色（实际与主题色的混合在 CSS 中完成，切换主题即时生效） */
-function edgeEndpointColors(e: any): { from: string; to: string } {
-  return {
-    from: agentIdentityColor(edgeAgentId(e, 'from')),
-    to: agentIdentityColor(edgeAgentId(e, 'to')),
+// —— 连线配色：按「源智能体」定纯色 ——
+// 规则：同一个智能体引出的所有连线同色；不同智能体引出的线不同色。
+// 基础色仍取身份色（与头像同源），再与主题强调色混合以适配配色方案；
+// 同一画布内若多个源智能体撞色，则依次顺延到调色板中未占用的色，保证「异源异色」。
+const edgeSourceColors = computed(() => {
+  const map = new Map<number, string>()
+  if ((settings.data.avatar_mode || 'differentiated') === 'unified') return map
+  // 收集本画布所有连线源端对应的智能体（按 id 排序 → 分配结果稳定可预期）
+  const srcAgents = new Set<number>()
+  for (const e of edges.value) {
+    const n = nodeById.value.get(e.from_node)
+    if (n && n.agent_id != null) srcAgents.add(n.agent_id)
   }
-}
-function edgeAgentId(e: any, side: 'from' | 'to'): number | undefined {
-  const node = nodeById.value.get(side === 'from' ? e.from_node : e.to_node)
-  return node?.agent_id
+  const sorted = [...srcAgents].sort((a, b) => a - b)
+  const pool = getPaletteRgbPool()
+  const used = new Set<string>()
+  for (const aid of sorted) {
+    // 先用该智能体自己的身份色；被占用则顺延取调色板中首个未用色
+    let color = getAvatarRgb(aid)
+    if (used.has(color)) {
+      const free = pool.find(c => !used.has(c))
+      color = free ?? generateRgb(sorted.indexOf(aid))
+    }
+    used.add(color)
+    map.set(aid, color)
+  }
+  return map
+})
+/** 连线颜色：只由源智能体决定（与目标智能体无关） */
+function edgeSourceColor(e: any): string {
+  const n = nodeById.value.get(e.from_node)
+  const aid = n?.agent_id
+  if (aid == null) return 'var(--accent)'
+  return edgeSourceColors.value.get(aid) ?? 'var(--accent)'
 }
 
 // —— 查找表 computed：避免每次 O(nodes) 线性查找 ——
@@ -1663,7 +1680,7 @@ function computeEdge(e: any) {
     const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
     const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
     const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: midX, y: midY }]
-    return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles, p1, p2 }
+    return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
   }
 
   // 2) 直线 / 含控制点的曲线
@@ -1690,13 +1707,12 @@ function computeEdge(e: any) {
   } else {
     angle = Math.atan2(pts[midSeg + 1].y - pts[midSeg].y, pts[midSeg + 1].x - pts[midSeg].x) * 180 / Math.PI
   }
-  return { d, midX: mid.x, midY: mid.y, midAngle: angle, handles, p1: pts[0], p2: pts[pts.length - 1] }
+  return { d, midX: mid.x, midY: mid.y, midAngle: angle, handles }
 }
 
 const edgeGeoms = computed(() => edges.value.map((e: any) => {
   const g = computeEdge(e)
-  const c = g ? edgeEndpointColors(e) : { from: 'var(--accent)', to: 'var(--accent)' }
-  return { e, g, ...c }
+  return { e, g, color: g ? edgeSourceColor(e) : 'var(--accent)' }
 }))
 
 // —— 连线控制点交互 ——
@@ -1774,6 +1790,15 @@ function resetEdgeWaypoints(edge: any) {
   canvases.saveCurrent()
   closeMenus()
 }
+
+/** 拖拽连线时的临时预览色：与将要创建的连线一致（按源节点所属智能体） */
+const linkingSourceColor = computed(() => {
+  if (!linking.value) return 'var(--accent)'
+  const n = nodeById.value.get(linking.value.from)
+  const aid = n?.agent_id
+  if (aid == null) return 'var(--accent)'
+  return edgeSourceColors.value.get(aid) ?? 'var(--accent)'
+})
 
 function tempPath() {
   if (!linking.value) return ''
@@ -2156,16 +2181,11 @@ defineExpose({ viewportRef, computeNodeBbox })
       <div class="viewport" ref="viewportRef" :style="{ zoom: scale }" @contextmenu="showBgMenu">
         <svg class="edge-layer">
           <g v-for="item in edgeGeoms" :key="item.e.id"
-             :style="{ '--eg-from': item.from, '--eg-to': item.to }"
+             :style="{ '--eg-c': item.color }"
              @mouseenter="hoveringEdgeId = item.e.id"
              @mouseleave="hoveringEdgeId = null">
-            <!-- 每条连线一套渐变（身份色 → 主题强调色混合）：方向即调用方向 -->
+            <!-- 每条连线一个箭头，颜色跟随所属源智能体（与连线同色） -->
             <defs>
-              <linearGradient v-if="item.g" :id="`eg-${item.e.id}`" gradientUnits="userSpaceOnUse"
-                              :x1="item.g.p1.x" :y1="item.g.p1.y" :x2="item.g.p2.x" :y2="item.g.p2.y">
-                <stop class="eg-stop eg-stop-from" offset="0" />
-                <stop class="eg-stop eg-stop-to" offset="1" />
-              </linearGradient>
               <marker v-if="item.g" :id="`egm-${item.e.id}`" viewBox="0 0 10 10" refX="8" refY="5"
                       markerWidth="6" markerHeight="6" orient="auto">
                 <path d="M0,0 L10,5 L0,10 Z" class="eg-arrow" />
@@ -2177,12 +2197,11 @@ defineExpose({ viewportRef, computeNodeBbox })
                   @contextmenu="showEdgeMenu($event, item.e)" />
             <path v-if="item.g" :d="item.g.d"
                   :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
-                  :style="{ '--eg-stroke': `url(#eg-${item.e.id})` }"
                   :marker-end="`url(#egm-${item.e.id})`" pointer-events="none" />
             <path v-if="item.g" class="edge-mid"
                   :class="{ dim: isEdgeDim(item.e) }"
                   :transform="`translate(${item.g.midX},${item.g.midY}) rotate(${item.g.midAngle})`"
-                  d="M -5,-4 L 5,0 L -5,4 Z" />
+                  d="M -7,-5 L 7,0 L -7,5 Z" />
             <!-- 连线控制点：悬停 / 拖动中显示。空心中点=拖动新增控制点，实心点=拖动改形、双击删除 -->
             <g v-if="item.g && showEdgeHandles(item.e)" class="edge-handle-layer">
               <g v-for="h in item.g.handles" :key="h.kind + '-' + h.index">
@@ -2197,7 +2216,7 @@ defineExpose({ viewportRef, computeNodeBbox })
               </g>
             </g>
           </g>
-          <path v-if="linking" :d="tempPath()" class="edge temp" />
+          <path v-if="linking" :d="tempPath()" class="edge temp" :style="{ '--eg-c': linkingSourceColor }" />
           <!-- 边缘对齐辅助线 -->
           <g v-if="dragging && (snapGuides.x.length || snapGuides.y.length)" class="snap-guides" pointer-events="none">
             <line v-for="gx in snapGuides.x" :key="'gx-' + gx"
@@ -2495,14 +2514,17 @@ defineExpose({ viewportRef, computeNodeBbox })
 .zoom-indicator.panning .zoom-tip { color: var(--accent-2); opacity: 1; }
 
 .edge-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
-/* —— 连线配色：身份色（与头像同源取色）× 主题强调色 ——
-   渐变方向即调用方向；强调色占比由各主题的 --edge-accent-share 决定：
-   深色主题偏亮、浅色主题偏深，保证任何主题下连线都清晰可辨 */
-.eg-stop-from { stop-color: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-from)); }
-.eg-stop-to { stop-color: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-to)); }
-.eg-arrow { fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-to)); }
-.edge { fill: none; stroke: var(--eg-stroke, rgba(var(--text-rgb), 0.45)); stroke-width: 2; pointer-events: stroke; cursor: pointer; stroke-dasharray: 8 6; transition: stroke .3s, stroke-width .3s, filter .3s; }
-.edge.temp { stroke: rgba(var(--accent-rgb), 0.75); stroke-dasharray: 3,3; animation: none; }
+/* —— 连线配色：纯色，颜色只由「源智能体」决定 ——
+   同一智能体引出的所有连线同色；不同智能体引出的线不同色。
+   --eg-c 由模板按源智能体注入，与主题强调色混合后仍跟随配色方案 */
+.eg-arrow { fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c)); }
+.edge {
+  fill: none;
+  stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
+  stroke-width: 2; pointer-events: stroke; cursor: pointer; stroke-dasharray: 8 6;
+  transition: stroke .3s, stroke-width .3s, filter .3s;
+}
+.edge.temp { stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c, var(--accent))); stroke-dasharray: 3,3; animation: none; }
 /* 调用进行中：加粗 + 强调色外发光 + 流动虚线 */
 .edge.active { stroke-width: 2.8; filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), 0.9)) saturate(1.35) brightness(1.12); animation: edgeFlow 0.6s linear infinite; }
 /* 端点智能体已停用：整体去色并压暗 */
@@ -2511,7 +2533,17 @@ defineExpose({ viewportRef, computeNodeBbox })
 .edge-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 .edge-hit.dim { cursor: default; }
 .edge-hit.active { cursor: pointer; }
-.edge-mid { fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-to)); pointer-events: none; opacity: 0.85; }
+/* 中点箭头：方向指示。放大到 14×10 并加一圈底色描边（paint-order 让描边在外、
+   填充在内），把箭头从虚线中"抠"出来，轮廓更锐利又不显笨重 */
+.edge-mid {
+  fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
+  stroke: rgb(var(--edge-halo-rgb));
+  stroke-width: 3;
+  stroke-linejoin: round;
+  paint-order: stroke fill;
+  pointer-events: none;
+  opacity: 0.95;
+}
 .edge-mid.dim { opacity: 0.4; }
 /* 连线控制点：命中圆透明且更大，可见圆只负责展示 */
 .edge-handle-layer { pointer-events: none; }

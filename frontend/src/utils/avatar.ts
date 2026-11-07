@@ -64,6 +64,42 @@ export function getAvatarRgb(nameOrId: string | number): string {
     return `rgb(${r}, ${g}, ${b})`
 }
 
+/**
+ * 调色板去重后的 rgb 列表（固定顺序）
+ * 供「同组同色、异组异色」的场景依次取空闲色用。
+ */
+export function getPaletteRgbPool(): string[] {
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const pair of PALETTE) {
+        for (const hex of pair) {
+            const [r, g, b] = hexToRgb(hex)
+            const s = `rgb(${r}, ${g}, ${b})`
+            if (!seen.has(s)) { seen.add(s); out.push(s) }
+        }
+    }
+    return out
+}
+
+/** HSL → RGB */
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+    const a = s * Math.min(l, 1 - l)
+    const f = (n: number) => {
+        const k = (n + h / 30) % 12
+        return l - a * Math.max(-1, Math.min(Math.min(k - 3, 9 - k), 1))
+    }
+    return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)]
+}
+
+/**
+ * 调色板用尽后的兜底色：黄金角递进的色相环
+ * 低饱和度与调色板观感一致，且任意数量都不会重色。
+ */
+export function generateRgb(index: number): string {
+    const [r, g, b] = hslToRgb((index * 137.508 + 205) % 360, 0.42, 0.55)
+    return `rgb(${r}, ${g}, ${b})`
+}
+
 export function getAvatarInitial(name: string | undefined | null): string {
     if (!name) return '?'
     return name.slice(0, 1).toUpperCase()
