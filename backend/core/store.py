@@ -697,6 +697,9 @@ def get_store_paths() -> dict:
         # 自定义技能/插件：按子目录实际加载的文件数统计
         paths["stats"]["skills"] = _count_skill_dirs()
         paths["stats"]["plugins"] = _count_plugin_dirs()
+        # 自定义背景/功能拓展：同样按子目录实际生效的文件数统计
+        paths["stats"]["backgrounds"] = _count_background_dirs()
+        paths["stats"]["extensions"] = _count_extension_dirs()
         return paths
 
 
@@ -754,6 +757,32 @@ def _count_plugin_dirs() -> int:
         return 0
     return sum(1 for sub in folder.iterdir()
                if sub.is_dir() and not sub.name.startswith(("_", ".")) and (sub / "manifest.yaml").is_file())
+
+
+def _count_background_dirs() -> int:
+    """统计已生效的自定义背景数量（AppData/backgrounds/*/manifest.json）。
+
+    口径与 ``/api/backgrounds`` 列表接口一致：每个含 manifest.json 的子目录算一个背景，
+    跳过 spec.md 等散落文件。
+    """
+    folder = ROOT / "backgrounds"
+    if not folder.exists():
+        return 0
+    return sum(1 for sub in folder.iterdir()
+               if sub.is_dir() and not sub.name.startswith(("_", ".")) and (sub / "manifest.json").is_file())
+
+
+def _count_extension_dirs() -> int:
+    """统计已安装的功能拓展数量（AppData/extensions/*/manifest.json）。
+
+    口径：与 ``/api/extensions`` 的 installed 视图一致——只认含 manifest.json 的已安装目录，
+    排除 ``_builtin``（内置拓展源，安装时拷贝出去，不算已安装）与遗留的 __pycache__ 目录。
+    """
+    folder = ROOT / "extensions"
+    if not folder.exists():
+        return 0
+    return sum(1 for sub in folder.iterdir()
+               if sub.is_dir() and not sub.name.startswith(("_", ".")) and (sub / "manifest.json").is_file())
 
 
 def _list_explorer_hwnds() -> list:

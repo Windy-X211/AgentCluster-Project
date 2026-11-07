@@ -16,7 +16,16 @@ from fastapi.responses import Response
 from core.store import ROOT
 
 router = APIRouter()
-BG_ROOT = ROOT / "backgrounds"
+
+
+def _bg_root() -> Path:
+    """背景根目录（动态取当前 ROOT）。
+
+    不能在导入时把 ROOT 快照成常量：用户在设置里切换存储位置后 store.ROOT 会变，
+    快照路径会让本接口仍指向旧目录，与设置页数据存储表格显示的数量对不上。
+    """
+    import core.store as _store
+    return _store.ROOT / "backgrounds"
 
 _MIME_FIX = {
     ".html": "text/html; charset=utf-8",
@@ -44,10 +53,11 @@ def _safe_id(bg_id: str) -> str:
 
 
 def _bg_dir(bg_id: str) -> Path:
-    """返回背景目录（已校验存在 + 在 BG_ROOT 内）"""
+    """返回背景目录（已校验存在 + 在背景根目录内）"""
     _safe_id(bg_id)
-    root_resolved = BG_ROOT.resolve()
-    d = (BG_ROOT / bg_id).resolve()
+    bg_root = _bg_root()
+    root_resolved = bg_root.resolve()
+    d = (bg_root / bg_id).resolve()
     try:
         inside = d.is_relative_to(root_resolved)
     except AttributeError:
@@ -61,9 +71,10 @@ def _bg_dir(bg_id: str) -> Path:
 def list_backgrounds():
     """列出所有背景（扫描 backgrounds/ 下每个子目录的 manifest.json）"""
     result = []
-    if not BG_ROOT.exists():
+    bg_root = _bg_root()
+    if not bg_root.exists():
         return result
-    for sub in sorted(BG_ROOT.iterdir(), key=lambda p: p.name):
+    for sub in sorted(bg_root.iterdir(), key=lambda p: p.name):
         if not sub.is_dir():
             continue
         mf = sub / "manifest.json"
@@ -143,7 +154,7 @@ async def upload_background(
 
     # 生成 id（英文 + 时间戳，避免中文路径问题）
     bg_id = "bg_" + str(int(time.time())) + "_" + secrets.token_hex(3)
-    d = BG_ROOT / bg_id
+    d = _bg_root() / bg_id
     d.mkdir(parents=True, exist_ok=True)
 
     saved_names = []

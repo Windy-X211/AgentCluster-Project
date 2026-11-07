@@ -1059,14 +1059,14 @@ async function clearDefaultWorkdir() {
               <td>🎨 自定义背景</td>
               <td class="tag-t">每背景一个文件夹</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.backgrounds_dir) }}</td>
-              <td class="mono">-</td>
+              <td class="mono">{{ storagePaths.stats?.backgrounds ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.backgrounds_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.backgrounds_dir)">打开</button></td>
             </tr>
             <tr>
               <td>🧩 功能拓展</td>
               <td class="tag-t">每拓展一个文件夹</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.extensions_dir) }}</td>
-              <td class="mono">-</td>
+              <td class="mono">{{ storagePaths.stats?.extensions ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.extensions_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.extensions_dir)">打开</button></td>
             </tr>
           </tbody>

@@ -39,8 +39,14 @@ import core.store as _store
 router = APIRouter()
 
 # —— 存储根 ——
-EXT_ROOT = _store.ROOT / "extensions"
-INSTALLED_FILE = EXT_ROOT / "installed.json"
+# 动态取当前 ROOT：用户在设置里切换存储位置后 store.ROOT 会变，
+# 导入时快照成常量会让本接口仍指向旧目录，与设置页数据存储表格显示的数量对不上。
+def _ext_root() -> Path:
+    return _store.ROOT / "extensions"
+
+
+def _installed_file() -> Path:
+    return _ext_root() / "installed.json"
 
 # 市场资源仓库（项目内、随程序分发）：拓展源与统一索引都在这里
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -55,7 +61,7 @@ _MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
 def _ensure_dirs() -> None:
-    EXT_ROOT.mkdir(parents=True, exist_ok=True)
+    _ext_root().mkdir(parents=True, exist_ok=True)
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -94,7 +100,7 @@ def _load_market() -> list[dict]:
             out.append(meta)
         return out
     # —— 旧版清单兜底 ——
-    legacy = EXT_ROOT / "extensions_market.json"
+    legacy = _ext_root() / "extensions_market.json"
     data = _read_json(legacy, None)
     if isinstance(data, dict) and isinstance(data.get("extensions"), list):
         return data["extensions"]
@@ -105,18 +111,18 @@ def _load_market() -> list[dict]:
 
 def _load_installed() -> dict[str, dict]:
     """已安装拓展状态：{ ext_id: { enabled, installed_at, version, source } }"""
-    data = _read_json(INSTALLED_FILE, None)
+    data = _read_json(_installed_file(), None)
     if isinstance(data, dict):
         return {str(k): v for k, v in data.items() if isinstance(v, dict)}
     return {}
 
 
 def _save_installed(data: dict[str, dict]) -> None:
-    _write_json(INSTALLED_FILE, data)
+    _write_json(_installed_file(), data)
 
 
 def _ext_dir(ext_id: str) -> Path:
-    return EXT_ROOT / ext_id
+    return _ext_root() / ext_id
 
 
 def _read_manifest(ext_id: str) -> dict | None:
@@ -287,7 +293,7 @@ def auto_install_first_time() -> None:
     用户仍可在管理页卸载后重装体验完整流程。
     """
     _ensure_dirs()
-    if INSTALLED_FILE.exists():
+    if _installed_file().exists():
         return
     market = _load_market()
     installed: dict[str, dict] = {}
