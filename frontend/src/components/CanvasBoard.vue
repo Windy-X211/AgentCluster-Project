@@ -4,7 +4,7 @@ import { useCanvasStore, useAgentStore, useConvStore, useSettingsStore } from '@
 import { api } from '@/api'
 import { toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, type ToolCallPhase } from '@/stores/conversation'
 import { renderMarkdown } from '@/utils/markdown'
-import { getAvatarGradient } from '@/utils/avatar'
+import { getAvatarGradient, getAvatarRgb } from '@/utils/avatar'
 
 const canvases = useCanvasStore()
 const agents = useAgentStore()
@@ -397,6 +397,25 @@ function nodeState(agentId: number): 'speaking' | 'calling' | 'waiting' | null {
   const callEdges = convs.callEdges || []
   if (callEdges.some(d => d.from === agentId || d.to === agentId)) return 'calling'
   return 'waiting'
+}
+
+// —— 连线配色：身份色（与头像同源取色）× 主题强调色 ——
+// 统一头像模式下所有智能体同色，连线也退化为纯主题色，保证整块画布只有一种色相
+function agentIdentityColor(agentId: number | undefined | null): string {
+  const mode = settings.data.avatar_mode || 'differentiated'
+  if (mode === 'unified' || agentId == null) return 'var(--accent)'
+  return getAvatarRgb(agentId)
+}
+/** 连线两端的身份色（实际与主题色的混合在 CSS 中完成，切换主题即时生效） */
+function edgeEndpointColors(e: any): { from: string; to: string } {
+  return {
+    from: agentIdentityColor(edgeAgentId(e, 'from')),
+    to: agentIdentityColor(edgeAgentId(e, 'to')),
+  }
+}
+function edgeAgentId(e: any, side: 'from' | 'to'): number | undefined {
+  const node = nodeById.value.get(side === 'from' ? e.from_node : e.to_node)
+  return node?.agent_id
 }
 
 // —— 查找表 computed：避免每次 O(nodes) 线性查找 ——
@@ -836,6 +855,10 @@ function endDrag() {
 
 // —— 选区 ——
 function clearSelection() { selectedNodeIds.value = new Set() }
+// Ctrl+A：全选当前画布的所有节点
+function selectAllNodes() {
+  selectedNodeIds.value = new Set(nodes.value.map((n: any) => n.id))
+}
 function toggleNodeSelection(id: number) {
   const next = new Set(selectedNodeIds.value)
   if (next.has(id)) next.delete(id)
@@ -1167,9 +1190,13 @@ function toggleWorkspace() {
 function toggleBubble(node: any) {
   bubbleHidden.value = { ...bubbleHidden.value, [node.id]: !bubbleHidden.value[node.id] }
 }
-// 双击节点（非按钮/气泡区域）：直接打开智能体编辑
+// 双击节点头像：显示或隐藏该节点的消息泡泡
+// 双击节点其他位置（非按钮/气泡区域）：直接打开智能体编辑
 function onNodeDblClick(e: MouseEvent, node: any) {
-  if ((e.target as HTMLElement)?.closest('button, input, label, a')) return
+  const t = e.target as HTMLElement | null
+  if (t?.closest('button, input, label, a')) return
+  // 头像：切换消息泡泡（与双击气泡本身一致）
+  if (t?.closest('.avatar')) { toggleBubble(node); return }
   openAgentEdit(node)
 }
 function hideAllBubbles() { bubbleHidden.value = {} }  // 清空隐藏 = 全部显示
@@ -1636,7 +1663,7 @@ function computeEdge(e: any) {
     const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
     const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
     const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: midX, y: midY }]
-    return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
+    return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles, p1, p2 }
   }
 
   // 2) 直线 / 含控制点的曲线
@@ -1663,10 +1690,14 @@ function computeEdge(e: any) {
   } else {
     angle = Math.atan2(pts[midSeg + 1].y - pts[midSeg].y, pts[midSeg + 1].x - pts[midSeg].x) * 180 / Math.PI
   }
-  return { d, midX: mid.x, midY: mid.y, midAngle: angle, handles }
+  return { d, midX: mid.x, midY: mid.y, midAngle: angle, handles, p1: pts[0], p2: pts[pts.length - 1] }
 }
 
-const edgeGeoms = computed(() => edges.value.map((e: any) => ({ e, g: computeEdge(e) })))
+const edgeGeoms = computed(() => edges.value.map((e: any) => {
+  const g = computeEdge(e)
+  const c = g ? edgeEndpointColors(e) : { from: 'var(--accent)', to: 'var(--accent)' }
+  return { e, g, ...c }
+}))
 
 // —— 连线控制点交互 ——
 function showEdgeHandles(e: any): boolean {
@@ -2125,15 +2156,29 @@ defineExpose({ viewportRef, computeNodeBbox })
       <div class="viewport" ref="viewportRef" :style="{ zoom: scale }" @contextmenu="showBgMenu">
         <svg class="edge-layer">
           <g v-for="item in edgeGeoms" :key="item.e.id"
+             :style="{ '--eg-from': item.from, '--eg-to': item.to }"
              @mouseenter="hoveringEdgeId = item.e.id"
              @mouseleave="hoveringEdgeId = null">
+            <!-- 每条连线一套渐变（身份色 → 主题强调色混合）：方向即调用方向 -->
+            <defs>
+              <linearGradient v-if="item.g" :id="`eg-${item.e.id}`" gradientUnits="userSpaceOnUse"
+                              :x1="item.g.p1.x" :y1="item.g.p1.y" :x2="item.g.p2.x" :y2="item.g.p2.y">
+                <stop class="eg-stop eg-stop-from" offset="0" />
+                <stop class="eg-stop eg-stop-to" offset="1" />
+              </linearGradient>
+              <marker v-if="item.g" :id="`egm-${item.e.id}`" viewBox="0 0 10 10" refX="8" refY="5"
+                      markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0,0 L10,5 L0,10 Z" class="eg-arrow" />
+              </marker>
+            </defs>
             <path v-if="item.g" :d="item.g.d"
                   :class="['edge-hit', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
                   @dblclick="removeEdge(item.e.id)"
                   @contextmenu="showEdgeMenu($event, item.e)" />
             <path v-if="item.g" :d="item.g.d"
                   :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
-                  marker-end="url(#arrow)" pointer-events="none" />
+                  :style="{ '--eg-stroke': `url(#eg-${item.e.id})` }"
+                  :marker-end="`url(#egm-${item.e.id})`" pointer-events="none" />
             <path v-if="item.g" class="edge-mid"
                   :class="{ dim: isEdgeDim(item.e) }"
                   :transform="`translate(${item.g.midX},${item.g.midY}) rotate(${item.g.midAngle})`"
@@ -2162,9 +2207,6 @@ defineExpose({ viewportRef, computeNodeBbox })
                   :x1="-9999" :y1="gy" :x2="9999" :y2="gy"
                   stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
           </g>
-          <defs>
-            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" style="fill: var(--accent)" /></marker>
-          </defs>
         </svg>
 
         <div v-for="n in nodes" :key="n.id" class="node glass-soft"
@@ -2216,7 +2258,9 @@ defineExpose({ viewportRef, computeNodeBbox })
             </div>
           </div>
           <div class="node-head">
-            <div class="avatar" :style="{ background: avatarGradient(n.agent_id) }">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
+            <div class="avatar" :style="{ background: avatarGradient(n.agent_id) }"
+                 title="双击显示/隐藏消息泡泡"
+                 @dblclick.stop="toggleBubble(n)">{{ (agentById(n.agent_id)?.name || '?').slice(0,1).toUpperCase() }}</div>
             <div class="name">{{ agentById(n.agent_id)?.name || '未知' }}</div>
             <span v-if="agentById(n.agent_id)?.enabled === false" class="off-tag" title="已停用">⏸</span>
           </div>
@@ -2376,7 +2420,7 @@ defineExpose({ viewportRef, computeNodeBbox })
     <div v-if="!nodes.length" class="hint">从左侧拖拽智能体到此处开始编排集群<br/>
       <span class="hint-shortcuts">滚轮缩放 · 左键拖动画布 · Shift+拖拽框选（左→右包含 / 右→左触及）· Shift+Ctrl+拖拽连续框选<br/>
         Ctrl+拖动整体移动 · Delete/Backspace 删除选中 · Ctrl+Z 撤销 / Ctrl+Y 重做<br/>
-        双击节点编辑 · 悬停连线拖动圆点改形状 · 右键菜单 · 双击连线删除</span>
+        双击节点编辑 · 双击节点头像显示/隐藏消息泡泡 · 悬停连线拖动圆点改形状 · 右键菜单 · 双击连线删除</span>
     </div>
 
     <RulesDialog :open="rulesOpen" @close="rulesOpen = false" />
@@ -2451,16 +2495,24 @@ defineExpose({ viewportRef, computeNodeBbox })
 .zoom-indicator.panning .zoom-tip { color: var(--accent-2); opacity: 1; }
 
 .edge-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
-.edge { fill: none; stroke: rgba(var(--text-rgb), 0.45); stroke-width: 2; pointer-events: stroke; cursor: pointer; stroke-dasharray: 8 6; transition: stroke .3s, stroke-width .3s, filter .3s; }
-.edge.temp { stroke: rgba(var(--accent2-rgb), 0.7); stroke-dasharray: 3,3; animation: none; }
-.edge.active { stroke: var(--accent-2); stroke-width: 2.5; filter: drop-shadow(0 0 6px rgba(var(--accent2-rgb), 0.8)); animation: edgeFlow 0.6s linear infinite; }
-.edge.dim { stroke: rgba(var(--text-rgb), 0.68); stroke-width: 1.5; stroke-dasharray: 4 4; cursor: default; animation: none; filter: grayscale(0.8); }
-.edge.active.dim { stroke: rgba(var(--accent2-rgb), 0.35); filter: grayscale(0.8) drop-shadow(0 0 4px rgba(var(--accent2-rgb), 0.2)); }
+/* —— 连线配色：身份色（与头像同源取色）× 主题强调色 ——
+   渐变方向即调用方向；强调色占比由各主题的 --edge-accent-share 决定：
+   深色主题偏亮、浅色主题偏深，保证任何主题下连线都清晰可辨 */
+.eg-stop-from { stop-color: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-from)); }
+.eg-stop-to { stop-color: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-to)); }
+.eg-arrow { fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-to)); }
+.edge { fill: none; stroke: var(--eg-stroke, rgba(var(--text-rgb), 0.45)); stroke-width: 2; pointer-events: stroke; cursor: pointer; stroke-dasharray: 8 6; transition: stroke .3s, stroke-width .3s, filter .3s; }
+.edge.temp { stroke: rgba(var(--accent-rgb), 0.75); stroke-dasharray: 3,3; animation: none; }
+/* 调用进行中：加粗 + 强调色外发光 + 流动虚线 */
+.edge.active { stroke-width: 2.8; filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), 0.9)) saturate(1.35) brightness(1.12); animation: edgeFlow 0.6s linear infinite; }
+/* 端点智能体已停用：整体去色并压暗 */
+.edge.dim { stroke-width: 1.5; stroke-dasharray: 4 4; cursor: default; animation: none; filter: grayscale(0.85); opacity: 0.55; }
+.edge.active.dim { filter: grayscale(0.85) drop-shadow(0 0 4px rgba(var(--accent-rgb), 0.25)); opacity: 0.7; }
 .edge-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 .edge-hit.dim { cursor: default; }
 .edge-hit.active { cursor: pointer; }
-.edge-mid { fill: rgba(var(--text-rgb), 0.6); pointer-events: none; }
-.edge-mid.dim { fill: rgba(var(--text-rgb), 0.68); }
+.edge-mid { fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-to)); pointer-events: none; opacity: 0.85; }
+.edge-mid.dim { opacity: 0.4; }
 /* 连线控制点：命中圆透明且更大，可见圆只负责展示 */
 .edge-handle-layer { pointer-events: none; }
 .edge-handle-hit { fill: transparent; stroke: none; pointer-events: all; cursor: grab; }
@@ -2469,7 +2521,6 @@ defineExpose({ viewportRef, computeNodeBbox })
 .edge-handle.insert { fill: rgba(var(--node-bg-rgb), 0.85); stroke: var(--accent-2); stroke-dasharray: 2.5 2.5; }
 @keyframes edgeFlow { to { stroke-dashoffset: -28; } }
 .snap-guides line { stroke: var(--accent-2); }
-marker#arrow path { fill: var(--accent); }
 
 .node { position: absolute; width: 180px; padding: 10px; cursor: grab; user-select: none; transition: box-shadow .2s, opacity .2s, filter .2s, border-color .25s;
   border: 1px solid rgba(var(--text-rgb), 0.14); border-radius: 12px;

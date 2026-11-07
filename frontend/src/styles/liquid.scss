@@ -37,6 +37,10 @@
   --tint-input-bg: rgba(var(--surface-rgb), 0.03);
   --glass-shadow: 0 8px 32px rgba(var(--shadow-rgb), 0.25), inset 0 1px 0 rgba(var(--surface-rgb), 0.08);
   --popup-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
+  /* 画布连线配色：连线 = 智能体身份色（头像取色）× 主题强调色
+     --edge-accent-share 决定强调色占比，其余留给身份色
+     → 同一主题下连线既保留归属感，又不脱离配色方案；浅色主题加大强调色占比保证对比度 */
+  --edge-accent-share: 45%;
 }
 
 /* 银河蓝（深蓝紫渐变底；原「深邃黑」槽位，深邃黑已并入 standard） */
@@ -55,6 +59,8 @@
   --success-light: #80e4b8;
   --panel-bg: #1a1f30;
   --node-bg-rgb: 20, 26, 44;
+  /* 深蓝底：强调色占比上调，连线更亮更贴主题 */
+  --edge-accent-share: 58%;
 }
 
 /* 科技白 */
@@ -82,6 +88,8 @@
   --tint-input-bg: #f8fafc;
   --glass-shadow: 0 1px 8px rgba(20, 30, 50, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.6);
   --popup-shadow: 0 4px 20px rgba(20, 30, 50, 0.08);
+  /* 白底：身份色在白底上偏淡，强调色占比压低、整体压深，保证连线可读 */
+  --edge-accent-share: 30%;
 }
 
 /* 科技白：左右面板去玻璃灰底——容器背景透明露出白底，仅消息泡泡与列表卡片保留灰 */
@@ -117,6 +125,8 @@
   --red-ink: #c53030;
   --warn-ink: #92400e;
   --code-ink: var(--accent-light);
+  /* 米黄底：与科技白同理，身份色占比压低保证对比度 */
+  --edge-accent-share: 30%;
 }
 
 $bg-deep: var(--bg-base);
