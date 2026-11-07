@@ -1,4 +1,5 @@
 import { marked } from 'marked'
+import katex from 'katex'
 import { API_BASE } from './env'
 import { parseVizSegments, hasVizSegment } from '@/extensions/viz-parse'
 
@@ -44,11 +45,138 @@ function patchStreamingMarkdown(text: string): string {
     result = result.slice(0, result.length - lastLine.length) + replacement
   }
 
+  // 4. 修复流式中未闭合的块级公式：$$ 与 \[ 数量不配对时补闭合
+  //    在代码块/行内代码之外统计，避免代码里的 $$(shell PID) 误触发
+  const strippedForMath = result.replace(/^```[\s\S]*?^```/gm, '').replace(/`[^`\n]*`/g, '')
+  const dollarCount = (strippedForMath.match(/\$\$/g) || []).length
+  if (dollarCount % 2 !== 0) {
+    result += '\n$$'
+  }
+  const openBrackets = (strippedForMath.match(/\\\[/g) || []).length
+  const closeBrackets = (strippedForMath.match(/\\\]/g) || []).length
+  if (openBrackets > closeBrackets) {
+    result += '\n\\]'
+  }
+
   return result
+}
+
+// —— 数学公式（LaTeX/KaTeX）支持 ——
+interface MathSeg { display: boolean; tex: string }
+
+/** 扫描文本，把 LaTeX 公式替换为占位符（%%KBX{n}%%）。
+ *  跳过围栏代码块与行内代码，避免把代码里的 $ 误当公式；
+ *  占位符为纯 ASCII 文本，可安全穿过 marked 与 sanitizeHtml，渲染后统一还原成 KaTeX HTML。 */
+function extractMathSegments(src: string): { text: string; segs: MathSeg[] } {
+  // 快速通道：不含 $ 也不含 \( \[ 定界符时原样返回
+  if (!src.includes('$') && !src.includes('\\(') && !src.includes('\\[')) {
+    return { text: src, segs: [] }
+  }
+  const segs: MathSeg[] = []
+  const placeholder = (display: boolean, tex: string): string => {
+    segs.push({ display, tex })
+    return `%%KBX${segs.length - 1}%%`
+  }
+  let out = ''
+  let i = 0
+  const n = src.length
+  while (i < n) {
+    // 围栏代码块整体跳过（未闭合时跳到结尾）
+    if (src.startsWith('```', i)) {
+      const end = src.indexOf('```', i + 3)
+      const stop = end < 0 ? n : end + 3
+      out += src.slice(i, stop)
+      i = stop
+      continue
+    }
+    const ch = src[i]
+    // 行内代码整体跳过（支持多反引号围栏）
+    if (ch === '`') {
+      let run = 1
+      while (src[i + run] === '`') run++
+      const fence = '`'.repeat(run)
+      const end = src.indexOf(fence, i + run)
+      const stop = end < 0 ? i + run : end + run
+      out += src.slice(i, stop)
+      i = stop
+      continue
+    }
+    // 块级公式 $$...$$（可跨行）
+    if (src.startsWith('$$', i)) {
+      const end = src.indexOf('$$', i + 2)
+      if (end < 0) { out += src[i]; i++; continue }
+      const tex = src.slice(i + 2, end).trim()
+      out += tex ? placeholder(true, tex) : src.slice(i, end + 2)
+      i = end + 2
+      continue
+    }
+    // 块级公式 \[...\]
+    if (src.startsWith('\\[', i)) {
+      const end = src.indexOf('\\]', i + 2)
+      if (end < 0) { out += src.slice(i, i + 2); i += 2; continue }
+      const tex = src.slice(i + 2, end).trim()
+      out += tex ? placeholder(true, tex) : src.slice(i, end + 2)
+      i = end + 2
+      continue
+    }
+    // 行内公式 \(...\)
+    if (src.startsWith('\\(', i)) {
+      const end = src.indexOf('\\)', i + 2)
+      if (end < 0) { out += src.slice(i, i + 2); i += 2; continue }
+      const tex = src.slice(i + 2, end).trim()
+      out += tex ? placeholder(false, tex) : src.slice(i, end + 2)
+      i = end + 2
+      continue
+    }
+    // 行内公式 $...$（不跨行；开界后与闭界前不能是空白，防误伤货币金额）
+    if (ch === '$') {
+      const next = src[i + 1]
+      if (next && next !== ' ' && next !== '\t' && next !== '\n' && next !== '$') {
+        let j = i + 1
+        let close = -1
+        while (j < n) {
+          const c = src[j]
+          if (c === '\n') break
+          if (c === '$') { close = j; break }
+          j += c === '\\' ? 2 : 1
+        }
+        if (close > i + 1) {
+          const tex = src.slice(i + 1, close)
+          const lastCh = tex[tex.length - 1]
+          if (lastCh !== ' ' && lastCh !== '\t') {
+            out += placeholder(false, tex)
+            i = close + 1
+            continue
+          }
+        }
+      }
+      out += src[i]
+      i++
+      continue
+    }
+    out += src[i]
+    i++
+  }
+  return { text: out, segs }
+}
+
+/** 把占位符替换回 KaTeX 渲染出的 HTML（KaTeX 输出可信，无需再过 sanitize）。 */
+function restoreMath(html: string, segs: MathSeg[]): string {
+  if (!segs.length) return html
+  return html.replace(/%%KBX(\d+)%%/g, (m, idxStr) => {
+    const seg = segs[parseInt(idxStr, 10)]
+    if (!seg) return m
+    try {
+      return katex.renderToString(seg.tex, { throwOnError: false, displayMode: seg.display })
+    } catch {
+      return escHtml(seg.tex)
+    }
+  })
 }
 
 const ALLOWED_TAGS: Record<string, string[]> = {
   h1: ['align'],
+
   h2: ['align'],
   h3: ['align'],
   h4: ['align'],
@@ -203,21 +331,27 @@ function sanitizeTag(tag: string, isClose: boolean): string {
   return selfClose ? `<${name}${attrStr}/>` : `<${name}${attrStr}>`
 }
 
+/** 单次渲染：流式补丁 → 公式提取 → marked → 消毒 → 外链处理 → 公式还原 */
+function _renderOnce(src: string): string {
+  const patched = patchStreamingMarkdown(src)
+  const { text: withPh, segs } = extractMathSegments(patched)
+  const html = marked.parse(withPh, { async: false }) as string
+  return restoreMath(_autoOpenExternalInNewTab(sanitizeHtml(html)), segs)
+}
+
 /** Markdown → 安全 HTML。异常时返回转义后的原文，避免 v-html 出现裸内容。 */
 export function renderMarkdown(text: string | undefined | null): string {
   const src = (text || '').trim()
   if (!src) return ''
   try {
     // 流式时内容可能不完整，先做补丁修复
-    const patched = patchStreamingMarkdown(src)
-    const html = marked.parse(patched, { async: false }) as string
-    // marked 配置：autolink 自动把裸 URL 转成 <a>，breaks 已在 setOptions 中开启
-    return _autoOpenExternalInNewTab(sanitizeHtml(html))
+    return _renderOnce(src)
   } catch (e) {
     // 备用：尝试不带补丁直接解析
     try {
-      const html = marked.parse(src, { async: false }) as string
-      return _autoOpenExternalInNewTab(sanitizeHtml(html))
+      const { text: withPh, segs } = extractMathSegments(src)
+      const html = marked.parse(withPh, { async: false }) as string
+      return restoreMath(_autoOpenExternalInNewTab(sanitizeHtml(html)), segs)
     } catch {
       return escHtml(src).replace(/\n/g, '<br>')
     }
