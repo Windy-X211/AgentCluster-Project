@@ -620,6 +620,25 @@ function isPreviewImage(preview: string): boolean {
   return lower.startsWith('http') || lower.startsWith('data:image') || lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.gif') || lower.endsWith('.webp') || lower.endsWith('.svg')
 }
 
+// —— 发布者头像（GitHub 公开头像端点，无需鉴权）——
+const avatarFail = ref<Set<string>>(new Set())
+function authorName(author: string): string {
+  return String(author || '').trim().replace(/^@+/, '').replace(/\/.*$/, '')
+}
+function authorAvatarUrl(author: string): string {
+  const name = authorName(author)
+  if (auth.value?.logged_in && auth.value.avatar_url
+    && String(auth.value.username || '').toLowerCase() === name.toLowerCase()) {
+    return auth.value.avatar_url
+  }
+  return `https://github.com/${encodeURIComponent(name)}.png?size=40`
+}
+function markAvatarFail(author: string) {
+  const next = new Set(avatarFail.value)
+  next.add(authorName(author))
+  avatarFail.value = next
+}
+
 // —— 资源详情预览弹窗 ——
 const previewOpen = ref(false)
 const previewLoading = ref(false)
@@ -961,7 +980,8 @@ onBeforeUnmount(() => {
             </div>
             <div class="mc-foot">
               <span v-if="m.author" class="mc-author" :title="'发布者：' + m.author">
-                <span class="mc-author-avatar">👤</span>@{{ m.author }}
+                <img v-if="!avatarFail.has(authorName(m.author))" class="mc-author-avatar" :src="authorAvatarUrl(m.author)" alt="" @error="markAvatarFail(m.author)" />
+                <span v-else class="mc-author-avatar mc-author-fallback">👤</span>@{{ m.author }}
               </span>
               <div class="mc-actions">
                 <button class="act ghost" @click="openPreview(m)">预览</button>
@@ -1197,7 +1217,10 @@ onBeforeUnmount(() => {
             <template v-else-if="previewData">
               <div class="pv-header">
                 <span class="pv-kind">{{ KIND_ICON[previewData.preview.kind] || '📦' }} {{ kindLabel(previewData.preview.kind) }}</span>
-                <span v-if="previewData.item?.author" class="pv-author">@{{ previewData.item.author }}</span>
+                <span v-if="previewData.item?.author" class="pv-author">
+                  <img v-if="!avatarFail.has(authorName(previewData.item.author))" class="pv-author-avatar" :src="authorAvatarUrl(previewData.item.author)" alt="" @error="markAvatarFail(previewData.item.author)" />
+                  <span v-else class="pv-author-avatar pv-author-fallback">👤</span>@{{ previewData.item.author }}
+                </span>
                 <span v-if="previewData.item?.version" class="pv-version">v{{ previewData.item.version }}</span>
                 <span v-if="previewData.item?.updated_at" class="pv-updated">更新于 {{ previewData.item.updated_at.slice(0, 16).replace('T', ' ') }}</span>
               </div>
@@ -1597,7 +1620,10 @@ onBeforeUnmount(() => {
 }
 .mc-author:hover { opacity: .85; background: rgba(var(--surface-rgb), .09); }
 .mc-author-avatar {
-  width: 16px; height: 16px; border-radius: 50%;
+  width: 16px; height: 16px; border-radius: 50%; object-fit: cover; display: block;
+  filter: brightness(1.25) saturate(1.08);
+}
+span.mc-author-avatar {
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 10px; background: rgba(var(--accent-rgb, 120, 140, 255), .25);
 }
@@ -1615,7 +1641,9 @@ onBeforeUnmount(() => {
 .preview-modal { width: min(780px, 94vw); max-height: 86vh; }
 .pv-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-bottom: 10px; border-bottom: 1px solid rgba(var(--surface-rgb), .08); margin-bottom: 12px; }
 .pv-kind { font-size: 14px; font-weight: 600; }
-.pv-author { font-size: 12px; opacity: .6; padding: 2px 8px; border-radius: 8px; background: rgba(var(--surface-rgb), .05); }
+.pv-author { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; opacity: .6; padding: 2px 8px; border-radius: 8px; background: rgba(var(--surface-rgb), .05); }
+.pv-author-avatar { width: 16px; height: 16px; border-radius: 50%; object-fit: cover; display: block; filter: brightness(1.25) saturate(1.08); }
+span.pv-author-avatar { display: inline-flex; align-items: center; justify-content: center; font-size: 10px; background: rgba(var(--accent-rgb, 120, 140, 255), .25); }
 .pv-version { font-size: 11px; opacity: .45; padding: 2px 6px; border-radius: 6px; border: 1px solid rgba(var(--surface-rgb), .1); }
 .pv-updated { font-size: 11px; opacity: .4; margin-left: auto; }
 .pv-desc { font-size: 13px; opacity: .75; line-height: 1.6; padding: 0 2px 12px; border-bottom: 1px solid rgba(var(--surface-rgb), .05); margin-bottom: 12px; white-space: pre-wrap; }
