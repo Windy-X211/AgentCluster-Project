@@ -442,8 +442,8 @@ function createSplash() {
 
   // 图标路径（与原 launch_splash.py 一致）
   const iconPaths = [
-    path.join(ROOT, 'public', 'icon.png'),
     path.join(ROOT, 'public', 'icon.jpg'),
+
     path.join(PROJECT_ROOT, '1791461860623.webp.jpg'),
   ]
   let iconDataUrl = ''
@@ -592,10 +592,10 @@ async function createMainWindow() {
   if (IS_DEV) {
     await waitFrontendReady(DEV_URL)
   }
-  // 窗口图标：优先项目根的 agentcluster.ico（Windows 多分辨率最佳），再 fallback png
+  // 窗口图标：优先项目根的 agentcluster.ico（Windows 多分辨率最佳），再 fallback 新图标 icon.jpg
   const _winIconPath = fs.existsSync(path.join(PROJECT_ROOT, 'agentcluster.ico'))
     ? path.join(PROJECT_ROOT, 'agentcluster.ico')
-    : (fs.existsSync(path.join(ROOT, 'public', 'icon.png')) ? path.join(ROOT, 'public', 'icon.png') : undefined)
+    : (fs.existsSync(path.join(ROOT, 'public', 'icon.jpg')) ? path.join(ROOT, 'public', 'icon.jpg') : undefined)
 
   mainWindow = new BrowserWindow({
     width: 1280, height: 820,
@@ -889,9 +889,8 @@ function createTray() {
   // 图标：优先项目 agentcluster.ico（Windows 多分辨率最佳），否则 png fallback
   const iconPaths = [
     path.join(PROJECT_ROOT, 'agentcluster.ico'),
-    path.join(ROOT, 'public', 'icon.png'),
-    path.join(ROOT, 'dist', 'icon.png'),
     path.join(ROOT, 'public', 'icon.jpg'),
+
     path.join(PROJECT_ROOT, '1791461860623.webp.jpg'),
   ]
   let img = null

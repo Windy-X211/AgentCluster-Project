@@ -81,7 +81,7 @@
                     ]
                 }
             ],
-            "icon": "public/icon.png"
+            "icon": "../agentcluster.ico"
         },
         "nsis": {
             "oneClick": false,
