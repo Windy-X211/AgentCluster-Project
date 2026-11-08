@@ -12,11 +12,7 @@ export type ThemeId = typeof THEMES[number]
 export const THEME_DEFAULT: ThemeId = 'standard'
 
 // 界面字体候选（id 持久化；stack 为 CSS font-family 回退链，本机未安装的字体自动跳到下一项）
-// 「跟随系统」放在首位，即默认字体（FONT_FAMILY_DEFAULT 取首项）
 export const FONT_FAMILIES: { id: string; name: string; stack: string }[] = [
-  { id: 'system', name: '跟随系统', stack: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Segoe UI Variable Text", "PingFang SC", "Microsoft YaHei", sans-serif' },
-  { id: 'harmonyos-sans', name: 'HarmonyOS Sans', stack: '"HarmonyOS Sans SC", "HarmonyOS Sans", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif' },
-  { id: 'times-new-roman', name: 'Times New Roman', stack: '"Times New Roman", "Times", "PingFang SC", "Microsoft YaHei", serif' },
   { id: 'noto-sans-sc', name: '思源黑体 · Noto Sans SC', stack: '"Noto Sans SC", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif' },
   { id: 'noto-serif-sc', name: '思源宋体 · Noto Serif SC', stack: '"Noto Serif SC", "Source Han Serif SC", "SimSun", serif' },
   { id: 'dengxian', name: '等线 · DengXian', stack: '"DengXian", "等线", "Segoe UI", "Microsoft YaHei", sans-serif' },
@@ -24,6 +20,7 @@ export const FONT_FAMILIES: { id: string; name: string; stack: string }[] = [
   { id: 'stxihei', name: '华文细黑', stack: '"STXihei", "华文细黑", "Microsoft YaHei", sans-serif' },
   { id: 'kaiti', name: '楷体', stack: '"KaiTi", "楷体", "STKaiti", "华文楷体", serif' },
   { id: 'youyuan', name: '幼圆', stack: '"YouYuan", "幼圆", "Microsoft YaHei", sans-serif' },
+  { id: 'system', name: '跟随系统', stack: '-apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif' },
 ]
 export const FONT_FAMILY_DEFAULT: string = FONT_FAMILIES[0].id
 

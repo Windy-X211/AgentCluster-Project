@@ -5,7 +5,7 @@ import { useRoute } from 'vue-router'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
 import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
 import { renderChatMarkdown } from '@/utils/markdown'
-import { getAvatarGradient, getAvatarInitial, agentAvatarGradient } from '@/utils/avatar'
+import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
 import { api } from '@/api'
 import { API_BASE } from '@/utils/env'
 import FileViewer, { type ViewerFile } from './FileViewer.vue'
@@ -1299,26 +1299,6 @@ async function removeWdRecord(path: string) {
   await settings.removeWorkspaceRecord(path)
   wdHistory.value = wdHistory.value.filter(x => x !== path)
 }
-/** 全局默认工作区（设置中心 →「📁 默认工作区」配置） */
-const globalDefaultWd = computed(() => (settings.data?.default_workdir || '').trim() || '')
-/** 把某路径设为全局默认工作区 */
-async function setAsGlobalDefault(path: string) {
-  if (!path) return
-  try {
-    await settings.setDefaultWorkdir(path)
-    wdHistory.value = await settings.ensureWorkspaceHistory()
-  } catch (e: any) {
-    console.error('[RightPanel] 设置全局默认工作区失败:', e)
-  }
-}
-/** 清除全局默认工作区 */
-async function clearGlobalDefaultWd() {
-  try {
-    await settings.setDefaultWorkdir('')
-  } catch (e: any) {
-    console.error('[RightPanel] 清除全局默认工作区失败:', e)
-  }
-}
 /** 浏览…：系统文件夹选择框，选中即设置当前会话工作区并记录 */
 async function browseWdDir() {
   try {
@@ -1589,17 +1569,12 @@ const renderItems = computed(() => {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result' || m2.role === 'tool') { i++; continue }
       if (m2.role === 'a2a') {
-        // 只渲染"发给当前智能体"的信封（from !== cur）；自己发出的不渲染信封卡片。
-        // 显示在左/右侧由 sideOf（设置项）决定，与"是否渲染"无关。
-        const isOwn = cur != null && m2.envelope?.from?.agent_id === cur
-        if (cur == null || isOwn) {
-          i++
-        } else {
-          children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: sideOf(m2) })
-          i++
-        }
+        // 所有 a2a 信封统一渲染为 plain 子块（消息泡泡显示文字），不再有左右侧区分
+        children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: 'left' })
+        i++
       } else {
-        children.push({ kind: 'assistant', msg: m2, idx: i, side: sideOf(m2) })
+        // 所有 assistant 子块统一 side='left'，不再按 agent 归属分左右
+        children.push({ kind: 'assistant', msg: m2, idx: i, side: 'left' })
         i++
       }
     }
@@ -1611,17 +1586,8 @@ const renderItems = computed(() => {
       if (hasTool) out.push({ type: 'turn', start, end, children, side: 'left' })
       continue
     }
-    // 按左右侧切成连续段：同侧相邻子块归入同一段
-    let g = 0
-    while (g < children.length) {
-      const side = children[g].side
-      const segStart = g === 0 ? start : children[g].idx
-      let ge = g
-      while (ge + 1 < children.length && children[ge + 1].side === side && children[ge + 1].kind === children[g].kind) ge++
-      const segEnd = ge + 1 < children.length ? children[ge + 1].idx - 1 : end
-      out.push({ type: 'turn', start: segStart, end: segEnd, children: children.slice(g, ge + 1), side })
-      g = ge + 1
-    }
+    // 全部子块统一 side='left'，不再按左右侧切段
+    out.push({ type: 'turn', start, end, children, side: 'left' })
   }
   return out
 })
@@ -1972,20 +1938,20 @@ function turnAvatar(turn: any): string {
 
 function turnAvatarGradient(turn: any): string {
   const mode = settings.data.avatar_mode || 'differentiated'
-  const ch = turn?.children?.find((c: any) => c.kind === 'assistant')
-  const agentId = ch?.msg?.agent_id || turnName(turn) || '智能体'
-  // 用户在画布调色板里指定过的自定义色优先于「统一/差异化」两种全局风格
-  const agent = typeof agentId === 'number' ? agents.list.find((a: any) => a.id === agentId) : null
-  if (agent?.avatar_color) return agentAvatarGradient(agent, mode)
   if (mode === 'unified') {
     return 'linear-gradient(135deg, var(--accent), var(--accent-2))'
   }
+  const ch = turn?.children?.find((c: any) => c.kind === 'assistant')
+  const agentId = ch?.msg?.agent_id || turnName(turn) || '智能体'
   return getAvatarGradient(agentId)
 }
 
 function userAvatarGradient(): string {
-  // 用户头像统一走强调色（原为橙→粉渐变，是界面里最跳的一块颜色）
-  return 'linear-gradient(135deg, var(--accent), var(--accent-2))'
+  const mode = settings.data.avatar_mode || 'differentiated'
+  if (mode === 'unified') {
+    return 'linear-gradient(135deg, var(--accent), var(--accent-2))'
+  }
+  return 'linear-gradient(135deg, #f97316, #ec4899)'
 }
 /** 子块智能体名标签：仅当与"上一个 assistant 子块"的 agent 不同时返回名字（标注接力切换） */
 function childAgentLabel(child: any, turn: any): string {
@@ -3106,12 +3072,7 @@ const cvOverId = ref<number | null>(null)
 const cvOverPos = ref<'before' | 'after'>('before')
 function onCvDragStart(e: DragEvent, c: any) {
   cvDragId.value = c.id
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move'
-    e.dataTransfer.setData('text/plain', String(c.id))
-    // 自定义类型供 CanvasBoard 识别：把整张画布拖进当前画布，复用其中的智能体
-    e.dataTransfer.setData('canvas', String(c.id))
-  }
+  if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(c.id)) }
 }
 function onCvDragEnd() { cvDragId.value = null; cvOverId.value = null }
 function onCvDragOver(e: DragEvent, c: any) {
@@ -3169,17 +3130,9 @@ async function deleteSelected() {
   await convs.removeMany(selectedIds.value)
   exitSel()
 }
-function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx() }
+function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true }
 function onDocKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
-}
-// 点击对话区空白 → toggle 对话记录浮窗；点击消息气泡/按钮等有具体交互的元素则不触发
-function onChatBoxClick(e: MouseEvent) {
-  const t = e.target as HTMLElement | null
-  if (!t) return
-  // 如果点击了消息气泡本身、按钮、链接、输入框、textarea 等可交互元素，则不触发折叠
-  if (t.closest('.msg, button, a, input, textarea, select, label, .chat-attach, .chat-img-wrap, .viz-slot')) return
-  convsCollapsed.value = !convsCollapsed.value
+    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
 }
 
 /** 聊天消息内附件点击事件委托（冒泡到 document 处理，支持 v-html 渲染的附件卡片） */
@@ -3381,18 +3334,6 @@ onDeactivated(() => {
   window.removeEventListener('mousemove', onLbPanMove)
   window.removeEventListener('mouseup', onLbPanEnd)
   unmountAllVizSlots()
-  // —— KeepAlive 切走 Home 时，Teleport 到 body 的 modal/overlay 必须主动关闭 ——
-  // 否则会残留在后续路由页面上阻塞点击
-  lightboxOpen.value = false
-  lightboxSrc.value = null
-  ctxMenu.value = { show: false, x: 0, y: 0, id: null }
-  cvCtxMenu.value = { show: false, x: 0, y: 0, id: null }
-  agentDdOpen.value = false
-  modelDdOpen.value = false
-  reasoningDdOpen.value = false
-  wdDdOpen.value = false
-  fileOpsDlg.value.open = false
-  editDlg.value.open = false
 })
 onBeforeUnmount(() => {
   // 清理附件预览 URL
@@ -3405,21 +3346,21 @@ onBeforeUnmount(() => {
   <div class="right-panel glass">
     <!-- 画布列表 -->
     <div class="canvases-pane">
-      <div class="section-title clickable" @click="canvasesCollapsed = !canvasesCollapsed" :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
+      <div class="section-title">
         <button class="collapse-btn" type="button"
+                @click.stop="canvasesCollapsed = !canvasesCollapsed"
                 :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
           {{ canvasesCollapsed ? '▸' : '▾' }}
         </button>
         <span>画布列表</span>
         <span class="conv-count">{{ canvases.list.length }}</span>
         <span class="flex-spacer"></span>
-        <button class="btn sm add-canvas-btn" @click.stop="canvases.create()" title="新建画布">+</button>
+        <button class="btn sm add-canvas-btn" @click="canvases.create()" title="新建画布">+</button>
       </div>
       <div class="cv-list" v-show="!canvasesCollapsed">
         <div v-for="c in canvases.list" :key="c.id"
              :class="['cv-item', { active: canvas?.id === c.id, dragging: cvDragId === c.id, 'drop-before': cvOverId === c.id && cvOverPos === 'before' && cvDragId !== c.id, 'drop-after': cvOverId === c.id && cvOverPos === 'after' && cvDragId !== c.id }]"
              :draggable="renameId !== c.id"
-             :title="'拖动可排序；拖入画布中可复用其智能体 · ' + (c.nodes?.length || 0) + ' 个节点'"
              @dragstart="onCvDragStart($event, c)"
              @dragend="onCvDragEnd"
              @dragover="onCvDragOver($event, c)"
@@ -3600,7 +3541,7 @@ onBeforeUnmount(() => {
           </div>
           <!-- 查看文件操作历史（仅用户消息） -->
           <div v-if="msgCtxMenu.role === 'user'" class="msg-ctx-item" @click.stop="openFileOpsFromMsg">
-            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M3 7v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H10l-2-2H5a2 2 0 0 0-2 2z" fill="#fff" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 7a2 2 0 0 1 2-2h3l2 2H3z" fill="currentColor"/></svg></span>
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M3 7v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H10l-2-2H5a2 2 0 0 0-2 2z" fill="#fff" stroke="#2E7D8A" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 7a2 2 0 0 1 2-2h3l2 2H3z" fill="#8FC1C1"/></svg></span>
             <span>查看此消息后的文件操作历史</span>
           </div>
         </div>
@@ -3701,7 +3642,7 @@ onBeforeUnmount(() => {
       <Teleport to="body">
         <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
       </Teleport>
-      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll" @click="onChatBoxClick">
+      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll">
         <div v-if="!conv" class="no-conv">请新建对话</div>
         <!-- ============ 消息列表 ============
              tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
@@ -3829,8 +3770,7 @@ onBeforeUnmount(() => {
                         <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
                       </div>
                       <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full">
-                        <div class="think-full-text"
-                             style="display:block;width:100%;max-width:100%;box-sizing:border-box;overflow-wrap:anywhere!important;word-break:break-word!important;white-space:pre-wrap!important;">{{ stripContinueTag(ch.msg.reasoning) }}</div>
+                        <pre class="think-full-text">{{ stripContinueTag(ch.msg.reasoning) }}</pre>
                       </div>
 
                       <!-- 流式正文（仅流式中，带光标）—— 始终在过程框内流式显示 -->
@@ -4099,20 +4039,6 @@ onBeforeUnmount(() => {
                   <span class="dd-item-dot"></span>
                   <span class="wd-item-name">未设置（跟随画布/默认）</span>
                 </div>
-                <!-- 全局默认工作区（设置中心可配）：展示当前值，并可把当前会话工作区设为其默认 -->
-                <div v-if="globalDefaultWd" class="wd-sub">全局默认</div>
-                <div v-if="globalDefaultWd" class="wd-item" :title="globalDefaultWd">
-                  <span class="dd-item-dot"></span>
-                  <span class="wd-item-name">{{ wdBasename(globalDefaultWd) || globalDefaultWd }}</span>
-                  <button type="button" class="wd-del" title="清除全局默认工作区（设置中心 → 默认工作区）"
-                          @click.stop="clearGlobalDefaultWd">✕</button>
-                </div>
-                <div v-if="convWorkdir && convWorkdir !== globalDefaultWd" class="wd-item"
-                     title="把当前会话工作区设为全局默认（设置中心 → 默认工作区）"
-                     @click="setAsGlobalDefault(convWorkdir)">
-                  <span class="dd-item-dot"></span>
-                  <span class="wd-item-name">⭐ 设为全局默认</span>
-                </div>
                 <div class="wd-sub">记录过的工作区</div>
                 <div v-for="p in wdHistory" :key="p" class="wd-item" :class="{ active: convWorkdir === p }"
                      :title="p" @click="selectWorkdir(p)">
@@ -4194,12 +4120,10 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.right-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; min-width: 0; }
+.right-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
 .canvases-pane { padding: 4px 0; flex-shrink: 0; }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
-.section-title.clickable { cursor: pointer; border-radius: 6px; transition: background .15s; }
-.section-title.clickable:hover { background: rgba(var(--surface-rgb), 0.06); }
 .section-title .add-canvas-btn { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: calc(16px * var(--font-scale)); font-weight: 500; line-height: 1; color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.10); border: 1px solid rgba(var(--accent-rgb), 0.26); border-radius: 7px; cursor: pointer; transition: background .2s ease, border-color .2s ease, color .2s ease; }
 .section-title .add-canvas-btn:hover { background: rgba(var(--accent-rgb), 0.20); border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent-light); }
 .section-title .add-canvas-btn:active { background: rgba(var(--accent-rgb), 0.28); }
@@ -4224,7 +4148,7 @@ onBeforeUnmount(() => {
 .cv-rename { width: 100%; font-size: calc(12px * var(--font-scale)); padding: 2px 6px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.18); border: 1px solid rgba(var(--accent-rgb), 0.4); color: rgb(var(--text-rgb)); }
 .divider { height: 1px; flex-shrink: 0; background: rgba(var(--surface-rgb), 0.08); margin: 4px 10px; }
 
-.chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative; }
+.chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
 .chat-header { flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid rgba(var(--surface-rgb), 0.06); }
 /* 对话列表浮层：贴右侧面板左边缘，覆盖在画布区域上，不压缩对话区高度 */
 .conv-float {
@@ -4308,7 +4232,7 @@ onBeforeUnmount(() => {
 .conv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
 
-.chat-box { flex: 1; min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
+.chat-box { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
 .no-conv { text-align: center; opacity: .7; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
 /* ============ 消息容器 ============ */
@@ -4347,7 +4271,7 @@ onBeforeUnmount(() => {
   background: rgba(var(--accent2-rgb), 0.08);
   border: 1px solid rgba(var(--accent2-rgb), 0.22);
   font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.65);
-  max-width: 100%; min-width: 0; box-sizing: border-box;
+  max-width: 100%; min-width: 0;
 }
 .think-stream.clickable { cursor: pointer; transition: background .15s, border-color .15s; }
 .think-stream.clickable:hover { background: rgba(var(--accent2-rgb), 0.15); border-color: rgba(var(--accent2-rgb), 0.38); }
@@ -4355,7 +4279,7 @@ onBeforeUnmount(() => {
 .think-icon { flex-shrink: 0; font-size: calc(11px * var(--font-scale)); }
 .think-text {
   flex: 1; min-width: 0;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  overflow: hidden; white-space: nowrap;
   font-style: italic; letter-spacing: 0.2px;
 }
 .think-cursor {
@@ -4370,18 +4294,10 @@ onBeforeUnmount(() => {
   background: rgba(var(--accent2-rgb), 0.05);
   border: 1px solid rgba(var(--accent2-rgb), 0.16);
   border-radius: 7px;
-  width: 100%;
-  min-width: 0;
-  box-sizing: border-box;
 }
 .think-full-text {
-  display: block;
-  width: 100%;
-  box-sizing: border-box;
   margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-wrap: anywhere;
+  white-space: pre-wrap; word-break: break-word;
   font-size: calc(10.5px * var(--font-scale)); line-height: 1.5;
   color: rgba(var(--text-rgb), 0.72);
   font-family: Consolas, monospace;
@@ -4418,27 +4334,23 @@ onBeforeUnmount(() => {
   color: rgba(var(--text-rgb), 0.68);
 }
 
-/* 过程框本体：高度随内容自适应（封顶 260px 内部滚动），改用中性底 + 虚线边框与实底气泡区分，
-   不再用整块琥珀暖色（多一个色相就多一分花哨） */
+/* 过程框本体：高度随内容自适应（封顶 260px 内部滚动），琥珀暖色 + 虚线与冷色气泡明显区分 */
 .process-window {
   margin-top: 5px;
   max-height: 260px;
   width: 100%;
-  min-width: 0;
-  background: rgba(var(--surface-rgb), 0.05);
-  border: 1px dashed rgba(var(--surface-rgb), 0.28);
+  background: rgba(255, 184, 82, 0.09);
+  border: 1px dashed rgba(255, 184, 82, 0.45);
   border-radius: 6px;
-  overflow: visible;
-  overflow-y: hidden;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
 .process-body {
   flex: 1;
   min-height: 0;
-  min-width: 0;
-  box-sizing: border-box;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 8px 9px;
   display: flex;
   flex-direction: column;
@@ -4449,12 +4361,6 @@ onBeforeUnmount(() => {
      从底部"顶开"，表现为跟随时底部莫名出现空隙 */
   overflow-anchor: none;
 }
-/* 关键修复：防止 flex 子项在滚动容器内被压缩。
-   当 process-body 被父容器 max-height 限制时，flex 默认 flex-shrink:1 会把所有子元素
-   （bubble / think-stream / tool-row 等）的高度压缩到零，导致内容互相遮挡。
-   设置 flex-shrink:0 让子元素保持自然高度，超出部分由 overflow-y:auto 显示滚动条。 */
-.process-body > * { flex-shrink: 0; }
-
 .process-body::-webkit-scrollbar { width: 5px; }
 .process-body::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.28); border-radius: 999px; }
 .process-body::-webkit-scrollbar-track { background: transparent; }
@@ -4484,7 +4390,7 @@ onBeforeUnmount(() => {
 .avatar.user-avatar {
   width: var(--chat-avatar-size, 24px); height: var(--chat-avatar-size, 24px);
   border-radius: calc(var(--chat-avatar-size, 24px) * 0.29);
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  background: linear-gradient(135deg, #f97316, #ec4899);
   overflow: hidden;
 }
 .avatar .avatar-photo {
@@ -4518,9 +4424,9 @@ onBeforeUnmount(() => {
 
 /* 用户消息泡泡额外样式 */
 .bubble.user-bubble { color: rgba(var(--text-rgb), 0.95); }
-.bubble.user-bubble.markdown a { color: var(--accent-light); }
+.bubble.user-bubble.markdown a { color: #ffd088; }
 .bubble.user-bubble.markdown code { background: var(--code-tint-strong); color: var(--code-ink); }
-.bubble.user-bubble.markdown blockquote { background: rgba(var(--surface-rgb), 0.08); border-left-color: rgba(var(--accent-rgb), 0.45); }
+.bubble.user-bubble.markdown blockquote { background: rgba(var(--surface-rgb), 0.08); border-left-color: rgba(255,208,136,0.5); }
 
 /* 流式占位泡泡（只有光标闪烁） */
 .bubble.streaming-placeholder {
@@ -5023,7 +4929,7 @@ onBeforeUnmount(() => {
 .ak { color: var(--purple-ink); }
 .av { color: rgb(var(--text-rgb)); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tc-error { color: #ff9090; background: rgba(255,80,80,0.15); padding: 1px 6px; border-radius: 3px; font-size: calc(10px * var(--font-scale)); }
-.tr-body { font-family: Consolas, monospace; font-size: calc(11px * var(--font-scale)); background: rgba(var(--shadow-rgb), 0.12); padding: 6px 10px; border-radius: 6px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; color: rgba(var(--text-rgb), 0.85); }
+.tr-body { font-family: Consolas, monospace; font-size: calc(11px * var(--font-scale)); background: rgba(var(--shadow-rgb), 0.12); padding: 6px 10px; border-radius: 6px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; color: var(--green-ink); }
 
 /* —— 助手消息下的工具行 —— */
 .tool-row { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
@@ -5060,8 +4966,8 @@ onBeforeUnmount(() => {
 .tr-arg-streaming { display: inline-flex; align-items: center; gap: 5px; color: var(--accent-ink); font-size: calc(10px * var(--font-scale)); }
 .tr-arg-streaming-wrap { display: flex; flex-direction: column; gap: 2px; }
 .tr-streaming-args { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: calc(10px * var(--font-scale)); max-height: 180px; overflow-y: auto; color: rgb(var(--text-rgb)); opacity: .9; padding: 0 0 10px; }
-.tr-filename { color: rgba(var(--text-rgb), 0.75); font-size: calc(10px * var(--font-scale)); font-family: Consolas, monospace; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
-.tr-filename-mini { color: rgba(var(--text-rgb), 0.75); font-size: calc(9.5px * var(--font-scale)); font-family: Consolas, monospace; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+.tr-filename { color: var(--green-ink); font-size: calc(10px * var(--font-scale)); font-family: Consolas, monospace; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+.tr-filename-mini { color: var(--green-ink); font-size: calc(9.5px * var(--font-scale)); font-family: Consolas, monospace; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
 .tr-block-title { font-size: calc(9.5px * var(--font-scale)); opacity: .65; margin-bottom: 1px; font-family: Consolas, monospace; }
 .tr-block pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: calc(10px * var(--font-scale)); max-height: 180px; overflow-y: auto; }
 .ti-spinner { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid rgba(var(--accent-rgb), 0.25); border-top-color: var(--accent); animation: tiSpin .8s linear infinite; flex-shrink: 0; display: inline-block; }
@@ -5070,8 +4976,6 @@ onBeforeUnmount(() => {
    事件条目按类型着色（轮次灰 / 调用蓝 / 完成 绿红 / 提示黄） */
 .sub-proc-block { padding: 4px 7px; }
 .sub-proc { display: flex; flex-direction: column; gap: 2px; padding: 3px 5px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.12); border: 1px solid rgba(var(--surface-rgb), 0.06); font-size: calc(10px * var(--font-scale)); max-height: 220px; overflow-y: auto; }
-/* 同 .process-body：防止 flex 子项在 max-height 限制下被压缩 */
-.sub-proc > * { flex-shrink: 0; }
 .sp-item { display: flex; align-items: baseline; gap: 5px; line-height: 1.5; min-width: 0; flex-wrap: wrap; }
 .sp-round { color: rgba(var(--text-rgb), 0.62); font-size: calc(9px * var(--font-scale)); }
 .sp-txt { color: rgba(var(--text-rgb), 0.85); }
@@ -5095,7 +4999,7 @@ onBeforeUnmount(() => {
    点击后 abort 后端 fetch，send() 的 catch/finally 会补 "[已停止]" 并复位状态 */
 .send.stop-btn {
   padding: 0; width: 52px; min-width: 52px;
-  background: rgba(255, 90, 95, 0.55);
+  background: linear-gradient(135deg, rgba(255,90,110,0.55), rgba(255,60,80,0.55));
   border: 1px solid rgba(255,140,150,0.7);
   color: rgb(var(--text-rgb));
   animation: stopBtnPulse 1.4s ease-in-out infinite;
@@ -5141,10 +5045,6 @@ onBeforeUnmount(() => {
 </style>
 
 <style>
-/* —— 滚动容器内 flex 子项禁止压缩（防止 max-height 限制下 flex-shrink:1 把气泡/思考行压扁）—— */
-.process-body > * { flex-shrink: 0; }
-.sub-proc > * { flex-shrink: 0; }
-
 /* —— 泡泡内 Markdown（v-html 注入的元素无法被 scoped 命中，必须用全局样式）—— */
 .bubble.markdown { white-space: normal; word-break: break-word; overflow-wrap: anywhere; line-height: 1.6; }
 .bubble.markdown > :first-child { margin-top: 0 !important; }
@@ -5211,7 +5111,7 @@ onBeforeUnmount(() => {
   color: var(--purple-ink);
   background: rgba(var(--accent-rgb), 0.12);
 }
-.bubble.markdown a:active { color: var(--accent-light); }
+.bubble.markdown a:active { color: #ffb088; }
 /* 外链提示小箭头（通过 CSS ::after，避免污染 HTML） */
 .bubble.markdown a[href^="http"]::after {
   content: '↗';
@@ -5563,23 +5463,5 @@ onBeforeUnmount(() => {
 @keyframes lbFloatIn {
   from { opacity: 0; transform: scale(0.94); }
   to { opacity: 1; transform: scale(1); }
-}
-
-/* —— 修复思考框文字不完整：只对文字本身强制换行 + 容器锁宽度 —— */
-/* 关键策略：容器 overflow-x 保持 hidden（防止被长字符串撑爆），
-   文字用 overflow-wrap:anywhere 在任意位置断开换行 */
-.think-full-text {
-  display: block !important;
-  width: 100% !important;
-  max-width: 100% !important;
-  box-sizing: border-box !important;
-  white-space: pre-wrap !important;
-  word-break: break-word !important;
-  overflow-wrap: anywhere !important;
-}
-/* 容器链加 min-width:0 防止 flex/grid item 撑爆 */
-.think-full, .process-body, .process-window,
-.col-wrap, .msg.assistant, .chat-box, .chat-pane, .right-panel, .right {
-  min-width: 0 !important;
 }
 </style>

@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useAgentStore, useSettingsStore, useModelStore } from '@/stores'
-import { agentAvatarGradient } from '@/utils/avatar'
-import ColorSpectrumPopover from './ColorSpectrumPopover.vue'
 
 const props = defineProps<{ agent: any }>()
 const emit = defineEmits<{ close: [] }>()
@@ -20,8 +18,6 @@ function initForm(a: any) {
     workflow_mode: a?.workflow_mode || 'none',
     group_id: a?.group_id ?? null,
     reasoning_level: a?.reasoning_level || 'off',
-    // 头像自定义色：空串 = 跟随全局头像风格（默认）；#rrggbb = 指定色
-    avatar_color: a?.avatar_color || '',
   }
 }
 const form = ref<any>(initForm(props.agent))
@@ -46,34 +42,10 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape') return
   if (confirmClose.value) { confirmClose.value = false; return }
   if (pickerOpen.value) { closePicker(); return }
-  if (colorPickerOpen.value) { colorPickerOpen.value = false; return }
   requestClose()
 }
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
-
-// —— 头像配色（与画布调色板同一套色谱浮窗）——
-// 选中即写入表单，保存时随表单一起提交；「自动配色」→ 清空 = 跟随全局头像风格
-const colorPickerOpen = ref(false)
-const colorPickerPos = ref({ x: 0, y: 0 })
-const colorBtnEl = ref<HTMLElement | null>(null)
-// 头像预览：自定义色优先，否则按全局风格（与画布/列表/对话区显示一致）
-const avatarPreview = computed(() =>
-  agentAvatarGradient(
-    { id: form.value.id, avatar_color: form.value.avatar_color },
-    settings.data.avatar_mode || 'differentiated',
-  ),
-)
-function toggleColorPicker() {
-  if (colorPickerOpen.value) { colorPickerOpen.value = false; return }
-  const el = colorBtnEl.value
-  const r = el?.getBoundingClientRect()
-  colorPickerPos.value = { x: r ? r.left : 24, y: r ? r.bottom + 8 : 64 }
-  colorPickerOpen.value = true
-}
-function onColorChanged(hex: string) {
-  form.value.avatar_color = hex || ''
-}
 
 // 联动: 选中 interface_id 后，模型下拉自动填充该接口的 models
 const currentInterface = computed(() => models.list.find((m: any) => m.id === form.value.interface_id))
@@ -232,24 +204,8 @@ async function remove() {
         <div class="modal-title">{{ form.id ? '编辑智能体' : '新建智能体' }}</div>
         <button class="dlg-close" @click="requestClose" title="关闭">✕</button>
       </div>
-      <div class="modal-body">
       <div class="grid">
         <label>名称<input class="input" v-model="form.name" /></label>
-        <label class="avatar-color-label">头像颜色
-          <div class="avatar-color-row">
-            <span class="avatar-preview" :style="{ background: avatarPreview }">
-              {{ (form.name || '?').slice(0, 1).toUpperCase() }}
-            </span>
-            <button ref="colorBtnEl" class="btn sm ghost color-btn"
-                    :class="{ active: colorPickerOpen }"
-                    @click="toggleColorPicker"
-                    title="打开色谱浮窗选择头像颜色">
-              🎨 {{ form.avatar_color ? form.avatar_color.toUpperCase() : '默认配色' }}
-            </button>
-            <button v-if="form.avatar_color" class="btn sm ghost color-reset"
-                    @click="form.avatar_color = ''" title="清除自定义色，回到默认配色">↺</button>
-          </div>
-        </label>
         <label>描述<input class="input" v-model="form.description" /></label>
         <label>模型接口
           <select class="input" v-model="form.interface_id" @change="onInterfaceChange(form.interface_id)">
@@ -348,7 +304,6 @@ async function remove() {
 
         <button class="btn" @click="save">保存</button>
       </div>
-      </div><!-- /.modal-body -->
     </div>
     </div>
   </Teleport>
@@ -416,16 +371,6 @@ async function remove() {
       </div>
     </Teleport>
 
-  <!-- 头像配色色谱浮窗（与画布调色板同一个组件；Teleport 到 body 避免被弹窗裁剪） -->
-  <Teleport to="body">
-    <ColorSpectrumPopover
-      v-if="colorPickerOpen"
-      :pos="colorPickerPos"
-      :initial="form.avatar_color || null"
-      @change="onColorChanged"
-      @close="colorPickerOpen = false" />
-  </Teleport>
-
     <!-- 关闭确认（✕ / ESC 关闭时有未保存修改） -->
     <Teleport to="body">
       <div v-if="confirmClose" class="confirm-mask">
@@ -445,9 +390,8 @@ async function remove() {
 
 <style scoped>
 .modal-bg { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.5); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-.modal { width: 560px; max-height: 85vh; padding: 20px; display: flex; flex-direction: column; overflow: hidden; }
-.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; flex-shrink: 0; }
-.modal-body { overflow-y: auto; flex: 1; min-height: 0; }
+.modal { width: 560px; max-height: 85vh; overflow-y: auto; padding: 20px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; }
 .modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; }
 .dlg-close { width: 26px; height: 26px; border-radius: 6px; cursor: pointer; border: 1px solid rgba(var(--surface-rgb), 0.16); background: transparent; color: rgba(var(--text-rgb), 0.75); font-size: 13px; line-height: 1; flex-shrink: 0; transition: background .15s, color .15s; }
 .dlg-close:hover { background: rgba(232, 92, 92, 0.14); color: #e85c5c; }
@@ -459,22 +403,6 @@ async function remove() {
 }
 .ta { min-height: 80px; resize: vertical; }
 
-/* 头像颜色选择：预览 + 打开色谱浮窗的按钮 */
-.avatar-color-row { display: flex; align-items: center; gap: 8px; }
-.avatar-preview {
-  width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
-  display: flex; align-items: center; justify-content: center;
-  font-size: calc(12px * var(--font-scale)); font-weight: 600; color: #fff;
-  text-shadow: 0 1px 2px rgba(var(--shadow-rgb), 0.3);
-  box-shadow: inset 0 1px 1px rgba(255,255,255,0.4), 0 2px 6px rgba(var(--shadow-rgb), 0.35);
-}
-.color-btn {
-  font-family: Consolas, monospace; letter-spacing: .4px;
-  display: inline-flex; align-items: center; gap: 5px;
-}
-.color-btn.active { background: rgba(var(--accent-rgb), 0.22); border-color: rgba(var(--accent-rgb), 0.5); }
-.color-reset { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); }
-
 .cap-block { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(var(--surface-rgb), 0.06); }
 .cap-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .cap-title { font-size: calc(12px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px; color: rgba(var(--text-rgb), 0.6); font-weight: 500; }
@@ -485,10 +413,9 @@ async function remove() {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 10px 3px 10px; border-radius: 999px; font-size: calc(12px * var(--font-scale)); cursor: default;
   border: 1px solid rgba(var(--surface-rgb), 0.15);
-  /* 命令 / 技能 / 插件三类标签统一为强调色，不再用蓝、紫、绿三色区分 */
-  &.blue,
-  &.purple,
-  &.green  { background: rgba(var(--accent-rgb), 0.18); color: var(--accent-light); border-color: rgba(var(--accent-rgb), 0.3); }
+  &.blue   { background: rgba(var(--accent-rgb), 0.18);  color: var(--accent-ink); border-color: rgba(var(--accent-rgb), 0.3); }
+  &.purple { background: rgba(var(--accent2-rgb), 0.18); color: var(--purple-ink); border-color: rgba(var(--accent2-rgb), 0.3); }
+  &.green  { background: rgba(100,220,160,0.18); color: var(--green-ink); border-color: rgba(100,220,160,0.3); }
   .x { margin-left: 4px; opacity: .7; font-weight: bold; cursor: pointer; padding: 0 2px; &:hover { opacity: 1; } }
 }
 .hint-empty { font-size: calc(12px * var(--font-scale)); opacity: .45; padding: 4px 0; }

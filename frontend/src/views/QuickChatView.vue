@@ -122,7 +122,7 @@ window.addEventListener('beforeunload', () => {
   -webkit-app-region: drag;
 }
 .qc-logo { font-size: 14px; }
-.qc-title { font-size: 12.5px; color: rgba(var(--text-rgb), 0.65); letter-spacing: .5px; }
+.qc-title { font-size: 12.5px; color: #8b9bc0; letter-spacing: .5px; }
 .qc-close {
   margin-left: auto;
   -webkit-app-region: no-drag;

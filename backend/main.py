@@ -11,13 +11,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
 
 from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, ROOT
-from core import diagnostics
-from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions, market, debug_diag
-
-# —— 黑匣子：尽早装上（faulthandler 要赶在任何原生崩溃之前）
-# 原生崩溃栈 → backend/diag/faulthandler.log；事件循环卡死 → backend/diag/stall-*.log；
-# 慢请求 → slow.log；运行异常完整 traceback → run-errors.log。可用 AGENTCLUSTER_DIAG=off 关闭。
-diagnostics.install()
+from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions, market
 
 from datetime import datetime
 
@@ -164,13 +158,6 @@ def _install_thread_excepthook():
             traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
         except Exception:
             pass
-        # 黑匣子：同一份 traceback 也落盘（stdout 走 GBK 管道，中文会乱码且可能被截断）
-        try:
-            from core import diagnostics
-            if args.exc_value is not None:
-                diagnostics.log_exception(f"thread:{getattr(args.thread, 'name', '?')}", args.exc_value)
-        except Exception:
-            pass
     threading.excepthook = _hook
 
 
@@ -201,12 +188,6 @@ async def lifespan(app: FastAPI):
     from core import mainloop
     mainloop.set(asyncio.get_running_loop())
     _install_loop_exception_handler(asyncio.get_running_loop())
-    # —— 黑匣子：登记事件循环 + 起心跳（看门狗据心跳判断"事件循环是否被卡死"）
-    try:
-        diagnostics.attach_loop(asyncio.get_running_loop())
-        diagnostics.start_heartbeat()
-    except Exception as e:
-        print(f"[main] WARN 诊断心跳启动失败（不阻断启动）：{e}", flush=True)
     try:
         _ensure_orchestrator()
     except Exception as e:
@@ -310,8 +291,6 @@ class JsonGzipMiddleware:
 app = FastAPI(title="AgentCluster", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(JsonGzipMiddleware, minimum_size=2048)
-# 最外层：慢请求计时（旁路，只写 diag/slow.log，不影响响应）
-app.add_middleware(diagnostics.SlowRequestMiddleware)
 
 ROUTES = [
     ("agents", agents.router),
@@ -328,7 +307,6 @@ ROUTES = [
     ("backgrounds", backgrounds.router),
     ("extensions", extensions.router),
     ("market", market.router),
-    ("debug", debug_diag.router),
 ]
 for name, r in ROUTES:
     app.include_router(r, prefix=f"/api/{name}", tags=[name])

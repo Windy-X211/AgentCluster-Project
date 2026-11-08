@@ -23,7 +23,7 @@ from core.store import load, save, upsert, upsert_async, get_by, next_id
 import core.store as store  # 运行时访问 store.ROOT（可变，set_root() 会修改）
 from core import run_registry  # 运行期共享会话对象（并发按智能体运行的落库一致性）
 from core.llm import chat_with_failover as chat, ModelDegenerateError, ModelRepetitionError, _encode_tool_name
-from core.commands import run_command, filter_tools, COMMAND_META, WORKDIR_CTX, get_default_workdir
+from core.commands import run_command, filter_tools, COMMAND_META, WORKDIR_CTX
 from core.smart_search import SMART_SEARCH_CTX
 from core.subagent import SUBAGENT_CTX
 from core.a2a import (
@@ -522,72 +522,6 @@ def _truncate_history_content(content: str | None, max_chars: int = HISTORY_MSG_
     return content[:max_chars] + f"...[历史消息截断，原始 {len(content)} 字符]"
 
 
-# —— tool_calls 参数回灌给 LLM 时的裁剪 ——
-# 场景：智能体用 file.write 写了一份几十万字的长文，tool_call.arguments 里带着
-# 完整文件内容。它会被原样落库，并在**之后每一轮**都作为 assistant.tool_calls
-# 回灌给模型 —— 一份 90KB 的文件 = 每轮白白烧掉 90K token，上下文迅速爆掉，
-# 上游直接返回 400，整轮失败。
-#
-# 处理：只裁剪「发给 LLM 的那份副本」里的超长字符串值（保留键结构与短值，
-# 让模型仍知道写过什么、写到哪里）；落库与前端展示的那份保持完整。
-TOOL_ARGS_LLM_MAX_CHARS = 2000   # 单个字符串值回灌给 LLM 的上限
-
-
-def _trim_tool_call_arguments(arguments: Any) -> Any:
-    """裁剪单个 tool_call 的 arguments（发给 LLM 的副本）。
-
-    arguments 是 JSON 字符串；逐个把超长的字符串值截断，保留 JSON 结构合法。
-    非字符串 / 解析失败时原样返回（宁可原样也不要把非法 JSON 传给上游）。
-    """
-    if not isinstance(arguments, str) or len(arguments) <= TOOL_ARGS_LLM_MAX_CHARS:
-        return arguments
-    try:
-        parsed = json.loads(arguments)
-    except Exception:
-        return arguments
-
-    def _shrink(v: Any) -> Any:
-        if isinstance(v, str):
-            if len(v) > TOOL_ARGS_LLM_MAX_CHARS:
-                return v[:TOOL_ARGS_LLM_MAX_CHARS] + f"...[参数截断，原始 {len(v)} 字符]"
-            return v
-        if isinstance(v, list):
-            return [_shrink(x) for x in v]
-        if isinstance(v, dict):
-            return {k: _shrink(x) for k, x in v.items()}
-        return v
-
-    try:
-        trimmed = json.dumps(_shrink(parsed), ensure_ascii=False)
-    except Exception:
-        return arguments
-    # 裁剪后仍超长（例如超大数组）→ 再整体兜底截断
-    if len(trimmed) > TOOL_ARGS_LLM_MAX_CHARS * 4:
-        trimmed = trimmed[:TOOL_ARGS_LLM_MAX_CHARS * 4] + "...[参数整体截断]"
-    return trimmed
-
-
-def _trim_tool_calls_for_llm(tool_calls: Any) -> Any:
-    """裁剪 tool_calls 列表里每个调用的超长 arguments（发给 LLM 的副本）。"""
-    if not isinstance(tool_calls, list):
-        return tool_calls
-    out = []
-    for tc in tool_calls:
-        if not isinstance(tc, dict):
-            out.append(tc)
-            continue
-        fn = tc.get("function")
-        if not isinstance(fn, dict) or "arguments" not in fn:
-            out.append(tc)
-            continue
-        new_args = _trim_tool_call_arguments(fn.get("arguments"))
-        if new_args is fn.get("arguments"):
-            out.append(tc)
-        else:
-            out.append({**tc, "function": {**fn, "arguments": new_args}})
-    return out
-
-
 def _sanitize_tool_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """清洗 LLM 生成的 tool 参数。
 
@@ -652,8 +586,7 @@ def _history_llm_entry(m, mode: str, speaker_names: dict) -> dict | None:
     初始组装与运行中压缩重建共用同一转换，保证两条路径产出的 LLM 历史完全一致：
     - <continue> 标记剥离 + 超长内容截断
     - linked 集群模式给 assistant 消息标注发言者（智能体分得清谁说了什么）
-    - 保留 tool_calls / tool_call_id（工具配对历史完整回灌）
-    - tool_calls 的超长参数只在此处裁剪（发给 LLM 的副本），落库/前端那份保持完整"""
+    - 保留 tool_calls / tool_call_id（工具配对历史完整回灌）"""
     if not isinstance(m, dict):
         return None
     if m.get("role") == "a2a":
@@ -667,7 +600,7 @@ def _history_llm_entry(m, mode: str, speaker_names: dict) -> dict | None:
         if name:
             content = f"[{name}] {content}"
     entry = {"role": _m_role, "content": content}
-    if m.get("tool_calls"): entry["tool_calls"] = _trim_tool_calls_for_llm(m["tool_calls"])
+    if m.get("tool_calls"): entry["tool_calls"] = m["tool_calls"]
     if m.get("tool_call_id"): entry["tool_call_id"] = m["tool_call_id"]
     return entry
 
@@ -874,7 +807,7 @@ def _rules_for_agent(agent_id, canvas_id=None) -> list[str]:
     return out
 
 
-def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_id=None, canvas: dict | None = None, wd_probe=None, wd_default=None) -> str:
+def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_id=None, canvas: dict | None = None, wd_probe=None) -> str:
     parts = [agent.get("system_prompt") or "你是一个有用的智能体。"]
     agent_name = agent.get("name", "智能体")
     if agent_name: parts.append(f"\n你的名字: {agent_name}")
@@ -903,7 +836,7 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
             + probe_note
         )
     else:
-        # 无画布 workdir 的兜底提示（独立对话模式）
+        # 无 workdir 的兜底提示（独立对话模式）
         probe_note = ""
         if wd_probe:
             ok, note = wd_probe
@@ -911,28 +844,14 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
                 probe_note = "\n- ✅ 系统探测到一个默认工作区可用。"
             else:
                 probe_note = f"\n- ❌ 默认工作区写权限探测失败：{note}"
-        if wd_default:
-            # 设置中心配置了「默认工作区」→ 明确告诉智能体产出应落在哪
-            parts.append(
-                f"\n## 默认工作区（硬性约束，必须遵守）\n"
-                f"当前会话与画布都没有单独绑定工作区，系统为你启用了设置中心配置的**默认工作区**：`{wd_default}`\n"
-                f"- 所有 file.read / file.write / file.structure / cmd.run 都以它为基准解析相对路径；\n"
-                f"- 保存文件**一律用相对路径**，例如 file.write(path='report.md', content='...') "
-                f"会写入 `{wd_default}\\report.md`；\n"
-                f"- ⚠️ **禁止写入 backend/、frontend/、AppData/、node_modules/ 等系统目录**——"
-                f"即使你手搓了绝对路径也会污染项目；\n"
-                f"- 所有产出集中在 `{wd_default}` 方便用户统一查看。"
-                + probe_note
-            )
-        else:
-            parts.append(
-                "\n## 文件输出规则（硬性约束）\n"
-                "- 禁止写入 backend/、frontend/、AppData/ 等系统目录——"
-                "这些是项目源码和数据库，不能被产出物污染；\n"
-                "- 若需要保存文件，请先用绝对路径指定一个清晰的用户目录，"
-                "或等待画布绑定工作区后再使用相对路径。"
-                + probe_note
-            )
+        parts.append(
+            "\n## 文件输出规则（硬性约束）\n"
+            "- 禁止写入 backend/、frontend/、AppData/ 等系统目录——"
+            "这些是项目源码和数据库，不能被产出物污染；\n"
+            "- 若需要保存文件，请先用绝对路径指定一个清晰的用户目录，"
+            "或等待画布绑定工作区后再使用相对路径。"
+            + probe_note
+        )
     # 规章制度（画布顶部「📋 规章制度」维护；按当前画布隔离，默认全员，可限定智能体）
     rules = _rules_for_agent(agent.get("id"), canvas_id)
     if rules:
@@ -1037,18 +956,16 @@ def _execute_tool(name: str, arguments: dict,
 
     conv_id / tool_call_id / agent_id 可选：传入时在执行前注入 commands.BACKUP_CTX，
     让 file.* 写/删命令自动做快照备份。"""
+    import re
 
     def _fix_bare_identifiers(raw: str) -> str:
         """把 JSON 里的裸标识符值修复成字符串。
         例：{"to_agent": 总经理, "x": 123} → {"to_agent": "总经理", "x": 123}
-
-        实现说明：这里复用 core.tool_stream_validator 的线性扫描实现，
-        不再自带正则副本。旧正则的键侧 "(?:[^\"\\\\]|\\\\.)*" 含嵌套量词，
-        在长正文参数上会灾难性回溯（12KB 实测 323ms，141KB 要 36 秒），
-        足以卡死事件循环 → 表现为「写长文件时后端 failed」。
+        策略：匹配 "key": 后面紧跟的、非引号非数字非 true/false/null 的标识符，加引号。
         """
-        from core.tool_stream_validator import fix_bare_identifiers as _linear_fix
-        return _linear_fix(raw)
+        # 匹配模式：冒号 + 可选空格 + (非引号/非数字开头/非 null/true/false) + 逗号或 }
+        pattern = r'''("(?:[^"\\]|\\.)*"\s*:\s*)(?!")(?![0-9{\[]|null|true|false\b)([\u4e00-\u9fff\w]+)'''
+        return re.sub(pattern, r'\1"\2"', raw)
 
     # 注入备份上下文（如果三个都有）
     backup_token = None
@@ -1516,13 +1433,8 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
     _stop_event = threading.Event()
     _stop_token = set_stop_event(_stop_event)
 
-    # —— 注入 WORKDIR_CTX：优先级「会话/画布 workdir」>「全局默认工作区(settings.default_workdir)」 ——
+    # —— 注入 WORKDIR_CTX：画布有 workdir 则优先使用，否则让 commands.py 回落到 settings.default_workdir ——
     _workdir = (canvas or {}).get("workdir") if canvas else None
-    _wd_is_default = False
-    if not _workdir:
-        # 会话级与画布级都没设工作区 → 回落到设置中心配置的「默认工作区」
-        _workdir = get_default_workdir()
-        _wd_is_default = bool(_workdir)
     _wd_probe = None  # (ok: bool, note: str)
     _wd_token = None
     if _workdir:
@@ -1562,8 +1474,6 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
 
     # 把 probe 结果传递给 _system_prompt（通过 turn 共享上下文，不污染 canvas/store）
     turn["_wd_probe"] = _wd_probe
-    # 生效的工作区来自全局默认（而非画布/会话显式设置）→ 告知智能体，供 prompt 措辞区分
-    turn["_wd_default"] = _workdir if (_wd_is_default and _workdir) else None
 
     # —— 并行模式下的模型分配：每个 agent 占用一个不同的模型槽 ——
     cur_task = asyncio.current_task()
@@ -1659,8 +1569,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     if mode == "linked" and canvas:
         cluster_context, speaker_names = _build_cluster_context(canvas, agent)
     _wd_probe = turn.get("_wd_probe") if turn else None
-    _wd_default = turn.get("_wd_default") if turn else None
-    system_prompt_base = _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe, _wd_default)
+    system_prompt_base = _system_prompt(agent, tools, cluster_context, canvas.get("id") if canvas else None, canvas, _wd_probe)
     # 保存不带工作流 preamble 的核心 prompt（每轮刷新 preamble 时复用）
     _system_prompt_core = system_prompt_base
     # —— 历史上下文压缩：达到压缩线（模型窗口×阈值）时，先把较早历史压成摘要再组装 ——

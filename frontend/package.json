@@ -18,7 +18,6 @@
         "@aiden0z/pptx-renderer": "^1.3.0",
         "@vueuse/core": "^10.11",
         "fflate": "^0.8.3",
-        "katex": "^0.19.1",
         "marked": "^18.0.14",
         "pinia": "^2.1",
         "vue": "^3.4",
@@ -81,7 +80,7 @@
                     ]
                 }
             ],
-            "icon": "../agentcluster.ico"
+            "icon": "public/icon.png"
         },
         "nsis": {
             "oneClick": false,

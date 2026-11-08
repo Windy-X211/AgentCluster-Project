@@ -303,13 +303,6 @@ async def _pump(session: RunSession, conv_id: int, agent: dict, content: str, mo
     except Exception as e:
         import traceback
         print(f"[run_registry] pump FATAL for conv {conv_id}: {e}\n{traceback.format_exc()}", flush=True)
-        # 黑匣子：完整 traceback 落盘（stdout 进的是 GBK 管道，中文会乱码且会被截断）
-        try:
-            from core import diagnostics
-            diagnostics.log_run_exception(conv_id, getattr(session, "agent_id", None), e,
-                                          extra=f"正在运行的内容(前 200 字): {str(content)[:200]}")
-        except Exception:
-            pass
         err_text = str(e).replace("\n", "\\n").replace("\r", "\\r")
         session.push(f"E:后端崩溃：{err_text}\n")
     finally:

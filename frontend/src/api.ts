@@ -103,7 +103,6 @@ export const api = {
     list: () => req<any[]>('/agents'),
     create: (d: any) => req('/agents', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
-    setAvatarColor: (id: number, color: string) => req(`/agents/${id}/avatar-color`, { method: 'PUT', body: JSON.stringify({ color }) }),
     remove: (id: number) => req(`/agents/${id}`, { method: 'DELETE' }),
     reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
@@ -112,10 +111,6 @@ export const api = {
     create: (d: any) => req('/agent_groups', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agent_groups/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/agent_groups/${id}`, { method: 'DELETE' }),
-    // 清空分组：保留组，组内智能体移回「全部」
-    clear: (id: number) => req(`/agent_groups/${id}/clear`, { method: 'POST' }),
-    // 删除组和智能体：组与组内智能体一并彻底删除（含画布节点/连线清理）
-    purge: (id: number) => req(`/agent_groups/${id}/purge`, { method: 'DELETE' }),
     reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
   canvases: {
@@ -285,13 +280,7 @@ export const api = {
   },
   settings: {
     get: () => req<any>('/settings'),
-    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) }),
-    /** 设置全局默认工作区（空串=清除）；后端会归一化为绝对路径并自动创建目录 */
-    setDefaultWorkdir: (path: string) =>
-      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir', { method: 'PUT', body: JSON.stringify({ default_workdir: path }) }),
-    /** 读取默认工作区及其目录存在状态（设置页回显用） */
-    getDefaultWorkdir: () =>
-      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir'),
+    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) })
   },
   backgrounds: {
     list: () => req<any[]>('/backgrounds'),
