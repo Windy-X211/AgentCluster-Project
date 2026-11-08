@@ -416,6 +416,7 @@ def _parse_canvas(path: Path) -> dict:
     agent_groups = raw.get("agent_groups") or []
     return {
         "execution_mode": raw.get("execution_mode", "serial"),
+        "edge_shape": raw.get("edge_shape"),
         "agent_count": len(agents),
         "node_count": len(nodes),
         "edge_count": len(edges),
@@ -448,6 +449,7 @@ def _parse_canvas(path: Path) -> dict:
             for e in edges
         ],
         "nodes_raw": nodes,
+        "edges_raw": edges,
     }
 
 

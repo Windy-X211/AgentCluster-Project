@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount, onDeactivated } from 'vue'
 import { useCanvasStore, useAgentStore, useConvStore, useSettingsStore } from '@/stores'
 import { api } from '@/api'
 import { toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, type ToolCallPhase } from '@/stores/conversation'
@@ -45,7 +45,8 @@ const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5, ZOOM_STEP = 1.25
 
 // —— 画布坐标基础类型 / 连线形状 / 控制点 ——
 type Pt = { x: number; y: number }
-type EdgeShape = 'curve' | 'straight'
+/** curve=平滑曲线 | straight=斜线直连 | ortho=直角折线（L 形，整条线只有一个 90° 折角） */
+type EdgeShape = 'curve' | 'straight' | 'ortho'
 type EdgeHandle = { kind: 'point' | 'insert'; index: number; x: number; y: number }
 
 // 节点拖动（group 非空时表示 Ctrl 整体拖动）
@@ -1017,7 +1018,7 @@ function snapshotCanvas(): CanvasSnapshot {
   return {
     nodes: JSON.parse(JSON.stringify(nodes.value || [])),
     edges: JSON.parse(JSON.stringify(edges.value || [])),
-    edge_shape: canvas.value?.edge_shape === 'straight' ? 'straight' : 'curve',
+    edge_shape: defaultEdgeShape(),
   }
 }
 function pushSnapshot(snap: CanvasSnapshot) {
@@ -1070,14 +1071,17 @@ function endLink(e: MouseEvent, toNodeId: number | null) {
   if (linking.value && toNodeId != null && linking.value.from !== toNodeId && canvas.value) {
     const nextId = Math.max(0, ...edges.value.map((n: any) => n.id)) + 1
     pushHistory()
-    canvas.value.edges.push({
+    const edge = {
       id: nextId,
       from_node: linking.value.from,
       to_node: toNodeId,
       type: 'chat',
-      shape: canvas.value.edge_shape === 'straight' ? 'straight' : 'curve',
+      shape: defaultEdgeShape(),
       waypoints: [],
-    })
+    }
+    canvas.value.edges.push(edge)
+    // 默认形状为 ortho 时注入默认拐点
+    if (edge.shape === 'ortho') injectDefaultOrthoWaypoint(edge)
     canvases.saveCurrent()
   }
   linking.value = null
@@ -1280,9 +1284,9 @@ function importCanvasPart(src: any, drop: Pt) {
     const destFrom = nodeById.value.get(from)
     const ddx = srcFrom && destFrom ? destFrom.x - srcFrom.x : tx
     const ddy = srcFrom && destFrom ? destFrom.y - srcFrom.y : ty
-    const shape: EdgeShape = e.shape === 'straight' || e.shape === 'curve'
+    const shape: EdgeShape = e.shape === 'curve' || e.shape === 'straight' || e.shape === 'ortho'
       ? e.shape
-      : (src.edge_shape === 'straight' ? 'straight' : 'curve')
+      : (src.edge_shape === 'ortho' || src.edge_shape === 'straight' ? src.edge_shape : 'curve')
     canvas.value.edges.push({
       id: nextEdgeId++,
       from_node: from,
@@ -1522,7 +1526,7 @@ async function commitNewCanvas() {
   const payload = pendingCanvasPayload.value
   pendingCanvasPayload.value = null
   newCanvasDialog.value = false
-  const edgeShape: EdgeShape = canvas.value?.edge_shape === 'straight' ? 'straight' : 'curve'
+  const edgeShape: EdgeShape = defaultEdgeShape()
   await canvases.create({ name, edge_shape: edgeShape, ...(payload || {}) })
   if (payload) showToast(`已用 ${payload.nodes.length} 个智能体创建画布「${name}」`)
 }
@@ -1683,7 +1687,19 @@ function smoothPath(pts: { x: number; y: number }[]) {
 }
 
 function offsetEdgePath(p0: any, c1: any, c2: any, p3: any, dist: number) {
-  const pts: { x: number; y: number }[] = []
+  return smoothPath(offsetCubicSamples(p0, c1, c2, p3, dist))
+}
+
+/** 单条三次贝塞尔的均匀采样点（用于命中检测与路径中点） */
+function cubicSamples(p0: Pt, c1: Pt, c2: Pt, p3: Pt, n = 48): Pt[] {
+  const out: Pt[] = []
+  for (let i = 0; i <= n; i++) out.push(cubicAt(p0, c1, c2, p3, i / n))
+  return out
+}
+
+/** 沿贝塞尔法线等距偏移后的采样点（双向连线用，保证两条线处处平行） */
+function offsetCubicSamples(p0: any, c1: any, c2: any, p3: any, dist: number): Pt[] {
+  const pts: Pt[] = []
   for (let i = 0; i <= EDGE_SAMPLES; i++) {
     const t = i / EDGE_SAMPLES
     const B = cubicAt(p0, c1, c2, p3, t)
@@ -1691,13 +1707,24 @@ function offsetEdgePath(p0: any, c1: any, c2: any, p3: any, dist: number) {
     const len = Math.hypot(T.x, T.y) || 1
     pts.push({ x: B.x - (T.y / len) * dist, y: B.y + (T.x / len) * dist })
   }
-  return smoothPath(pts)
+  return pts
 }
 
-// —— 连线曲直 / 控制点 ——
+// —— 连线形状 / 控制点 ——
+/** 画布默认形状；旧数据或未知值一律回落为曲线 */
+function defaultEdgeShape(): EdgeShape {
+  const s = canvas.value?.edge_shape
+  return s === 'straight' || s === 'ortho' ? s : 'curve'
+}
 function edgeShapeOf(e: any): EdgeShape {
-  if (e?.shape === 'curve' || e?.shape === 'straight') return e.shape
-  return canvas.value?.edge_shape === 'straight' ? 'straight' : 'curve'
+  const s = e?.shape
+  if (s === 'curve' || s === 'straight' || s === 'ortho') return s
+  return defaultEdgeShape()
+}
+/** 双向连线且两端共线时：按端点 id 稳定分配相反的边缘偏移，两条直线不会叠在一起 */
+function orthoBias(e: any): number {
+  if (!hasReverseEdge(e)) return 0
+  return e.from_node < e.to_node ? BIDIR_OFFSET : -BIDIR_OFFSET
 }
 function sanitizeWaypoints(raw: any): Pt[] {
   if (!Array.isArray(raw)) return []
@@ -1723,23 +1750,124 @@ function linePath(pts: Pt[]): string {
   return d
 }
 
+// —— 直角折线（L 形）：全水平/垂直段，整条线只有一个 90° 折角 ——
+const ORTHO_COLINEAR_EPS = 1 // 两节点中心在该轴上几乎对齐 → 退化为一条直线（0 折角）
+
+/** 去掉连续重合点（共线或退化段会产生） */
+function dedupePts(pts: Pt[]): Pt[] {
+  const out: Pt[] = []
+  for (const p of pts) {
+    const last = out[out.length - 1]
+    if (last && Math.abs(last.x - p.x) < 0.01 && Math.abs(last.y - p.y) < 0.01) continue
+    out.push(p)
+  }
+  return out
+}
+
+/** L 形：p → 拐角 → q，只拐一次。
+ *  horizontalFirst=true 先水平后垂直（拐角 = (q.x, p.y)）；false 先垂直后水平（拐角 = (p.x, q.y)）。
+ *  p、q 共线时拐角与端点重合，dedupe 后自然退化成一条直线。 */
+function lShape(p: Pt, q: Pt, horizontalFirst: boolean): Pt[] {
+  const corner = horizontalFirst ? { x: q.x, y: p.y } : { x: p.x, y: q.y }
+  return dedupePts([p, corner, q])
+}
+
+/** 折线专用锚点：起点与终点各取「相邻的两条边」，让 L 形两段都沿节点边缘法线正出正入。
+ *  · 水平距离为主 → 源节点左右侧出、目标节点上下侧入（先水平后垂直）
+ *  · 垂直距离为主 → 源节点上下侧出、目标节点左右侧入（先垂直后水平）
+ *  · 两中心水平/垂直共线 → 两端取同一对侧边，直接一条直线（无折角）
+ *  bias：双向且共线时沿边缘法线错开，避免两条线重叠；非共线时两个方向的 L 形天然分离。 */
+function orthoAnchors(a: any, b: any, bias: number) {
+  const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
+  const bcx = b.x + NODE_W / 2, bcy = b.y + NODE_H / 2
+  const dx = bcx - acx, dy = bcy - acy
+  const sx = Math.sign(dx) || 1, sy = Math.sign(dy) || 1
+
+  if (Math.abs(dy) < ORTHO_COLINEAR_EPS) {
+    return {
+      p1: { x: sx > 0 ? a.x + NODE_W : a.x, y: acy + bias },
+      p2: { x: sx > 0 ? b.x : b.x + NODE_W, y: bcy + bias },
+      horizontalFirst: true,
+    }
+  }
+  if (Math.abs(dx) < ORTHO_COLINEAR_EPS) {
+    return {
+      p1: { x: acx + bias, y: sy > 0 ? a.y + NODE_H : a.y },
+      p2: { x: bcx + bias, y: sy > 0 ? b.y : b.y + NODE_H },
+      horizontalFirst: false,
+    }
+  }
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return {
+      p1: { x: sx > 0 ? a.x + NODE_W : a.x, y: acy },
+      p2: { x: bcx, y: sy > 0 ? b.y : b.y + NODE_H },
+      horizontalFirst: true,
+    }
+  }
+  return {
+    p1: { x: acx, y: sy > 0 ? a.y + NODE_H : a.y },
+    p2: { x: sx > 0 ? b.x : b.x + NODE_W, y: bcy },
+    horizontalFirst: false,
+  }
+}
+
+/** 按「路径长度」取折线中点，并给出该点所在线段方向角（直角折线下恒为 0/90/180/270） */
+function polylineMid(pts: Pt[]): Pt & { angle: number } {
+  if (pts.length < 2) return { x: pts[0]?.x ?? 0, y: pts[0]?.y ?? 0, angle: 0 }
+  const lens: number[] = []
+  let total = 0
+  for (let i = 0; i < pts.length - 1; i++) {
+    const l = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y)
+    lens.push(l); total += l
+  }
+  if (total < 0.001) return { x: pts[0].x, y: pts[0].y, angle: 0 }
+  let acc = 0
+  const half = total / 2
+  for (let i = 0; i < lens.length; i++) {
+    if (acc + lens[i] >= half || i === lens.length - 1) {
+      const t = lens[i] > 0 ? (half - acc) / lens[i] : 0
+      const p = pts[i], q = pts[i + 1]
+      return {
+        x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t,
+        angle: Math.atan2(q.y - p.y, q.x - p.x) * 180 / Math.PI,
+      }
+    }
+    acc += lens[i]
+  }
+  const p = pts[pts.length - 2], q = pts[pts.length - 1]
+  return { x: q.x, y: q.y, angle: Math.atan2(q.y - p.y, q.x - p.x) * 180 / Math.PI }
+}
+
 /** Catmull-Rom → 三次 Bézier：曲线严格穿过每个控制点（区别于采样平滑用的 smoothPath） */
+function smoothControls(pts: Pt[], i: number) {
+  const p1 = pts[i], p2 = pts[i + 1]
+  const p0 = pts[i - 1] || p1, p3 = pts[i + 2] || p2
+  return {
+    c1: { x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6 },
+    c2: { x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6 },
+  }
+}
 function smoothThrough(pts: Pt[]): string {
   if (!pts.length) return ''
   if (pts.length === 2) return linePath(pts)
   let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`
   for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[i - 1] || pts[i]
-    const p1 = pts[i]
-    const p2 = pts[i + 1]
-    const p3 = pts[i + 2] || p2
-    const c1x = p1.x + (p2.x - p0.x) / 6
-    const c1y = p1.y + (p2.y - p0.y) / 6
-    const c2x = p2.x - (p3.x - p1.x) / 6
-    const c2y = p2.y - (p3.y - p1.y) / 6
-    d += ` C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`
+    const { c1, c2 } = smoothControls(pts, i)
+    d += ` C ${c1.x.toFixed(1)} ${c1.y.toFixed(1)}, ${c2.x.toFixed(1)} ${c2.y.toFixed(1)}, ${pts[i + 1].x.toFixed(1)} ${pts[i + 1].y.toFixed(1)}`
   }
   return d
+}
+
+/** 把控制点序列按 Catmull-Rom 采样成折线，供「是否穿过节点」判定与路径中点共用 */
+function smoothSamples(pts: Pt[], perSeg = 14): Pt[] {
+  if (pts.length < 2) return pts.slice()
+  if (pts.length === 2) return [pts[0], pts[1]]
+  const out: Pt[] = [pts[0]]
+  for (let i = 0; i < pts.length - 1; i++) {
+    const { c1, c2 } = smoothControls(pts, i)
+    for (let k = 1; k <= perSeg; k++) out.push(cubicAt(pts[i], c1, c2, pts[i + 1], k / perSeg))
+  }
+  return out
 }
 
 /** 第 i 段（pts[i] → pts[i+1]）的中点；smooth=按 Catmull-Rom 曲线取真实中点 */
@@ -1754,6 +1882,249 @@ function segmentMidpoint(pts: Pt[], i: number, smooth: boolean): Pt {
   return cubicAt(p1, c1, c2, p2, 0.5)
 }
 
+// —— 连线避让：曲线 / 直角折线尽量绕开其他智能体节点（斜线直连保持原样，不参与避让） ——
+type Rect = { l: number; t: number; r: number; b: number }
+const AVOID_PAD = 10     // 其它节点外扩，保证绕行后仍留出视觉间隙
+const AVOID_INSET = 6    // 起止节点内缩：贴着边缘不算穿体，切进内部才算
+const AVOID_GAP = 16     // 绕行路径与挡路节点边缘的额外间距
+const AVOID_SAMPLES = 14 // 每段曲线的采样数（命中判定与取中点共用）
+
+/** 参与避让的矩形：其它节点外扩留白，起止节点内缩 */
+function avoidRects(fromNode: any, toNode?: any): Rect[] {
+  const out: Rect[] = []
+  const fid = fromNode?.id, tid = toNode?.id
+  for (const n of nodes.value) {
+    if (n.id === fid || n.id === tid) {
+      out.push({
+        l: n.x + AVOID_INSET, t: n.y + AVOID_INSET,
+        r: n.x + NODE_W - AVOID_INSET, b: n.y + NODE_H - AVOID_INSET,
+      })
+    } else {
+      out.push({
+        l: n.x - AVOID_PAD, t: n.y - AVOID_PAD,
+        r: n.x + NODE_W + AVOID_PAD, b: n.y + NODE_H + AVOID_PAD,
+      })
+    }
+  }
+  return out
+}
+
+/** 线段落在矩形内的长度（Liang–Barsky 裁剪），0 表示不相交 */
+function segRectLen(p: Pt, q: Pt, r: Rect): number {
+  const dx = q.x - p.x, dy = q.y - p.y
+  const len = Math.hypot(dx, dy)
+  if (len < 1e-6) return 0
+  const P = [-dx, dx, -dy, dy]
+  const Q = [p.x - r.l, r.r - p.x, p.y - r.t, r.b - p.y]
+  let u1 = 0, u2 = 1
+  for (let i = 0; i < 4; i++) {
+    if (Math.abs(P[i]) < 1e-9) { if (Q[i] < 0) return 0; continue }
+    const t = Q[i] / P[i]
+    if (P[i] < 0) u1 = Math.max(u1, t)
+    else u2 = Math.min(u2, t)
+    if (u1 > u2) return 0
+  }
+  return Math.max(0, u2 - u1) * len
+}
+
+/** 折线穿过节点的程度：被穿过的节点个数 + 累计穿越长度（判定与候选评分共用） */
+function routeHits(pts: Pt[], rects: Rect[]) {
+  const hit = new Set<number>()
+  let len = 0
+  for (let i = 0; i < pts.length - 1; i++) {
+    for (let j = 0; j < rects.length; j++) {
+      const l = segRectLen(pts[i], pts[i + 1], rects[j])
+      if (l > 0.5) { hit.add(j); len += l }
+    }
+  }
+  return { n: hit.size, len }
+}
+function polylineLen(pts: Pt[]): number {
+  let s = 0
+  for (let i = 1; i < pts.length; i++) s += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
+  return s
+}
+
+/**
+ * 曲线绕行：每个原始段插入两个「抬升」控制点，沿该段法线把曲线推到挡路节点之外。
+ * 返回的控制点序列恒为 [p0, a, b, p1, ...]，即每个原始段对应 3 个渲染段，
+ * 因此插入控制点的柄可以按「原始段序号」精确映射到渲染曲线上。
+ */
+function detourCurve(pts: Pt[], rects: Rect[], sidePref: 1 | -1) {
+  let best: { pts: Pt[]; score: number } | null = null
+  for (const side of [sidePref, -sidePref] as (1 | -1)[]) {
+    for (const gain of [1, 1.4, 2, 3]) {
+      const built: Pt[] = [pts[0]]
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p = pts[i], q = pts[i + 1]
+        const dx = q.x - p.x, dy = q.y - p.y
+        const len = Math.hypot(dx, dy) || 1
+        const nx = -dy / len * side, ny = dx / len * side
+        // 挡路矩形：弦本身穿过，或落在弦附近（曲线过冲也可能擦到）
+        let need = 0
+        for (const r of rects) {
+          const rr = { l: r.l - 24, t: r.t - 24, r: r.r + 24, b: r.b + 24 }
+          if (segRectLen(p, q, rr) <= 0) continue
+          const proj = [
+            { x: rr.l, y: rr.t }, { x: rr.r, y: rr.t },
+            { x: rr.l, y: rr.b }, { x: rr.r, y: rr.b },
+          ].map(c => (c.x - p.x) * -dy / len + (c.y - p.y) * dx / len)
+          const lo = Math.min(...proj), hi = Math.max(...proj)
+          need = Math.max(need, side > 0 ? hi + AVOID_GAP : -lo + AVOID_GAP)
+        }
+        const k = need * gain
+        built.push(
+          { x: p.x + dx * 0.28 + nx * k, y: p.y + dy * 0.28 + ny * k },
+          { x: p.x + dx * 0.72 + nx * k, y: p.y + dy * 0.72 + ny * k },
+          q,
+        )
+      }
+      const samples = smoothSamples(built, AVOID_SAMPLES)
+      const h = routeHits(samples, rects)
+      const score = h.n * 10000 + h.len * 5 + (gain - 1) * 80 + (side === sidePref ? 0 : 120)
+      if (!best || score < best.score) best = { pts: built, score }
+    }
+  }
+  const chosen = best!
+  const samples = smoothSamples(chosen.pts, AVOID_SAMPLES)
+  // 每个原始段的插入柄：取该段在渲染曲线上的弧长中点
+  const mids: Pt[] = []
+  for (let i = 0; i < pts.length - 1; i++) {
+    const s = 1 + 3 * i * AVOID_SAMPLES
+    const t = Math.min(1 + 3 * (i + 1) * AVOID_SAMPLES, samples.length - 1)
+    const m = polylineMid(samples.slice(s, t + 1))
+    mids.push({ x: m.x, y: m.y })
+  }
+  return { pts: chosen.pts, d: smoothThrough(chosen.pts), samples, mids }
+}
+
+/** 直角折线候选评分：穿过节点的次数/长度权重最高，其次才是路径长度与偏离默认朝向 */
+function orthoScore(pts: Pt[], rects: Rect[], pen: number): number {
+  const h = routeHits(pts, rects)
+  return h.n * 1000 + h.len * 2 + pen + polylineLen(pts) * 0.02
+}
+
+/** 锚点可变坐标候选：默认居中 + 贴边 + 挡路节点边缘的外侧，限制在节点边长内 */
+function anchorCandidates(lo: number, hi: number, center: number, blockers: Rect[], axis: 'x' | 'y'): number[] {
+  const vals = [center, lo, hi, center - (hi - lo) * 0.35, center + (hi - lo) * 0.35]
+  for (const r of blockers) {
+    const u = axis === 'y' ? r.t : r.l, v = axis === 'y' ? r.b : r.r
+    vals.push(u - AVOID_GAP, v + AVOID_GAP)
+  }
+  const out: number[] = []
+  for (const t of vals) {
+    const c = Math.max(lo, Math.min(hi, t))
+    if (!out.some(x => Math.abs(x - c) < 3)) out.push(c)
+  }
+  return out.slice(0, 6)
+}
+
+/**
+ * 直角折线避让：在「整条线只有一个折角」的约束下，从多种朝向与锚点位置里挑最少穿节点的一条。
+ * 水平主导走「源左右侧出 + 目标上下侧入」，垂直主导走「源上下侧出 + 目标左右侧入」，
+ * 非默认朝向与逆着目标方向出/入都会加罚分，保证无障碍时保持原样。
+ */
+function detourOrtho(a: any, b: any, bias: number, rects: Rect[], fallback: Pt[]): Pt[] {
+  const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
+  const bcx = b.x + NODE_W / 2, bcy = b.y + NODE_H / 2
+  const dx = bcx - acx, dy = bcy - acy
+  const sx = Math.sign(dx) || 1, sy = Math.sign(dy) || 1
+  const M = 10 // 锚点离节点角的最小距离
+  const defaultH = Math.abs(dx) >= Math.abs(dy)
+  const colinearH = Math.abs(dy) < ORTHO_COLINEAR_EPS
+  const colinearV = Math.abs(dx) < ORTHO_COLINEAR_EPS
+  // 候选坐标只从「默认路径实际穿过的矩形」推导，控制搜索规模
+  const blockers = rects.filter(r => routeHits(fallback, [r]).n > 0)
+  const aY = anchorCandidates(a.y + M, a.y + NODE_H - M, acy + (colinearH ? bias : 0), blockers, 'y')
+  const aX = anchorCandidates(a.x + M, a.x + NODE_W - M, acx + (colinearV ? bias : 0), blockers, 'x')
+  const bY = anchorCandidates(b.y + M, b.y + NODE_H - M, bcy + (colinearH ? bias : 0), blockers, 'y')
+  const bX = anchorCandidates(b.x + M, b.x + NODE_W - M, bcx + (colinearV ? bias : 0), blockers, 'x')
+
+  let best = fallback, bestScore = orthoScore(fallback, rects, 0)
+  const consider = (p1: Pt, p2: Pt, hFirst: boolean, pen: number) => {
+    const pts = lShape(p1, p2, hFirst)
+    const score = orthoScore(pts, rects, pen)
+    if (score < bestScore) { bestScore = score; best = pts }
+  }
+
+  // 共线：保持 0 折角的直线，只在节点边缘内沿法线平移找空档
+  if (colinearH || colinearV) {
+    if (colinearH) {
+      for (const y1 of aY) {
+        consider(
+          { x: sx > 0 ? a.x + NODE_W : a.x, y: y1 },
+          { x: sx > 0 ? b.x : b.x + NODE_W, y: y1 + (bcy - acy) },
+          true,
+          Math.abs(y1 - acy - bias) * 0.15,
+        )
+      }
+    } else {
+      for (const x1 of aX) {
+        consider(
+          { x: x1, y: sy > 0 ? a.y + NODE_H : a.y },
+          { x: x1 + (bcx - acx), y: sy > 0 ? b.y : b.y + NODE_H },
+          false,
+          Math.abs(x1 - acx - bias) * 0.15,
+        )
+      }
+    }
+    return best
+  }
+
+  // 非共线：两种「先横后竖 / 先竖后横」× 四种出边 × 四种入边，再叠加锚点位置
+  for (const hFirst of [defaultH, !defaultH]) {
+    const srcSides = hFirst ? ['r', 'l'] : ['b', 't']
+    const dstSides = hFirst ? ['t', 'b'] : ['l', 'r']
+    for (const src of srcSides) for (const dst of dstSides) {
+      const srcNat = hFirst ? src === (sx > 0 ? 'r' : 'l') : src === (sy > 0 ? 'b' : 't')
+      const dstNat = hFirst ? dst === (sy > 0 ? 't' : 'b') : dst === (sx > 0 ? 'l' : 'r')
+      const pen = (srcNat ? 0 : 350) + (dstNat ? 0 : 350) + (hFirst === defaultH ? 0 : 20)
+      const sv = hFirst ? aY : aX, dv = hFirst ? bX : bY
+      const sc = hFirst ? acy : acx, dc = hFirst ? bcx : bcy
+      for (const s of sv) for (const d of dv) {
+        const p1: Pt = hFirst
+          ? { x: src === 'r' ? a.x + NODE_W : a.x, y: s }
+          : { x: s, y: src === 'b' ? a.y + NODE_H : a.y }
+        const p2: Pt = hFirst
+          ? { x: d, y: dst === 't' ? b.y : b.y + NODE_H }
+          : { x: dst === 'r' ? b.x + NODE_W : b.x, y: d }
+        consider(p1, p2, hFirst, pen + Math.abs(s - sc) * 0.15 + Math.abs(d - dc) * 0.15)
+      }
+    }
+  }
+  return best
+}
+
+/** 带手动控制点的直角折线：逐段在两个 L 形朝向里挑更不穿节点的那个，仍保持每段一个折角 */
+function orthoRouteAvoid(p1: Pt, p2: Pt, horizontalFirst: boolean, wps: Pt[], rects: Rect[]) {
+  const raw = [p1, ...wps, p2]
+  const pts: Pt[] = [p1]
+  const insertHandles: EdgeHandle[] = []
+  for (let i = 0; i < raw.length - 1; i++) {
+    const A = lShape(raw[i], raw[i + 1], horizontalFirst)
+    const B = lShape(raw[i], raw[i + 1], !horizontalFirst)
+    // 相等时（含无障碍）保留默认朝向，保证外观稳定
+    const seg = orthoScore(A, rects, 0) <= orthoScore(B, rects, 1) ? A : B
+    const m = polylineMid(seg)
+    insertHandles.push({ kind: 'insert', index: i, x: m.x, y: m.y })
+    for (const p of seg.slice(1)) pts.push(p)
+  }
+  return { pts: dedupePts(pts), insertHandles }
+}
+
+/** 计算 ortho 折线的默认拐点位置：取自动生成的 L 形路径的折角点 */
+function defaultOrthoWaypoint(a: any, b: any, bias: number, rects: Rect[]): Pt | null {
+  const oa = orthoAnchors(a, b, bias)
+  let pts = lShape(oa.p1, oa.p2, oa.horizontalFirst)
+  if (routeHits(pts, rects).n > 0) {
+    pts = detourOrtho(a, b, bias, rects, pts)
+  }
+  // pts 形如 [p1, corner, p2]，取中间那个点作为默认拐点
+  if (pts.length >= 3) return pts[1]
+  // 退化（共线）时没有拐点，返回 null
+  return null
+}
+
 function computeEdge(e: any) {
   const a = nodeById.value.get(e.from_node)
   const b = nodeById.value.get(e.to_node)
@@ -1762,8 +2133,10 @@ function computeEdge(e: any) {
   const shape = edgeShapeOf(e)
   const wps = sanitizeWaypoints(e.waypoints)
   const rev = hasReverseEdge(e)
+  // 斜线直连不参与避让；曲线 / 直角折线尽量绕开其他智能体节点
+  const rects = shape === 'straight' ? [] : avoidRects(a, b)
 
-  // 1) 自动曲线（无控制点）：沿用原三次曲线 + 双向避让 + 中点插入控制点
+  // 1) 自动曲线（无控制点）：沿用原三次曲线 + 双向避让；穿过节点时改为绕行
   if (shape === 'curve' && wps.length === 0) {
     let c1 = { ...p1 }, c2 = { ...p2 }
     if (horizontal) {
@@ -1775,22 +2148,71 @@ function computeEdge(e: any) {
       c1 = { x: p1.x, y: my }
       c2 = { x: p2.x, y: my }
     }
-    // 双向两条线：沿曲线法线做等距偏移（采样+平滑）→ 两条线处处平行、垂直间距恒定
-    const d = rev
-      ? offsetEdgePath(p1, c1, c2, p2, BIDIR_OFFSET)
-      : `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`
-    const mid = cubicAt(p1, c1, c2, p2, 0.5)
-    const tang = cubicTangentAt(p1, c1, c2, p2, 0.5)
-    const tlen = Math.hypot(tang.x, tang.y) || 1
-    const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
-    const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
-    const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: midX, y: midY }]
-    return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
+    const check = rev ? offsetCubicSamples(p1, c1, c2, p2, BIDIR_OFFSET) : cubicSamples(p1, c1, c2, p2)
+    const baseHits = routeHits(check, rects)
+    // 穿过节点 → 沿法线绕行。绕行方向取同侧（反向线的法线相反，天然落到遮挡另一侧）。
+    // 只有确实比原路径更干净时才改走绕行，避免绕行反而更糟。
+    const det = baseHits.n > 0 ? detourCurve([p1, p2], rects, 1) : null
+    const detScore = det ? routeHits(det.samples, rects).n * 10000 + routeHits(det.samples, rects).len * 5 : Infinity
+    const baseScore = baseHits.n * 10000 + baseHits.len * 5
+    if (!det || detScore >= baseScore) {
+      // 双向两条线：沿曲线法线做等距偏移（采样+平滑）→ 两条线处处平行、垂直间距恒定
+      const d = rev
+        ? offsetEdgePath(p1, c1, c2, p2, BIDIR_OFFSET)
+        : `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`
+      const mid = cubicAt(p1, c1, c2, p2, 0.5)
+      const tang = cubicTangentAt(p1, c1, c2, p2, 0.5)
+      const tlen = Math.hypot(tang.x, tang.y) || 1
+      const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
+      const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
+      const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: midX, y: midY }]
+      return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
+    }
+    const mid = polylineMid(det.samples)
+    return {
+      d: det.d, midX: mid.x, midY: mid.y, midAngle: mid.angle,
+      handles: [{ kind: 'insert', index: 0, x: mid.x, y: mid.y }],
+    }
   }
 
-  // 2) 直线 / 含控制点的曲线
+  // 2) 直角折线（L 形）：waypoints 就是拐点，默认一个拐点，可继续添加
+  if (shape === 'ortho') {
+    const bias = orthoBias(e)
+    const oa = orthoAnchors(a, b, bias)
+    // 没有 waypoints 时注入一个默认拐点（仅用于渲染，不持久化到 edge）
+    let effectiveWps = wps
+    if (wps.length === 0) {
+      const def = defaultOrthoWaypoint(a, b, bias, rects)
+      if (def) effectiveWps = [def]
+    }
+    const r = orthoRouteAvoid(oa.p1, oa.p2, oa.horizontalFirst, effectiveWps, rects)
+    const pts = r.pts
+    const mid = polylineMid(pts)
+    const handles: EdgeHandle[] = []
+    effectiveWps.forEach((p, i) => handles.push({ kind: 'point', index: i, x: p.x, y: p.y }))
+    handles.push(...r.insertHandles)
+    return { d: linePath(pts), midX: mid.x, midY: mid.y, midAngle: mid.angle, handles }
+  }
+
+  // 3) 直线 / 含控制点的曲线
   const pts: Pt[] = [p1, ...wps, p2]
   const smooth = shape === 'curve'
+  if (smooth) {
+    const base = smoothSamples(pts, AVOID_SAMPLES)
+    const baseHits = routeHits(base, rects)
+    // 穿过节点 → 在各段间插入绕行控制点；手动控制点仍被曲线严格穿过
+    if (baseHits.n > 0) {
+      const det = detourCurve(pts, rects, 1)
+      const detHits = routeHits(det.samples, rects)
+      if (detHits.n * 10000 + detHits.len * 5 < baseHits.n * 10000 + baseHits.len * 5) {
+        const mid = polylineMid(det.samples)
+        const handles: EdgeHandle[] = []
+        wps.forEach((p, i) => handles.push({ kind: 'point', index: i, x: p.x, y: p.y }))
+        det.mids.forEach((m, i) => handles.push({ kind: 'insert', index: i, x: m.x, y: m.y }))
+        return { d: det.d, midX: mid.x, midY: mid.y, midAngle: mid.angle, handles }
+      }
+    }
+  }
   const d = smooth ? smoothThrough(pts) : linePath(pts)
   const handles: EdgeHandle[] = []
   wps.forEach((p, i) => handles.push({ kind: 'point', index: i, x: p.x, y: p.y }))
@@ -1817,7 +2239,7 @@ function computeEdge(e: any) {
 
 const edgeGeoms = computed(() => edges.value.map((e: any) => {
   const g = computeEdge(e)
-  return { e, g, color: g ? edgeSourceColor(e) : 'var(--accent)' }
+  return { e, g, color: g ? edgeSourceColor(e) : 'var(--accent)', ortho: edgeShapeOf(e) === 'ortho' }
 }))
 
 // —— 连线控制点交互 ——
@@ -1828,15 +2250,36 @@ function startEdgeHandleDrag(e: MouseEvent, edge: any, h: EdgeHandle) {
   if (e.button !== 0) return
   e.stopPropagation(); e.preventDefault()
   const wps = ensureWaypoints(edge)
-  if (h.kind === 'insert') {
-    // 插入控制点本身就是一次修改，先入栈再 splice
-    pushHistory()
-    wps.splice(h.index, 0, { x: h.x, y: h.y })
-    edgeDrag.value = { edge, index: h.index }
+  // ortho 模式下默认拐点可能还未持久化：拖动前先注入
+  if (edgeShapeOf(edge) === 'ortho') {
+    if (h.kind === 'point' && h.index >= wps.length) {
+      const a = nodeById.value.get(edge.from_node)
+      const b = nodeById.value.get(edge.to_node)
+      const bias = orthoBias(edge)
+      const rects = avoidRects(a, b)
+      const def = defaultOrthoWaypoint(a, b, bias, rects)
+      if (def) {
+        pushHistory()
+        wps.push(def)
+      }
+    }
+    if (h.kind === 'insert') {
+      pushHistory()
+      wps.splice(h.index, 0, { x: h.x, y: h.y })
+      edgeDrag.value = { edge, index: h.index }
+    } else {
+      pendingEdgeSnapshot = snapshotCanvas()
+      edgeDrag.value = { edge, index: h.index }
+    }
   } else {
-    // 已有控制点：第一次真正移动时才入栈，单击不产生空步骤
-    pendingEdgeSnapshot = snapshotCanvas()
-    edgeDrag.value = { edge, index: h.index }
+    if (h.kind === 'insert') {
+      pushHistory()
+      wps.splice(h.index, 0, { x: h.x, y: h.y })
+      edgeDrag.value = { edge, index: h.index }
+    } else {
+      pendingEdgeSnapshot = snapshotCanvas()
+      edgeDrag.value = { edge, index: h.index }
+    }
   }
   closeMenus()
 }
@@ -1862,20 +2305,49 @@ function removeWaypoint(edge: any, index: number) {
   edgeDrag.value = null
   canvases.saveCurrent()
 }
+/** 为 ortho 连线注入默认拐点（替换原有 waypoints） */
+function injectDefaultOrthoWaypoint(edge: any): boolean {
+  const a = nodeById.value.get(edge.from_node)
+  const b = nodeById.value.get(edge.to_node)
+  if (!a || !b) { edge.waypoints = []; return false }
+  const bias = orthoBias(edge)
+  const rects = avoidRects(a, b)
+  const def = defaultOrthoWaypoint(a, b, bias, rects)
+  const wps = ensureWaypoints(edge)
+  wps.length = 0
+  if (def) { wps.push(def); return true }
+  return false
+}
 function setEdgeShape(edge: any, shape: EdgeShape) {
+  const changed = edgeShapeOf(edge) !== shape
   pushHistory()
   edge.shape = shape
+  if (changed && shape === 'ortho') {
+    injectDefaultOrthoWaypoint(edge)
+  }
   canvases.saveCurrent()
   closeMenus()
+  showToast(`连线已设为${shapeLabel(shape)}`)
+}
+function shapeLabel(shape: EdgeShape): string {
+  return shape === 'ortho' ? '直角折线' : shape === 'straight' ? '斜线直连' : '平滑曲线'
 }
 function setAllEdgeShapes(shape: EdgeShape) {
   if (!canvas.value) return
+  const changed = defaultEdgeShape() !== shape
+  let injected = 0
   pushHistory()
-  for (const e of (canvas.value.edges || [])) e.shape = shape
+  for (const e of (canvas.value.edges || [])) {
+    e.shape = shape
+    if (changed && shape === 'ortho') {
+      injectDefaultOrthoWaypoint(e)
+      injected++
+    }
+  }
   canvas.value.edge_shape = shape
   canvases.saveCurrent()
   closeMenus()
-  showToast(`已把全部连线设为${shape === 'straight' ? '直线' : '曲线'}`)
+  showToast(`已把全部连线设为${shapeLabel(shape)}${injected ? `（注入 ${injected} 条线的默认拐点）` : ''}`)
 }
 function addEdgeWaypoint(edge: any) {
   const g = edgeGeoms.value.find((x: any) => x.e.id === edge.id)?.g
@@ -1884,6 +2356,10 @@ function addEdgeWaypoint(edge: any) {
   const h = inserts[Math.floor(inserts.length / 2)]
   if (!h) return
   pushHistory()
+  // ortho 模式下先确保默认拐点已持久化
+  if (edgeShapeOf(edge) === 'ortho' && !hasWaypoints(edge)) {
+    injectDefaultOrthoWaypoint(edge)
+  }
   ensureWaypoints(edge).splice(h.index, 0, { x: h.x, y: h.y })
   canvases.saveCurrent()
   closeMenus()
@@ -1919,10 +2395,24 @@ function tempPath() {
   }
   const x2 = linking.value.mouseX, y2 = linking.value.mouseY
   const mx = (p1.x + x2) / 2, my = (p1.y + y2) / 2
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return `M ${p1.x} ${p1.y} C ${mx} ${p1.y}, ${mx} ${y2}, ${x2} ${y2}`
+  // 拖拽预览跟随画布默认形状，所见即所得
+  const shape = defaultEdgeShape()
+  const rects = shape === 'straight' ? [] : avoidRects(a)
+  const q = { x: x2, y: y2 }
+  if (shape === 'ortho') {
+    const A = lShape(p1, q, Math.abs(dx) >= Math.abs(dy))
+    const B = lShape(p1, q, Math.abs(dx) < Math.abs(dy))
+    return linePath(orthoScore(A, rects, 0) <= orthoScore(B, rects, 1) ? A : B)
   }
-  return `M ${p1.x} ${p1.y} C ${p1.x} ${my}, ${x2} ${my}, ${x2} ${y2}`
+  if (shape === 'straight') return linePath([p1, q])
+  const c1 = Math.abs(dx) >= Math.abs(dy) ? { x: mx, y: p1.y } : { x: p1.x, y: my }
+  const c2 = Math.abs(dx) >= Math.abs(dy) ? { x: mx, y: y2 } : { x: x2, y: my }
+  const d = `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${x2} ${y2}`
+  const baseHits = routeHits(cubicSamples(p1, c1, c2, q, 32), rects)
+  if (baseHits.n === 0) return d
+  const det = detourCurve([p1, q], rects, 1)
+  const detHits = routeHits(det.samples, rects)
+  return detHits.n * 10000 + detHits.len * 5 < baseHits.n * 10000 + baseHits.len * 5 ? det.d : d
 }
 
 // 视图适配：缩放+平移视图，使画布上的所有节点都完整可见（并居中）
@@ -2002,6 +2492,22 @@ onBeforeUnmount(() => {
   if (viewSyncRaf) { cancelAnimationFrame(viewSyncRaf); viewSyncRaf = 0 }
   // 清理所有气泡上挂的延迟恢复定时器，避免销毁后定时器仍持有 DOM
   resetBubbleStick()
+})
+
+// KeepAlive 缓存 Home 页面时，CanvasBoard 不卸载但被 deactivated。
+// 此时 Teleport 到 body 的 modal/mask/ctx-menu 会残留在 body 上阻塞后续路由的点击，
+// 必须在 deactivated 时主动关闭所有浮层和对话框。
+onDeactivated(() => {
+  ctxMenu.value = null
+  bgMenu.value = null
+  edgeMenu.value = null
+  triggerDlg.value = false
+  newCanvasDialog.value = false
+  wdOpen.value = false
+  paletteOpen.value = false
+  rulesOpen.value = false
+  editingAgent.value = null
+  renameEdit.value = false
 })
 
 watch([tx, ty], () => { nextTick(syncGrid) }, { immediate: true })
@@ -2320,7 +2826,7 @@ defineExpose({ viewportRef, computeNodeBbox })
                   @dblclick="removeEdge(item.e.id)"
                   @contextmenu="showEdgeMenu($event, item.e)" />
             <path v-if="item.g" :d="item.g.d"
-                  :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
+                  :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e), ortho: item.ortho }]"
                   :marker-end="`url(#egm-${item.e.id})`" pointer-events="none" />
             <path v-if="item.g" class="edge-mid"
                   :class="{ dim: isEdgeDim(item.e) }"
@@ -2443,12 +2949,14 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div class="ctx-title">画布</div>
         <div class="ctx-item" @click="closeMenus(); resetView()">⟳ 重置视图</div>
         <div class="ctx-item submenu" @click.stop>
-          <div class="submenu-label">〰 连线曲直（全部连线）</div>
+          <div class="submenu-label">〰 连线形状（全部连线）</div>
           <div class="submenu-body">
-            <div class="sub-item edge-all-curve" :class="{ checked: (canvas?.edge_shape || 'curve') === 'curve' }"
+            <div class="sub-item edge-all-curve" :class="{ checked: defaultEdgeShape() === 'curve' }"
                  @click="setAllEdgeShapes('curve')">曲线（平滑）</div>
-            <div class="sub-item edge-all-straight" :class="{ checked: canvas?.edge_shape === 'straight' }"
-                 @click="setAllEdgeShapes('straight')">直线（折线）</div>
+            <div class="sub-item edge-all-straight" :class="{ checked: defaultEdgeShape() === 'straight' }"
+                 @click="setAllEdgeShapes('straight')">直线（斜线直连）</div>
+            <div class="sub-item edge-all-ortho" :class="{ checked: defaultEdgeShape() === 'ortho' }"
+                 @click="setAllEdgeShapes('ortho')">⌐ 直角折线</div>
           </div>
         </div>
         <div class="ctx-divider" />
@@ -2506,7 +3014,9 @@ defineExpose({ viewportRef, computeNodeBbox })
             <div class="sub-item edge-shape-curve" :class="{ checked: edgeShapeOf(edgeMenu.edge) === 'curve' }"
                  @click="setEdgeShape(edgeMenu.edge, 'curve')">曲线（平滑）</div>
             <div class="sub-item edge-shape-straight" :class="{ checked: edgeShapeOf(edgeMenu.edge) === 'straight' }"
-                 @click="setEdgeShape(edgeMenu.edge, 'straight')">直线（折线）</div>
+                 @click="setEdgeShape(edgeMenu.edge, 'straight')">直线（斜线直连）</div>
+            <div class="sub-item edge-shape-ortho" :class="{ checked: edgeShapeOf(edgeMenu.edge) === 'ortho' }"
+                 @click="setEdgeShape(edgeMenu.edge, 'ortho')">⌐ 直角折线</div>
           </div>
         </div>
         <div class="ctx-divider" />
@@ -2654,6 +3164,8 @@ defineExpose({ viewportRef, computeNodeBbox })
   transition: stroke .3s, stroke-width .3s, filter .3s;
 }
 .edge.temp { stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c, var(--accent))); stroke-dasharray: 3,3; animation: none; }
+/* 直角折线：拐角描边接缝做圆润处理（几何仍是 90° 直角），避免虚线断点处出现毛刺尖角 */
+.edge.ortho { stroke-linejoin: round; stroke-linecap: round; }
 /* 调用进行中：加粗 + 强调色外发光 + 流动虚线 */
 .edge.active { stroke-width: 2.8; filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), 0.9)) saturate(1.35) brightness(1.12); animation: edgeFlow 0.6s linear infinite; }
 /* 端点智能体已停用：整体去色并压暗 */

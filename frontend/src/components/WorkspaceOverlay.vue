@@ -202,7 +202,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount, onDeactivated } from 'vue'
 import { api } from '@/api'
 import FileViewer, { type ViewerFile } from './FileViewer.vue'
 
@@ -1003,6 +1003,17 @@ onBeforeUnmount(() => {
   consoleGen++
   consoleAbort?.abort()
   if (pyConsole.value?.sessionId) api.canvases.filePyClose(cid(), pyConsole.value.sessionId).catch(() => { })
+})
+
+// KeepAlive 切走 Home 时，关闭所有浮窗和菜单
+onDeactivated(() => {
+  ctxMenu.value = null
+  editor.value = null
+  pyConsole.value = null
+  trashOpen.value = false
+  viewerFile.value = null
+  renameTarget.value = null
+  if (consoleAbort) { consoleAbort.abort(); consoleAbort = null }
 })
 
 function scrollConsole() {

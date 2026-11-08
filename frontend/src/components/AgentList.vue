@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount, onDeactivated } from 'vue'
 import { useAgentStore, useSettingsStore, useModelStore } from '@/stores'
 import { toolLabel } from '@/stores/conversation'
 import { agentAvatarGradient } from '@/utils/avatar'
@@ -207,6 +207,12 @@ async function ctxNewGroupAndAssign() {
 function closeAllMenus() { ctx.value = null; groupCtx.value = null }
 onMounted(() => window.addEventListener('click', closeAllMenus))
 onBeforeUnmount(() => window.removeEventListener('click', closeAllMenus))
+// KeepAlive 缓存 Home 时，右键菜单 / AgentEditDialog 可能残留
+onDeactivated(() => {
+  ctx.value = null
+  groupCtx.value = null
+  editing.value = null
+})
 
 // —— 列表内拖拽排序 —— 与"拖到画布"共用同一次拖拽：dragstart 仍写入 'agent' 数据
 // 供 CanvasBoard 接收；落点是列表内其它项时改为重排顺序（仅在当前可见列表内重排）。

@@ -3381,6 +3381,18 @@ onDeactivated(() => {
   window.removeEventListener('mousemove', onLbPanMove)
   window.removeEventListener('mouseup', onLbPanEnd)
   unmountAllVizSlots()
+  // —— KeepAlive 切走 Home 时，Teleport 到 body 的 modal/overlay 必须主动关闭 ——
+  // 否则会残留在后续路由页面上阻塞点击
+  lightboxOpen.value = false
+  lightboxSrc.value = null
+  ctxMenu.value = { show: false, x: 0, y: 0, id: null }
+  cvCtxMenu.value = { show: false, x: 0, y: 0, id: null }
+  agentDdOpen.value = false
+  modelDdOpen.value = false
+  reasoningDdOpen.value = false
+  wdDdOpen.value = false
+  fileOpsDlg.value.open = false
+  editDlg.value.open = false
 })
 onBeforeUnmount(() => {
   // 清理附件预览 URL

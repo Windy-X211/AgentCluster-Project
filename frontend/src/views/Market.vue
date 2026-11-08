@@ -745,28 +745,102 @@ const canvasThumbNodes = computed(() => {
     }
   })
 })
+/** L 形直角折线的单段拐角 */
+function lShapeSeg(a: { x: number; y: number }, b: { x: number; y: number }, horizontalFirst: boolean) {
+  const corner = horizontalFirst ? { x: b.x, y: a.y } : { x: a.x, y: b.y }
+  return [a, corner, b]
+}
+/** Catmull-Rom → 三次 Bézier 的控制点 */
+function smoothCtrl(pts: { x: number; y: number }[], i: number) {
+  const p1 = pts[i], p2 = pts[i + 1]
+  const p0 = pts[i - 1] || p1, p3 = pts[i + 2] || p2
+  return {
+    c1: { x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6 },
+    c2: { x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6 },
+  }
+}
+/** 缩略图连线路径：按原始 shape + waypoints 生成（复刻 CanvasBoard 核心逻辑，去掉绕障/双向错开） */
+function thumbEdgePath(e: any, from: any, to: any, nodeR: number, canvasDefaultShape: string): string {
+  const fx = Number(from.x) || 0, fy = Number(from.y) || 0
+  const tx = Number(to.x) || 0, ty = Number(to.y) || 0
+  const dx = tx - fx, dy = ty - fy
+  const len = Math.hypot(dx, dy) || 1
+  const ux = dx / len, uy = dy / len
+  // 起点从源节点中心推到圆边缘；终点给箭头留 6px 空间
+  const sx = fx + ux * nodeR, sy = fy + uy * nodeR
+  const ex = tx - ux * (nodeR + 6), ey = ty - uy * (nodeR + 6)
+
+  const shape = (e?.shape === 'curve' || e?.shape === 'straight' || e?.shape === 'ortho')
+    ? e.shape : canvasDefaultShape
+  const wpsRaw = Array.isArray(e?.waypoints) ? e.waypoints : []
+  const wps = wpsRaw
+    .map((p: any) => ({ x: Number(p?.x), y: Number(p?.y) }))
+    .filter((p: any) => Number.isFinite(p.x) && Number.isFinite(p.y))
+
+  if (shape === 'straight') {
+    // 斜线直连：无控制点时直接一条线，有控制点则折线依次穿过
+    if (wps.length === 0) return `M ${sx.toFixed(1)} ${sy.toFixed(1)} L ${ex.toFixed(1)} ${ey.toFixed(1)}`
+    const pts = [{ x: sx, y: sy }, ...wps, { x: ex, y: ey }]
+    return pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
+  }
+
+  if (shape === 'ortho') {
+    // 直角折线（L 形）：水平/垂直距离大的方向优先（与 CanvasBoard orthoAnchors 一致）
+    const horizontalFirst = Math.abs(dx) >= Math.abs(dy)
+    const rawPts: { x: number; y: number }[] = [{ x: sx, y: sy }, ...wps, { x: ex, y: ey }]
+    const pts: { x: number; y: number }[] = [rawPts[0]]
+    for (let i = 0; i < rawPts.length - 1; i++) {
+      const seg = lShapeSeg(rawPts[i], rawPts[i + 1], horizontalFirst)
+      for (const p of seg.slice(1)) pts.push(p)
+    }
+    // 去掉连续重合点
+    const deduped: { x: number; y: number }[] = [pts[0]]
+    for (let i = 1; i < pts.length; i++) {
+      const last = deduped[deduped.length - 1]
+      if (Math.abs(last.x - pts[i].x) > 0.01 || Math.abs(last.y - pts[i].y) > 0.01) deduped.push(pts[i])
+    }
+    return deduped.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
+  }
+
+  // curve：平滑曲线（默认形状）
+  const pts: { x: number; y: number }[] = [{ x: sx, y: sy }, ...wps, { x: ex, y: ey }]
+  if (pts.length === 2) {
+    // 无控制点：退化为单次三次 Bézier，控制点取中点
+    let c1, c2
+    const mx = (sx + ex) / 2, my = (sy + ey) / 2
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      c1 = { x: mx, y: sy }; c2 = { x: mx, y: ey }
+    } else {
+      c1 = { x: sx, y: my }; c2 = { x: ex, y: my }
+    }
+    return `M ${sx.toFixed(1)} ${sy.toFixed(1)} C ${c1.x.toFixed(1)} ${c1.y.toFixed(1)}, ${c2.x.toFixed(1)} ${c2.y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`
+  }
+  // 带控制点：Catmull-Rom 样条，曲线严格穿过每个控制点
+  let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`
+  for (let i = 0; i < pts.length - 1; i++) {
+    const { c1, c2 } = smoothCtrl(pts, i)
+    d += ` C ${c1.x.toFixed(1)} ${c1.y.toFixed(1)}, ${c2.x.toFixed(1)} ${c2.y.toFixed(1)}, ${pts[i + 1].x.toFixed(1)} ${pts[i + 1].y.toFixed(1)}`
+  }
+  return d
+}
+
 const canvasThumbEdges = computed(() => {
   const canvas = previewData.value?.preview?.canvas
   const nodes: any[] = canvas?.nodes_raw || []
-  const edges: any[] = canvas?.edges || []
+  const edges: any[] = canvas?.edges_raw || []
   const nodeMap = new Map(nodes.map((n: any) => [n.id, n]))
   const nodeR = THUMB_NODE_R
+  const defaultShape = canvas?.edge_shape || 'curve'
   return edges.map((e: any) => {
-    const from = nodeMap.get(e.from_node)
-    const to = nodeMap.get(e.to_node)
+    const from = nodeMap.get(e.from_node ?? e.source_node)
+    const to = nodeMap.get(e.to_node ?? e.target_node)
     if (!from || !to) return { path: '' }
-    const fx = Number(from.x) || 0, fy = Number(from.y) || 0
-    const tx = Number(to.x) || 0, ty = Number(to.y) || 0
-    // 方向向量，用于把终点从节点中心推到边缘
-    const dx = tx - fx, dy = ty - fy
-    const len = Math.hypot(dx, dy) || 1
-    const ux = dx / len, uy = dy / len
-    const sx = fx + ux * nodeR, sy = fy + uy * nodeR
-    const ex = tx - ux * (nodeR + 6), ey = ty - uy * (nodeR + 6)
-    // 中间控制点做平滑曲线
-    const mx = (sx + ex) / 2
-    const my = (sy + ey) / 2
-    return { path: `M ${sx} ${sy} Q ${mx} ${sy} ${ex} ${ey}` }
+    // 同时兼容新旧字段名（CanvasBoard 新格式用 from_node/to_node，旧数据用 source_node/target_node）
+    const edgeCompat = {
+      shape: e.shape,
+      waypoints: e.waypoints,
+    }
+    return { path: thumbEdgePath(edgeCompat, from, to, nodeR, defaultShape) }
   }).filter((e: any) => e.path)
 })
 

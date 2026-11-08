@@ -2,7 +2,8 @@ import { defineStore } from 'pinia'
 import { api } from '@/api'
 import { useLayoutStore } from './layout'
 
-export type CanvasEdgeShape = 'curve' | 'straight'
+/** curve=平滑曲线 | straight=斜线直连 | ortho=直角折线（L 形，一个 90° 折角） */
+export type CanvasEdgeShape = 'curve' | 'straight' | 'ortho'
 
 /** 画布内剪贴板：节点按原始绝对坐标保存，连线端点用 nodes 下标表示，粘贴时整体平移并重映射 id。 */
 export interface CanvasClipboard {
