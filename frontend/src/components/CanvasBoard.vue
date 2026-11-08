@@ -43,11 +43,45 @@ const tx = ref(0)
 const ty = ref(0)
 const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5, ZOOM_STEP = 1.25
 
+// 连线箭头的反向缩放系数：画布缩小（CSS zoom < 1）时按比例放大箭头在画布内的尺寸，
+// 让箭头的屏幕像素尺寸基本恒定。缩到 30% 仍保留约 0.75 倍大小（12–14px），
+// 一眼能看清连线方向；放大时略微收缩，避免箭头相对节点过于夸张。
+const arrowScale = computed(() => Math.min(2.5, Math.max(0.7, 1 / Math.max(scale.value, 0.001))))
+
 // —— 画布坐标基础类型 / 连线形状 / 控制点 ——
 type Pt = { x: number; y: number }
-/** curve=平滑曲线 | straight=斜线直连 | ortho=直角折线（L 形，整条线只有一个 90° 折角） */
-type EdgeShape = 'curve' | 'straight' | 'ortho'
-type EdgeHandle = { kind: 'point' | 'insert'; index: number; x: number; y: number }
+/** curve=平滑曲线 | straight=斜线直连 | ortho=直角折线 | mixed=逐段绘制（每段线型可不同） */
+type EdgeShape = 'curve' | 'straight' | 'ortho' | 'mixed'
+type EdgeHandle = {
+  kind: 'point' | 'insert' | 'anchor' | 'vertex' | 'ctrl' | 'bulge'
+  index: number
+  x: number; y: number
+  nx?: number; ny?: number
+  end?: AnchorEnd
+  /** 分段连线的段序号；存在时这个柄属于 segments 而不是 waypoints */
+  seg?: number
+  /** ctrl 柄对应的控制点下标（0/1） */
+  ctrl?: number
+}
+/** 分段连线的一段线型：直线 / 平滑曲线（三次贝塞尔）/ 圆弧 / 垂线（垂直于上一段末端） */
+type SegType = 'curve' | 'straight' | 'arc' | 'vert'
+/** 落点确认后的一段：end 为段终点，ctrl 为曲线控制点（垂线段用 ctrl[0] 存单位法线方向），
+ *  bulge 为圆弧带符号归一化矢高。 */
+type EdgeSegment = { type: SegType; end: Pt; ctrl: Pt[]; bulge: number }
+type DrawState = {
+  from: number
+  /** 起点锚点；未确认第一段前按鼠标方向动态取最近边点，确认后冻结 */
+  anchor: AnchorSpec
+  mouse: Pt
+  type: SegType
+  /** 右键呼出线型菜单时的画布坐标：决定当前段曲线/圆弧的弯向 */
+  via: Pt | null
+  segs: EdgeSegment[]
+}
+/** 手动锚点：吸附在节点某条边上，t 为沿边归一化位置（0..1，已含离角留白）。
+ *  用「边 + 比例」而不是绝对坐标存储，节点移动后锚点自动跟着走、不会脱边。 */
+type AnchorEnd = 'from' | 'to'
+type AnchorSpec = { side: OrthoSide; t: number }
 
 // 节点拖动（group 非空时表示 Ctrl 整体拖动）
 const dragging = ref<{
@@ -58,8 +92,10 @@ const dragging = ref<{
   y0: number
   group?: { node: any; x0: number; y0: number }[]
 } | null>(null)
-// 连线中
-const linking = ref<{ from: number; mouseX: number; mouseY: number } | null>(null)
+// 逐段绘制连线：左键落点确认一段、右键切换该段线型、点击节点结束、Esc 取消
+const draw = ref<DrawState | null>(null)
+// 绘制中的「本段线型」右键菜单（客户端坐标 + 右键时的画布坐标）
+const segMenu = ref<{ x: number; y: number; via: Pt } | null>(null)
 // 画布平移（左键）
 const panning = ref<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
 const spaceDown = ref(false)
@@ -74,12 +110,23 @@ const lasso = ref<{
 } | null>(null)
 // 拖动开始时备份相关连线的控制点；拖动过程中按总位移重算，避免累积误差
 let dragWaypoints: { edge: any; points: Pt[] }[] = []
+// 分段连线的顶点 / 曲线控制点同样是画布绝对坐标，节点移动时一并平移
+let dragSegments: { edge: any; segs: { end: Pt; ctrl: Pt[]; type?: string }[] }[] = []
 // 拖动结束后的 click 不应清空选区
 let suppressBoardClick = false
 
 // 连线控制点
 const hoveringEdgeId = ref<number | null>(null)
-const edgeDrag = ref<{ edge: any; index: number } | null>(null)
+/** 鼠标在画布坐标系里的位置：锚点只在鼠标靠近时才显现，避免整张画布都是小圆点 */
+const pointerCanvas = ref<Pt | null>(null)
+const edgeDrag = ref<{
+  edge: any
+  index: number
+  anchor?: AnchorEnd
+  seg?: number
+  field?: 'vertex' | 'ctrl' | 'bulge'
+  ctrl?: number
+} | null>(null)
 
 // —— 撤销 / 重做：只记录画布图结构（节点 / 连线 / 默认曲直） ——
 type CanvasSnapshot = { nodes: any[]; edges: any[]; edge_shape: EdgeShape }
@@ -663,6 +710,8 @@ function applyPendingZoom() {
 const PAN_IGNORE = '.canvas-toolbar, .ws-panel, .ws-trash, .ws-ctx, .ws-modal-bg, .ctx-menu, .modal-bg, .conv-float, .hint, .btn, input, label, select, textarea, button, a'
 function startPan(e: MouseEvent) {
   if (e.button !== 0) return
+  // 绘制中左键一律用于落点/结束连线（空格+拖拽仍可平移视图）
+  if (draw.value && !spaceDown.value) return
   suppressBoardClick = false
   const target = e.target as HTMLElement
   if (target?.closest(PAN_IGNORE)) return
@@ -847,6 +896,8 @@ const onKeyDown = (e: KeyboardEvent) => {
     return
   }
   if (e.code === 'Escape' && !editable) {
+    // 绘制连线中：Esc 优先取消整条未完成的连线
+    if (draw.value || segMenu.value) { cancelDraw(); return }
     // Esc = 彻底退出调色（关浮窗 + 清待应用色）
     if (paletteOpen.value || pickedColor.value !== null) {
       closePalette()
@@ -882,6 +933,8 @@ function onDrop(e: DragEvent) {
 }
 
 function startDrag(e: MouseEvent, node: any) {
+  // 逐段绘制中：点节点是「结束连线」，不能顺手把节点拖走
+  if (draw.value) return
   if ((e.target as HTMLElement).closest('.ctx-action, button, label, input')) return
   if (spaceDown.value || e.button !== 0) return
   if (e.shiftKey) return   // Shift 拖动交给画布套索
@@ -912,11 +965,24 @@ function startDrag(e: MouseEvent, node: any) {
       edge: e,
       points: e.waypoints.map((p: any) => ({ x: p.x, y: p.y })),
     }))
+  dragSegments = edges.value
+    .filter((e: any) =>
+      (movingIds.has(e.from_node) || movingIds.has(e.to_node)) &&
+      Array.isArray(e.segments) && e.segments.length)
+    .map((e: any) => ({
+      edge: e,
+      segs: e.segments.map((s: any) => ({
+        end: { x: Number(s?.end?.x) || 0, y: Number(s?.end?.y) || 0 },
+        // 垂线段的 ctrl[0] 是单位法线（方向），不是坐标：节点平移时不能跟着加位移
+        type: s?.type === 'vert' ? 'vert' : '',
+        ctrl: Array.isArray(s?.ctrl) ? s.ctrl.map((p: any) => ({ x: Number(p?.x) || 0, y: Number(p?.y) || 0 })) : [],
+      })),
+    }))
   dragging.value = { node, dx: c.x - node.x, dy: c.y - node.y, x0: node.x, y0: node.y, group }
 }
 /** 节点拖动时：把关联连线的控制点整体平移同样的画布位移 */
 function translateDragWaypoints(dx: number, dy: number) {
-  if ((!dx && !dy) || !dragWaypoints.length) return
+  if (!dx && !dy) return
   for (const item of dragWaypoints) {
     const wps = item.edge.waypoints
     if (!Array.isArray(wps)) continue
@@ -928,10 +994,30 @@ function translateDragWaypoints(dx: number, dy: number) {
       p.y = item.points[i].y + dy
     }
   }
+  for (const item of dragSegments) {
+    const segs = item.edge.segments
+    if (!Array.isArray(segs)) continue
+    const n = Math.min(segs.length, item.segs.length)
+    for (let i = 0; i < n; i++) {
+      const s = segs[i], snap = item.segs[i]
+      if (!s || typeof s !== 'object') continue
+      if (!s.end || typeof s.end !== 'object') s.end = {}
+      s.end.x = snap.end.x + dx
+      s.end.y = snap.end.y + dy
+      if (snap.type === 'vert') continue   // 方向向量不参与平移
+      if (!Array.isArray(s.ctrl)) s.ctrl = []
+      for (let k = 0; k < Math.min(s.ctrl.length, snap.ctrl.length); k++) {
+        if (!s.ctrl[k] || typeof s.ctrl[k] !== 'object') s.ctrl[k] = {}
+        s.ctrl[k].x = snap.ctrl[k].x + dx
+        s.ctrl[k].y = snap.ctrl[k].y + dy
+      }
+    }
+  }
 }
 function onMouseMove(e: MouseEvent) {
   doPan(e)
   const c = clientToCanvas(e.clientX, e.clientY)
+  pointerCanvas.value = c
   if (lasso.value) { updateLasso(c); suppressBoardClick = true }
   if (dragging.value) {
     // 第一次真正移动时才入栈：单击节点不产生空的撤销步骤
@@ -961,16 +1047,28 @@ function onMouseMove(e: MouseEvent) {
     moveEdgeWaypoint(c)
     suppressBoardClick = true
   }
-  if (linking.value) { linking.value.mouseX = c.x; linking.value.mouseY = c.y }
+  // 线型菜单打开期间冻结预览终点，避免鼠标移到菜单上时预览乱跳
+  if (draw.value && !segMenu.value) { draw.value.mouse = c }
 }
 function onMouseUpGlobal() {
+  // 绘制模式是「点击式」的，鼠标抬起不能清空状态；只有落点 / 结束 / Esc 才结束
   endDrag(); endPan(); finishLasso(); endEdgeDrag()
-  linking.value = null
 }
 function endDrag() {
   pendingDragSnapshot = null
+  const wasDragging = !!dragging.value
   dragWaypoints = []
-  if (dragging.value) { dragging.value = null; canvases.saveCurrent() }
+  dragSegments = []
+  if (wasDragging) {
+    dragging.value = null
+    // 节点移动后化简 ortho 折线：只处理「用户手动设过拐点」的线。
+    // 自动布线的线必须保留 waypoints 为空，否则渲染拐点被固化成手动控制点，
+    // 之后顺/逆时针偏好会被这些硬约束锁死，方向切换就再也换不到另一侧。
+    for (const e of edges.value) {
+      if (edgeShapeOf(e) === 'ortho' && hasWaypoints(e)) commitOrthoGeometry(e, false)
+    }
+    canvases.saveCurrent()
+  }
   snapGuides.value = { x: [], y: [] }
 }
 
@@ -1002,6 +1100,12 @@ function deleteSelectedNodes() {
 }
 // 点击空白 / 拖动结束后的 click：只有"没有发生拖动"的空白点击才清空选区
 function onBoardClick(e: MouseEvent) {
+  // 逐段绘制中：空白左键 = 确认本段终点（节点上的点击由节点自己的处理器结束连线）
+  if (draw.value) {
+    suppressBoardClick = false
+    if (e.button === 0) confirmDrawSegment(clientToCanvas(e.clientX, e.clientY))
+    return
+  }
   const swallow = suppressBoardClick
   suppressBoardClick = false
   closeMenus()
@@ -1034,10 +1138,12 @@ function restoreSnapshot(snap: CanvasSnapshot) {
   canvas.value.nodes = JSON.parse(JSON.stringify(snap.nodes))
   canvas.value.edges = JSON.parse(JSON.stringify(snap.edges))
   canvas.value.edge_shape = snap.edge_shape
-  pendingDragSnapshot = null
-  pendingEdgeSnapshot = null
-  dragWaypoints = []
-  dragging.value = null
+    pendingDragSnapshot = null
+    pendingEdgeSnapshot = null
+    dragWaypoints = []
+    dragSegments = []
+    cancelDraw()
+    dragging.value = null
   edgeDrag.value = null
   lasso.value = null
   selectedNodeIds.value = new Set()
@@ -1062,29 +1168,144 @@ function redoCanvas() {
   showToast('已重做')
 }
 
+// —— 逐段绘制连线：按钮起笔 → 右键选本段线型 → 左键落点确认 → 继续画 → 点节点收笔 ——
+/** 点节点上的「连线」按钮：以距离鼠标最近的边上点作为起点锚点开始绘制 */
 function startLink(e: MouseEvent, nodeId: number) {
   e.stopPropagation()
+  const node = nodeById.value.get(nodeId)
+  if (!node) return
   const c = clientToCanvas(e.clientX, e.clientY)
-  linking.value = { from: nodeId, mouseX: c.x, mouseY: c.y }
-}
-function endLink(e: MouseEvent, toNodeId: number | null) {
-  if (linking.value && toNodeId != null && linking.value.from !== toNodeId && canvas.value) {
-    const nextId = Math.max(0, ...edges.value.map((n: any) => n.id)) + 1
-    pushHistory()
-    const edge = {
-      id: nextId,
-      from_node: linking.value.from,
-      to_node: toNodeId,
-      type: 'chat',
-      shape: defaultEdgeShape(),
-      waypoints: [],
-    }
-    canvas.value.edges.push(edge)
-    // 默认形状为 ortho 时注入默认拐点
-    if (edge.shape === 'ortho') injectDefaultOrthoWaypoint(edge)
-    canvases.saveCurrent()
+  draw.value = {
+    from: nodeId,
+    anchor: closestEdgeAnchor(nodeRect(node), c),
+    mouse: c,
+    type: 'straight',
+    via: null,
+    segs: [],
   }
-  linking.value = null
+  segMenu.value = null
+  closeMenus()
+  showToast('绘制连线：左键落点确认一段 · 右键切换线型 · 点击节点结束 · Esc 取消')
+}
+/** 未确认第一段之前，起点锚点跟随鼠标方向动态取最近边点；第一段确认后冻结 */
+function drawStartSpec(d: DrawState): AnchorSpec {
+  if (d.segs.length) return d.anchor
+  const n = nodeById.value.get(d.from)
+  return n ? closestEdgeAnchor(nodeRect(n), d.mouse) : d.anchor
+}
+function drawStartPoint(d: DrawState): Pt {
+  const n = nodeById.value.get(d.from)
+  return n ? anchorPoint(drawStartSpec(d), nodeRect(n)) : d.mouse
+}
+/** 已确认各段串起来后，末尾处的单位切向。第一段没有上一段，用起点锚点的出边法线。 */
+function drawTailTangent(d: DrawState): Pt {
+  let tan = anchorNormal(drawStartSpec(d).side)
+  let cur = drawStartPoint(d)
+  for (const s of d.segs) {
+    const normal = s.type === 'vert' ? normalOf(tan) : null
+    const built = buildSegment(cur, s.end, s.type, s.ctrl, s.bulge, normal)
+    tan = segEndTangent(cur, s.end, s.type, s.ctrl, s.bulge, built)
+    cur = s.end
+  }
+  return tan
+}
+/** 预览终点：悬停在别的节点上时贴到该节点离鼠标最近的边上点 */
+function drawPendingEnd(d: DrawState): Pt {
+  const hid = hoverNodeId.value
+  if (hid != null && hid !== d.from) {
+    const n = nodeById.value.get(hid)
+    if (n) return anchorPoint(closestEdgeAnchor(nodeRect(n), d.mouse), nodeRect(n))
+  }
+  return d.mouse
+}
+/** 左键落点：确认当前段，并把线型弯向烘焙进段数据；随后自动开始下一段（沿用当前线型） */
+function confirmDrawSegment(c: Pt) {
+  const d = draw.value
+  if (!d) return
+  d.mouse = c
+  segMenu.value = null
+  // 第二段起的起点是上一落点，不是节点锚点：曲线控制点 / 垂线方向都依赖正确的 p0
+  const p0 = d.segs.length ? d.segs[d.segs.length - 1].end : drawStartPoint(d)
+  if (Math.hypot(c.x - p0.x, c.y - p0.y) < SEG_MIN_LEN) return
+  const normal = d.type === 'vert' ? normalOf(drawTailTangent(d)) : null
+  if (normal) {
+    const q = projectOnNormal(p0, c, normal)
+    if (Math.hypot(q.x - p0.x, q.y - p0.y) < SEG_MIN_LEN) return
+  }
+  d.anchor = drawStartSpec(d)   // 冻结起点锚点
+  d.segs.push(makeDrawSegment(p0, c, d.type, d.via, normal))
+  d.via = null
+}
+/** 点击目标节点收笔：以距离鼠标最近的边上点作为终点锚点 */
+function finishDraw(toNodeId: number | null, c: Pt) {
+  const d = draw.value
+  if (!d || toNodeId == null || !canvas.value) { cancelDraw(); return }
+  const fromNode = nodeById.value.get(d.from), toNode = nodeById.value.get(toNodeId)
+  if (!fromNode || !toNode || toNodeId === d.from) {
+    showToast('请选择另一个节点作为终点')
+    return
+  }
+  d.mouse = c
+  const rf = nodeRect(fromNode), rt = nodeRect(toNode)
+  const startSpec = drawStartSpec(d)
+  const endSpec = closestEdgeAnchor(rt, c)
+  const p0 = d.segs.length ? d.segs[d.segs.length - 1].end : anchorPoint(startSpec, rf)
+  const p1 = anchorPoint(endSpec, rt)
+  const segs = d.segs.map(cloneSegment)
+  if (Math.hypot(p1.x - p0.x, p1.y - p0.y) >= 2) {
+    const normal = d.type === 'vert' ? normalOf(drawTailTangent(d)) : null
+    segs.push(makeDrawSegment(p0, p1, d.type, d.via, normal))
+  }
+  if (!segs.length) { cancelDraw(); showToast('连线太短，未创建'); return }
+  segs[segs.length - 1].end = { x: p1.x, y: p1.y }
+  const nextId = Math.max(0, ...edges.value.map((n: any) => n.id)) + 1
+  pushHistory()
+  canvas.value.edges.push({
+    id: nextId,
+    from_node: d.from,
+    to_node: toNodeId,
+    type: 'chat',
+    shape: 'mixed',
+    waypoints: [],
+    ortho_dir: null,
+    anchor_from: startSpec,
+    anchor_to: endSpec,
+    segments: segs.map(s => ({
+      type: s.type,
+      end: { x: s.end.x, y: s.end.y },
+      ctrl: s.ctrl.map(p => ({ x: p.x, y: p.y })),
+      bulge: s.bulge,
+    })),
+  })
+  const count = segs.length
+  cancelDraw()
+  canvases.saveCurrent()
+  showToast(`已创建 ${count} 段连线`)
+}
+function cancelDraw(notify = false) {
+  draw.value = null
+  segMenu.value = null
+  if (notify) showToast('已取消绘制连线')
+}
+/** 绘制中点节点 = 收笔（阻止冒泡，避免被当成空白落点再确认一段） */
+function onNodeClickInDraw(e: MouseEvent, nodeId: number) {
+  if (!draw.value) return
+  e.stopPropagation()
+  if (e.button === 0) finishDraw(nodeId, clientToCanvas(e.clientX, e.clientY))
+}
+/** 绘制中的右键：呼出「本段线型」菜单，同时记下右键位置作为曲线/圆弧的弯向参考 */
+function openSegMenu(e: MouseEvent) {
+  e.preventDefault(); e.stopPropagation()
+  ctxMenu.value = null; bgMenu.value = null; edgeMenu.value = null
+  segMenu.value = { x: e.clientX, y: e.clientY, via: clientToCanvas(e.clientX, e.clientY) }
+  clampToViewport(segMenu as any, '.seg-menu')
+}
+function chooseSegType(t: SegType) {
+  if (draw.value) {
+    draw.value.type = t
+    draw.value.via = segMenu.value?.via || null
+  }
+  segMenu.value = null
 }
 
 // —— 浮层位置对齐（避免超出视口） ——
@@ -1104,6 +1325,7 @@ async function clampToViewport(ref: { value: { x: number; y: number } | null }, 
 
 // —— 右键菜单 ——
 function showCtxMenu(e: MouseEvent, node: any) {
+  if (draw.value) { openSegMenu(e); return }
   e.preventDefault(); e.stopPropagation()
   // 右键未选中的节点时，先把选区收到该节点，保证复制/剪切目标明确
   if (!selectedNodeIds.value.has(node.id)) selectedNodeIds.value = new Set([node.id])
@@ -1113,6 +1335,7 @@ function showCtxMenu(e: MouseEvent, node: any) {
   edgeMenu.value = null
 }
 function showBgMenu(e: MouseEvent) {
+  if (draw.value) { openSegMenu(e); return }
   // 仅在真正空白（没有点到节点/连线/工具栏/浮层）时弹出
   const target = e.target as HTMLElement
   if (target?.closest('.node, .edge, .edge-hit, .edge-mid, .edge-handle, .edge-handle-hit, .canvas-toolbar, .hint, .canvas-mini, .collapse-btn')) return
@@ -1124,15 +1347,30 @@ function showBgMenu(e: MouseEvent) {
   clampToViewport(bgMenu as any, '.ctx-menu')
 }
 function showEdgeMenu(e: MouseEvent, edge: any) {
+  if (draw.value) { openSegMenu(e); return }
   e.preventDefault(); e.stopPropagation()
   ctxMenu.value = null
   bgMenu.value = null
   edgeMenu.value = { edge, x: e.clientX, y: e.clientY }
   clampToViewport(edgeMenu as any, '.ctx-menu')
 }
-function closeMenus() { ctxMenu.value = null; bgMenu.value = null; edgeMenu.value = null }
+function closeMenus() {
+  ctxMenu.value = null; bgMenu.value = null; edgeMenu.value = null; segMenu.value = null
+}
 
 // —— 剪贴板：复制 / 剪切 / 粘贴 ——
+/** 分段路径都是画布绝对坐标：复制时按整体位移平移顶点与曲线控制点。
+ *  垂线段的 ctrl[0] 是单位法线（方向向量），只拷贝不平移。 */
+function mapSegments(e: any, dx = 0, dy = 0) {
+  return readSegments(e).map(s => ({
+    type: s.type,
+    end: { x: s.end.x + dx, y: s.end.y + dy },
+    ctrl: s.ctrl.map(p => s.type === 'vert'
+      ? { x: p.x, y: p.y }
+      : { x: p.x + dx, y: p.y + dy }),
+    bulge: s.bulge,
+  }))
+}
 function copySelection(silent = false): boolean {
   const sel = selectionNodes()
   if (!sel.length) return false
@@ -1150,6 +1388,10 @@ function copySelection(silent = false): boolean {
       to: index.get(e.to_node)!,
       type: e.type || 'chat',
       shape: edgeShapeOf(e),
+      ortho_dir: orthoDirOf(e),
+      anchor_from: anchorSpecOf(e, 'from'),
+      anchor_to: anchorSpecOf(e, 'to'),
+      segments: mapSegments(e),
       waypoints: sanitizeWaypoints(e.waypoints).map(p => ({ x: p.x, y: p.y })),
     })),
     bbox: { x: minX, y: minY, w: Math.max(NODE_W, maxX - minX), h: Math.max(NODE_H, maxY - minY) },
@@ -1201,6 +1443,10 @@ function pasteClipboard(target?: Pt) {
       to_node: to,
       type: e.type || 'chat',
       shape: e.shape,
+      ortho_dir: e.ortho_dir ?? null,
+      anchor_from: e.anchor_from ?? null,
+      anchor_to: e.anchor_to ?? null,
+      segments: mapSegments(e, dx, dy),
       waypoints: (e.waypoints || []).map(p => ({ x: p.x + dx, y: p.y + dy })),
     })
   }
@@ -1231,6 +1477,10 @@ function createCanvasFromSelection() {
       to_node: index.get(e.to_node)! + 1,
       type: e.type || 'chat',
       shape: edgeShapeOf(e),
+      ortho_dir: orthoDirOf(e),
+      anchor_from: anchorSpecOf(e, 'from'),
+      anchor_to: anchorSpecOf(e, 'to'),
+      segments: mapSegments(e),
       waypoints: sanitizeWaypoints(e.waypoints).map(p => ({ x: p.x, y: p.y })),
     })),
   }
@@ -1284,7 +1534,7 @@ function importCanvasPart(src: any, drop: Pt) {
     const destFrom = nodeById.value.get(from)
     const ddx = srcFrom && destFrom ? destFrom.x - srcFrom.x : tx
     const ddy = srcFrom && destFrom ? destFrom.y - srcFrom.y : ty
-    const shape: EdgeShape = e.shape === 'curve' || e.shape === 'straight' || e.shape === 'ortho'
+    const shape: EdgeShape = e.shape === 'curve' || e.shape === 'straight' || e.shape === 'ortho' || e.shape === 'mixed'
       ? e.shape
       : (src.edge_shape === 'ortho' || src.edge_shape === 'straight' ? src.edge_shape : 'curve')
     canvas.value.edges.push({
@@ -1293,6 +1543,10 @@ function importCanvasPart(src: any, drop: Pt) {
       to_node: to,
       type: e.type || 'chat',
       shape,
+      ortho_dir: e.ortho_dir ?? null,
+      anchor_from: e.anchor_from ?? null,
+      anchor_to: e.anchor_to ?? null,
+      segments: mapSegments(e, ddx, ddy),
       waypoints: sanitizeWaypoints(e.waypoints).map(p => ({ x: p.x + ddx, y: p.y + ddy })),
     })
     addedEdges++
@@ -1635,6 +1889,57 @@ function snapToEdges(draggingNode: any, candidateX: number, candidateY: number, 
   return { x: finalX, y: finalY }
 }
 
+// —— 手动锚点：读取 / 换算 / 拖动吸附 ——
+/** 读一条连线某一端的手动锚点；缺字段或非法值 = 自动布线 */
+function anchorSpecOf(e: any, end: AnchorEnd): AnchorSpec | null {
+  const raw = end === 'from' ? e?.anchor_from : e?.anchor_to
+  if (!raw || !['l', 'r', 't', 'b'].includes(raw.side)) return null
+  const t = Number(raw.t)
+  if (!Number.isFinite(t)) return null
+  return { side: raw.side, t: Math.max(0, Math.min(1, t)) }
+}
+function hasManualAnchors(e: any): boolean {
+  return anchorSpecOf(e, 'from') !== null || anchorSpecOf(e, 'to') !== null
+}
+/** 归一化 t → 边的有效可变坐标（离角留白由 sideRange 保证） */
+function anchorVar(spec: AnchorSpec, r: Rect): number {
+  const [lo, hi] = sideRange(spec.side, r)
+  return lo + (hi - lo) * spec.t
+}
+function anchorPoint(spec: AnchorSpec, r: Rect): Pt {
+  return pointOnSide(spec.side, r, anchorVar(spec, r))
+}
+/** 四边中点吸附：鼠标靠近任一条边的中点（屏幕 10px 内）就精确吸到 t=0.5。
+ *  四条边一起比，节点中心附近也能吸到最近的中点，不受「最近边」判定影响。 */
+const ANCHOR_MID_SNAP_PX = 10
+function snapToSideMid(r: Rect, p: Pt): AnchorSpec | null {
+  const radius = ANCHOR_MID_SNAP_PX / (scale.value || 1)
+  let best: { side: OrthoSide; d: number } | null = null
+  for (const s of ORTHO_SIDES) {
+    const [lo, hi] = sideRange(s, r)
+    const q = pointOnSide(s, r, (lo + hi) / 2)
+    const d = Math.hypot(q.x - p.x, q.y - p.y)
+    if (d <= radius && (!best || d < best.d)) best = { side: s, d }
+  }
+  return best ? { side: best.side, t: 0.5 } : null
+}
+/** 拖动时把鼠标位置吸附到节点最合适的边：按相对中心的方向选边，
+ *  再把沿边坐标换算成 t 并 clamp，锚点始终贴在节点边缘上。 */
+function nearestAnchor(r: Rect, p: Pt): AnchorSpec {
+  const mid = snapToSideMid(r, p)
+  if (mid) return mid
+  const w = (r.r - r.l) / 2 || 1, h = (r.b - r.t) / 2 || 1
+  const dx = (p.x - (r.l + r.r) / 2) / w
+  const dy = (p.y - (r.t + r.b) / 2) / h
+  const side: OrthoSide = Math.abs(dx) >= Math.abs(dy)
+    ? (dx >= 0 ? 'r' : 'l')
+    : (dy >= 0 ? 'b' : 't')
+  const [lo, hi] = sideRange(side, r)
+  const v = sideAxis(side) === 'H' ? p.y : p.x
+  const t = hi > lo ? (v - lo) / (hi - lo) : 0.5
+  return { side, t: Math.max(0, Math.min(1, t)) }
+}
+
 /** 按相对方位选最近侧锚点：水平差为主走左右，垂直差为主走上下 */
 function sideAnchors(a: any, b: any): { p1: { x: number; y: number }; p2: { x: number; y: number }; horizontal: boolean } {
   const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
@@ -1718,7 +2023,7 @@ function defaultEdgeShape(): EdgeShape {
 }
 function edgeShapeOf(e: any): EdgeShape {
   const s = e?.shape
-  if (s === 'curve' || s === 'straight' || s === 'ortho') return s
+  if (s === 'curve' || s === 'straight' || s === 'ortho' || s === 'mixed') return s
   return defaultEdgeShape()
 }
 /** 双向连线且两端共线时：按端点 id 稳定分配相反的边缘偏移，两条直线不会叠在一起 */
@@ -1750,8 +2055,314 @@ function linePath(pts: Pt[]): string {
   return d
 }
 
-// —— 直角折线（L 形）：全水平/垂直段，整条线只有一个 90° 折角 ——
-const ORTHO_COLINEAR_EPS = 1 // 两节点中心在该轴上几乎对齐 → 退化为一条直线（0 折角）
+// ————————————————————————————————————————————————————————————————————————
+// 分段连线（shape=mixed）：一条边由若干段串成，每段独立保存线型。
+//   顶点序列 = [起点锚点, seg0.end, seg1.end, …, 终点锚点]
+//   起止锚点用「边 + 比例」存相对值，节点移动后仍贴合边缘；中间顶点是画布绝对坐标。
+//   直线 = L；曲线 = 三次贝塞尔 C（两个控制点可拖）；圆弧 = 真正的 A 圆弧（弦 + 带符号矢高）；
+//   垂线 = 垂直于「上一段末端方向」的直线，垂足是上一段末尾；落点投影到该直线上决定长度与朝向。
+// ————————————————————————————————————————————————————————————————————————
+const SEG_MIN_LEN = 6
+const DEFAULT_ARC_BULGE = 0.22   // 圆弧默认矢高 / 弦长
+const MAX_ARC_BULGE = 0.45       // 上限 0.5 就是半圆，留一点余量避免半径退化
+const VERT_EPS = 1.5             // 终点已落在垂线上时的容差（不必补连接短线）
+type BuiltSeg = { d: string; samples: Pt[]; mid: Pt; ctrl: Pt[]; endTan?: Pt }
+
+function clampNum(v: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, v)) }
+function isSegType(v: any): v is SegType { return v === 'straight' || v === 'curve' || v === 'arc' || v === 'vert' }
+function asPt(v: any): Pt | null {
+  const x = Number(v?.x), y = Number(v?.y)
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null
+}
+function segLabel(t: SegType): string {
+  return t === 'curve' ? '曲线' : t === 'arc' ? '圆弧' : t === 'vert' ? '垂线' : '直线'
+}
+/** 单位向量；零向量返回 null */
+function unitVec(v: Pt | null | undefined): Pt | null {
+  if (!v) return null
+  const x = Number(v.x), y = Number(v.y)
+  const len = Math.hypot(x, y)
+  return Number.isFinite(len) && len > 0.001 ? { x: x / len, y: y / len } : null
+}
+/** 左转 90°：与末端切向垂直的单位法线 */
+function normalOf(t: Pt): Pt { return { x: -t.y, y: t.x } }
+/** p 在「过 p0、方向 n」的直线上的垂足 */
+function projectOnNormal(p0: Pt, p: Pt, n: Pt): Pt {
+  const L = (p.x - p0.x) * n.x + (p.y - p0.y) * n.y
+  return { x: p0.x + n.x * L, y: p0.y + n.y * L }
+}
+/** 起点锚点所在边的出边法线：第一段没有上一段，用节点边法线作为参考方向 */
+function anchorNormal(side: OrthoSide): Pt {
+  return side === 'l' ? { x: -1, y: 0 } : side === 'r' ? { x: 1, y: 0 }
+    : side === 't' ? { x: 0, y: -1 } : { x: 0, y: 1 }
+}
+function segmentBaseNormal(e: any, start: Pt): Pt {
+  const f = anchorSpecOf(e, 'from')
+  if (f) return anchorNormal(f.side)
+  const a = nodeById.value.get(e.from_node)
+  if (a) {
+    const t = unitVec({ x: start.x - (a.x + NODE_W / 2), y: start.y - (a.y + NODE_H / 2) })
+    if (t) return t
+  }
+  return { x: 1, y: 0 }
+}
+function cloneSegment(s: EdgeSegment): EdgeSegment {
+  return { type: s.type, end: { ...s.end }, ctrl: s.ctrl.map(p => ({ ...p })), bulge: s.bulge }
+}
+/** 读渲染用的分段（纯函数：返回副本，绝不在 computed 里改源数据） */
+function readSegments(e: any): EdgeSegment[] {
+  if (!Array.isArray(e?.segments)) return []
+  const out: EdgeSegment[] = []
+  for (const s of e.segments) {
+    const end = asPt(s?.end)
+    if (!end) continue
+    out.push({
+      type: isSegType(s?.type) ? s.type : 'straight',
+      end,
+      ctrl: Array.isArray(s?.ctrl)
+        ? (s.ctrl as any[]).map(asPt).filter((p: Pt | null): p is Pt => !!p)
+        : [],
+      bulge: Number.isFinite(Number(s?.bulge))
+        ? clampNum(Number(s.bulge), -MAX_ARC_BULGE, MAX_ARC_BULGE)
+        : DEFAULT_ARC_BULGE,
+    })
+  }
+  return out
+}
+function hasSegments(e: any): boolean { return readSegments(e).length > 0 }
+/** 写回时用活对象（自己创建的数据一定是规范结构） */
+function liveSegments(e: any): any[] { return Array.isArray(e?.segments) ? e.segments : [] }
+
+/** 距离鼠标最近的「边上点」：四条边各取投影后比距离，沿边 clamp 保证离角留白。
+ *  鼠标在节点内部时自然取最近的一条边；在外部时取该边上离鼠标最近的点。 */
+function closestEdgeAnchor(r: Rect, p: Pt): AnchorSpec {
+  const mid = snapToSideMid(r, p)
+  if (mid) return mid
+  let bestSide: OrthoSide = 'r', bestV = 0, bestD = Infinity
+  for (const s of ORTHO_SIDES) {
+    const [lo, hi] = sideRange(s, r)
+    const along = sideAxis(s) === 'H' ? p.y : p.x
+    const v = clampNum(along, lo, hi)
+    const q = pointOnSide(s, r, v)
+    const dd = (q.x - p.x) ** 2 + (q.y - p.y) ** 2
+    if (dd < bestD) { bestD = dd; bestSide = s; bestV = v }
+  }
+  const [lo, hi] = sideRange(bestSide, r)
+  return { side: bestSide, t: hi > lo ? clampNum((bestV - lo) / (hi - lo), 0, 1) : 0.5 }
+}
+
+/** 右键位置相对当前段弦的位置：t=沿弦归一化位置，s=归一化垂距（带符号）。
+ *  右键点正好落在端点或弦上时返回 null → 用默认弯向。 */
+function viaBend(p0: Pt, p1: Pt, via: Pt | null | undefined): { t: number; s: number } | null {
+  if (!via) return null
+  const dx = p1.x - p0.x, dy = p1.y - p0.y
+  const len = Math.hypot(dx, dy)
+  if (len < 0.001) return null
+  const ux = dx / len, uy = dy / len
+  const t = ((via.x - p0.x) * ux + (via.y - p0.y) * uy) / len
+  const s = ((via.x - p0.x) * -uy + (via.y - p0.y) * ux) / len
+  if (t < 0.06 || t > 0.94 || Math.abs(s) < 0.02) return null
+  return { t, s }
+}
+/** 曲线默认 S 形控制点；有右键弯向时把两个控制点一起沿弦法线平移，曲线随之鼓向右键侧 */
+function segCurveCtrl(p0: Pt, p1: Pt, via?: Pt | null): Pt[] {
+  const dx = p1.x - p0.x, dy = p1.y - p0.y
+  const len = Math.hypot(dx, dy) || 1
+  let c1: Pt, c2: Pt
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    c1 = { x: p0.x + dx / 3, y: p0.y }; c2 = { x: p1.x - dx / 3, y: p1.y }
+  } else {
+    c1 = { x: p0.x, y: p0.y + dy / 3 }; c2 = { x: p1.x, y: p1.y - dy / 3 }
+  }
+  const bend = viaBend(p0, p1, via)
+  if (bend) {
+    const m = clampNum((4 / 3) * bend.s * len, -1.2 * len, 1.2 * len)
+    const nx = -dy / len, ny = dx / len
+    c1 = { x: c1.x + nx * m, y: c1.y + ny * m }
+    c2 = { x: c2.x + nx * m, y: c2.y + ny * m }
+  }
+  return [c1, c2]
+}
+/** 圆弧矢高：右键点在某处的垂距 s 反推圆弧中点矢高（抛物线近似 s(t)≈4b·t(1-t)） */
+function segBulge(p0: Pt, p1: Pt, via?: Pt | null): number {
+  const bend = viaBend(p0, p1, via)
+  if (!bend) return DEFAULT_ARC_BULGE
+  const b = bend.s / (4 * bend.t * (1 - bend.t))
+  return clampNum(b, -MAX_ARC_BULGE, MAX_ARC_BULGE) || DEFAULT_ARC_BULGE
+}
+/** 弦 + 归一化矢高 → 真圆弧：半径 R=len·(1/8|b| + |b|/2)，圆心在弦中点的法线另一侧。
+ *  b>0 鼓向法线正侧（sweep=0），b<0 鼓向另一侧（sweep=1）。 */
+function arcGeom(p0: Pt, p1: Pt, b: number) {
+  const dx = p1.x - p0.x, dy = p1.y - p0.y
+  const len = Math.hypot(dx, dy)
+  if (len < 0.001 || Math.abs(b) < 0.001) return null
+  const bb = clampNum(b, -MAX_ARC_BULGE, MAX_ARC_BULGE)
+  const R = len * (1 / (8 * Math.abs(bb)) + Math.abs(bb) / 2)
+  const sag = Math.abs(bb) * len
+  const nx = -dy / len, ny = dx / len
+  const sign = bb > 0 ? 1 : -1
+  const cx = (p0.x + p1.x) / 2 - sign * (R - sag) * nx
+  const cy = (p0.y + p1.y) / 2 - sign * (R - sag) * ny
+  const a0 = Math.atan2(p0.y - cy, p0.x - cx)
+  const a1 = Math.atan2(p1.y - cy, p1.x - cx)
+  const sweep = bb > 0 ? 0 : 1
+  let delta = a1 - a0
+  while (delta > Math.PI) delta -= 2 * Math.PI
+  while (delta <= -Math.PI) delta += 2 * Math.PI
+  if ((sweep === 1 && delta < 0) || (sweep === 0 && delta > 0)) delta += sweep === 1 ? 2 * Math.PI : -2 * Math.PI
+  return { R, cx, cy, a0, delta, sweep }
+}
+function straightBuilt(p0: Pt, p1: Pt): BuiltSeg {
+  const samples = [0, 0.25, 0.5, 0.75, 1].map(k => ({ x: p0.x + (p1.x - p0.x) * k, y: p0.y + (p1.y - p0.y) * k }))
+  return {
+    d: `L ${p1.x.toFixed(1)} ${p1.y.toFixed(1)}`, samples, mid: samples[2], ctrl: [],
+    endTan: unitVec({ x: p1.x - p0.x, y: p1.y - p0.y }) || { x: 1, y: 0 },
+  }
+}
+/** 垂线段：p0 = 垂足（上一段末尾），n = 垂直于上一段末端切向的单位法线。
+ *  主体是 p0 → T（end 在垂线上的投影）；若 end 不在垂线上（最后一段 end 是目标节点锚点），
+ *  再补一小段把线接到 end，保证「主段严格垂直」且「线仍然连到节点」。 */
+function vertBuilt(p0: Pt, p1: Pt, normal: Pt | null | undefined, ctrl: Pt[]): BuiltSeg {
+  const n = unitVec(normal) || unitVec(ctrl?.[0])
+  if (!n) return straightBuilt(p0, p1)
+  const T = projectOnNormal(p0, p1, n)
+  const tail = { x: p1.x - T.x, y: p1.y - T.y }
+  if (Math.hypot(tail.x, tail.y) <= VERT_EPS) return straightBuilt(p0, p1)
+  const samples: Pt[] = [p0]
+  for (const q of [T, p1]) {
+    const from = samples[samples.length - 1]
+    for (let k = 1; k <= 4; k++) {
+      samples.push({ x: from.x + (q.x - from.x) * k / 4, y: from.y + (q.y - from.y) * k / 4 })
+    }
+  }
+  samples[samples.length - 1] = { x: p1.x, y: p1.y }
+  return {
+    d: `L ${T.x.toFixed(1)} ${T.y.toFixed(1)} L ${p1.x.toFixed(1)} ${p1.y.toFixed(1)}`,
+    samples, mid: { x: (p0.x + T.x) / 2, y: (p0.y + T.y) / 2 }, ctrl: [n],
+    endTan: unitVec(tail) || n,
+  }
+}
+/** 一段在终点处的单位切向：曲线看末端控制点、圆弧看终点切线、直线/垂线看最后一段方向。
+ *  垂线方向必须取「上一段末端」的切向，不能用整段弦方向，否则曲线/圆弧段后面接的垂线会歪。 */
+function segEndTangent(p0: Pt, p1: Pt, type: SegType, ctrl: Pt[], bulge: number, built?: BuiltSeg): Pt {
+  if (built?.endTan) return built.endTan
+  if (type === 'curve' && ctrl.length >= 2) {
+    const t = unitVec({ x: p1.x - ctrl[1].x, y: p1.y - ctrl[1].y })
+    if (t) return t
+  }
+  if (type === 'arc') {
+    const g = arcGeom(p0, p1, bulge)
+    if (g) {
+      const r = { x: p1.x - g.cx, y: p1.y - g.cy }
+      const s = g.delta >= 0 ? 1 : -1
+      const t = unitVec({ x: -r.y * s, y: r.x * s })
+      if (t) return t
+    }
+  }
+  return unitVec({ x: p1.x - p0.x, y: p1.y - p0.y }) || { x: 1, y: 0 }
+}
+/** 生成一段的 SVG 片段（不含起点 M）+ 采样点（箭头中点与控制柄定位共用）。
+ *  normal 只对垂线段有效，由调用方按「上一段末端切向」实时算出，上一段被编辑后垂线会自动跟着转。 */
+function buildSegment(p0: Pt, p1: Pt, type: SegType, ctrl: Pt[], bulge: number, normal?: Pt | null): BuiltSeg {
+  if (type === 'vert') return vertBuilt(p0, p1, normal, ctrl)
+  if (type === 'arc') {
+    const g = arcGeom(p0, p1, bulge)
+    if (!g) return straightBuilt(p0, p1)
+    const N = 24
+    const samples: Pt[] = [p0]
+    for (let k = 1; k <= N; k++) {
+      const a = g.a0 + g.delta * k / N
+      samples.push({ x: g.cx + g.R * Math.cos(a), y: g.cy + g.R * Math.sin(a) })
+    }
+    samples[samples.length - 1] = { x: p1.x, y: p1.y }
+    return {
+      d: `A ${g.R.toFixed(3)} ${g.R.toFixed(3)} 0 0 ${g.sweep} ${p1.x.toFixed(2)} ${p1.y.toFixed(2)}`,
+      samples, mid: samples[N / 2], ctrl: [],
+    }
+  }
+  if (type === 'curve') {
+    const cs = ctrl.length >= 2 ? ctrl.slice(0, 2) : segCurveCtrl(p0, p1)
+    const samples = cubicSamples(p0, cs[0], cs[1], p1, 20)
+    return {
+      d: `C ${cs[0].x.toFixed(1)} ${cs[0].y.toFixed(1)}, ${cs[1].x.toFixed(1)} ${cs[1].y.toFixed(1)}, ${p1.x.toFixed(1)} ${p1.y.toFixed(1)}`,
+      samples, mid: samples[10], ctrl: cs,
+    }
+  }
+  return straightBuilt(p0, p1)
+}
+/** 落点确认：把「右键弯向」烘焙成段自带的控制点 / 矢高，之后与菜单位置再无关系。
+ *  垂线段另把落点投影到法线上（垂足 = p0），并记下单位法线，保证段本身就是一条垂直直线。 */
+function makeDrawSegment(p0: Pt, p1: Pt, type: SegType, via: Pt | null, normal?: Pt | null): EdgeSegment {
+  if (type === 'vert') {
+    const n = unitVec(normal) || { x: 0, y: 1 }
+    return { type, end: projectOnNormal(p0, p1, n), ctrl: [n], bulge: DEFAULT_ARC_BULGE }
+  }
+  return {
+    type,
+    end: { x: p1.x, y: p1.y },
+    ctrl: type === 'curve' ? segCurveCtrl(p0, p1, via) : [],
+    bulge: type === 'arc' ? segBulge(p0, p1, via) : DEFAULT_ARC_BULGE,
+  }
+}
+/** 分段连线的顶点序列：首末锚点由节点实时派生，中间顶点取各段 end */
+function mixedPoints(e: any): Pt[] {
+  const a = nodeById.value.get(e.from_node), b = nodeById.value.get(e.to_node)
+  if (!a || !b) return []
+  const f = anchorSpecOf(e, 'from'), t = anchorSpecOf(e, 'to')
+  const auto = sideAnchors(a, b)
+  const start = f ? anchorPoint(f, nodeRect(a)) : auto.p1
+  const end = t ? anchorPoint(t, nodeRect(b)) : auto.p2
+  const segs = readSegments(e)
+  return segs.length ? [start, ...segs.slice(0, -1).map(s => s.end), end] : [start, end]
+}
+/** 渲染一条分段连线；每段返回自己的可拖手柄（顶点 / 曲线控制点 / 圆弧矢高 / 拆分点） */
+function computeMixedEdge(e: any, segs: EdgeSegment[]) {
+  const pts = mixedPoints(e)
+  if (pts.length < 2) return null
+  let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`
+  const samples: Pt[] = [pts[0]]
+  const handles: EdgeHandle[] = []
+  // 逐段推进末端切向：垂线段的方向由「上一段末端」实时决定，拖动上一段后垂线自动保持垂直
+  let prevTan = segmentBaseNormal(e, pts[0])
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]
+    const normal = s.type === 'vert' ? normalOf(prevTan) : null
+    const built = buildSegment(pts[i], pts[i + 1], s.type, s.ctrl, s.bulge, normal)
+    prevTan = segEndTangent(pts[i], pts[i + 1], s.type, s.ctrl, s.bulge, built)
+    d += ' ' + built.d
+    samples.push(...built.samples.slice(1))
+    // 顶点柄（最后一段终点是目标锚点，交给锚点柄）
+    if (i < segs.length - 1) handles.push({ kind: 'vertex', seg: i, index: i, x: pts[i + 1].x, y: pts[i + 1].y })
+    if (s.type === 'curve') {
+      built.ctrl.forEach((cp, k) => handles.push({ kind: 'ctrl', seg: i, ctrl: k, index: k, x: cp.x, y: cp.y }))
+    }
+    if (s.type === 'arc') handles.push({ kind: 'bulge', seg: i, index: 0, x: built.mid.x, y: built.mid.y })
+    // 拆分柄放在 25% 处，避免与圆弧矢高柄（中点）重叠
+    const q = built.samples[Math.max(1, Math.floor(built.samples.length / 4))] || built.mid
+    handles.push({ kind: 'insert', seg: i, index: i, x: q.x, y: q.y })
+  }
+  const mid = polylineMid(samples)
+  return {
+    d, midX: mid.x, midY: mid.y, midAngle: mid.angle, handles,
+    anchorFrom: pts[0], anchorTo: pts[pts.length - 1],
+  }
+}
+/** 第 idx 段（垂线段）渲染时实际使用的单位法线：按前面各段的末端切向逐段推进。
+ *  编辑垂线顶点时用它投影，避免「拖动时按旧方向、渲染时按新方向」造成跳动。 */
+function mixedNormalAt(e: any, idx: number): Pt {
+  const pts = mixedPoints(e), segs = readSegments(e)
+  let tan: Pt = pts.length ? segmentBaseNormal(e, pts[0]) : { x: 1, y: 0 }
+  for (let i = 0; i < idx && i < segs.length && pts[i + 1]; i++) {
+    const s = segs[i]
+    const normal = s.type === 'vert' ? normalOf(tan) : null
+    const built = buildSegment(pts[i], pts[i + 1], s.type, s.ctrl, s.bulge, normal)
+    tan = segEndTangent(pts[i], pts[i + 1], s.type, s.ctrl, s.bulge, built)
+  }
+  return normalOf(tan)
+}
+
+// —— 直角折线：路径 = [锚点A, 拐点…, 锚点B]，锚点为派生量、控制点严格为折角 ——
+// 路由算法见下方 avoidRects 之后的「ortho 路由」段落（依赖 Rect 类型）。
 
 /** 去掉连续重合点（共线或退化段会产生） */
 function dedupePts(pts: Pt[]): Pt[] {
@@ -1762,53 +2373,6 @@ function dedupePts(pts: Pt[]): Pt[] {
     out.push(p)
   }
   return out
-}
-
-/** L 形：p → 拐角 → q，只拐一次。
- *  horizontalFirst=true 先水平后垂直（拐角 = (q.x, p.y)）；false 先垂直后水平（拐角 = (p.x, q.y)）。
- *  p、q 共线时拐角与端点重合，dedupe 后自然退化成一条直线。 */
-function lShape(p: Pt, q: Pt, horizontalFirst: boolean): Pt[] {
-  const corner = horizontalFirst ? { x: q.x, y: p.y } : { x: p.x, y: q.y }
-  return dedupePts([p, corner, q])
-}
-
-/** 折线专用锚点：起点与终点各取「相邻的两条边」，让 L 形两段都沿节点边缘法线正出正入。
- *  · 水平距离为主 → 源节点左右侧出、目标节点上下侧入（先水平后垂直）
- *  · 垂直距离为主 → 源节点上下侧出、目标节点左右侧入（先垂直后水平）
- *  · 两中心水平/垂直共线 → 两端取同一对侧边，直接一条直线（无折角）
- *  bias：双向且共线时沿边缘法线错开，避免两条线重叠；非共线时两个方向的 L 形天然分离。 */
-function orthoAnchors(a: any, b: any, bias: number) {
-  const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
-  const bcx = b.x + NODE_W / 2, bcy = b.y + NODE_H / 2
-  const dx = bcx - acx, dy = bcy - acy
-  const sx = Math.sign(dx) || 1, sy = Math.sign(dy) || 1
-
-  if (Math.abs(dy) < ORTHO_COLINEAR_EPS) {
-    return {
-      p1: { x: sx > 0 ? a.x + NODE_W : a.x, y: acy + bias },
-      p2: { x: sx > 0 ? b.x : b.x + NODE_W, y: bcy + bias },
-      horizontalFirst: true,
-    }
-  }
-  if (Math.abs(dx) < ORTHO_COLINEAR_EPS) {
-    return {
-      p1: { x: acx + bias, y: sy > 0 ? a.y + NODE_H : a.y },
-      p2: { x: bcx + bias, y: sy > 0 ? b.y : b.y + NODE_H },
-      horizontalFirst: false,
-    }
-  }
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return {
-      p1: { x: sx > 0 ? a.x + NODE_W : a.x, y: acy },
-      p2: { x: bcx, y: sy > 0 ? b.y : b.y + NODE_H },
-      horizontalFirst: true,
-    }
-  }
-  return {
-    p1: { x: acx, y: sy > 0 ? a.y + NODE_H : a.y },
-    p2: { x: sx > 0 ? b.x : b.x + NODE_W, y: bcy },
-    horizontalFirst: false,
-  }
 }
 
 /** 按「路径长度」取折线中点，并给出该点所在线段方向角（直角折线下恒为 0/90/180/270） */
@@ -1998,143 +2562,496 @@ function detourCurve(pts: Pt[], rects: Rect[], sidePref: 1 | -1) {
   return { pts: chosen.pts, d: smoothThrough(chosen.pts), samples, mids }
 }
 
-/** 直角折线候选评分：穿过节点的次数/长度权重最高，其次才是路径长度与偏离默认朝向 */
-function orthoScore(pts: Pt[], rects: Rect[], pen: number): number {
-  const h = routeHits(pts, rects)
-  return h.n * 1000 + h.len * 2 + pen + polylineLen(pts) * 0.02
+// ————————————————————————————————————————————————————————————————————————
+// 直角折线路由（ortho）
+//  1. 包围盒内无阻挡 → 顺时针 / 逆时针两条 L 形（各 1 个拐点），可手动切换方向
+//  2. 一侧被挡 → 自动切到另一条；两侧都被挡 → 生成 Z / U 形多拐点通道绕行
+//  3. 锚点由相邻拐点正交投影到节点边派生，随拐点移动、沿边滑动，取总长最短
+//  4. 投影落不进节点边范围 → 自动插入拐点（L / Z），锚点仍合法落在节点上
+//  5. 化简：去除重合点、合并共线段、消除折返 → 中间点恒为 90° 折角（控制点严格为拐点）
+//  6. 禁止自交：任意两条非相邻段不得相交或共线重叠
+// ————————————————————————————————————————————————————————————————————————
+type OrthoDir = 'cw' | 'ccw'
+type Axis = 'H' | 'V'
+type OrthoSide = 'l' | 'r' | 't' | 'b'
+type OrthoResult = {
+  pts: Pt[]; corners: Pt[]; dir: OrthoDir
+  hits: number; cross: number; score: number
+  missing: number   // 未被保留成折角的用户控制点数
+  valid: boolean    // 全水平/垂直段且中间点全是折角
 }
 
-/** 锚点可变坐标候选：默认居中 + 贴边 + 挡路节点边缘的外侧，限制在节点边长内 */
-function anchorCandidates(lo: number, hi: number, center: number, blockers: Rect[], axis: 'x' | 'y'): number[] {
-  const vals = [center, lo, hi, center - (hi - lo) * 0.35, center + (hi - lo) * 0.35]
-  for (const r of blockers) {
-    const u = axis === 'y' ? r.t : r.l, v = axis === 'y' ? r.b : r.r
-    vals.push(u - AVOID_GAP, v + AVOID_GAP)
-  }
-  const out: number[] = []
-  for (const t of vals) {
-    const c = Math.max(lo, Math.min(hi, t))
-    if (!out.some(x => Math.abs(x - c) < 3)) out.push(c)
-  }
-  return out.slice(0, 6)
+const ORTHO_MARGIN = 10   // 锚点离节点角的最小距离
+const ORTHO_EPS = 0.5
+const ORTHO_BULGE = 24    // 插入控制点时的法向凸起量，保证新控制点立刻是折角
+const ORTHO_SIDES: OrthoSide[] = ['l', 'r', 't', 'b']
+
+function nodeRect(n: any): Rect {
+  return { l: n.x, t: n.y, r: n.x + NODE_W, b: n.y + NODE_H }
 }
-
-/**
- * 直角折线避让：在「整条线只有一个折角」的约束下，从多种朝向与锚点位置里挑最少穿节点的一条。
- * 水平主导走「源左右侧出 + 目标上下侧入」，垂直主导走「源上下侧出 + 目标左右侧入」，
- * 非默认朝向与逆着目标方向出/入都会加罚分，保证无障碍时保持原样。
- */
-function detourOrtho(a: any, b: any, bias: number, rects: Rect[], fallback: Pt[]): Pt[] {
-  const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
-  const bcx = b.x + NODE_W / 2, bcy = b.y + NODE_H / 2
-  const dx = bcx - acx, dy = bcy - acy
-  const sx = Math.sign(dx) || 1, sy = Math.sign(dy) || 1
-  const M = 10 // 锚点离节点角的最小距离
-  const defaultH = Math.abs(dx) >= Math.abs(dy)
-  const colinearH = Math.abs(dy) < ORTHO_COLINEAR_EPS
-  const colinearV = Math.abs(dx) < ORTHO_COLINEAR_EPS
-  // 候选坐标只从「默认路径实际穿过的矩形」推导，控制搜索规模
-  const blockers = rects.filter(r => routeHits(fallback, [r]).n > 0)
-  const aY = anchorCandidates(a.y + M, a.y + NODE_H - M, acy + (colinearH ? bias : 0), blockers, 'y')
-  const aX = anchorCandidates(a.x + M, a.x + NODE_W - M, acx + (colinearV ? bias : 0), blockers, 'x')
-  const bY = anchorCandidates(b.y + M, b.y + NODE_H - M, bcy + (colinearH ? bias : 0), blockers, 'y')
-  const bX = anchorCandidates(b.x + M, b.x + NODE_W - M, bcx + (colinearV ? bias : 0), blockers, 'x')
-
-  let best = fallback, bestScore = orthoScore(fallback, rects, 0)
-  const consider = (p1: Pt, p2: Pt, hFirst: boolean, pen: number) => {
-    const pts = lShape(p1, p2, hFirst)
-    const score = orthoScore(pts, rects, pen)
-    if (score < bestScore) { bestScore = score; best = pts }
-  }
-
-  // 共线：保持 0 折角的直线，只在节点边缘内沿法线平移找空档
-  if (colinearH || colinearV) {
-    if (colinearH) {
-      for (const y1 of aY) {
-        consider(
-          { x: sx > 0 ? a.x + NODE_W : a.x, y: y1 },
-          { x: sx > 0 ? b.x : b.x + NODE_W, y: y1 + (bcy - acy) },
-          true,
-          Math.abs(y1 - acy - bias) * 0.15,
-        )
-      }
-    } else {
-      for (const x1 of aX) {
-        consider(
-          { x: x1, y: sy > 0 ? a.y + NODE_H : a.y },
-          { x: x1 + (bcx - acx), y: sy > 0 ? b.y : b.y + NODE_H },
-          false,
-          Math.abs(x1 - acx - bias) * 0.15,
-        )
-      }
-    }
-    return best
-  }
-
-  // 非共线：两种「先横后竖 / 先竖后横」× 四种出边 × 四种入边，再叠加锚点位置
-  for (const hFirst of [defaultH, !defaultH]) {
-    const srcSides = hFirst ? ['r', 'l'] : ['b', 't']
-    const dstSides = hFirst ? ['t', 'b'] : ['l', 'r']
-    for (const src of srcSides) for (const dst of dstSides) {
-      const srcNat = hFirst ? src === (sx > 0 ? 'r' : 'l') : src === (sy > 0 ? 'b' : 't')
-      const dstNat = hFirst ? dst === (sy > 0 ? 't' : 'b') : dst === (sx > 0 ? 'l' : 'r')
-      const pen = (srcNat ? 0 : 350) + (dstNat ? 0 : 350) + (hFirst === defaultH ? 0 : 20)
-      const sv = hFirst ? aY : aX, dv = hFirst ? bX : bY
-      const sc = hFirst ? acy : acx, dc = hFirst ? bcx : bcy
-      for (const s of sv) for (const d of dv) {
-        const p1: Pt = hFirst
-          ? { x: src === 'r' ? a.x + NODE_W : a.x, y: s }
-          : { x: s, y: src === 'b' ? a.y + NODE_H : a.y }
-        const p2: Pt = hFirst
-          ? { x: d, y: dst === 't' ? b.y : b.y + NODE_H }
-          : { x: dst === 'r' ? b.x + NODE_W : b.x, y: d }
-        consider(p1, p2, hFirst, pen + Math.abs(s - sc) * 0.15 + Math.abs(d - dc) * 0.15)
-      }
-    }
-  }
-  return best
+function sideAxis(s: OrthoSide): Axis { return s === 'l' || s === 'r' ? 'H' : 'V' }
+function sideFixed(s: OrthoSide, r: Rect): number {
+  if (s === 'l') return r.l
+  if (s === 'r') return r.r
+  if (s === 't') return r.t
+  return r.b
 }
-
-/** 带手动控制点的直角折线：逐段在两个 L 形朝向里挑更不穿节点的那个，仍保持每段一个折角 */
-function orthoRouteAvoid(p1: Pt, p2: Pt, horizontalFirst: boolean, wps: Pt[], rects: Rect[]) {
-  const raw = [p1, ...wps, p2]
-  const pts: Pt[] = [p1]
-  const insertHandles: EdgeHandle[] = []
-  for (let i = 0; i < raw.length - 1; i++) {
-    const A = lShape(raw[i], raw[i + 1], horizontalFirst)
-    const B = lShape(raw[i], raw[i + 1], !horizontalFirst)
-    // 相等时（含无障碍）保留默认朝向，保证外观稳定
-    const seg = orthoScore(A, rects, 0) <= orthoScore(B, rects, 1) ? A : B
-    const m = polylineMid(seg)
-    insertHandles.push({ kind: 'insert', index: i, x: m.x, y: m.y })
-    for (const p of seg.slice(1)) pts.push(p)
-  }
-  return { pts: dedupePts(pts), insertHandles }
+function sideRange(s: OrthoSide, r: Rect): [number, number] {
+  return s === 'l' || s === 'r'
+    ? [r.t + ORTHO_MARGIN, r.b - ORTHO_MARGIN]
+    : [r.l + ORTHO_MARGIN, r.r - ORTHO_MARGIN]
 }
-
-/** 计算 ortho 折线的默认拐点位置：取自动生成的 L 形路径的折角点 */
-function defaultOrthoWaypoint(a: any, b: any, bias: number, rects: Rect[]): Pt | null {
-  const oa = orthoAnchors(a, b, bias)
-  let pts = lShape(oa.p1, oa.p2, oa.horizontalFirst)
-  if (routeHits(pts, rects).n > 0) {
-    pts = detourOrtho(a, b, bias, rects, pts)
-  }
-  // pts 形如 [p1, corner, p2]，取中间那个点作为默认拐点
-  if (pts.length >= 3) return pts[1]
-  // 退化（共线）时没有拐点，返回 null
+/** 锚点：把可变坐标 clamp 在边的有效范围内，保证「落在节点上」且沿法线正出正入 */
+function pointOnSide(s: OrthoSide, r: Rect, v: number): Pt {
+  const [lo, hi] = sideRange(s, r)
+  const c = Math.max(lo, Math.min(hi, v))
+  return s === 'l' || s === 'r'
+    ? { x: sideFixed(s, r), y: c }
+    : { x: c, y: sideFixed(s, r) }
+}
+function segDir(p: Pt, q: Pt): Axis | null {
+  if (Math.abs(p.y - q.y) < ORTHO_EPS) return 'H'
+  if (Math.abs(p.x - q.x) < ORTHO_EPS) return 'V'
   return null
+}
+function segLen(p: Pt, q: Pt): number { return Math.abs(q.x - p.x) + Math.abs(q.y - p.y) }
+
+/** 两条轴对齐线段是否相交（含端点相接与共线重叠） */
+function segsOverlap(p: Pt, q: Pt, s: Pt, t: Pt): boolean {
+  const lo = (a: number, b: number) => Math.min(a, b)
+  const hi = (a: number, b: number) => Math.max(a, b)
+  const h1 = Math.abs(p.y - q.y) < ORTHO_EPS, h2 = Math.abs(s.y - t.y) < ORTHO_EPS
+  const v1 = Math.abs(p.x - q.x) < ORTHO_EPS, v2 = Math.abs(s.x - t.x) < ORTHO_EPS
+  if (h1 && h2) return Math.abs(p.y - s.y) < ORTHO_EPS && Math.min(hi(p.x, q.x), hi(s.x, t.x)) >= Math.max(lo(p.x, q.x), lo(s.x, t.x)) - ORTHO_EPS
+  if (v1 && v2) return Math.abs(p.x - s.x) < ORTHO_EPS && Math.min(hi(p.y, q.y), hi(s.y, t.y)) >= Math.max(lo(p.y, q.y), lo(s.y, t.y)) - ORTHO_EPS
+  return Math.min(hi(p.x, q.x), hi(s.x, t.x)) >= Math.max(lo(p.x, q.x), lo(s.x, t.x)) - ORTHO_EPS
+    && Math.min(hi(p.y, q.y), hi(s.y, t.y)) >= Math.max(lo(p.y, q.y), lo(s.y, t.y)) - ORTHO_EPS
+}
+/** 自交计数：相邻段共享端点是正常折角，跳过；非相邻段任何接触都算违规 */
+function selfCrossCount(pts: Pt[]): number {
+  const segs: [Pt, Pt][] = []
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (segDir(pts[i], pts[i + 1]) && segLen(pts[i], pts[i + 1]) > ORTHO_EPS) segs.push([pts[i], pts[i + 1]])
+  }
+  let n = 0
+  for (let i = 0; i < segs.length; i++) {
+    for (let j = i + 2; j < segs.length; j++) {
+      if (segsOverlap(segs[i][0], segs[i][1], segs[j][0], segs[j][1])) n++
+    }
+  }
+  return n
+}
+
+/** 化简：三点共线（同向或 180° 折返）就去掉中间点；最终中间点全是 90° 折角 */
+function simplifyOrtho(pts: Pt[]): Pt[] {
+  let out = dedupePts(pts)
+  for (let pass = 0; pass < 8 && out.length > 2; pass++) {
+    const next: Pt[] = [out[0]]
+    for (let i = 1; i < out.length - 1; i++) {
+      const a = next[next.length - 1], b = out[i], c = out[i + 1]
+      const h = Math.abs(a.y - b.y) < ORTHO_EPS && Math.abs(b.y - c.y) < ORTHO_EPS
+      const v = Math.abs(a.x - b.x) < ORTHO_EPS && Math.abs(b.x - c.x) < ORTHO_EPS
+      if (!h && !v) next.push(b)
+    }
+    next.push(out[out.length - 1])
+    const cleaned = dedupePts(next)
+    if (JSON.stringify(cleaned) === JSON.stringify(out)) return out
+    out = cleaned
+  }
+  return out
+}
+
+/** 评分：自交是硬约束，其次穿节点，再是总长度与拐点数量（倾向最简路径） */
+function orthoCost(pts: Pt[], rects: Rect[]) {
+  const h = routeHits(pts, rects)
+  const cross = selfCrossCount(pts)
+  return {
+    hits: h.n,
+    cross,
+    score: cross * 100000 + h.n * 10000 + h.len * 3 + polylineLen(pts) + (pts.length - 2) * 12,
+  }
+}
+
+/** 屏幕坐标 y 向下：首段向量到末段向量右转 = 顺时针 */
+function turnDir(pts: Pt[]): OrthoDir {
+  if (pts.length < 3) return 'cw'
+  const p0 = pts[0], p1 = pts[1], q0 = pts[pts.length - 2], q1 = pts[pts.length - 1]
+  const cross = (p1.x - p0.x) * (q1.y - q0.y) - (p1.y - p0.y) * (q1.x - q0.x)
+  return cross >= 0 ? 'cw' : 'ccw'
+}
+function centerDelta(ra: Rect, rb: Rect) {
+  return { dx: (rb.l + rb.r - ra.l - ra.r) / 2, dy: (rb.t + rb.b - ra.t - ra.b) / 2 }
+}
+/** 默认方向：水平主导走「先横后竖」，垂直主导走「先竖后横」，换算成顺/逆时针标签 */
+function defaultTurnDir(ra: Rect, rb: Rect): OrthoDir {
+  const { dx, dy } = centerDelta(ra, rb)
+  const cwHV: OrthoDir = dx * dy >= 0 ? 'cw' : 'ccw'
+  if (Math.abs(dx) >= Math.abs(dy)) return cwHV
+  return cwHV === 'cw' ? 'ccw' : 'cw'
+}
+/** 两条标准 L 使用的出边 / 入边（各贴包围盒一侧） */
+function standardLSides(ra: Rect, rb: Rect): [OrthoSide, OrthoSide][] {
+  const { dx, dy } = centerDelta(ra, rb)
+  return [
+    [dx >= 0 ? 'r' : 'l', dy >= 0 ? 't' : 'b'],
+    [dy >= 0 ? 'b' : 't', dx >= 0 ? 'l' : 'r'],
+  ]
+}
+
+/** 把有序点序列正交化：相邻点不同 x 且不同 y 时自动插入 L 拐点。
+ *  拐点朝向按「不穿节点 / 不自交 / 方向交替」就地择优；
+ *  turnFlags 标记的点（用户控制点）必须成为 90° 折角，其前后段方向强制不同。 */
+function orthogonalize(
+  raw: Pt[], rects: Rect[],
+  firstDir?: Axis, lastDir?: Axis, turnFlags?: boolean[],
+  forceTail = false,
+): Pt[] {
+  const out: Pt[] = [raw[0]]
+  let prevDir: Axis | null = null
+  let forbidOut: Axis | null = null  // 上一必经折角的入射方向：本次出发必须换方向
+  const last = raw.length - 2
+  for (let i = 0; i <= last; i++) {
+    const p = out[out.length - 1], q = raw[i + 1]
+    if (!p || !q) continue
+    const wantFirst = i === 0 ? firstDir : undefined
+    const wantLast = i === last ? lastDir : undefined
+    const isTurn = !!turnFlags?.[i + 1]
+    const d = segDir(p, q)
+    const direct = d && segLen(p, q) > ORTHO_EPS
+      && (!forbidOut || d !== forbidOut)
+      && (!wantFirst || d === wantFirst)
+      && (!wantLast || d === wantLast)
+    if (direct) {
+      out.push(q)
+      prevDir = d
+      forbidOut = isTurn ? d : null
+      continue
+    }
+    const cands: Pt[] = [{ x: q.x, y: p.y }, { x: p.x, y: q.y }]
+    let best: Pt | null = null, bestCost = Infinity
+    for (const c of cands) {
+      if (segLen(p, c) < ORTHO_EPS || segLen(c, q) < ORTHO_EPS) continue
+      const od = segDir(p, c), ad = segDir(c, q)
+      if (!od || !ad) continue
+      if (wantFirst && od !== wantFirst) continue
+      if (wantLast && ad !== wantLast) continue
+      if (forbidOut && od === forbidOut) continue
+      const trial = simplifyOrtho([...out, c, q])
+      const cost = orthoCost(trial, rects).score + (prevDir && od === prevDir ? 60 : 0)
+      if (cost < bestCost) { bestCost = cost; best = c }
+    }
+    if (best) {
+      out.push(best, q)
+      prevDir = segDir(best, q)
+    } else if (wantFirst && wantLast && wantFirst === wantLast && !isTurn) {
+      // 出边与入边同向：一个 L 拐点不够，插入两个拐点组成 Z 形（H-V-H / V-H-V）
+      const t = wantFirst === 'V' ? (p.y + q.y) / 2 : (p.x + q.x) / 2
+      const z: Pt[] = wantFirst === 'V'
+        ? [{ x: p.x, y: t }, { x: q.x, y: t }]
+        : [{ x: t, y: p.y }, { x: t, y: q.y }]
+      out.push(...z, q)
+      prevDir = wantLast
+    } else if (forceTail && wantLast) {
+      // 手动锚点的入边是硬约束：局部贪心无解（出发方向与末段方向冲突、
+      // 或端点对齐使 L 拐点退化）时，显式构造 3/4 段交替折线保证末段沿法线正入，
+      // 而不是让候选被淘汰、进而退化成「牺牲全部用户拐点」的自动布线。
+      const G = ORTHO_BULGE
+      const pickT = (a: number, b: number) =>
+        [(a + b) / 2, a + G, b - G, (a + b) / 2 + G].find(v =>
+          Math.abs(v - a) > ORTHO_EPS && Math.abs(v - b) > ORTHO_EPS) ?? (a + G * 1.5)
+      const needFour = forbidOut === wantLast
+        || (wantLast === 'H' ? Math.abs(p.y - q.y) < ORTHO_EPS : Math.abs(p.x - q.x) < ORTHO_EPS)
+      if (wantLast === 'H') {
+        const t = pickT(p.x, q.x)
+        if (needFour) {
+          const s = pickT(p.y, q.y)
+          out.push({ x: p.x, y: s }, { x: t, y: s }, { x: t, y: q.y }, q)
+        } else out.push({ x: t, y: p.y }, { x: t, y: q.y }, q)
+      } else {
+        const t = pickT(p.y, q.y)
+        if (needFour) {
+          const s = pickT(p.x, q.x)
+          out.push({ x: s, y: p.y }, { x: s, y: t }, { x: q.x, y: t }, q)
+        } else out.push({ x: p.x, y: t }, { x: q.x, y: t }, q)
+      }
+      prevDir = wantLast
+    } else {
+      // 兜底：宁可多一个拐点，也不允许出现斜线段或抹掉用户拐点
+      let c = cands.find(v => segLen(p, v) > ORTHO_EPS && segLen(v, q) > ORTHO_EPS
+        && (!forbidOut || segDir(p, v) !== forbidOut))
+      if (!c) c = cands.find(v => segLen(p, v) > ORTHO_EPS && segLen(v, q) > ORTHO_EPS)
+      if (c) out.push(c)
+      out.push(q)
+      prevDir = c ? segDir(c, q) : prevDir
+    }
+    forbidOut = isTurn ? prevDir : null
+  }
+  return simplifyOrtho(out)
+}
+
+function missingWaypoints(pts: Pt[], wps: Pt[]): number {
+  const corners = pts.slice(1, -1)
+  return wps.filter(w => !corners.some(c =>
+    Math.abs(c.x - w.x) < ORTHO_EPS && Math.abs(c.y - w.y) < ORTHO_EPS)).length
+}
+/** 确定性交替构造：段方向严格 H/V 交替，每个用户拐点必然落在段边界（即折角）上。
+ *  作为局部贪心的补充候选，专门避免「用户拐点被化简抹掉」。 */
+function alternatingPath(anchorA: Pt, anchorB: Pt, wps: Pt[], firstDir: Axis, lastDir: Axis): Pt[] | null {
+  const pts: Pt[] = [anchorA]
+  let d: Axis = firstDir
+  const targets = [...wps, anchorB]
+  for (let i = 0; i < targets.length; i++) {
+    const p = pts[pts.length - 1], q = targets[i]
+    const aligned = d === 'H' ? Math.abs(p.y - q.y) < ORTHO_EPS : Math.abs(p.x - q.x) < ORTHO_EPS
+    if (aligned && segLen(p, q) > ORTHO_EPS) {
+      pts.push(q)                                  // 1 段：到达方向 d，离开方向 !d
+      d = d === 'H' ? 'V' : 'H'
+    } else {
+      const c = d === 'H' ? { x: q.x, y: p.y } : { x: p.x, y: q.y }
+      if (segLen(p, c) < ORTHO_EPS || segLen(c, q) < ORTHO_EPS) return null
+      pts.push(c, q)                               // 2 段：到达方向 !d，离开方向 d
+    }
+  }
+  const lastSeg = segDir(pts[pts.length - 2], pts[pts.length - 1])
+  if (lastSeg !== lastDir) return null
+  return simplifyOrtho(pts)
+}
+
+/** 单条候选路径：给定出入边，派生锚点 → 正交化 → 化简 → 评分 */
+function orthoCandidate(
+  ra: Rect, rb: Rect, userWps: Pt[],
+  sa: OrthoSide, sb: OrthoSide,
+  bias: number, biasAxis: 'x' | 'y' | null,
+  pref: OrthoDir | null, rects: Rect[],
+  forced: Pt[] | null, strict: boolean,
+  anchors?: { from: AnchorSpec | null; to: AnchorSpec | null } | null,
+): OrthoResult | null {
+  const sAxis = sideAxis(sa), eAxis = sideAxis(sb)
+  const [aLo, aHi] = sideRange(sa, ra)
+  const [bLo, bHi] = sideRange(sb, rb)
+  const midA = (aLo + aHi) / 2, midB = (bLo + bHi) / 2
+  const first = forced?.[0] || userWps[0] || null
+  const last = forced?.[forced.length - 1] || userWps[userWps.length - 1] || null
+  // 手动锚点是硬约束 > 相邻拐点的正交投影（线最短） > 自动布线的边中点
+  const fromSpec = anchors?.from && anchors.from.side === sa ? anchors.from : null
+  const toSpec = anchors?.to && anchors.to.side === sb ? anchors.to : null
+  const aVar = fromSpec ? anchorVar(fromSpec, ra)
+    : (first ? (sAxis === 'H' ? first.y : first.x) : midA)
+      + (biasAxis === (sAxis === 'H' ? 'y' : 'x') ? bias : 0)
+  const bVar = toSpec ? anchorVar(toSpec, rb)
+    : (last ? (eAxis === 'H' ? last.y : last.x) : midB)
+      + (biasAxis === (eAxis === 'H' ? 'y' : 'x') ? bias : 0)
+  const anchorA = pointOnSide(sa, ra, aVar)
+  const anchorB = pointOnSide(sb, rb, bVar)
+  // 用户控制点必须落在折角上；自动绕行的通道点只是引导，可被化简合并
+  const flags = [false, ...(forced || []).map(() => false), ...userWps.map(() => true), false]
+  let pts = orthogonalize([anchorA, ...(forced || []), ...userWps, anchorB], rects, sAxis, eAxis, flags, !!toSpec)
+  if (userWps.length && !forced) {
+    // 补充候选：确定性交替构造，保证用户拐点不被化简抹掉
+    const alt = alternatingPath(anchorA, anchorB, userWps, sAxis, eAxis)
+    if (alt) {
+      // 手动锚点方向也是硬约束：优先选用满足正出正入的构造，避免整个候选被淘汰、
+      // 进而退化成「牺牲全部用户拐点」的自动布线
+      const dirPenalty = (p: Pt[]) =>
+        (fromSpec && segDir(p[0], p[1]) !== sAxis ? 100000 : 0)
+        + (toSpec && segDir(p[p.length - 2], p[p.length - 1]) !== eAxis ? 100000 : 0)
+      const rank = (p: Pt[]) => orthoCost(p, rects).score
+        + missingWaypoints(p, userWps) * 20000 + dirPenalty(p)
+      if (rank(alt) < rank(pts)) pts = alt
+    }
+  }
+  if (pts.length < 2) return null
+  // 手动锚点是硬约束：即使是非严格兜底候选，也必须沿指定边的法线正出正入。
+  // 否则用户拐点顺序与入边冲突时，会选出「锚点在边上但线贴着边进来」的路径。
+  if (fromSpec && segDir(pts[0], pts[1]) !== sAxis) return null
+  if (toSpec && segDir(pts[pts.length - 2], pts[pts.length - 1]) !== eAxis) return null
+  // 首尾段必须垂直于所选边（正出正入）；严格模式不满足即淘汰该候选
+  if (strict) {
+    if (segDir(pts[0], pts[1]) !== sAxis) return null
+    if (segDir(pts[pts.length - 2], pts[pts.length - 1]) !== eAxis) return null
+  }
+  const { score, hits, cross } = orthoCost(pts, rects)
+  const dir = turnDir(pts)
+  const { dx, dy } = centerDelta(ra, rb)
+  const natA = sa === (dx >= 0 ? 'r' : 'l') || sa === (dy >= 0 ? 'b' : 't')
+  const natB = sb === (dx >= 0 ? 'l' : 'r') || sb === (dy >= 0 ? 't' : 'b')
+  const missing = missingWaypoints(pts, userWps)
+  const valid = pts.every((p, i) => i === 0 || segDir(pts[i - 1], p) !== null)
+    && pts.every((p, i) => i === 0 || i === pts.length - 1
+      || segDir(pts[i - 1], p) !== segDir(p, pts[i + 1]))
+  return {
+    pts, corners: pts.slice(1, -1), dir, hits, cross, missing, valid,
+    score: score + missing * 20000 + (pref && dir !== pref ? 320 : 0)
+      + (natA ? 0 : 180) + (natB ? 0 : 180),
+  }
+}
+
+/** 两侧 L 都被挡时：沿阻挡节点外缘 / 包围盒外侧采样通道，生成 Z / U 形多拐点路径 */
+function channelValues(ra: Rect, rb: Rect, rects: Rect[], axis: 'x' | 'y'): number[] {
+  const vals = new Set<number>()
+  const G = AVOID_GAP
+  const box = {
+    l: Math.min(ra.l, rb.l), t: Math.min(ra.t, rb.t),
+    r: Math.max(ra.r, rb.r), b: Math.max(ra.b, rb.b),
+  }
+  if (axis === 'x') {
+    vals.add(Math.round(box.l - G * 2)); vals.add(Math.round(box.r + G * 2))
+    for (const r of rects) { vals.add(Math.round(r.l - G)); vals.add(Math.round(r.r + G)) }
+  } else {
+    vals.add(Math.round(box.t - G * 2)); vals.add(Math.round(box.b + G * 2))
+    for (const r of rects) { vals.add(Math.round(r.t - G)); vals.add(Math.round(r.b + G)) }
+  }
+  return [...vals].sort((a, b) => a - b).slice(0, 10)
+}
+function detourCandidates(
+  ra: Rect, rb: Rect, sa: OrthoSide, sb: OrthoSide,
+  bias: number, biasAxis: 'x' | 'y' | null,
+  pref: OrthoDir | null, rects: Rect[],
+  anchors?: { from: AnchorSpec | null; to: AnchorSpec | null } | null,
+): OrthoResult[] {
+  const xs = channelValues(ra, rb, rects, 'x')
+  const ys = channelValues(ra, rb, rects, 'y')
+  const cyA = (ra.t + ra.b) / 2, cyB = (rb.t + rb.b) / 2
+  const cxA = (ra.l + ra.r) / 2, cxB = (rb.l + rb.r) / 2
+  const out: OrthoResult[] = []
+  for (const x of xs) for (const y of ys) {
+    const paths: Pt[][] = [
+      [{ x, y: cyA }, { x, y: cyB }],                       // 竖直通道 Z
+      [{ x: cxA, y }, { x: cxB, y }],                       // 水平通道 Z
+      [{ x, y: cyA }, { x, y }, { x: cxB, y }],             // U 形绕外侧
+      [{ x: cxA, y }, { x, y }, { x, y: cyB }],
+    ]
+    for (const forced of paths) {
+      const r = orthoCandidate(ra, rb, [], sa, sb, bias, biasAxis, pref, rects, forced, true, anchors)
+      if (r) out.push(r)
+    }
+  }
+  return out
+}
+
+/** ortho 避让矩形：只看其他节点（起止节点本身已在边上，无需判定穿体） */
+function orthoBlockRects(a: any, b?: any): Rect[] {
+  const out: Rect[] = []
+  for (const n of nodes.value) {
+    if (n.id === a.id || n.id === b?.id) continue
+    out.push({
+      l: n.x - AVOID_PAD, t: n.y - AVOID_PAD,
+      r: n.x + NODE_W + AVOID_PAD, b: n.y + NODE_H + AVOID_PAD,
+    })
+  }
+  return out
+}
+function orthoDirOf(e: any): OrthoDir | null {
+  return e?.ortho_dir === 'cw' || e?.ortho_dir === 'ccw' ? e.ortho_dir : null
+}
+function orthoBiasInfo(e: any, a: any, b: any): { bias: number; axis: 'x' | 'y' | null } {
+  const bias = orthoBias(e)
+  if (!bias) return { bias: 0, axis: null }
+  const acy = a.y + NODE_H / 2, bcy = b.y + NODE_H / 2
+  const acx = a.x + NODE_W / 2, bcx = b.x + NODE_W / 2
+  if (Math.abs(bcy - acy) < ORTHO_EPS) return { bias, axis: 'y' }
+  if (Math.abs(bcx - acx) < ORTHO_EPS) return { bias, axis: 'x' }
+  return { bias: 0, axis: null }
+}
+
+/** 主入口：手动拐点为硬约束；自动布线按「双 L → 切换 → 多拐点绕行」逐级升级 */
+function routeOrthoEdge(
+  a: any, b: any, userWps: Pt[],
+  pref: OrthoDir | null, bias: number, biasAxis: 'x' | 'y' | null,
+  rects: Rect[],
+  anchors?: { from: AnchorSpec | null; to: AnchorSpec | null } | null,
+): OrthoResult {
+  const ra = nodeRect(a), rb = nodeRect(b)
+  const effectivePref = pref || defaultTurnDir(ra, rb)
+  const fromSide = anchors?.from?.side ?? null
+  const toSide = anchors?.to?.side ?? null
+  // 手动锚点 = 硬约束：出入边只允许落在用户指定的那一条边上
+  const limit = (list: [OrthoSide, OrthoSide][]) => list.filter(
+    ([sa, sb]) => (!fromSide || sa === fromSide) && (!toSide || sb === toSide))
+  const allSides: [OrthoSide, OrthoSide][] = []
+  for (const sa of ORTHO_SIDES) for (const sb of ORTHO_SIDES) allSides.push([sa, sb])
+  const full = limit(allSides)
+  const build = (sides: [OrthoSide, OrthoSide][], strict: boolean) => {
+    const out: OrthoResult[] = []
+    for (const [sa, sb] of sides) {
+      const r = orthoCandidate(ra, rb, userWps, sa, sb, bias, biasAxis, effectivePref, rects, null, strict, anchors)
+      if (r) out.push(r)
+    }
+    return out
+  }
+  const fallbackSides = full.length ? full : allSides
+
+  let cands: OrthoResult[]
+  if (userWps.length) {
+    cands = build(fallbackSides, true)
+    if (!cands.length) cands = build(fallbackSides, false)
+  } else {
+    const two = limit(standardLSides(ra, rb))
+    const sides = two.length ? two : fallbackSides
+    cands = build(sides, true)
+    if (!cands.length) cands = build(sides, false)
+    // 两个方向都挡 → 增加拐点绕开节点；同时允许换出入边作为兜底
+    if (cands.length && cands.every(c => c.hits > 0)) {
+      for (const [sa, sb] of sides.slice(0, 4)) {
+        cands.push(...detourCandidates(ra, rb, sa, sb, bias, biasAxis, effectivePref, rects, anchors))
+      }
+      cands.push(...build(fallbackSides, true))
+    }
+  }
+
+  if (!cands.length) {
+    // 手动锚点与用户拐点顺序冲突：牺牲拐点，按锚点重新自动布线（锚点仍是硬约束）
+    if (anchors && userWps.length) {
+      return routeOrthoEdge(a, b, [], pref, bias, biasAxis, rects, anchors)
+    }
+    const start = anchors?.from ? anchorPoint(anchors.from, ra)
+      : { x: (ra.l + ra.r) / 2, y: (ra.t + ra.b) / 2 }
+    const end = anchors?.to ? anchorPoint(anchors.to, rb)
+      : { x: (rb.l + rb.r) / 2, y: (rb.t + rb.b) / 2 }
+    const pts = orthogonalize([start, end], rects,
+      fromSide ? sideAxis(fromSide) : undefined, toSide ? sideAxis(toSide) : undefined)
+    return {
+      pts, corners: pts.slice(1, -1), dir: 'cw', hits: 0, cross: 0, score: Infinity,
+      missing: userWps.length, valid: false,
+    }
+  }
+  const legal = cands.filter(c => c.valid)
+  const base = legal.length ? legal : cands
+  const best = (list: OrthoResult[]) => list.reduce((a, b) => b.score < a.score ? b : a)
+  // 分级：优先「不穿节点 + 不自交 + 保留全部用户拐点」，逐级放宽；自交始终最后才考虑
+  const levels = [
+    base.filter(c => c.cross === 0 && c.hits === 0 && c.missing === 0),
+    base.filter(c => c.cross === 0 && c.missing === 0),
+    base.filter(c => c.cross === 0),
+  ]
+  for (const lv of levels) if (lv.length) return best(lv)
+  // 所有候选都自交（例如用户拐点顺序本身绕圈）→ 重规划：忽略手动拐点按自动布线重算
+  if (userWps.length) {
+    const replanned = routeOrthoEdge(a, b, [], pref, bias, biasAxis, rects, anchors)
+    if (replanned.cross === 0) return replanned
+  }
+  return best(base)
 }
 
 function computeEdge(e: any) {
   const a = nodeById.value.get(e.from_node)
   const b = nodeById.value.get(e.to_node)
   if (!a || !b) return null
-  const { p1, p2, horizontal } = sideAnchors(a, b)
+  // 分段连线是用户逐段画出来的显式路径：优先渲染，不参与自动布线 / 避让
+  const segs = readSegments(e)
+  if (segs.length) return computeMixedEdge(e, segs)
+  const ra = nodeRect(a), rb = nodeRect(b)
+  const manualFrom = anchorSpecOf(e, 'from'), manualTo = anchorSpecOf(e, 'to')
+  const anchors = (manualFrom || manualTo) ? { from: manualFrom, to: manualTo } : null
+  let { p1, p2, horizontal } = sideAnchors(a, b)
+  // 手动锚点覆盖自动锚点：曲线 / 斜线直连 / 直角折线通用
+  if (manualFrom) p1 = anchorPoint(manualFrom, ra)
+  if (manualTo) p2 = anchorPoint(manualTo, rb)
   const shape = edgeShapeOf(e)
   const wps = sanitizeWaypoints(e.waypoints)
   const rev = hasReverseEdge(e)
-  // 斜线直连不参与避让；曲线 / 直角折线尽量绕开其他智能体节点
-  const rects = shape === 'straight' ? [] : avoidRects(a, b)
+  // 斜线直连不参与避让；曲线避开所有节点（含起止节点内缩区）；直角折线只看其他节点
+  const rects = shape === 'straight' ? [] : shape === 'ortho' ? orthoBlockRects(a, b) : avoidRects(a, b)
 
   // 1) 自动曲线（无控制点）：沿用原三次曲线 + 双向避让；穿过节点时改为绕行
   if (shape === 'curve' && wps.length === 0) {
@@ -2175,23 +3092,30 @@ function computeEdge(e: any) {
     }
   }
 
-  // 2) 直角折线（L 形）：waypoints 就是拐点，默认一个拐点，可继续添加
+  // 2) 直角折线：锚点派生、控制点严格等于折角
   if (shape === 'ortho') {
-    const bias = orthoBias(e)
-    const oa = orthoAnchors(a, b, bias)
-    // 没有 waypoints 时注入一个默认拐点（仅用于渲染，不持久化到 edge）
-    let effectiveWps = wps
-    if (wps.length === 0) {
-      const def = defaultOrthoWaypoint(a, b, bias, rects)
-      if (def) effectiveWps = [def]
-    }
-    const r = orthoRouteAvoid(oa.p1, oa.p2, oa.horizontalFirst, effectiveWps, rects)
-    const pts = r.pts
+    const { bias, axis } = orthoBiasInfo(e, a, b)
+    const route = routeOrthoEdge(a, b, wps, orthoDirOf(e), bias, axis, rects, anchors)
+    const pts = route.pts
     const mid = polylineMid(pts)
     const handles: EdgeHandle[] = []
-    effectiveWps.forEach((p, i) => handles.push({ kind: 'point', index: i, x: p.x, y: p.y }))
-    handles.push(...r.insertHandles)
-    return { d: linePath(pts), midX: mid.x, midY: mid.y, midAngle: mid.angle, handles }
+    // 渲染出的每个折角都是可拖动的控制点
+    route.corners.forEach((p, i) => handles.push({ kind: 'point', index: i, x: p.x, y: p.y }))
+    // 插入柄放在段中点并带法向：新控制点一插入就是折角，不会落在直线段中间
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p = pts[i], q = pts[i + 1]
+      const h = segDir(p, q)
+      handles.push({
+        kind: 'insert', index: i,
+        x: (p.x + q.x) / 2, y: (p.y + q.y) / 2,
+        nx: h === 'V' ? 1 : 0, ny: h === 'H' ? -1 : 0,
+      })
+    }
+    return {
+      d: linePath(pts), midX: mid.x, midY: mid.y, midAngle: mid.angle, handles,
+      orthoCorners: route.corners, orthoDir: route.dir,
+      anchorFrom: pts[0], anchorTo: pts[pts.length - 1],
+    }
   }
 
   // 3) 直线 / 含控制点的曲线
@@ -2237,8 +3161,22 @@ function computeEdge(e: any) {
   return { d, midX: mid.x, midY: mid.y, midAngle: angle, handles }
 }
 
+/** 两端锚点手柄：手动锚点按设定落点；自动锚点用实际渲染出的首末点 */
+function anchorHandlesFor(e: any, g: any): EdgeHandle[] {
+  const a = nodeById.value.get(e.from_node), b = nodeById.value.get(e.to_node)
+  if (!a || !b) return []
+  const { p1, p2 } = sideAnchors(a, b)
+  const f = anchorSpecOf(e, 'from'), t = anchorSpecOf(e, 'to')
+  const from = f ? anchorPoint(f, nodeRect(a)) : (g?.anchorFrom || p1)
+  const to = t ? anchorPoint(t, nodeRect(b)) : (g?.anchorTo || p2)
+  return [
+    { kind: 'anchor', end: 'from', index: 0, x: from.x, y: from.y },
+    { kind: 'anchor', end: 'to', index: 1, x: to.x, y: to.y },
+  ]
+}
 const edgeGeoms = computed(() => edges.value.map((e: any) => {
   const g = computeEdge(e)
+  if (g) g.handles = [...anchorHandlesFor(e, g), ...(g.handles || [])]
   return { e, g, color: g ? edgeSourceColor(e) : 'var(--accent)', ortho: edgeShapeOf(e) === 'ortho' }
 }))
 
@@ -2246,55 +3184,128 @@ const edgeGeoms = computed(() => edges.value.map((e: any) => {
 function showEdgeHandles(e: any): boolean {
   return hoveringEdgeId.value === e.id || edgeDrag.value?.edge?.id === e.id
 }
+/** 鼠标进入锚点周围多少「屏幕像素」时，锚点才显现（除以 scale 换算成画布坐标） */
+const ANCHOR_PEEK_PX = 26
+/** 控制柄层内容：整条边的柄在悬停 / 拖动中显示；锚点只在鼠标靠近时显现。
+ *  锚点压在节点边缘，靠 hover 连线无法显示（鼠标一进节点连线就失去 hover），
+ *  因此改用鼠标到锚点的距离判定：靠近出现、离开消失，平时画布保持干净。 */
+function visibleHandles(e: any, g: any): EdgeHandle[] {
+  const hs: EdgeHandle[] = g?.handles || []
+  if (showEdgeHandles(e)) return hs
+  const p = pointerCanvas.value
+  if (!p) return []
+  const radius = ANCHOR_PEEK_PX / (scale.value || 1)
+  return hs.filter(h => h.kind === 'anchor' && Math.hypot(h.x - p.x, h.y - p.y) <= radius)
+}
+function orthoGeomOf(edge: any): any {
+  return edgeGeoms.value.find((x: any) => x.e.id === edge.id)?.g
+}
+/** 把渲染出的折角固化回 waypoints：控制点严格等于拐点，重合/共线的多余拐点一并消除 */
+function commitOrthoGeometry(edge: any, withHistory: boolean): boolean {
+  const corners = orthoGeomOf(edge)?.orthoCorners as Pt[] | undefined
+  if (!corners) return false
+  const wps = ensureWaypoints(edge)
+  const same = wps.length === corners.length && wps.every((p, i) =>
+    Math.abs(p.x - corners[i].x) < ORTHO_EPS && Math.abs(p.y - corners[i].y) < ORTHO_EPS)
+  if (same) return false
+  if (withHistory) pushHistory()
+  wps.splice(0, wps.length, ...corners.map(p => ({ x: p.x, y: p.y })))
+  return true
+}
 function startEdgeHandleDrag(e: MouseEvent, edge: any, h: EdgeHandle) {
   if (e.button !== 0) return
   e.stopPropagation(); e.preventDefault()
+  // 分段连线的柄属于 segments：顶点/曲线控制点/圆弧矢高可拖，插入柄用于拆分段
+  if (h.seg != null) {
+    if (h.kind === 'insert') { splitDrawSegment(edge, h.seg); return }
+    pendingEdgeSnapshot = snapshotCanvas()
+    edgeDrag.value = { edge, index: -1, seg: h.seg, field: h.kind as 'vertex' | 'ctrl' | 'bulge', ctrl: h.ctrl }
+    closeMenus()
+    return
+  }
+  // 拖锚点：走独立通道，不固化渲染拐点（否则会把自动布线锁死）
+  if (h.kind === 'anchor' && h.end) {
+    pendingEdgeSnapshot = snapshotCanvas()
+    edgeDrag.value = { edge, index: -1, anchor: h.end }
+    closeMenus()
+    return
+  }
+  const isOrtho = edgeShapeOf(edge) === 'ortho'
+  // ortho：先把渲染拐点固化，保证控制点就是折角、手柄 index 一定有效
+  if (isOrtho) {
+    const snap = snapshotCanvas()
+    if (commitOrthoGeometry(edge, false)) pushSnapshot(snap)
+  }
   const wps = ensureWaypoints(edge)
-  // ortho 模式下默认拐点可能还未持久化：拖动前先注入
-  if (edgeShapeOf(edge) === 'ortho') {
-    if (h.kind === 'point' && h.index >= wps.length) {
-      const a = nodeById.value.get(edge.from_node)
-      const b = nodeById.value.get(edge.to_node)
-      const bias = orthoBias(edge)
-      const rects = avoidRects(a, b)
-      const def = defaultOrthoWaypoint(a, b, bias, rects)
-      if (def) {
-        pushHistory()
-        wps.push(def)
-      }
-    }
-    if (h.kind === 'insert') {
-      pushHistory()
-      wps.splice(h.index, 0, { x: h.x, y: h.y })
-      edgeDrag.value = { edge, index: h.index }
-    } else {
-      pendingEdgeSnapshot = snapshotCanvas()
-      edgeDrag.value = { edge, index: h.index }
-    }
+  if (h.kind === 'insert') {
+    pushHistory()
+    // 法向凸起：新控制点一插入就是折角，不会落在直线段中间
+    const np = isOrtho
+      ? { x: h.x + (h.nx || 0) * ORTHO_BULGE, y: h.y + (h.ny || 0) * ORTHO_BULGE }
+      : { x: h.x, y: h.y }
+    const at = Math.min(h.index, wps.length)
+    wps.splice(at, 0, np)
+    edgeDrag.value = { edge, index: at }
   } else {
-    if (h.kind === 'insert') {
-      pushHistory()
-      wps.splice(h.index, 0, { x: h.x, y: h.y })
-      edgeDrag.value = { edge, index: h.index }
-    } else {
-      pendingEdgeSnapshot = snapshotCanvas()
-      edgeDrag.value = { edge, index: h.index }
-    }
+    pendingEdgeSnapshot = snapshotCanvas()
+    edgeDrag.value = { edge, index: h.index }
   }
   closeMenus()
+}
+/** 分段手柄拖动：顶点改 end、曲线控制点改 ctrl、圆弧按鼠标到弦的法向距离改 bulge */
+function moveSegmentHandle(d: NonNullable<typeof edgeDrag.value>, c: Pt) {
+  const segs = liveSegments(d.edge)
+  const s = segs[d.seg!]
+  if (!s || !d.field) return
+  if (d.field === 'vertex') {
+    // 垂线段的终点必须留在垂线上：拖动时把鼠标投影到当前法线，只改长度 / 朝向
+    if (s.type === 'vert' && d.seg != null) {
+      const p0 = mixedPoints(d.edge)[d.seg]
+      if (p0) { s.end = projectOnNormal(p0, c, mixedNormalAt(d.edge, d.seg)); return }
+    }
+    s.end = { x: c.x, y: c.y }; return
+  }
+  if (d.field === 'ctrl') {
+    if (!Array.isArray(s.ctrl)) s.ctrl = []
+    while (s.ctrl.length < 2) s.ctrl.push({ x: c.x, y: c.y })
+    s.ctrl[d.ctrl || 0] = { x: c.x, y: c.y }
+    return
+  }
+  const pts = mixedPoints(d.edge)
+  const p0 = pts[d.seg!], p1 = pts[d.seg! + 1]
+  if (!p0 || !p1) return
+  const dx = p1.x - p0.x, dy = p1.y - p0.y, len = Math.hypot(dx, dy)
+  if (len < 1) return
+  const nx = -dy / len, ny = dx / len
+  const rel = (c.x - (p0.x + p1.x) / 2) * nx + (c.y - (p0.y + p1.y) / 2) * ny
+  s.bulge = clampNum(rel / len, -MAX_ARC_BULGE, MAX_ARC_BULGE)
 }
 function moveEdgeWaypoint(c: Pt) {
   const d = edgeDrag.value
   if (!d) return
+  if (d.seg != null) { moveSegmentHandle(d, c); return }
+  if (d.anchor) {
+    // 手动锚点只吸附在节点边缘：按方向选边，沿边坐标换算成归一化 t
+    const node = nodeById.value.get(d.anchor === 'from' ? d.edge.from_node : d.edge.to_node)
+    if (!node) return
+    const spec = nearestAnchor(nodeRect(node), c)
+    d.edge[d.anchor === 'from' ? 'anchor_from' : 'anchor_to'] = spec
+    return
+  }
   const p = ensureWaypoints(d.edge)[d.index]
   if (!p) return
+  // 只改用户拐点；未手动固定的锚点跟随、自动插点、化简、消自交都由渲染层实时重算
   p.x = c.x
   p.y = c.y
 }
 function endEdgeDrag() {
   pendingEdgeSnapshot = null
-  if (!edgeDrag.value) return
+  const d = edgeDrag.value
+  if (!d) return
   edgeDrag.value = null
+  // 拖锚点 / 分段手柄都无需固化拐点，避免把自动布线变成手动控制点
+  if (d.anchor || d.seg != null) { canvases.saveCurrent(); return }
+  if (edgeShapeOf(d.edge) === 'ortho') commitOrthoGeometry(d.edge, false)
   canvases.saveCurrent()
 }
 function removeWaypoint(edge: any, index: number) {
@@ -2303,64 +3314,188 @@ function removeWaypoint(edge: any, index: number) {
   pushHistory()
   wps.splice(index, 1)
   edgeDrag.value = null
+  // 删光控制点即恢复自动布线，别把渲染拐点又固化回去（否则方向偏好会被锁死）
+  if (wps.length && edgeShapeOf(edge) === 'ortho') commitOrthoGeometry(edge, false)
   canvases.saveCurrent()
 }
-/** 为 ortho 连线注入默认拐点（替换原有 waypoints） */
-function injectDefaultOrthoWaypoint(edge: any): boolean {
-  const a = nodeById.value.get(edge.from_node)
-  const b = nodeById.value.get(edge.to_node)
-  if (!a || !b) { edge.waypoints = []; return false }
-  const bias = orthoBias(edge)
-  const rects = avoidRects(a, b)
-  const def = defaultOrthoWaypoint(a, b, bias, rects)
-  const wps = ensureWaypoints(edge)
-  wps.length = 0
-  if (def) { wps.push(def); return true }
-  return false
+/** 双击顶点柄 = 删掉这一段：后面的段自动从上一顶点接过来，路径仍然连续 */
+function removeDrawSegment(edge: any, index: number) {
+  const segs = liveSegments(edge)
+  if (index < 0 || index >= segs.length) return
+  pushHistory()
+  segs.splice(index, 1)
+  if (!segs.length) { edge.segments = []; edge.shape = 'curve' }
+  edgeDrag.value = null
+  pendingEdgeSnapshot = null
+  hoveringEdgeId.value = null
+  canvases.saveCurrent()
+  closeMenus()
+}
+/** 插入柄 / 菜单：把第 i 段在中点拆成两段同类型，保持曲线与圆弧形状不变 */
+function splitDrawSegment(edge: any, index: number) {
+  const segs = liveSegments(edge)
+  const s = segs[index]
+  const pts = mixedPoints(edge)
+  if (!s || !pts[index] || !pts[index + 1]) return
+  const p0 = pts[index], p1 = pts[index + 1]
+  const type = isSegType(s.type) ? s.type : 'straight'
+  const bulge = Number.isFinite(Number(s.bulge)) ? Number(s.bulge) : DEFAULT_ARC_BULGE
+  const built = buildSegment(p0, p1, type, Array.isArray(s.ctrl) ? s.ctrl : [], bulge)
+  const mid = { x: built.mid.x, y: built.mid.y }
+  let first: any, second: any
+  if (type === 'curve') {
+    // de Casteljau：t=0.5 精确拆成两段三次贝塞尔，形状与原曲线完全一致
+    const lerp = (a: Pt, b: Pt): Pt => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
+    const c1 = built.ctrl[0], c2 = built.ctrl[1]
+    const q0 = lerp(p0, c1), q1 = lerp(c1, c2), q2 = lerp(c2, p1)
+    const r0 = lerp(q0, q1), r1 = lerp(q1, q2)
+    const m = lerp(r0, r1)
+    first = { type, end: { ...m }, ctrl: [q0, r0], bulge }
+    second = { type, end: { ...p1 }, ctrl: [r1, q2], bulge }
+  } else if (type === 'arc') {
+    // 半弧角 = 原弧角/2，其归一化矢高 b'=(1−cos(Δ/4))/(2sin(Δ/4))，符号保持弯向
+    const g = arcGeom(p0, p1, bulge)
+    let b2 = DEFAULT_ARC_BULGE
+    if (g) {
+      const quarter = Math.abs(g.delta) / 4
+      const denom = 2 * Math.sin(quarter)
+      if (denom > 1e-6) b2 = clampNum(Math.sign(bulge) * (1 - Math.cos(quarter)) / denom, -MAX_ARC_BULGE, MAX_ARC_BULGE)
+    }
+    first = { type, end: { ...mid }, ctrl: [], bulge: b2 }
+    second = { type, end: { ...p1 }, ctrl: [], bulge: b2 }
+  } else if (type === 'vert') {
+    // 拆出的两段仍是垂线，沿用同一条法线
+    const n: Pt[] = Array.isArray(s.ctrl) ? s.ctrl.map((p: Pt) => ({ x: p.x, y: p.y })) : []
+    first = { type, end: { ...mid }, ctrl: n.map((p: Pt) => ({ ...p })), bulge }
+    second = { type, end: { ...p1 }, ctrl: n.map((p: Pt) => ({ ...p })), bulge }
+  } else {
+    first = { type, end: { ...mid }, ctrl: [], bulge }
+    second = { type, end: { ...p1 }, ctrl: [], bulge }
+  }
+  pushHistory()
+  segs.splice(index, 1, first, second)
+  edgeDrag.value = null
+  pendingEdgeSnapshot = null
+  hoveringEdgeId.value = null
+  canvases.saveCurrent()
+  closeMenus()
+}
+/** 清除整条分段路径，退回画布默认单一线型 */
+function clearEdgeSegments(edge: any) {
+  if (!hasSegments(edge)) return
+  pushHistory()
+  edge.segments = []
+  edge.shape = defaultEdgeShape() === 'mixed' ? 'curve' : defaultEdgeShape()
+  edge.waypoints = []
+  edge.anchor_from = null
+  edge.anchor_to = null
+  edgeDrag.value = null
+  pendingEdgeSnapshot = null
+  hoveringEdgeId.value = null
+  canvases.saveCurrent()
+  closeMenus()
+  showToast('已清除分段路径，恢复单一线型')
+}
+function handleTip(h: EdgeHandle, edge?: any): string {
+  if (h.kind === 'point') return '拖动改变连线形状；双击删除控制点'
+  if (h.kind === 'anchor') return '拖动改变锚点在节点上的位置（自动吸附到节点边）；双击恢复默认'
+  if (h.kind === 'vertex') {
+    const s = edge && h.seg != null ? liveSegments(edge)[h.seg] : null
+    if (s?.type === 'vert') return '拖动改变垂线长度（始终垂直于上一段）；双击删除这一段'
+    return '拖动改变该段终点；双击删除这一段'
+  }
+  if (h.kind === 'ctrl') return '拖动调整曲线弯曲程度'
+  if (h.kind === 'bulge') return '拖动调整圆弧弯向与弧度'
+  return '拖动以在连线上添加控制点 / 拆出一段'
+}
+function onEdgeHandleDblClick(edge: any, h: EdgeHandle) {
+  if (h.kind === 'vertex' && h.seg != null) { removeDrawSegment(edge, h.seg); return }
+  if (h.kind === 'point') removeWaypoint(edge, h.index)
+  else if (h.kind === 'anchor' && h.end) resetEdgeAnchors(edge, h.end)
+}
+
+/** 恢复锚点默认位置：不传 end 表示两端一起恢复为自动布线 */
+function resetEdgeAnchors(edge: any, end?: AnchorEnd) {
+  const keys: ('anchor_from' | 'anchor_to')[] = end
+    ? [end === 'from' ? 'anchor_from' : 'anchor_to']
+    : ['anchor_from', 'anchor_to']
+  if (!keys.some(k => edge[k] != null)) return
+  pushHistory()
+  for (const k of keys) edge[k] = null
+  edgeDrag.value = null
+  pendingEdgeSnapshot = null
+  hoveringEdgeId.value = null
+  canvases.saveCurrent()
+  closeMenus()
 }
 function setEdgeShape(edge: any, shape: EdgeShape) {
   const changed = edgeShapeOf(edge) !== shape
+  const cleared = changed && (hasWaypoints(edge) || hasManualAnchors(edge) || hasSegments(edge))
   pushHistory()
   edge.shape = shape
-  if (changed && shape === 'ortho') {
-    injectDefaultOrthoWaypoint(edge)
+  // 线型一变，旧形状的控制点语义不再适用：一律清除，恢复自动布线
+  if (changed) {
+    edge.waypoints = []
+    // 从分段连线切到单一线型：整条自定义路径也不再保留
+    edge.segments = []
+    // 线型变了，手动锚点也不继承到新形状，恢复默认自动布线
+    edge.anchor_from = null
+    edge.anchor_to = null
+    edgeDrag.value = null
+    pendingEdgeSnapshot = null
+    hoveringEdgeId.value = null
   }
   canvases.saveCurrent()
   closeMenus()
-  showToast(`连线已设为${shapeLabel(shape)}`)
+  showToast(`连线已设为${shapeLabel(shape)}${cleared ? '，控制点/锚点/分段已清除' : ''}`)
 }
 function shapeLabel(shape: EdgeShape): string {
-  return shape === 'ortho' ? '直角折线' : shape === 'straight' ? '斜线直连' : '平滑曲线'
+  return shape === 'mixed' ? '分段连线' : shape === 'ortho' ? '直角折线'
+    : shape === 'straight' ? '斜线直连' : '平滑曲线'
 }
 function setAllEdgeShapes(shape: EdgeShape) {
   if (!canvas.value) return
-  const changed = defaultEdgeShape() !== shape
-  let injected = 0
+  let reset = 0
   pushHistory()
   for (const e of (canvas.value.edges || [])) {
     e.shape = shape
-    if (changed && shape === 'ortho') {
-      injectDefaultOrthoWaypoint(e)
-      injected++
-    }
+    // 只统一「线型」；顺/逆时针是每条线各自的 ortho_dir，这里绝不动它
+    // 批量统一线型：所有连线都丢掉控制点与手动锚点，避免旧形状的设置被新线型继承
+    if (hasWaypoints(e) || hasManualAnchors(e) || hasSegments(e)) reset++
+    e.waypoints = []
+    e.segments = []
+    e.anchor_from = null
+    e.anchor_to = null
   }
+  edgeDrag.value = null
+  pendingEdgeSnapshot = null
+  hoveringEdgeId.value = null
   canvas.value.edge_shape = shape
   canvases.saveCurrent()
   closeMenus()
-  showToast(`已把全部连线设为${shapeLabel(shape)}${injected ? `（注入 ${injected} 条线的默认拐点）` : ''}`)
+  showToast(`已把全部连线设为${shapeLabel(shape)}${reset ? `（${reset} 条线的控制点已清除）` : ''}`)
 }
 function addEdgeWaypoint(edge: any) {
-  const g = edgeGeoms.value.find((x: any) => x.e.id === edge.id)?.g
+  const g = orthoGeomOf(edge)
   if (!g) return
   const inserts = g.handles.filter((h: EdgeHandle) => h.kind === 'insert')
   const h = inserts[Math.floor(inserts.length / 2)]
   if (!h) return
-  pushHistory()
-  // ortho 模式下先确保默认拐点已持久化
-  if (edgeShapeOf(edge) === 'ortho' && !hasWaypoints(edge)) {
-    injectDefaultOrthoWaypoint(edge)
+  // 分段连线：中点插入柄 = 把该段拆成两段同类型
+  if (h.seg != null) { splitDrawSegment(edge, h.seg); return }
+  const isOrtho = edgeShapeOf(edge) === 'ortho'
+  if (isOrtho) {
+    const snap = snapshotCanvas()
+    if (commitOrthoGeometry(edge, false)) pushSnapshot(snap)
   }
-  ensureWaypoints(edge).splice(h.index, 0, { x: h.x, y: h.y })
+  pushHistory()
+  const wps = ensureWaypoints(edge)
+  const np = isOrtho
+    ? { x: h.x + (h.nx || 0) * ORTHO_BULGE, y: h.y + (h.ny || 0) * ORTHO_BULGE }
+    : { x: h.x, y: h.y }
+  wps.splice(Math.min(h.index, wps.length), 0, np)
+  // 自动新增的拐点也固化为可拖动控制点
+  if (isOrtho) commitOrthoGeometry(edge, false)
   canvases.saveCurrent()
   closeMenus()
 }
@@ -2368,51 +3503,83 @@ function resetEdgeWaypoints(edge: any) {
   if (!hasWaypoints(edge)) return
   pushHistory()
   edge.waypoints = []
+  edgeDrag.value = null
+  pendingEdgeSnapshot = null
+  hoveringEdgeId.value = null
   canvases.saveCurrent()
   closeMenus()
 }
+/** 折线方向是每条连线各自独立的状态：只写当前 edge 的 ortho_dir，
+ *  没有画布级方向字段，也绝不做「全部连线」的统一方向设置。
+ *  保存回写由 store 按边 id 逐条补回方向，避免旧版后端吞字段时把其他线一起冲掉。
+ *  dir=null 表示「自动（按布局）」，即清掉这条线自己的偏好。
+ *  方向只对自动布线有意义：手动拐点会把路径锁死，因此改方向时一并清空控制点。 */
+function setEdgeDir(edge: any, dir: OrthoDir | null) {
+  // 重复选中同一项且没有待清的控制点 → 不产生无意义的历史
+  if (orthoDirOf(edge) === dir && !hasWaypoints(edge)) { closeMenus(); return }
+  pushHistory()
+  edge.ortho_dir = dir
+  const cleared = hasWaypoints(edge)
+  if (cleared) edge.waypoints = []
+  edgeDrag.value = null
+  pendingEdgeSnapshot = null
+  hoveringEdgeId.value = null
+  // 保存回写由 store 统一按边 id 补回方向（含其他连线），这里不再单独补当前线
+  void canvases.saveCurrent().catch(() => {})
+  closeMenus()
+  const label = dir === null ? '自动（按布局）' : dir === 'cw' ? '顺时针' : '逆时针'
+  showToast(`本条连线方向已设为${label}${cleared ? '，控制点已清除' : ''}`)
+}
+function edgeDirChecked(edge: any, dir: OrthoDir | null): boolean {
+  return orthoDirOf(edge) === dir
+}
+function edgeDirLabel(edge: any): string {
+  // 显示这条线自己的偏好；因避让而实际走了另一侧时明确说明，别被误认为设置没生效
+  const pref = orthoDirOf(edge)
+  const actual = orthoGeomOf(edge)?.orthoDir
+  const name = (d: string) => d === 'ccw' ? '逆时针' : '顺时针'
+  if (!pref) return `自动（${name(actual || 'cw')}）`
+  if (pref && actual && pref !== actual) return `${name(pref)}（遇阻挡已改走${name(actual)}）`
+  return name(pref)
+}
 
-/** 拖拽连线时的临时预览色：与将要创建的连线一致（按源节点所属智能体） */
-const linkingSourceColor = computed(() => {
-  if (!linking.value) return 'var(--accent)'
-  const n = nodeById.value.get(linking.value.from)
+/** 逐段绘制时的预览色：与将要创建的连线一致（按源节点所属智能体） */
+const drawSourceColor = computed(() => {
+  if (!draw.value) return 'var(--accent)'
+  const n = nodeById.value.get(draw.value.from)
   const aid = n?.agent_id
   if (aid == null) return 'var(--accent)'
   return edgeSourceColors.value.get(aid) ?? 'var(--accent)'
 })
-
-function tempPath() {
-  if (!linking.value) return ''
-  const a = nodeById.value.get(linking.value!.from)
-  if (!a) return ''
-  const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
-  const dx = linking.value.mouseX - acx, dy = linking.value.mouseY - acy
-  let p1: { x: number; y: number }
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    p1 = dx >= 0 ? { x: a.x + NODE_W, y: acy } : { x: a.x, y: acy }
-  } else {
-    p1 = dy >= 0 ? { x: acx, y: a.y + NODE_H } : { x: acx, y: a.y }
+/** 已确认的落点（顶点），在预览里画成小圆点 */
+const drawVertices = computed<Pt[]>(() => draw.value?.segs.map(s => s.end) || [])
+const drawStartPt = computed<Pt>(() => draw.value ? drawStartPoint(draw.value) : { x: 0, y: 0 })
+const drawEndPt = computed<Pt>(() => draw.value ? drawPendingEnd(draw.value) : { x: 0, y: 0 })
+const drawType = computed<SegType>(() => draw.value?.type || 'straight')
+const drawSegNo = computed(() => (draw.value?.segs.length || 0) + 1)
+/** 预览路径 = 起点锚点 → 已确认各段（各自线型）→ 当前待确认段（跟随鼠标） */
+function drawPath(): string {
+  const d = draw.value
+  if (!d) return ''
+  const start = drawStartPoint(d)
+  let path = `M ${start.x.toFixed(1)} ${start.y.toFixed(1)}`
+  let cur = start
+  let tan = anchorNormal(drawStartSpec(d).side)
+  for (const s of d.segs) {
+    const normal = s.type === 'vert' ? normalOf(tan) : null
+    const built = buildSegment(cur, s.end, s.type, s.ctrl, s.bulge, normal)
+    path += ' ' + built.d
+    tan = segEndTangent(cur, s.end, s.type, s.ctrl, s.bulge, built)
+    cur = s.end
   }
-  const x2 = linking.value.mouseX, y2 = linking.value.mouseY
-  const mx = (p1.x + x2) / 2, my = (p1.y + y2) / 2
-  // 拖拽预览跟随画布默认形状，所见即所得
-  const shape = defaultEdgeShape()
-  const rects = shape === 'straight' ? [] : avoidRects(a)
-  const q = { x: x2, y: y2 }
-  if (shape === 'ortho') {
-    const A = lShape(p1, q, Math.abs(dx) >= Math.abs(dy))
-    const B = lShape(p1, q, Math.abs(dx) < Math.abs(dy))
-    return linePath(orthoScore(A, rects, 0) <= orthoScore(B, rects, 1) ? A : B)
-  }
-  if (shape === 'straight') return linePath([p1, q])
-  const c1 = Math.abs(dx) >= Math.abs(dy) ? { x: mx, y: p1.y } : { x: p1.x, y: my }
-  const c2 = Math.abs(dx) >= Math.abs(dy) ? { x: mx, y: y2 } : { x: x2, y: my }
-  const d = `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${x2} ${y2}`
-  const baseHits = routeHits(cubicSamples(p1, c1, c2, q, 32), rects)
-  if (baseHits.n === 0) return d
-  const det = detourCurve([p1, q], rects, 1)
-  const detHits = routeHits(det.samples, rects)
-  return detHits.n * 10000 + detHits.len * 5 < baseHits.n * 10000 + baseHits.len * 5 ? det.d : d
+  const end = drawPendingEnd(d)
+  const onNode = hoverNodeId.value != null && hoverNodeId.value !== d.from
+  const normal = d.type === 'vert' ? normalOf(tan) : null
+  // 终点落在节点上时不能投影成垂足（线就连不到节点了）：保留锚点，由 vertBuilt 补连接短线
+  const pending: EdgeSegment = d.type === 'vert' && onNode && normal
+    ? { type: 'vert', end, ctrl: [normal], bulge: DEFAULT_ARC_BULGE }
+    : makeDrawSegment(cur, end, d.type, d.via, normal)
+  return path + ' ' + buildSegment(cur, pending.end, pending.type, pending.ctrl, pending.bulge, normal).d
 }
 
 // 视图适配：缩放+平移视图，使画布上的所有节点都完整可见（并居中）
@@ -2711,13 +3878,13 @@ defineExpose({ viewportRef, computeNodeBbox })
 <template>
   <div class="canvas-board glass" ref="boardRef"
        @dragover.prevent @drop="onDrop" @wheel.passive="onWheel"
-       @mousedown="startPan"
+       @mousedown="startPan" @mouseleave="pointerCanvas = null"
        @click="onBoardClick" @contextmenu="showBgMenu">
     <!-- 点状网格已移除 -->
 
 
     <!-- 工具栏（可折叠） -->
-    <div class="canvas-toolbar" :class="{ collapsed: toolbarCollapsed }">
+    <div class="canvas-toolbar" :class="{ collapsed: toolbarCollapsed }" @click.stop>
       <!-- 折叠态：极简小条 -->
       <template v-if="toolbarCollapsed">
         <div class="toolbar-left collapsed-bar">
@@ -2795,6 +3962,14 @@ defineExpose({ viewportRef, computeNodeBbox })
     <!-- 执行模式切换 / 选区 / 剪贴板提示 -->
     <div v-if="toast" class="exec-mode-toast">{{ toast.msg }}</div>
 
+    <!-- 逐段绘制状态条 -->
+    <div v-if="draw" class="draw-hint" @mousedown.stop @click.stop>
+      <span class="draw-hint-badge">第 {{ drawSegNo }} 段</span>
+      <span>当前线型：<b>{{ segLabel(drawType) }}</b></span>
+      <span class="draw-hint-tip">左键落点确认一段 · 右键切换线型 · 点击节点结束 · Esc 取消</span>
+      <button class="btn xs ghost" @click.stop="cancelDraw()">✕ 取消</button>
+    </div>
+
     <!-- 色谱浮窗（调色板按钮）：Teleport 到 body，避免被画布缩放层裁剪 -->
     <Teleport to="body">
       <ColorSpectrumPopover
@@ -2816,9 +3991,13 @@ defineExpose({ viewportRef, computeNodeBbox })
              @mouseleave="hoveringEdgeId = null">
             <!-- 每条连线一个箭头，颜色跟随所属源智能体（与连线同色） -->
             <defs>
-              <marker v-if="item.g" :id="`egm-${item.e.id}`" viewBox="0 0 10 10" refX="8" refY="5"
-                      markerWidth="6" markerHeight="6" orient="auto">
-                <path d="M0,0 L10,5 L0,10 Z" class="eg-arrow" />
+              <!-- userSpaceOnUse：箭头尺寸直接按画布坐标给，配合 arrowScale 抵消画布缩放；
+                   细长三角形（16.4×8.4），refX 落在尖端，整个箭头都在端点之前，不会被目标节点盖住 -->
+              <marker v-if="item.g" :id="`egm-${item.e.id}`" viewBox="0 0 20 20"
+                      :markerWidth="20 * arrowScale" :markerHeight="20 * arrowScale"
+                      refX="18.4" refY="10" orient="auto" markerUnits="userSpaceOnUse">
+                <path d="M 2,5.8 L 18.4,10 L 2,14.2 Z"
+                      :class="['eg-arrow', { dim: isEdgeDim(item.e) }]" />
               </marker>
             </defs>
             <path v-if="item.g" :d="item.g.d"
@@ -2830,23 +4009,15 @@ defineExpose({ viewportRef, computeNodeBbox })
                   :marker-end="`url(#egm-${item.e.id})`" pointer-events="none" />
             <path v-if="item.g" class="edge-mid"
                   :class="{ dim: isEdgeDim(item.e) }"
-                  :transform="`translate(${item.g.midX},${item.g.midY}) rotate(${item.g.midAngle})`"
-                  d="M -7,-5 L 7,0 L -7,5 Z" />
-            <!-- 连线控制点：悬停 / 拖动中显示。空心中点=拖动新增控制点，实心点=拖动改形、双击删除 -->
-            <g v-if="item.g && showEdgeHandles(item.e)" class="edge-handle-layer">
-              <g v-for="h in item.g.handles" :key="h.kind + '-' + h.index">
-                <circle class="edge-handle-hit" :cx="h.x" :cy="h.y" :r="10 / scale"
-                        @mousedown.stop.prevent="startEdgeHandleDrag($event, item.e, h)"
-                        @dblclick.stop="h.kind === 'point' && removeWaypoint(item.e, h.index)"
-                        @contextmenu.stop.prevent="showEdgeMenu($event, item.e)">
-                  <title>{{ h.kind === 'point' ? '拖动改变连线形状；双击删除控制点' : '拖动以在连线上添加控制点' }}</title>
-                </circle>
-                <circle class="edge-handle" :class="h.kind"
-                        :cx="h.x" :cy="h.y" :r="(h.kind === 'point' ? 4.5 : 5) / scale" />
-              </g>
-            </g>
+                  :transform="`translate(${item.g.midX},${item.g.midY}) rotate(${item.g.midAngle}) scale(${arrowScale})`"
+                  d="M -9,-4 L 9,0 L -9,4 Z" />
           </g>
-          <path v-if="linking" :d="tempPath()" class="edge temp" :style="{ '--eg-c': linkingSourceColor }" />
+          <!-- 逐段绘制预览：已确认段各自保留线型，最后一段跟随鼠标。
+               控制点 / 锚点不放在这一层：连线层在节点之下，边缘锚点会被节点盖住抓不到，
+               统一放到节点上方的 .handle-layer（见下方）。 -->
+          <g v-if="draw" :style="{ '--eg-c': drawSourceColor }">
+            <path :d="drawPath()" class="edge temp" />
+          </g>
           <!-- 边缘对齐辅助线 -->
           <g v-if="dragging && (snapGuides.x.length || snapGuides.y.length)" class="snap-guides" pointer-events="none">
             <line v-for="gx in snapGuides.x" :key="'gx-' + gx"
@@ -2869,7 +4040,7 @@ defineExpose({ viewportRef, computeNodeBbox })
              }"
              :style="{ left: n.x + 'px', top: n.y + 'px' }"
              @mousedown="startDrag($event, n)"
-             @mouseup="endLink($event, n.id)"
+             @click="onNodeClickInDraw($event, n.id)"
              @mouseenter="hoverNodeId = n.id"
              @mouseleave="hoverNodeId = null"
              @dblclick="onNodeDblClick($event, n)"
@@ -2920,6 +4091,32 @@ defineExpose({ viewportRef, computeNodeBbox })
             <button class="btn xs ghost ctx-action" @mousedown.stop @click.stop="startLink($event, n.id)">🔗 连线</button>
           </div>
         </div>
+
+        <!-- 控制柄层：必须浮在节点之上。锚点正好落在节点边缘，若与连线同层会被节点
+             的背景 / 命中区整个盖住，鼠标一移到节点上连线又失去 hover，锚点根本抓不到。 -->
+        <svg class="handle-layer">
+          <g v-for="item in edgeGeoms" :key="'h-' + item.e.id"
+             :style="{ '--eg-c': item.color }">
+            <g v-for="h in visibleHandles(item.e, item.g)" class="edge-handle-group"
+               :key="h.kind + '-' + (h.end || '') + '-' + (h.seg ?? '') + '-' + (h.ctrl ?? '') + '-' + h.index">
+              <circle class="edge-handle-hit" :cx="h.x" :cy="h.y" :r="10 / scale"
+                      @mousedown.stop.prevent="startEdgeHandleDrag($event, item.e, h)"
+                      @dblclick.stop="onEdgeHandleDblClick(item.e, h)"
+                      @contextmenu.stop.prevent="showEdgeMenu($event, item.e)">
+                <title>{{ handleTip(h, item.e) }}</title>
+              </circle>
+              <circle class="edge-handle" :class="[h.kind, { peeking: !showEdgeHandles(item.e) }]"
+                      :cx="h.x" :cy="h.y" :r="(h.kind === 'point' ? 4.5 : h.kind === 'anchor' ? 5.5 : 5) / scale" />
+            </g>
+          </g>
+          <!-- 绘制中的起点锚点 / 已确认顶点 / 当前落点也浮在节点之上 -->
+          <g v-if="draw" pointer-events="none">
+            <circle :cx="drawStartPt.x" :cy="drawStartPt.y" :r="5 / scale" class="draw-anchor" />
+            <circle v-for="(p, i) in drawVertices" :key="'dv-' + i" :cx="p.x" :cy="p.y" :r="4 / scale" class="draw-vertex" />
+            <circle :cx="drawEndPt.x" :cy="drawEndPt.y" :r="3.5 / scale" class="draw-cursor" />
+          </g>
+        </svg>
+
         <!-- 套索选框（画布坐标，随 viewport 缩放） -->
         <div v-if="lassoRect" class="lasso-rect" :class="[lassoRect.class, { additive: lassoRect.additive }]"
              :style="{ left: lassoRect.left, top: lassoRect.top, width: lassoRect.width, height: lassoRect.height }" />
@@ -2927,7 +4124,7 @@ defineExpose({ viewportRef, computeNodeBbox })
     </div>
 
     <!-- 选区提示条 -->
-    <div v-if="selectedNodeIds.size" class="selection-pill">
+    <div v-if="selectedNodeIds.size" class="selection-pill" @click.stop>
       已选 {{ selectedNodeIds.size }} 个智能体 · Ctrl 拖动整体移动 · Delete 删除 · 右键复制 / 剪切 / 创建画布
     </div>
 
@@ -3007,9 +4204,9 @@ defineExpose({ viewportRef, computeNodeBbox })
     <!-- 连线右键菜单 -->
     <Teleport to="body">
       <div v-if="edgeMenu" class="ctx-menu glass" :style="{ left: edgeMenu.x + 'px', top: edgeMenu.y + 'px' }" @click.stop>
-        <div class="ctx-title">连线</div>
+        <div class="ctx-title">{{ edgeShapeOf(edgeMenu.edge) === 'mixed' ? `分段连线（${readSegments(edgeMenu.edge).length} 段）` : '连线' }}</div>
         <div class="ctx-item submenu" @click.stop>
-          <div class="submenu-label">〰 连线形状</div>
+          <div class="submenu-label">〰 连线形状{{ edgeShapeOf(edgeMenu.edge) === 'mixed' ? '（切换将清除分段）' : '' }}</div>
           <div class="submenu-body">
             <div class="sub-item edge-shape-curve" :class="{ checked: edgeShapeOf(edgeMenu.edge) === 'curve' }"
                  @click="setEdgeShape(edgeMenu.edge, 'curve')">曲线（平滑）</div>
@@ -3019,11 +4216,42 @@ defineExpose({ viewportRef, computeNodeBbox })
                  @click="setEdgeShape(edgeMenu.edge, 'ortho')">⌐ 直角折线</div>
           </div>
         </div>
+        <div v-if="edgeShapeOf(edgeMenu.edge) === 'ortho'" class="ctx-item submenu" @click.stop>
+          <div class="submenu-label">⟳ 折线方向（仅本条：{{ edgeDirLabel(edgeMenu.edge) }}）</div>
+          <div class="submenu-body">
+            <div class="sub-item edge-dir-cw" :class="{ checked: edgeDirChecked(edgeMenu.edge, 'cw') }"
+                 @click="setEdgeDir(edgeMenu.edge, 'cw')">↻ 顺时针</div>
+            <div class="sub-item edge-dir-ccw" :class="{ checked: edgeDirChecked(edgeMenu.edge, 'ccw') }"
+                 @click="setEdgeDir(edgeMenu.edge, 'ccw')">↺ 逆时针</div>
+            <div class="sub-item edge-dir-auto" :class="{ checked: edgeDirChecked(edgeMenu.edge, null) }"
+                 @click="setEdgeDir(edgeMenu.edge, null)">◎ 自动（按布局）</div>
+          </div>
+        </div>
         <div class="ctx-divider" />
-        <div class="ctx-item edge-add-point" @click="addEdgeWaypoint(edgeMenu.edge)">➕ 添加控制点</div>
-        <div v-if="hasWaypoints(edgeMenu.edge)" class="ctx-item edge-reset" @click="resetEdgeWaypoints(edgeMenu.edge)">↺ 重置连线形状</div>
+        <div class="ctx-item edge-add-point" @click="addEdgeWaypoint(edgeMenu.edge)">
+          {{ edgeShapeOf(edgeMenu.edge) === 'mixed' ? '➕ 在中点拆出新的一段' : '➕ 添加控制点' }}
+        </div>
+        <div v-if="edgeShapeOf(edgeMenu.edge) === 'mixed'" class="ctx-item edge-reset" @click="clearEdgeSegments(edgeMenu.edge)">↺ 清除分段路径</div>
+        <div v-else-if="hasWaypoints(edgeMenu.edge)" class="ctx-item edge-reset" @click="resetEdgeWaypoints(edgeMenu.edge)">↺ 恢复自动布线</div>
+        <div v-if="hasManualAnchors(edgeMenu.edge)" class="ctx-item edge-reset-anchors" @click="resetEdgeAnchors(edgeMenu.edge)">⌖ 恢复锚点默认位置</div>
         <div class="ctx-divider" />
         <div class="ctx-item danger edge-delete" @click="removeEdge(edgeMenu.edge.id); closeMenus()">🗑 删除连线</div>
+      </div>
+    </Teleport>
+
+    <!-- 绘制中的「本段线型」右键菜单 -->
+    <Teleport to="body">
+      <div v-if="segMenu && draw" class="ctx-menu glass seg-menu"
+           :style="{ left: segMenu.x + 'px', top: segMenu.y + 'px' }"
+           @click.stop @contextmenu.prevent.stop>
+        <div class="ctx-title">第 {{ drawSegNo }} 段 · 选择线型</div>
+        <div class="ctx-item" :class="{ checked: drawType === 'curve' }" @click="chooseSegType('curve')">〰 曲线（平滑）</div>
+        <div class="ctx-item" :class="{ checked: drawType === 'straight' }" @click="chooseSegType('straight')">╱ 直线</div>
+        <div class="ctx-item" :class="{ checked: drawType === 'arc' }" @click="chooseSegType('arc')">◠ 圆弧</div>
+        <div class="ctx-item" :class="{ checked: drawType === 'vert' }" @click="chooseSegType('vert')">⊥ 垂线（垂直于上一段）</div>
+        <div class="ctx-divider" />
+        <div class="ctx-item" @click="cancelDraw()">✕ 取消绘制 <span class="ctx-kbd">Esc</span></div>
+        <div class="seg-menu-note">右键位置决定曲线 / 圆弧的弯向；垂线从上一段末尾垂直引出（第一段垂直于起点所在边），左键落点决定长度与朝向。左键确认本段后可继续画下一段</div>
       </div>
     </Teleport>
 
@@ -3153,10 +4381,22 @@ defineExpose({ viewportRef, computeNodeBbox })
 .zoom-indicator.panning .zoom-tip { color: var(--accent-2); opacity: 1; }
 
 .edge-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+/* 控制柄单独一层、盖在节点上方（z-index 7 > 节点默认层），否则节点边缘的锚点抓不到。
+   层本身不吃事件，只有 .edge-handle-hit 接收，节点其余区域照常可点可拖。 */
+.handle-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; z-index: 7; }
 /* —— 连线配色：纯色，颜色只由「源智能体」决定 ——
    同一智能体引出的所有连线同色；不同智能体引出的线不同色。
    --eg-c 由模板按源智能体注入，与主题强调色混合后仍跟随配色方案 */
-.eg-arrow { fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c)); }
+/* 端点箭头：细长三角形，和连线同色，但加一圈画布底色描边（paint-order 让描边在外、
+   填充在内），把箭头从节点边缘和背景里"抠"出来；尺寸由模板的 arrowScale 反向补偿画布缩放 */
+.eg-arrow {
+  fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
+  stroke: rgb(var(--edge-halo-rgb));
+  stroke-width: 2.4;
+  stroke-linejoin: round;
+  paint-order: stroke fill;
+}
+.eg-arrow.dim { opacity: 0.6; }
 .edge {
   fill: none;
   stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
@@ -3164,6 +4404,18 @@ defineExpose({ viewportRef, computeNodeBbox })
   transition: stroke .3s, stroke-width .3s, filter .3s;
 }
 .edge.temp { stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c, var(--accent))); stroke-dasharray: 3,3; animation: none; }
+/* 逐段绘制预览：起点锚点 / 已确认顶点 / 当前落点 */
+.draw-anchor { fill: var(--accent); stroke: rgba(var(--surface-rgb), 0.95); stroke-width: 2; pointer-events: none; }
+.draw-vertex { fill: rgba(var(--node-bg-rgb), 0.95); stroke: var(--accent-2); stroke-width: 2; pointer-events: none; }
+.draw-cursor { fill: var(--accent-2); stroke: rgba(var(--surface-rgb), 0.9); stroke-width: 1.5; pointer-events: none; }
+.draw-hint { position: absolute; left: 50%; top: 54px; transform: translateX(-50%); z-index: 60;
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px 7px 8px; border-radius: 10px;
+  background: rgba(var(--node-bg-rgb), 0.96); border: 1px solid rgba(var(--accent-rgb), 0.35);
+  box-shadow: 0 8px 26px rgba(var(--shadow-rgb), 0.4); font-size: calc(12px * var(--font-scale));
+  color: var(--text); white-space: nowrap; }
+.draw-hint-badge { padding: 2px 8px; border-radius: 6px; background: rgba(var(--accent-rgb), 0.18); color: var(--accent-light); }
+.draw-hint-tip { color: rgba(var(--text-rgb), 0.6); }
+.draw-hint .btn { padding: 2px 8px; }
 /* 直角折线：拐角描边接缝做圆润处理（几何仍是 90° 直角），避免虚线断点处出现毛刺尖角 */
 .edge.ortho { stroke-linejoin: round; stroke-linecap: round; }
 /* 调用进行中：加粗 + 强调色外发光 + 流动虚线 */
@@ -3174,24 +4426,33 @@ defineExpose({ viewportRef, computeNodeBbox })
 .edge-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 .edge-hit.dim { cursor: default; }
 .edge-hit.active { cursor: pointer; }
-/* 中点箭头：方向指示。放大到 14×10 并加一圈底色描边（paint-order 让描边在外、
-   填充在内），把箭头从虚线中"抠"出来，轮廓更锐利又不显笨重 */
+/* 中点箭头：方向指示。18×8 的细长三角形，并加一圈底色描边（paint-order 让描边在外、
+   填充在内），把箭头从虚线中"抠"出来，轮廓更锐利又不显笨重。
+   transform 里的 scale(arrowScale) 抵消画布缩放：画布缩小时箭头在屏幕上不会跟着变小。 */
 .edge-mid {
   fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
   stroke: rgb(var(--edge-halo-rgb));
-  stroke-width: 3;
+  stroke-width: 3.6;
   stroke-linejoin: round;
   paint-order: stroke fill;
   pointer-events: none;
-  opacity: 0.95;
 }
-.edge-mid.dim { opacity: 0.4; }
+.edge-mid.dim { opacity: 0.45; }
 /* 连线控制点：命中圆透明且更大，可见圆只负责展示 */
-.edge-handle-layer { pointer-events: none; }
+.handle-layer .edge-handle-group { pointer-events: none; }
+/* 靠近才出现的锚点：出现时就清晰可见，鼠标移到柄上再完全实色 */
+.edge-handle.peeking { opacity: .9; }
+.edge-handle-group:hover .edge-handle { opacity: 1; }
 .edge-handle-hit { fill: transparent; stroke: none; pointer-events: all; cursor: grab; }
 .edge-handle-hit:active { cursor: grabbing; }
 .edge-handle { fill: var(--accent-2); stroke: rgba(var(--surface-rgb), 0.95); stroke-width: 1.5; pointer-events: none; filter: drop-shadow(0 1px 3px rgba(var(--shadow-rgb), 0.5)); }
 .edge-handle.insert { fill: rgba(var(--node-bg-rgb), 0.85); stroke: var(--accent-2); stroke-dasharray: 2.5 2.5; }
+/* 锚点手柄用另一种实色，和拐点 / 插入柄区分开 */
+.edge-handle.anchor { fill: var(--accent); stroke: rgba(var(--surface-rgb), 0.95); stroke-width: 2; }
+/* 分段连线：顶点=方色实心、曲线控制点=空心环、圆弧矢高=菱形感的小点 */
+.edge-handle.vertex { fill: var(--accent); stroke: rgba(var(--surface-rgb), 0.95); stroke-width: 2; }
+.edge-handle.ctrl { fill: rgba(var(--node-bg-rgb), 0.9); stroke: var(--accent-2); stroke-width: 2; stroke-dasharray: 2 2; }
+.edge-handle.bulge { fill: var(--accent-2); stroke: rgba(var(--surface-rgb), 0.95); stroke-width: 2; }
 @keyframes edgeFlow { to { stroke-dashoffset: -28; } }
 .snap-guides line { stroke: var(--accent-2); }
 
@@ -3392,6 +4653,11 @@ defineExpose({ viewportRef, computeNodeBbox })
 .sub-item:hover { background: rgba(var(--accent2-rgb), 0.15); color: var(--accent2-light); }
 .sub-item.checked { color: var(--accent2-light); background: rgba(var(--accent2-rgb), 0.12); }
 .sub-item.checked::before { content: '✓ '; color: var(--accent-2); }
+/* 绘制中的线型菜单：当前选中项 */
+.ctx-item.checked { color: var(--accent2-light); background: rgba(var(--accent2-rgb), 0.14); }
+.ctx-item.checked::before { content: '✓ '; color: var(--accent-2); }
+.seg-menu { min-width: 250px; }
+.seg-menu-note { padding: 4px 10px 6px; font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.55); line-height: 1.5; white-space: normal; }
 
 /* 新建画布对话框 */
 .modal-bg { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.5); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 1000; }

@@ -70,11 +70,25 @@ export const useAgentStore = defineStore('agent', {
       if (i >= 0) this.groups[i] = g
       return g
     },
+    /** 删除分组：组本身删除，组内智能体移回「全部」组（智能体保留） */
     async removeGroup(id: number) {
       await api.agent_groups.remove(id)
       this.groups = this.groups.filter(x => x.id !== id)
       // 后端删除组时已把该组内智能体的 group_id 置空，同步本地
       this.list.forEach(a => { if (a.group_id === id) a.group_id = null })
+    },
+    /** 清空分组：保留组，组内智能体移回「全部」组（智能体保留） */
+    async clearGroup(id: number) {
+      await api.agent_groups.clear(id)
+      this.list.forEach(a => { if (a.group_id === id) a.group_id = null })
+    },
+    /** 删除组和智能体：组与组内智能体全部删除，后端会清理画布节点/连线 */
+    async removeGroupWithAgents(id: number) {
+      await api.agent_groups.purge(id)
+      this.list = this.list.filter(a => a.group_id !== id)
+      this.groups = this.groups.filter(x => x.id !== id)
+      // 后端已清理这些智能体在所有画布上的节点与连线，刷新画布保持一致
+      await useCanvasStore().fetch()
     },
     async reorderGroups(ids: number[]) {
       // 乐观更新：先按新顺序本地重排，界面立即响应

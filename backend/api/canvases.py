@@ -21,13 +21,35 @@ class EdgePoint(BaseModel):
     y: float
 
 
+class EdgeAnchor(BaseModel):
+    """手动锚点：吸附在节点某条边上，t 为沿边归一化位置（0..1）。用相对值存储，节点移动后不会脱边。"""
+    side: str = "r"  # l | r | t | b
+    t: float = 0.5
+
+
+class EdgeSegment(BaseModel):
+    """分段连线的一段：从上一顶点到 end，每段可以有自己的线型。
+    type: straight=直线 | curve=三次贝塞尔曲线 | arc=圆弧 | vert=垂线（垂直于上一段末端方向）；
+    ctrl 为曲线控制点（画布绝对坐标，0 或 2 个），vert 段的 ctrl[0] 为单位法线方向（不随节点平移）；
+    bulge 为圆弧归一化矢高（带符号，决定弯向）。
+    最后一段的 end 会被 anchor_to 派生出的目标锚点覆盖，保证节点移动后线仍贴合边缘。"""
+    type: str = "straight"
+    end: EdgePoint
+    ctrl: list[EdgePoint] = Field(default_factory=list)
+    bulge: float = 0.22
+
+
 class Edge(BaseModel):
     id: int
     from_node: int
     to_node: int
     type: str = "chat"  # chat | handoff
-    shape: str = "curve"  # curve=平滑曲线 | straight=斜线直连(可带控制点) | ortho=直角折线(L 形，一个 90° 折角)
-    waypoints: list[EdgePoint] = Field(default_factory=list, description="用户拖拽产生的控制点；空=自动布线")
+    shape: str = "curve"  # curve=平滑曲线 | straight=斜线直连(可带控制点) | ortho=直角折线 | mixed=逐段绘制的分段连线
+    waypoints: list[EdgePoint] = Field(default_factory=list, description="用户拖拽产生的拐点；空=自动布线")
+    ortho_dir: str | None = Field(default=None, description="直角折线方向偏好：cw=顺时针 | ccw=逆时针 | None=自动")
+    anchor_from: EdgeAnchor | None = Field(default=None, description="起点手动锚点；None=自动布线")
+    anchor_to: EdgeAnchor | None = Field(default=None, description="终点手动锚点；None=自动布线")
+    segments: list[EdgeSegment] = Field(default_factory=list, description="逐段绘制的连线；非空时优先于 shape/waypoints 渲染")
 
 
 class CanvasIn(BaseModel):

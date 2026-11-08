@@ -764,10 +764,23 @@ const canvasThumbNodes = computed(() => {
     }
   })
 })
-/** L 形直角折线的单段拐角 */
-function lShapeSeg(a: { x: number; y: number }, b: { x: number; y: number }, horizontalFirst: boolean) {
-  const corner = horizontalFirst ? { x: b.x, y: a.y } : { x: a.x, y: b.y }
-  return [a, corner, b]
+/** 缩略图直角折线：waypoints 已是折角，只补齐必要的 L 拐点并合并共线多余点 */
+function orthoThumbPts(raw: { x: number; y: number }[]): { x: number; y: number }[] {
+  const pts: { x: number; y: number }[] = [raw[0]]
+  for (let i = 0; i < raw.length - 1; i++) {
+    const p = pts[pts.length - 1], q = raw[i + 1]
+    if (Math.abs(p.x - q.x) > 0.01 && Math.abs(p.y - q.y) > 0.01) pts.push({ x: q.x, y: p.y })
+    pts.push(q)
+  }
+  const out: { x: number; y: number }[] = [pts[0]]
+  for (let i = 1; i < pts.length - 1; i++) {
+    const a = out[out.length - 1], b = pts[i], c = pts[i + 1]
+    const colin = (Math.abs(a.y - b.y) < 0.01 && Math.abs(b.y - c.y) < 0.01)
+      || (Math.abs(a.x - b.x) < 0.01 && Math.abs(b.x - c.x) < 0.01)
+    if (!colin) out.push(b)
+  }
+  if (pts.length > 1) out.push(pts[pts.length - 1])
+  return out.filter((p, i) => i === 0 || Math.abs(p.x - out[i - 1].x) > 0.01 || Math.abs(p.y - out[i - 1].y) > 0.01)
 }
 /** Catmull-Rom → 三次 Bézier 的控制点 */
 function smoothCtrl(pts: { x: number; y: number }[], i: number) {
@@ -789,6 +802,14 @@ function thumbEdgePath(e: any, from: any, to: any, nodeR: number, canvasDefaultS
   const sx = fx + ux * nodeR, sy = fy + uy * nodeR
   const ex = tx - ux * (nodeR + 6), ey = ty - uy * (nodeR + 6)
 
+  // 逐段绘制的连线：缩略图只取各段顶点做折线近似（曲线/圆弧的弯曲在小图里看不出来）
+  if (Array.isArray(e?.segments) && e.segments.length) {
+    const verts = e.segments
+      .map((s: any) => ({ x: Number(s?.end?.x), y: Number(s?.end?.y) }))
+      .filter((p: any) => Number.isFinite(p.x) && Number.isFinite(p.y))
+    return [{ x: sx, y: sy }, ...verts, { x: ex, y: ey }]
+      .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
+  }
   const shape = (e?.shape === 'curve' || e?.shape === 'straight' || e?.shape === 'ortho')
     ? e.shape : canvasDefaultShape
   const wpsRaw = Array.isArray(e?.waypoints) ? e.waypoints : []
@@ -804,21 +825,9 @@ function thumbEdgePath(e: any, from: any, to: any, nodeR: number, canvasDefaultS
   }
 
   if (shape === 'ortho') {
-    // 直角折线（L 形）：水平/垂直距离大的方向优先（与 CanvasBoard orthoAnchors 一致）
-    const horizontalFirst = Math.abs(dx) >= Math.abs(dy)
-    const rawPts: { x: number; y: number }[] = [{ x: sx, y: sy }, ...wps, { x: ex, y: ey }]
-    const pts: { x: number; y: number }[] = [rawPts[0]]
-    for (let i = 0; i < rawPts.length - 1; i++) {
-      const seg = lShapeSeg(rawPts[i], rawPts[i + 1], horizontalFirst)
-      for (const p of seg.slice(1)) pts.push(p)
-    }
-    // 去掉连续重合点
-    const deduped: { x: number; y: number }[] = [pts[0]]
-    for (let i = 1; i < pts.length; i++) {
-      const last = deduped[deduped.length - 1]
-      if (Math.abs(last.x - pts[i].x) > 0.01 || Math.abs(last.y - pts[i].y) > 0.01) deduped.push(pts[i])
-    }
-    return deduped.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
+    // 与画布一致：控制点严格为折角；缩略图不做避障 / 顺逆时针切换
+    return orthoThumbPts([{ x: sx, y: sy }, ...wps, { x: ex, y: ey }])
+      .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
   }
 
   // curve：平滑曲线（默认形状）
@@ -858,6 +867,7 @@ const canvasThumbEdges = computed(() => {
     const edgeCompat = {
       shape: e.shape,
       waypoints: e.waypoints,
+      segments: e.segments,
     }
     return { path: thumbEdgePath(edgeCompat, from, to, nodeR, defaultShape) }
   }).filter((e: any) => e.path)

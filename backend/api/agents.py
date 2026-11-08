@@ -120,14 +120,17 @@ def update_agent(aid: int, a: AgentIn):
     return upsert("agents", cur)
 
 
-@router.delete("/{aid}")
-def remove_agent(aid: int):
-    # 同时从所有画布清理该智能体的节点与相关连线
+def purge_agents(agent_ids: set[int]) -> dict:
+    """批量删除智能体，并从所有画布清理其节点与随之悬空的连线。
+
+    供「删除智能体」与「删除组和智能体」共用，避免两处清理逻辑漂移。
+    只删目标 id 的记录文件，不重写整个 agents 域。
+    """
     canvases = load("canvases")
     changed = 0
     for c in canvases:
         prev = len(c.get("nodes", []))
-        c["nodes"] = [n for n in c.get("nodes", []) if n.get("agent_id") != aid]
+        c["nodes"] = [n for n in c.get("nodes", []) if n.get("agent_id") not in agent_ids]
         if len(c["nodes"]) != prev:
             changed += 1
             ids = {n["id"] for n in c["nodes"]}
@@ -135,4 +138,12 @@ def remove_agent(aid: int):
                           if e.get("from_node") in ids and e.get("to_node") in ids]
     if changed:
         save("canvases", canvases)
-    return {"ok": delete_by("agents", aid), "cleaned_from_canvases": changed}
+    deleted = sum(1 for aid in agent_ids if delete_by("agents", aid))
+    return {"agents_deleted": deleted, "cleaned_from_canvases": changed}
+
+
+@router.delete("/{aid}")
+def remove_agent(aid: int):
+    # 同时从所有画布清理该智能体的节点与相关连线
+    r = purge_agents({aid})
+    return {"ok": bool(r["agents_deleted"]), "cleaned_from_canvases": r["cleaned_from_canvases"]}

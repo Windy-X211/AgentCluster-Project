@@ -112,6 +112,10 @@ export const api = {
     create: (d: any) => req('/agent_groups', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agent_groups/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/agent_groups/${id}`, { method: 'DELETE' }),
+    // 清空分组：保留组，组内智能体移回「全部」
+    clear: (id: number) => req(`/agent_groups/${id}/clear`, { method: 'POST' }),
+    // 删除组和智能体：组与组内智能体一并彻底删除（含画布节点/连线清理）
+    purge: (id: number) => req(`/agent_groups/${id}/purge`, { method: 'DELETE' }),
     reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
   canvases: {

@@ -151,12 +151,36 @@ async function ctxRenameGroup() {
   if (!name) return
   await agents.updateGroup(g.id, { name })
 }
+// 三个删除相关动作，语义互斥：
+//   删除分组       → 组删除，组内智能体移回「全部」组（智能体保留）
+//   清空分组       → 组保留，组内智能体移回「全部」组（智能体保留）
+//   删除组和智能体 → 组与组内智能体一并彻底删除（含画布节点/连线清理）
 async function ctxDeleteGroup() {
   if (!groupCtx.value) return
   const g = groupCtx.value.g
+  const n = agentsOfGroup(g.id).length
   closeGroupCtx()
-  if (window.confirm(`确定删除分组「${g.name}」吗？组内智能体会移回"全部"组。`)) {
+  if (window.confirm(`确定删除分组「${g.name}」吗？\n分组会被删除，组内 ${n} 个智能体将移回「全部」组（智能体保留）。`)) {
     await agents.removeGroup(g.id)
+  }
+}
+async function ctxClearGroup() {
+  if (!groupCtx.value) return
+  const g = groupCtx.value.g
+  const n = agentsOfGroup(g.id).length
+  closeGroupCtx()
+  if (window.confirm(`确定清空分组「${g.name}」吗？\n分组会保留，组内 ${n} 个智能体将移回「全部」组（智能体保留）。`)) {
+    await agents.clearGroup(g.id)
+  }
+}
+async function ctxPurgeGroup() {
+  if (!groupCtx.value) return
+  const g = groupCtx.value.g
+  const n = agentsOfGroup(g.id).length
+  closeGroupCtx()
+  const msg = `⚠️ 确定删除分组「${g.name}」及其组内全部 ${n} 个智能体吗？\n智能体会被永久删除，它们在画布上的节点与连线也会一并清理，此操作不可恢复！`
+  if (window.confirm(msg)) {
+    await agents.removeGroupWithAgents(g.id)
   }
 }
 function ctxNewAgentInGroup() {
@@ -338,7 +362,7 @@ function onGroupDrop(e: DragEvent, g: any) {
             <div class="group-empty" v-else>暂无智能体</div>
           </div>
 
-          <!-- 自定义组（可右键：重命名 / 删除 / 新建智能体） -->
+          <!-- 自定义组（可右键：重命名 / 新建智能体 / 删除分组 / 清空分组 / 删除组和智能体） -->
           <div class="group-card glass-soft" v-for="g in agents.groups" :key="g.id"
             draggable="true"
             :class="{ dragging: groupDragId === g.id, 'drop-before': groupOverId === g.id && groupOverPos === 'before' && groupDragId !== g.id, 'drop-after': groupOverId === g.id && groupOverPos === 'after' && groupDragId !== g.id }"
@@ -442,8 +466,12 @@ function onGroupDrop(e: DragEvent, g: any) {
       <div v-if="groupCtx" ref="groupCtxEl" class="agent-ctx glass" :style="{ left: groupCtx.x + 'px', top: groupCtx.y + 'px' }" @click.stop>
         <div class="ctx-title">{{ groupCtx.g.name }}</div>
         <div class="ctx-item" @click="ctxRenameGroup">✏️ 重命名</div>
-        <div class="ctx-item danger" @click="ctxDeleteGroup">🗑 删除组</div>
         <div class="ctx-item" @click="ctxNewAgentInGroup">➕ 新建智能体</div>
+        <div class="ctx-sep"></div>
+        <div class="ctx-sub">删除 / 清空</div>
+        <div class="ctx-item danger" @click="ctxDeleteGroup" title="删除该分组，组内智能体移回「全部」组（智能体保留）">🗑 删除分组</div>
+        <div class="ctx-item" @click="ctxClearGroup" title="保留该分组，组内智能体移回「全部」组（智能体保留）">🧹 清空分组</div>
+        <div class="ctx-item danger danger-strong" @click="ctxPurgeGroup" title="彻底删除分组及组内所有智能体，画布节点/连线一并清理，不可恢复">⚠️ 删除组和智能体</div>
       </div>
     </Teleport>
   </div>
@@ -519,6 +547,8 @@ function onGroupDrop(e: DragEvent, g: any) {
 .ctx-item { padding: 8px 12px; border-radius: 6px; font-size: calc(13px * var(--font-scale)); cursor: pointer; transition: background .15s; user-select: none; display: flex; align-items: center; justify-content: space-between; gap: 8px;
   &:hover { background: rgba(var(--accent-rgb), 0.18); }
   &.danger:hover { background: rgba(255,80,80,0.18); color: #ff9090; }
+  /* 最危险的「删除组和智能体」常驻左侧警示条，避免与另两项混淆 */
+  &.danger-strong { font-weight: 600; box-shadow: inset 2px 0 0 rgba(255,80,80,0.8); }
 }
 .ctx-sep { height: 1px; background: rgba(var(--surface-rgb), 0.08); margin: 4px 0; }
 .ctx-sub { font-size: calc(10px * var(--font-scale)); padding: 4px 10px; color: rgba(var(--text-rgb), 0.58); letter-spacing: 1px; }

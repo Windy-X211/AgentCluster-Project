@@ -65,14 +65,41 @@ def update_group(gid: int, g: AgentGroupIn):
     return upsert("agent_groups", cur)
 
 
-@router.delete("/{gid}")
-def remove_group(gid: int):
-    # 删除组前，把该组内所有智能体的 group_id 置空（移回"全部"组）
-    agents = load("agents")
+def _ungroup_agents(gid: int) -> int:
+    """把组内所有智能体的 group_id 置空（移回"全部"组），返回处理数量。"""
     ungrouped = 0
-    for a in agents:
+    for a in load("agents"):
         if a.get("group_id") == gid:
             a["group_id"] = None
             upsert("agents", a)
             ungrouped += 1
+    return ungrouped
+
+
+@router.post("/{gid}/clear")
+def clear_group(gid: int):
+    """清空分组：保留组本身，组内智能体移回"全部"组（智能体不删除）。"""
+    if not get_by("agent_groups", gid):
+        raise HTTPException(404, "not found")
+    return {"ok": True, "agents_ungrouped": _ungroup_agents(gid)}
+
+
+@router.delete("/{gid}/purge")
+def purge_group(gid: int):
+    """删除分组并彻底删除组内所有智能体（不可恢复）。
+
+    与「删除智能体」共用清理逻辑：同时从所有画布移除这些智能体的节点及悬空连线。
+    """
+    if not get_by("agent_groups", gid):
+        raise HTTPException(404, "not found")
+    doomed = {a["id"] for a in load("agents") if a.get("group_id") == gid}
+    from api.agents import purge_agents
+    result = purge_agents(doomed)
+    return {"ok": delete_by("agent_groups", gid), **result}
+
+
+@router.delete("/{gid}")
+def remove_group(gid: int):
+    """删除分组（组本身删除）：组内智能体移回"全部"组，不删除智能体。"""
+    ungrouped = _ungroup_agents(gid)
     return {"ok": delete_by("agent_groups", gid), "agents_ungrouped": ungrouped}
