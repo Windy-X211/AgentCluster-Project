@@ -49,6 +49,13 @@ tool.yaml 最小结构（每个插件至少一个 tool）：
 
 tool.py：标准 run(**kwargs) 返回 dict。
 
+能力分组（用户自定义）：
+  系统支持在「能力列表」界面给插件和技能按功能/用途分组（如 浏览器类、自动化类、PPT制作）。
+  分组信息存储在用户数据 `{storage_root}/capability_groups/plugins.json`（独立文件，不在 settings.json 中），
+  持久化生效。生成插件时建议 kebab-case 名称带上领域关键词（如 `browser_control`、`ppt_translate`），
+  便于用户拖进对应分组；批量生成同类插件时可提醒用户到「能力列表」把它们拖到合适的分组，
+  编排师选能力时会优先从同组挑选。
+
 对外 API（保持不变，agent_runtime 和 commands.py 无感知）：
   list_plugins() → dict[name] = {label, description, params, ...}
   run_plugin(name, **kwargs) → result dict

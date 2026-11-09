@@ -9,6 +9,7 @@
     model_interfaces/ 1.json ...          ← 模型接口
     skills/                                ← 自定义技能目录（预留）
     plugins/                               ← 自定义插件目录（预留）
+    capability_groups/       ← 用户自定义能力分组（按类型分）：{commands,skills,plugins}.json
     _legacy/                              ← 旧版单文件数组迁移后的归档
 
 迁移是安全的：init_store 时若检测到旧版 flat 文件，会全量读入 → 逐条写入新目录 →
@@ -68,6 +69,125 @@ def _resolve_root() -> Path:
 ROOT = _resolve_root()
 LEGACY_DIR = ROOT / "_legacy"
 LOCK = threading.RLock()
+
+ROOT_CAPABILITY_GROUPS = ROOT / "capability_groups"
+
+
+def _capability_groups_file(type_: str) -> Path:
+    """返回某个能力类型的分组文件路径。"""
+    return ROOT_CAPABILITY_GROUPS / f"{type_}.json"
+
+
+def _combos_file() -> Path:
+    """跨类型「组合技」存储文件路径（与单类型分组同目录）。"""
+    return ROOT_CAPABILITY_GROUPS / "combos.json"
+
+
+def load_combos() -> dict:
+    """加载用户自定义「组合技」（跨类型能力组合）。
+
+    返回：{"组合名": {"description": str, "members": [{"type","key"}, ...]}, ...}
+    """
+    fp = _combos_file()
+    if not fp.exists():
+        return {}
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        print(f"[store] WARN 读取 {fp} 失败：{e}")
+        return {}
+    # 容错：确保结构合法
+    out: dict = {}
+    if isinstance(data, dict):
+        for name, rec in data.items():
+            if not isinstance(rec, dict):
+                continue
+            members = [m for m in (rec.get("members") or []) if isinstance(m, dict)
+                       and m.get("type") in ("commands", "skills", "plugins") and m.get("key")]
+            rec_out = {"description": str(rec.get("description") or ""), "members": members}
+            if rec.get("market_id"):
+                rec_out["market_id"] = str(rec["market_id"])
+            out[name] = rec_out
+    return out
+
+
+def save_combos(combos: dict) -> None:
+    """保存用户自定义「组合技」到独立文件。"""
+    fp = _combos_file()
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    clean: dict = {}
+    for name, rec in (combos or {}).items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(rec, dict):
+            continue
+        members = [m for m in (rec.get("members") or []) if isinstance(m, dict)
+                   and m.get("type") in ("commands", "skills", "plugins") and m.get("key")]
+        rec_clean = {"description": str(rec.get("description") or ""), "members": members}
+        # market_id：从市场安装的组合技保留来源标记，用于「已安装」判定
+        if rec.get("market_id"):
+            rec_clean["market_id"] = str(rec["market_id"])
+        clean[name] = rec_clean
+    _atomic_write_json(fp, clean)
+
+
+def load_capability_groups(type_: str) -> dict:
+    """加载用户自定义能力分组。
+
+    返回：{"组名": ["能力名1", "能力名2"], ...}
+    默认：空字典 {}（若文件不存在或读取失败）
+    """
+    fp = _capability_groups_file(type_)
+    if not fp.exists():
+        return {}
+    try:
+        return json.loads(fp.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        print(f"[store] WARN 读取 {fp} 失败：{e}")
+        return {}
+
+
+def save_capability_groups(type_: str, groups: dict) -> None:
+    """保存用户自定义能力分组到独立文件。
+
+    类型：
+      - "commands"
+      - "skills"
+      - "plugins"
+    """
+    fp = _capability_groups_file(type_)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(fp, groups)
+
+
+def _migrate_capability_groups_from_settings() -> None:
+    """如果 settings.json 中已有 capability_groups，则迁移到独立文件。"""
+    settings_file = ROOT / "settings.json"
+    if not settings_file.exists():
+        return
+    try:
+        cur = json.loads(settings_file.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    old_groups = cur.get("capability_groups") or {}
+    if not old_groups:
+        return
+
+    print(f"[store] 迁移能力分组数据：从 settings.json 能力分组 → {ROOT_CAPABILITY_GROUPS} 目录")
+
+    # 迁移到独立文件（仅迁移非空且类型合法的）
+    for type_, groups in old_groups.items():
+        if type_ not in ("commands", "skills", "plugins"):
+            continue
+        if groups:
+            save_capability_groups(type_, groups)
+
+    # 迁移完成后从 settings.json 中移除旧字段
+    cur.pop("capability_groups", None)
+    _atomic_write_json(settings_file, cur)
+
+    # 写入迁移标记
+    (ROOT / ".migrated_from_settings_capability_groups").write_text(
+        f"migrated_at={datetime.now().isoformat()}\n", encoding="utf-8"
+    )
 
 # 写盘 fsync 策略（可用环境变量 AGENTCLUSTER_FSYNC 覆盖）：
 #   sync  - 旧版行为：每次写盘同步 fsync，数据先落盘再返回（本机实测 ~45ms/次）
@@ -162,8 +282,8 @@ def _drain_sync_queue() -> None:
 RECORD_DOMAINS = ["agents", "agent_groups", "canvases", "conversations", "model_interfaces", "rules", "param_presets"]
 # 单文件域 → 整个域一个 json
 SINGLE_DOMAINS = ["settings"]
-# 预留的文件夹（用户可在这里放自定义 skills / plugins / backgrounds）
-EXTRA_DIRS = ["skills", "plugins", "backgrounds"]
+# 预留的文件夹（用户可在这里放自定义 skills / plugins / backgrounds / capability_groups）
+EXTRA_DIRS = ["skills", "plugins", "backgrounds", "capability_groups"]
 
 DEFAULT_SETTINGS = {
     "storage_version": 2,
@@ -333,7 +453,9 @@ def _migrate_if_needed() -> None:
 
     version = current.get("storage_version", 1)
     if version >= 2:
-        return  # 已是新版
+        # 已是新版；仍要检查旧版 capability_groups 字段是否残留在 settings.json 中
+        _migrate_capability_groups_from_settings()
+        return
 
     migrated_any = False
     for domain in RECORD_DOMAINS:
@@ -382,6 +504,9 @@ def _migrate_if_needed() -> None:
     current["storage_version"] = 2
     _atomic_write_json(settings_file, current)
     print(f"[store] storage migrated to v2: {migrated_any} domains archived to _legacy/")
+
+    # 新版专用迁移：settings.json 中的能力分组 → 独立文件
+    _migrate_capability_groups_from_settings()
 
 
 # ==============================================================
@@ -685,6 +810,7 @@ def get_store_paths() -> dict:
             "skills_dir": str(ROOT / "skills"),
             "plugins_dir": str(ROOT / "plugins"),
             "backgrounds_dir": str(ROOT / "backgrounds"),
+            "capability_groups_dir": str(ROOT_CAPABILITY_GROUPS),
             "param_presets_dir": str(ROOT / "param_presets"),
             "agent_groups_dir": str(ROOT / "agent_groups"),
             "legacy_dir": str(LEGACY_DIR),

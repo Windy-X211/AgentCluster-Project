@@ -1,12 +1,17 @@
 // 校验 fairy_ball 菜单独立窗改造：页面 JS 语法 + 关键逻辑（防超屏/失焦关/焦点归还/换装同步）
 const fs = require('fs')
+const path = require('path')
+
+// 拓展统一从市场下载到用户数据目录，不再依赖项目内 AppData 或 _builtin 副本
+const EXT_ROOT = path.join(process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local'), 'AgentCluster', 'extensions')
+const FAIRY_DIR = path.join(EXT_ROOT, 'fairy_ball')
 
 let fail = 0
 const ok = (name) => console.log('✓ ' + name)
 const bad = (name) => { console.log('✗ ' + name); fail++ }
 
-for (const f of ['AppData/extensions/fairy_ball/fairy.html', 'AppData/extensions/fairy_ball/menu.html']) {
-    const html = fs.readFileSync(f, 'utf8')
+for (const f of ['fairy.html', 'menu.html']) {
+    const html = fs.readFileSync(path.join(FAIRY_DIR, f), 'utf8')
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
     let err = null
     scripts.forEach(m => { try { new Function(m[1]) } catch (e) { err = e } })
@@ -15,9 +20,9 @@ for (const f of ['AppData/extensions/fairy_ball/fairy.html', 'AppData/extensions
 
 const main = fs.readFileSync('frontend/electron/main.cjs', 'utf8')
 const preload = fs.readFileSync('frontend/electron/preload.cjs', 'utf8')
-const fairyHtml = fs.readFileSync('AppData/extensions/fairy_ball/fairy.html', 'utf8')
-const menuHtml = fs.readFileSync('AppData/extensions/fairy_ball/menu.html', 'utf8')
-const manifest = JSON.parse(fs.readFileSync('AppData/extensions/fairy_ball/manifest.json', 'utf8'))
+const fairyHtml = fs.readFileSync(path.join(FAIRY_DIR, 'fairy.html'), 'utf8')
+const menuHtml = fs.readFileSync(path.join(FAIRY_DIR, 'menu.html'), 'utf8')
+const manifest = JSON.parse(fs.readFileSync(path.join(FAIRY_DIR, 'manifest.json'), 'utf8'))
 
 const mainChecks = [
     ['main: openFairyMenu 定义', /function openFairyMenu/],
@@ -62,12 +67,7 @@ for (const [name, src, re] of pageChecks) {
 if (manifest.version === '1.3.1') ok('manifest: 版本 1.3.1'); else bad('manifest: 版本应为 1.3.1，实际 ' + manifest.version)
 if (manifest.pages.includes('menu.html')) ok('manifest: pages 含 menu.html'); else bad('manifest: pages 缺 menu.html')
 
-// _builtin 与已安装目录同步一致性
-for (const f of ['fairy.html', 'menu.html', 'manifest.json']) {
-    const a = fs.readFileSync('AppData/extensions/_builtin/fairy_ball/' + f)
-    const b = fs.readFileSync('AppData/extensions/fairy_ball/' + f)
-    if (a.equals(b)) ok('同步一致 ' + f); else bad('同步不一致 ' + f)
-}
+// 拓展统一从市场下载，不再维护 _builtin 副本（已移除）
 
 console.log(fail ? 'RESULT: FAIL ×' + fail : 'RESULT: ALL PASS')
 process.exit(fail ? 1 : 0)

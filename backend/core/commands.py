@@ -3054,35 +3054,57 @@ def cmd_cluster_list_capabilities(keyword: str | None = None,
                 "name": name, "label": label, "description": desc, "params": params,
             })
 
-    # 技能
+    # 技能（按用户自定义分组返回）
     skill_list: list[dict] = []
+    skills_by_group: dict[str, list[dict]] = {}
     if kinds_filter is None or "skills" in kinds_filter:
+        user_groups = _store.load_capability_groups("skills")
+        # 反向索引：skill_name → group
+        _sg_map: dict[str, str] = {}
+        for g, names in user_groups.items():
+            for n in names:
+                _sg_map[n] = g
         for k, v in _list_skills().items():
             label = v.get("label", k)
             desc = v.get("description", "")
             if not _match(f"{k} {label} {desc}"):
                 continue
-            skill_list.append({"name": k, "label": label, "description": desc})
+            entry = {"name": k, "label": label, "description": desc}
+            skill_list.append(entry)
+            g = _sg_map.get(k, "未分组")
+            skills_by_group.setdefault(g, []).append(entry)
 
-    # 插件
+    # 插件（按用户自定义分组返回）
     plugin_list: list[dict] = []
+    plugins_by_group: dict[str, list[dict]] = {}
     if kinds_filter is None or "plugins" in kinds_filter:
+        user_groups = _store.load_capability_groups("plugins")
+        _pg_map: dict[str, str] = {}
+        for g, names in user_groups.items():
+            for n in names:
+                _pg_map[n] = g
         for k, v in _list_plugins().items():
             label = v.get("label", k)
             desc = v.get("description", "")
             if not _match(f"{k} {label} {desc}"):
                 continue
-            plugin_list.append({"name": k, "label": label, "description": desc})
+            entry = {"name": k, "label": label, "description": desc}
+            plugin_list.append(entry)
+            g = _pg_map.get(k, "未分组")
+            plugins_by_group.setdefault(g, []).append(entry)
 
     return {
         "commands": commands_by_group,
-        "skills": skill_list,
-        "plugins": plugin_list,
+        "skills": skills_by_group,
+        "plugins": plugins_by_group,
+        "_flat_skills": skill_list,
+        "_flat_plugins": plugin_list,
         "keyword": keyword,
         "_tips": [
             "创建智能体时请根据其职责从上述列表中选择合适的 commands / skills / plugins 配置进去，不要留空",
             "命令 (commands) 是内建工具，技能 (skills) 是专业工作流，插件 (plugins) 是外部功能扩展",
             "cluster.* 系列命令已默认给编排师自己使用，不需要分配给普通智能体",
+            "命令按内置功能分类分组（文件操作/智能命令/命令运行/集群编排），技能和插件按用户自定义分组组织",
         ],
     }
 

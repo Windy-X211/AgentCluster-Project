@@ -16,6 +16,7 @@ class AgentIn(BaseModel):
     commands: list[str] = []
     skills: list[str] = []
     plugins: list[str] = []
+    combos: list[str] = []  # 组合技：跨类型能力组合名称列表
     trigger: dict = {"type": "manual", "cron": "", "message": ""}
     tags: list[str] = []
     max_tool_rounds: int | None = None  # 单次回复最大工具调用轮数，None=跟随全局设置

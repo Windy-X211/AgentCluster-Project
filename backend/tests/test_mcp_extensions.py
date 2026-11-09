@@ -15,8 +15,7 @@ import pytest
 
 from core.store import ROOT as STORE_ROOT
 EXT_ROOT = STORE_ROOT / "extensions"
-if not EXT_ROOT.exists():
-    EXT_ROOT = Path(__file__).resolve().parent.parent.parent / "market" / "extensions"
+# 拓展统一从市场下载到用户数据目录；若尚未安装则 skip
 
 
 def _load_ext_module(ext_id: str):

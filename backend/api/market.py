@@ -53,9 +53,13 @@ KIND_ORDER = [
     ("background", "背景"),
     ("skill", "技能"),
     ("plugin", "插件"),
+    ("combo", "组合技"),
     ("extension", "功能拓展"),
 ]
 KIND_LABEL = dict(KIND_ORDER)
+
+# 能力类型中文名（组合技成员描述用）
+_CAP_TYPE_LABEL = {"commands": "命令", "skills": "技能", "plugins": "插件"}
 
 # 复制资源目录时排除的运行时垃圾
 _EXCLUDE_DIRS = {"__pycache__", "_webengine_profile", "node_modules", ".git", ".pytest_cache", ".runtime"}
@@ -138,6 +142,15 @@ def _safe_id(value: str) -> str:
 def _slugify(text: str, fallback: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", text or "").strip("-").lower()
     return s or fallback
+
+
+def _combo_slug(name: str) -> str:
+    """组合技可能用中文名，slugify 后为空 → 用 md5 短哈希兜底，保证稳定且唯一。"""
+    import hashlib
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", name or "").strip("-").lower()
+    if s:
+        return s
+    return "combo-" + hashlib.md5((name or "combo").encode("utf-8")).hexdigest()[:10]
 
 
 def _unique_name(base: str, taken: set[str]) -> str:
@@ -225,12 +238,20 @@ def _installed_state(items: list[dict]) -> None:
         canvases = store.load("canvases")
     except Exception:
         canvases = []
+    try:
+        combos = store.load_combos()
+    except Exception:
+        combos = {}
     agent_names = {a.get("name") for a in agents}
     # 画布安装后会加序号改名（游戏团队 → 游戏团队2），名字对不上，
     # 因此用安装时写入的 market_id 做权威判定；名字匹配仅作旧数据的兜底。
     canvas_market_ids = {str(c.get("market_id")) for c in canvases if c.get("market_id")}
     canvas_names = {c.get("name") for c in canvases}
     agent_market_ids = {str(a.get("market_id")) for a in agents if a.get("market_id")}
+    # 组合技安装后以名字为准（本地组合名 = 市场名），market_id 兜底
+    combo_names = set(combos.keys())
+    combo_market_ids = {str(rec.get("market_id")) for rec in combos.values()
+                        if rec.get("market_id")}
     for it in items:
         kind, iid = it.get("kind"), it.get("id", "")
         if kind == "skill":
@@ -244,6 +265,8 @@ def _installed_state(items: list[dict]) -> None:
             it["enabled"] = it["installed"] and bool(
                 _read_installed().get(iid, {}).get("enabled")
             )
+        elif kind == "combo":
+            it["installed"] = (it.get("name") in combo_names) or (str(iid) in combo_market_ids)
         elif kind == "agent":
             # 智能体安装后不改名（重名也不改名），名字匹配仍然有效
             it["installed"] = (str(iid) in agent_market_ids) or (it.get("name") in agent_names)
@@ -365,9 +388,35 @@ def _parse_preview(item: dict, folder: Path) -> dict:
         out["skill"] = _parse_skill(folder / "SKILL.md")
     elif kind == "plugin":
         out["plugin"] = _parse_plugin(folder / "manifest.yaml", folder)
+    elif kind == "combo":
+        out["combo"] = _parse_combo(folder / "combo.json")
     elif kind == "extension":
         out["extension"] = _parse_extension(folder / "manifest.json", folder)
     return out
+
+
+def _parse_combo(path: Path) -> dict:
+    """解析市场里的组合技条目（组合名 + 成员列表）。"""
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(_safe_read_text(path))
+    except Exception:
+        return {"error": "无法解析 combo.json"}
+    members = raw.get("members") or []
+    counts = {"commands": 0, "skills": 0, "plugins": 0}
+    for m in members:
+        t = m.get("type")
+        if t in counts:
+            counts[t] += 1
+    return {
+        "name": raw.get("name", ""),
+        "description": raw.get("description", ""),
+        "members": members,
+        "member_count": len(members),
+        "member_counts": counts,
+        "summary": "、".join(f"{v} {_CAP_TYPE_LABEL[t]}" for t, v in counts.items() if v),
+    }
 
 
 def _safe_read_text(path: Path, max_chars: int = 200_000) -> str:
@@ -393,6 +442,7 @@ def _parse_agent(path: Path) -> dict:
         "commands": raw.get("commands", []) or [],
         "tools": raw.get("tools", []) or [],
         "skills": raw.get("skills", []) or [],
+        "combos": raw.get("combos", []) or [],
         "interface_id": raw.get("interface_id"),
         "trigger": raw.get("trigger", {}),
         "max_tool_rounds": raw.get("max_tool_rounds"),
@@ -665,6 +715,8 @@ def install(payload: dict):
         return _install_canvas(item)
     if kind == "extension":
         return _install_extension(item)
+    if kind == "combo":
+        return _install_combo(item)
     if kind in ("background", "skill", "plugin"):
         return _install_directory(item)
     raise HTTPException(400, f"不支持的资源类型：{kind}")
@@ -696,6 +748,39 @@ def _install_agent(item: dict) -> dict:
         rec["market_id"] = item.get("id")
         store.upsert("agents", rec)
     return {"ok": True, "kind": "agent", "id": rec["id"], "name": rec.get("name")}
+
+
+def _install_combo(item: dict) -> dict:
+    """安装市场「组合技」到本机组合技存储。
+
+    需求①：其他用户可直接下载组合能力 → 落盘为本地组合技，可在能力管理/
+    智能体编辑中直接使用。同名时用市场名做主键（保留名字），避免与已有组合混淆。
+    """
+    src = _item_dir(item) / (item.get("file") or "combo.json")
+    if not src.exists():
+        raise HTTPException(500, f"市场资源文件缺失：{src}")
+    raw = json.loads(src.read_text(encoding="utf-8"))
+    name = str(raw.get("name") or item.get("name") or "组合技").strip()
+    members = [m for m in (raw.get("members") or []) if isinstance(m, dict)
+               and m.get("type") in ("commands", "skills", "plugins") and m.get("key")]
+    if not members:
+        raise HTTPException(400, "该组合技没有成员，无法安装")
+    with _install_lock:
+        combos = store.load_combos()
+        # 市场名已存在 → 覆盖（同来源重复安装时刷新成员），否则新建
+        existing = None
+        for cname, rec in combos.items():
+            if rec.get("market_id") == item.get("id") or cname == name:
+                existing = cname
+                break
+        target = existing or name
+        combos[target] = {
+            "description": str(raw.get("description") or ""),
+            "members": members,
+            "market_id": item.get("id"),
+        }
+        store.save_combos(combos)
+    return {"ok": True, "kind": "combo", "id": item.get("id"), "name": target}
 
 
 def _canvas_agent_snapshots(item: dict, raw: dict) -> list[tuple[str, dict]]:
@@ -888,7 +973,7 @@ def _install_extension(item: dict) -> dict:
         "enabled": True,
         "installed_at": datetime.utcnow().isoformat(),
         "version": item.get("version", "0.0.0"),
-        "source": "builtin",
+        "source": "market",     # 所有拓展统一从市场下载
     }
     _write_installed(installed)
     return {"ok": True, "kind": "extension", "id": item_id, "name": item.get("name"),
@@ -1038,7 +1123,7 @@ def delete_item(kind: str, item_id: str, push: bool = False):
 @router.get("/publishable")
 def publishable(kind: str = ""):
     kind = (kind or "").strip()
-    if kind not in {"agent", "canvas", "background", "skill", "plugin", "extension"}:
+    if kind not in {"agent", "canvas", "background", "skill", "plugin", "combo", "extension"}:
         raise HTTPException(400, f"不支持的类型：{kind}")
     items = _publishable_items(kind)
     _mark_published(kind, items)
@@ -1056,16 +1141,23 @@ def _mark_published(kind: str, items: list[dict]) -> None:
     origin_key = {"agent": "origin_agent_id", "canvas": "origin_canvas_id"}.get(kind)
     published_ids: set[str] = set()
     published_origins: set[tuple[int, str]] = set()
+    published_combo_origins: set[str] = set()
     for it in _load_index().get("items", []):
         if it.get("kind") != kind:
             continue
         published_ids.add(str(it.get("id") or ""))
+        if it.get("origin_combo"):
+            published_combo_origins.add(str(it["origin_combo"]))
         if origin_key:
             try:
                 published_origins.add((int(it.get(origin_key)), str(it.get("name") or "")))
             except (TypeError, ValueError):
                 pass
     for item in items:
+        if kind == "combo":
+            # 组合技用发布源标识回显「已发布」：本机组合名 或 group:<type>:<名>
+            item["published"] = str(item.get("id") or "") in published_combo_origins
+            continue
         if origin_key:
             try:
                 key = (int(item.get("id")), str(item.get("name") or ""))
@@ -1130,6 +1222,28 @@ def _publishable_items(kind: str) -> list[dict]:
                     pass
             out.append({"id": eid, "name": meta.get("name", eid),
                         "description": meta.get("description", "")})
+    elif kind == "combo":
+        # 组合技：跨类型能力组合，按名字发布（id=组合名）
+        for name, rec in store.load_combos().items():
+            members = rec.get("members") or []
+            counts = {"commands": 0, "skills": 0, "plugins": 0}
+            for m in members:
+                t = m.get("type")
+                if t in counts:
+                    counts[t] += 1
+            summary = "、".join(f"{v} {_CAP_TYPE_LABEL[t]}" for t, v in counts.items() if v) or "暂无成员"
+            out.append({"id": name, "name": name,
+                        "description": (rec.get("description") or "") + f" · {summary}"})
+        # 需求①：单类型能力分组也能直接上传（上传后以「组合技」形式呈现）
+        for type_ in ("commands", "skills", "plugins"):
+            for gname, keys in store.load_capability_groups(type_).items():
+                if not keys:
+                    continue
+                out.append({
+                    "id": f"group:{type_}:{gname}",
+                    "name": f"{gname}（{_CAP_TYPE_LABEL[type_]}组）",
+                    "description": f"分组内 {len(keys)} 项{_CAP_TYPE_LABEL[type_]}能力 · 可直接作为组合技发布",
+                })
     return out
 
 
@@ -1165,6 +1279,8 @@ def publish(payload: dict):
             result = _publish_agent(local_id, version=requested_version)
         elif kind == "canvas":
             result = _publish_canvas(local_id, version=requested_version)
+        elif kind == "combo":
+            result = _publish_combo(local_id, version=requested_version)
         elif kind in ("background", "skill", "plugin", "extension"):
             result = _publish_directory(kind, local_id, version=requested_version)
         else:
@@ -1590,7 +1706,7 @@ def _publish_directory(kind: str, local_id: str, version: str = "1.0.0") -> dict
                     version=str(meta.get("version", "1.0.0")),
                     icon=meta.get("icon") or "🧩",
                     tags=[str(t) for t in (meta.get("tags") or [])],
-                    ext_type=meta.get("type"), source="builtin",
+                    ext_type=meta.get("type"), source="local",
                     frontend_files=meta.get("frontend_files", []),
                     backend_entry=meta.get("backend_entry"),
                     pages=meta.get("pages", []), config_page=meta.get("config_page"),
@@ -1599,6 +1715,82 @@ def _publish_directory(kind: str, local_id: str, version: str = "1.0.0") -> dict
 
     dest = MARKET_ROOT / folder / local_id
     _copy_dir(src, dest, overwrite=True)
+    _save_item(item)
+    return {"ok": True, "item": item}
+
+
+def _publish_combo(local_id: str, version: str = "1.0.0") -> dict:
+    """把本机「组合技」发布到市场。
+
+    local_id 两种形式：
+      - 组合名            （跨类型组合技，来自 load_combos）
+      - group:<type>:<名> （需求①：单类型能力分组直接上传，呈现为组合技）
+    """
+    members: list[dict] = []
+    name = local_id
+    description = ""
+    source_kind = "combo"
+
+    if local_id.startswith("group:"):
+        # 需求①：能力分组 → 组合技
+        parts = local_id.split(":", 2)
+        if len(parts) != 3:
+            raise HTTPException(400, "非法分组标识")
+        type_, gname = parts[1], parts[2]
+        if type_ not in _CAP_TYPE_LABEL:
+            raise HTTPException(400, f"不支持的分组类型：{type_}")
+        groups = store.load_capability_groups(type_)
+        keys = groups.get(gname) or []
+        if not keys:
+            raise HTTPException(404, f"本机分组不存在或为空：{type_}/{gname}")
+        members = [{"type": type_, "key": k} for k in keys]
+        name = gname
+        description = f"{_CAP_TYPE_LABEL[type_]}分组：{gname}（{len(keys)} 项能力）"
+        source_kind = "group"
+    else:
+        combo_map = store.load_combos()
+        rec = combo_map.get(local_id)
+        if not rec:
+            raise HTTPException(404, f"本机组合技不存在：{local_id}")
+        members = rec.get("members") or []
+        description = rec.get("description") or ""
+        name = local_id
+
+    if not members:
+        raise HTTPException(400, "组合技没有成员，无法发布")
+
+    slug = _combo_slug(name)
+    dest = MARKET_ROOT / "combos" / slug
+    if dest.exists():
+        try:
+            shutil.rmtree(dest)
+        except OSError:
+            pass
+    dest.mkdir(parents=True, exist_ok=True)
+    payload = {"name": name, "description": description, "members": members,
+               "source_kind": source_kind}
+    (dest / "combo.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    counts = {"commands": 0, "skills": 0, "plugins": 0}
+    for m in members:
+        t = m.get("type")
+        if t in counts:
+            counts[t] += 1
+    tags = [f"{v} {_CAP_TYPE_LABEL[t]}" for t, v in counts.items() if v]
+
+    item = {
+        "kind": "combo", "id": slug, "name": name,
+        "description": description, "version": version,
+        "author": _safe_author(), "icon": "🎯",
+        "tags": tags,
+        "dir": f"combos/{slug}", "file": "combo.json", "updated_at": _now(),
+        "source_kind": source_kind,
+        "member_count": len(members),
+        "member_counts": counts,
+        # 发布源标识（本机组合名 或 group:<type>:<名>），用于「已发布」回显
+        "origin_combo": local_id,
+    }
     _save_item(item)
     return {"ok": True, "item": item}
 

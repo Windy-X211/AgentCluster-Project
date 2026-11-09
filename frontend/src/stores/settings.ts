@@ -9,6 +9,7 @@ export const useSettingsStore = defineStore('settings', {
     commandGroups: [] as string[],  // 命令分组展示顺序
     skillsMeta: {} as any,     // {name: {label, description, prompt, version, triggers, tags}}
     pluginsMeta: {} as any,    // {name: {label, params, description}}
+    combos: {} as Record<string, import('@/api').ComboRecord>,  // 组合技（跨类型能力组合）
     asrAvailable: false,       // 语音识别是否可用（funasr-onnx 已安装）
     asrEnabled: localStorage.getItem('agentcluster.asrEnabled') !== 'false',  // 用户启停开关，默认开启
     ctxBadgeEnabled: localStorage.getItem('agentcluster.ctxBadge') !== 'false',  // 上下文长度指示开关，默认显示
@@ -22,6 +23,7 @@ export const useSettingsStore = defineStore('settings', {
       this.commandGroups = caps.command_groups || []
       this.skillsMeta = caps.skills || {}
       this.pluginsMeta = caps.plugins || {}
+      try { this.combos = await api.settings.getCombos() } catch { this.combos = {} }
       try { this.asrAvailable = (await api.asr.status()).available } catch { this.asrAvailable = false }
     },
     setAsrEnabled(v: boolean) {
@@ -40,6 +42,10 @@ export const useSettingsStore = defineStore('settings', {
       this.commandGroups = caps.command_groups || []
       this.skillsMeta = caps.skills || {}
       this.pluginsMeta = caps.plugins || {}
+    },
+    /** 刷新组合技数据（能力管理/市场下载安装后调用） */
+    async reloadCombos() {
+      try { this.combos = await api.settings.getCombos() } catch { this.combos = {} }
     },
     async update(d: any) { this.data = await api.settings.update({ ...this.data, ...d }) },
     /** 设置全局默认工作区（会话级/画布级都没设时生效）。

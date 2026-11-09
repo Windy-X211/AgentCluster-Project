@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount, onDeactivated } from 'vue'
-import { useCanvasStore, useAgentStore, useConvStore, useSettingsStore } from '@/stores'
+import { useCanvasStore, useAgentStore, useConvStore, useSettingsStore, useLayoutStore } from '@/stores'
 import { api } from '@/api'
 import { toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, type ToolCallPhase } from '@/stores/conversation'
 import { renderMarkdown } from '@/utils/markdown'
@@ -10,6 +10,7 @@ const canvases = useCanvasStore()
 const agents = useAgentStore()
 const convs = useConvStore()
 const settings = useSettingsStore()
+const layout = useLayoutStore()
 import AgentEditDialog from './AgentEditDialog.vue'
 import RulesDialog from './RulesDialog.vue'
 import ColorSpectrumPopover from './ColorSpectrumPopover.vue'
@@ -1117,6 +1118,15 @@ function onBoardClick(e: MouseEvent) {
   clearSelection()
 }
 
+// 双击画布空白区：折叠智能体列表 + 收窄右侧对话区（再次双击恢复）。
+// 命中节点 / 连线 / 控制柄 / 工具栏 / 菜单 / 气泡等交互元素时不触发。
+function onBoardDblClick(e: MouseEvent) {
+  const target = e.target as Element | null
+  if (!target) return
+  if (target.closest('.node, .edge-hit, .edge-handle-hit, .edge-handle, .edge-handle-group, .canvas-toolbar, .ctx-menu, .modal-bg, .conv-float, .node-bubble, .draw-hint, .exec-mode-toast, .selection-pill')) return
+  layout.toggleFocusMode()
+}
+
 // —— 撤销 / 重做 ——
 function snapshotCanvas(): CanvasSnapshot {
   return {
@@ -1177,9 +1187,9 @@ function startLink(e: MouseEvent, nodeId: number) {
   const c = clientToCanvas(e.clientX, e.clientY)
   draw.value = {
     from: nodeId,
-    anchor: closestEdgeAnchor(nodeRect(node), c),
+    anchor: nearestMidAnchor(nodeRect(node), c),
     mouse: c,
-    type: 'straight',
+    type: 'curve',
     via: null,
     segs: [],
   }
@@ -1191,7 +1201,7 @@ function startLink(e: MouseEvent, nodeId: number) {
 function drawStartSpec(d: DrawState): AnchorSpec {
   if (d.segs.length) return d.anchor
   const n = nodeById.value.get(d.from)
-  return n ? closestEdgeAnchor(nodeRect(n), d.mouse) : d.anchor
+  return n ? nearestMidAnchor(nodeRect(n), d.mouse) : d.anchor
 }
 function drawStartPoint(d: DrawState): Pt {
   const n = nodeById.value.get(d.from)
@@ -1209,12 +1219,16 @@ function drawTailTangent(d: DrawState): Pt {
   }
   return tan
 }
-/** 预览终点：悬停在别的节点上时贴到该节点离鼠标最近的边上点 */
+/** 预览终点：悬停在别的节点上时贴到该节点「朝向源节点那一侧的边中点」 */
 function drawPendingEnd(d: DrawState): Pt {
   const hid = hoverNodeId.value
   if (hid != null && hid !== d.from) {
     const n = nodeById.value.get(hid)
-    if (n) return anchorPoint(closestEdgeAnchor(nodeRect(n), d.mouse), nodeRect(n))
+    const src = nodeById.value.get(d.from)
+    if (n && src) {
+      const srcCenter = { x: src.x + NODE_W / 2, y: src.y + NODE_H / 2 }
+      return anchorPoint(facingMidAnchor(nodeRect(n), srcCenter), nodeRect(n))
+    }
   }
   return d.mouse
 }
@@ -1233,7 +1247,9 @@ function confirmDrawSegment(c: Pt) {
     if (Math.hypot(q.x - p0.x, q.y - p0.y) < SEG_MIN_LEN) return
   }
   d.anchor = drawStartSpec(d)   // 冻结起点锚点
-  d.segs.push(makeDrawSegment(p0, c, d.type, d.via, normal))
+  // 第一段紧贴源节点锚点：曲线控制点沿出边法线外推，确保从节点外部指向锚点
+  const n0 = d.segs.length === 0 ? anchorNormal(drawStartSpec(d).side) : null
+  d.segs.push(makeDrawSegment(p0, c, d.type, d.via, normal, n0, null))
   d.via = null
 }
 /** 点击目标节点收笔：以距离鼠标最近的边上点作为终点锚点 */
@@ -1248,13 +1264,17 @@ function finishDraw(toNodeId: number | null, c: Pt) {
   d.mouse = c
   const rf = nodeRect(fromNode), rt = nodeRect(toNode)
   const startSpec = drawStartSpec(d)
-  const endSpec = closestEdgeAnchor(rt, c)
+  const srcCenter = { x: rf.l + NODE_W / 2, y: rf.t + NODE_H / 2 }
+  const endSpec = facingMidAnchor(rt, srcCenter)
   const p0 = d.segs.length ? d.segs[d.segs.length - 1].end : anchorPoint(startSpec, rf)
   const p1 = anchorPoint(endSpec, rt)
   const segs = d.segs.map(cloneSegment)
   if (Math.hypot(p1.x - p0.x, p1.y - p0.y) >= 2) {
     const normal = d.type === 'vert' ? normalOf(drawTailTangent(d)) : null
-    segs.push(makeDrawSegment(p0, p1, d.type, d.via, normal))
+    // 首末段紧贴两端锚点：曲线控制点分别沿源/目标出边法线外推，两端都从节点外部指向锚点
+    const n0 = d.segs.length === 0 ? anchorNormal(startSpec.side) : null
+    const n1 = anchorNormal(endSpec.side)
+    segs.push(makeDrawSegment(p0, p1, d.type, d.via, normal, n0, n1))
   }
   if (!segs.length) { cancelDraw(); showToast('连线太短，未创建'); return }
   segs[segs.length - 1].end = { x: p1.x, y: p1.y }
@@ -2150,6 +2170,23 @@ function closestEdgeAnchor(r: Rect, p: Pt): AnchorSpec {
   const [lo, hi] = sideRange(bestSide, r)
   return { side: bestSide, t: hi > lo ? clampNum((bestV - lo) / (hi - lo), 0, 1) : 0.5 }
 }
+/** 绘制连线的起点锚点：始终吸附到「四条边中最靠近鼠标的那条边的中点」。
+ *  鼠标绕节点移动时锚点会在上/右/下/左四个边中点间平滑切换，不再按最近投影点游走。 */
+function nearestMidAnchor(r: Rect, p: Pt): AnchorSpec {
+  const cx = (r.l + r.r) / 2, cy = (r.t + r.b) / 2
+  const dx = p.x - cx, dy = p.y - cy
+  // 越靠外的轴越优先：鼠标在节点外时自然选朝向鼠标的一侧
+  const side: OrthoSide = Math.abs(dx) >= Math.abs(dy) ? (dx >= 0 ? 'r' : 'l') : (dy >= 0 ? 'b' : 't')
+  return { side, t: 0.5 }
+}
+/** 绘制连线的终点锚点：吸附到「朝向源节点那一侧的边中点」。
+ *  从目标节点中心指向源节点中心，取分量最大的轴对应的边，t 恒为 0.5（正对中线）。 */
+function facingMidAnchor(r: Rect, towards: Pt): AnchorSpec {
+  const cx = (r.l + r.r) / 2, cy = (r.t + r.b) / 2
+  const dx = towards.x - cx, dy = towards.y - cy
+  const side: OrthoSide = Math.abs(dx) >= Math.abs(dy) ? (dx >= 0 ? 'r' : 'l') : (dy >= 0 ? 'b' : 't')
+  return { side, t: 0.5 }
+}
 
 /** 右键位置相对当前段弦的位置：t=沿弦归一化位置，s=归一化垂距（带符号）。
  *  右键点正好落在端点或弦上时返回 null → 用默认弯向。 */
@@ -2165,11 +2202,20 @@ function viaBend(p0: Pt, p1: Pt, via: Pt | null | undefined): { t: number; s: nu
   return { t, s }
 }
 /** 曲线默认 S 形控制点；有右键弯向时把两个控制点一起沿弦法线平移，曲线随之鼓向右键侧 */
-function segCurveCtrl(p0: Pt, p1: Pt, via?: Pt | null): Pt[] {
+function segCurveCtrl(p0: Pt, p1: Pt, via?: Pt | null, n0?: Pt | null, n1?: Pt | null): Pt[] {
   const dx = p1.x - p0.x, dy = p1.y - p0.y
   const len = Math.hypot(dx, dy) || 1
   let c1: Pt, c2: Pt
-  if (Math.abs(dx) >= Math.abs(dy)) {
+  // 端点贴在节点锚点上时（n0/n1 = 该锚点的出边法线，指向节点外侧）：
+  // 控制点沿法线外推 → 曲线在锚点处与边垂直，必定从节点外部指向锚点，
+  // 不会出现「曲线从节点内部鼓出来再连到边上」的情形。
+  if (n0 || n1) {
+    const d = Math.min(len / 3, 90)
+    const u0 = unitVec(n0) || { x: dx / len, y: dy / len }
+    const u1 = unitVec(n1) || { x: -dx / len, y: -dy / len }
+    c1 = { x: p0.x + u0.x * d, y: p0.y + u0.y * d }
+    c2 = { x: p1.x + u1.x * d, y: p1.y + u1.y * d }
+  } else if (Math.abs(dx) >= Math.abs(dy)) {
     c1 = { x: p0.x + dx / 3, y: p0.y }; c2 = { x: p1.x - dx / 3, y: p1.y }
   } else {
     c1 = { x: p0.x, y: p0.y + dy / 3 }; c2 = { x: p1.x, y: p1.y - dy / 3 }
@@ -2292,7 +2338,7 @@ function buildSegment(p0: Pt, p1: Pt, type: SegType, ctrl: Pt[], bulge: number, 
 }
 /** 落点确认：把「右键弯向」烘焙成段自带的控制点 / 矢高，之后与菜单位置再无关系。
  *  垂线段另把落点投影到法线上（垂足 = p0），并记下单位法线，保证段本身就是一条垂直直线。 */
-function makeDrawSegment(p0: Pt, p1: Pt, type: SegType, via: Pt | null, normal?: Pt | null): EdgeSegment {
+function makeDrawSegment(p0: Pt, p1: Pt, type: SegType, via: Pt | null, normal?: Pt | null, n0?: Pt | null, n1?: Pt | null): EdgeSegment {
   if (type === 'vert') {
     const n = unitVec(normal) || { x: 0, y: 1 }
     return { type, end: projectOnNormal(p0, p1, n), ctrl: [n], bulge: DEFAULT_ARC_BULGE }
@@ -2300,7 +2346,7 @@ function makeDrawSegment(p0: Pt, p1: Pt, type: SegType, via: Pt | null, normal?:
   return {
     type,
     end: { x: p1.x, y: p1.y },
-    ctrl: type === 'curve' ? segCurveCtrl(p0, p1, via) : [],
+    ctrl: type === 'curve' ? segCurveCtrl(p0, p1, via, n0, n1) : [],
     bulge: type === 'arc' ? segBulge(p0, p1, via) : DEFAULT_ARC_BULGE,
   }
 }
@@ -3186,16 +3232,27 @@ function showEdgeHandles(e: any): boolean {
 }
 /** 鼠标进入锚点周围多少「屏幕像素」时，锚点才显现（除以 scale 换算成画布坐标） */
 const ANCHOR_PEEK_PX = 26
-/** 控制柄层内容：整条边的柄在悬停 / 拖动中显示；锚点只在鼠标靠近时显现。
- *  锚点压在节点边缘，靠 hover 连线无法显示（鼠标一进节点连线就失去 hover），
- *  因此改用鼠标到锚点的距离判定：靠近出现、离开消失，平时画布保持干净。 */
+/** 控制柄层内容：拖动中 / DOM-hover 边时显示整条边的手柄；否则用「到手柄包围盒的距离」
+ *  判定（含一定外扩）。贝塞尔曲线完全落在其控制点+锚点构成的包围盒内，曲线控制点（离线
+ *  虚线圆点）也带进包围盒 —— 鼠标从边线移向控制点中途不会失去显示；且距离判定不依赖
+ *  DOM hover，鼠标踩上手柄（pointer-events:all）导致边组 mouseleave 时手柄也不会消失，
+ *  避免「控制点一放上去就没了」的闪烁与抽搐。 */
 function visibleHandles(e: any, g: any): EdgeHandle[] {
   const hs: EdgeHandle[] = g?.handles || []
   if (showEdgeHandles(e)) return hs
   const p = pointerCanvas.value
-  if (!p) return []
-  const radius = ANCHOR_PEEK_PX / (scale.value || 1)
-  return hs.filter(h => h.kind === 'anchor' && Math.hypot(h.x - p.x, h.y - p.y) <= radius)
+  if (!p || !hs.length) return []
+  const inflate = 40 / (scale.value || 1)
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const h of hs) {
+    if (h.x < minX) minX = h.x
+    if (h.y < minY) minY = h.y
+    if (h.x > maxX) maxX = h.x
+    if (h.y > maxY) maxY = h.y
+  }
+  const hit = p.x >= minX - inflate && p.x <= maxX + inflate &&
+              p.y >= minY - inflate && p.y <= maxY + inflate
+  return hit ? hs : []
 }
 function orthoGeomOf(edge: any): any {
   return edgeGeoms.value.find((x: any) => x.e.id === edge.id)?.g
@@ -3575,10 +3632,21 @@ function drawPath(): string {
   const end = drawPendingEnd(d)
   const onNode = hoverNodeId.value != null && hoverNodeId.value !== d.from
   const normal = d.type === 'vert' ? normalOf(tan) : null
+  // 预览段同样两端贴锚点：首段沿源锚点法线外推；悬停目标时末段沿目标锚点法线外推，
+  // 让预览曲线与最终烘焙出的曲线形状一致（从节点外部指向锚点）
+  const n0 = d.segs.length === 0 ? anchorNormal(drawStartSpec(d).side) : null
+  let n1: Pt | null = null
+  if (onNode) {
+    const src = nodeById.value.get(d.from), tgt = nodeById.value.get(hoverNodeId.value!)
+    if (src && tgt) {
+      const srcC = { x: src.x + NODE_W / 2, y: src.y + NODE_H / 2 }
+      n1 = anchorNormal(facingMidAnchor(nodeRect(tgt), srcC).side)
+    }
+  }
   // 终点落在节点上时不能投影成垂足（线就连不到节点了）：保留锚点，由 vertBuilt 补连接短线
   const pending: EdgeSegment = d.type === 'vert' && onNode && normal
     ? { type: 'vert', end, ctrl: [normal], bulge: DEFAULT_ARC_BULGE }
-    : makeDrawSegment(cur, end, d.type, d.via, normal)
+    : makeDrawSegment(cur, end, d.type, d.via, normal, n0, n1)
   return path + ' ' + buildSegment(cur, pending.end, pending.type, pending.ctrl, pending.bulge, normal).d
 }
 
@@ -3879,7 +3947,8 @@ defineExpose({ viewportRef, computeNodeBbox })
   <div class="canvas-board glass" ref="boardRef"
        @dragover.prevent @drop="onDrop" @wheel.passive="onWheel"
        @mousedown="startPan" @mouseleave="pointerCanvas = null"
-       @click="onBoardClick" @contextmenu="showBgMenu">
+       @click="onBoardClick" @contextmenu="showBgMenu"
+       @dblclick="onBoardDblClick">
     <!-- 点状网格已移除 -->
 
 
@@ -4390,8 +4459,8 @@ defineExpose({ viewportRef, computeNodeBbox })
 /* 端点箭头：细长三角形，和连线同色，但加一圈画布底色描边（paint-order 让描边在外、
    填充在内），把箭头从节点边缘和背景里"抠"出来；尺寸由模板的 arrowScale 反向补偿画布缩放 */
 .eg-arrow {
-  fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
-  stroke: rgb(var(--edge-halo-rgb));
+  fill: color-mix(in oklab, var(--accent) var(--edge-accent-share, 45%), var(--eg-c, var(--accent)));
+  stroke: rgb(var(--edge-halo-rgb, 10, 10, 10));
   stroke-width: 2.4;
   stroke-linejoin: round;
   paint-order: stroke fill;
@@ -4399,11 +4468,11 @@ defineExpose({ viewportRef, computeNodeBbox })
 .eg-arrow.dim { opacity: 0.6; }
 .edge {
   fill: none;
-  stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
+  stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share, 45%), var(--eg-c, var(--accent)));
   stroke-width: 2; pointer-events: stroke; cursor: pointer; stroke-dasharray: 8 6;
   transition: stroke .3s, stroke-width .3s, filter .3s;
 }
-.edge.temp { stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c, var(--accent))); stroke-dasharray: 3,3; animation: none; }
+.edge.temp { stroke: color-mix(in oklab, var(--accent) var(--edge-accent-share, 45%), var(--eg-c, var(--accent))); stroke-dasharray: 3,3; animation: none; }
 /* 逐段绘制预览：起点锚点 / 已确认顶点 / 当前落点 */
 .draw-anchor { fill: var(--accent); stroke: rgba(var(--surface-rgb), 0.95); stroke-width: 2; pointer-events: none; }
 .draw-vertex { fill: rgba(var(--node-bg-rgb), 0.95); stroke: var(--accent-2); stroke-width: 2; pointer-events: none; }
@@ -4430,8 +4499,8 @@ defineExpose({ viewportRef, computeNodeBbox })
    填充在内），把箭头从虚线中"抠"出来，轮廓更锐利又不显笨重。
    transform 里的 scale(arrowScale) 抵消画布缩放：画布缩小时箭头在屏幕上不会跟着变小。 */
 .edge-mid {
-  fill: color-mix(in oklab, var(--accent) var(--edge-accent-share), var(--eg-c));
-  stroke: rgb(var(--edge-halo-rgb));
+  fill: color-mix(in oklab, var(--accent) var(--edge-accent-share, 45%), var(--eg-c, var(--accent)));
+  stroke: rgb(var(--edge-halo-rgb, 10, 10, 10));
   stroke-width: 3.6;
   stroke-linejoin: round;
   paint-order: stroke fill;

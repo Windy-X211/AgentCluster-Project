@@ -3,6 +3,8 @@ import { defineStore } from 'pinia'
 const KEY = 'agentcluster.layout.v1'
 export const RIGHT_MIN = 180
 export const RIGHT_DEFAULT = 300
+// 双击画布空白区进入「聚焦模式」时对话区的收窄宽度
+export const RIGHT_FOCUS_COMPACT = 200
 export const FONT_SCALE_MIN = 0.85
 export const FONT_SCALE_MAX = 1.4
 export const FONT_SCALE_DEFAULT = 1.0
@@ -57,6 +59,16 @@ function readWidth(): number {
   return Math.max(RIGHT_MIN, Math.round(n))
 }
 
+function readFocusMode(): boolean {
+  return readStore()?.focusMode === true
+}
+
+function readSavedRightWidth(): number {
+  const n = Number(readStore()?.savedRightWidth)
+  if (!isFinite(n) || n <= 0) return 0
+  return Math.max(RIGHT_MIN, Math.round(n))
+}
+
 function readFontScale(): number {
   const n = Number(readStore()?.fontScale)
   if (!isFinite(n) || n <= 0) return FONT_SCALE_DEFAULT
@@ -108,9 +120,15 @@ export const useLayoutStore = defineStore('layout', {
     convListScrollTop: 0,
     // 左侧智能体列表折叠态（仅内存，不持久化）。新建画布成功后自动展开（见 canvas store create）。
     agentsCollapsed: true,
+    // 双击画布空白区进入的「聚焦模式」：同时折叠智能体列表并收窄对话区，再次双击恢复。
+    // focusMode / savedRightWidth 持久化，重启后状态一致；savedRightWidth 记忆进入聚焦前对话区宽度用于精确恢复。
+    focusMode: readFocusMode(),
+    savedRightWidth: readSavedRightWidth(),
     // 对话记录浮层折叠态（仅内存，不持久化）。放 store 是因为 Home 布局需感知：
     // 画布关闭时展开对话记录，对话区要缩回为浮层留位（见 Home.vue gridStyle 三态）。
     convsCollapsed: true,
+    // 进入聚焦前对话记录折叠态（仅内存）：退出聚焦时恢复原样
+    savedConvsCollapsed: true,
   }),
   actions: {
     setRightWidth(v: number) {
@@ -120,6 +138,25 @@ export const useLayoutStore = defineStore('layout', {
     },
     resetRightWidth() {
       this.setRightWidth(RIGHT_DEFAULT)
+    },
+    // 聚焦模式开关：进入时折叠智能体列表、收窄对话区并折叠对话记录；退出时恢复三者
+    toggleFocusMode() {
+      if (!this.focusMode) {
+        this.savedRightWidth = this.rightWidth
+        writeStore({ savedRightWidth: this.rightWidth })
+        this.savedConvsCollapsed = this.convsCollapsed
+        this.agentsCollapsed = true
+        this.convsCollapsed = true
+        this.setRightWidth(RIGHT_FOCUS_COMPACT)
+        this.focusMode = true
+        writeStore({ focusMode: true })
+      } else {
+        this.agentsCollapsed = false
+        this.convsCollapsed = this.savedConvsCollapsed
+        this.setRightWidth(this.savedRightWidth || RIGHT_DEFAULT)
+        this.focusMode = false
+        writeStore({ focusMode: false })
+      }
     },
     setFontScale(v: number) {
       const n = Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, Math.round(v * 100) / 100))

@@ -38,6 +38,12 @@ SKILL.md 要求：
 
 好处：用户可以任意增删技能文件夹，不用改代码；
      同时兼容 Dify、Coze、Claude Code、Cursor 等平台的技能格式。
+
+能力分组（用户自定义）：
+  系统支持在「能力列表」界面给技能和插件按功能/用途分组（如 PPT制作、写作类、浏览器类）。
+  分组信息存储在用户数据 `{storage_root}/capability_groups/skills.json`（独立文件，不在 settings.json 中），
+  持久化生效。生成技能时建议 kebab-case 名称带上领域关键词（如 `pptx_outline`），便于用户拖进对应分组；
+  批量生成同类能力时可提醒用户到「能力列表」把它们拖到合适的分组，编排师选能力时会优先从同组挑选。
 """
 import json, re, os
 from pathlib import Path

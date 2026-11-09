@@ -34,6 +34,19 @@ export interface FailedEntry {
   load_error: string
 }
 
+/** 组合技成员：type ∈ commands | skills | plugins，key 为该类型下的能力标识 */
+export interface ComboMember {
+  type: 'commands' | 'skills' | 'plugins'
+  key: string
+}
+
+/** 组合技：跨类型能力组合（命令/技能/插件可混编） */
+export interface ComboRecord {
+  description: string
+  members: ComboMember[]
+  market_id?: string
+}
+
 export interface PluginScanResult {
   root_dir: string
   plugins: PluginEntry[]
@@ -104,14 +117,18 @@ export const api = {
     create: (d: any) => req('/agents', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/agents/${id}`, { method: 'DELETE' }),
-    reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
+    reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) }),
+    setAvatarColor: (id: number, color: string) =>
+      req(`/agents/${id}/avatar-color`, { method: 'PUT', body: JSON.stringify({ avatar_color: color }) })
   },
   agent_groups: {
     list: () => req<any[]>('/agent_groups'),
     create: (d: any) => req('/agent_groups', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agent_groups/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/agent_groups/${id}`, { method: 'DELETE' }),
-    reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
+    reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) }),
+    clear: (id: number) => req(`/agent_groups/${id}/clear`, { method: 'POST' }),
+    purge: (id: number) => req(`/agent_groups/${id}/purge`, { method: 'DELETE' })
   },
   canvases: {
     list: () => req<any[]>('/canvases'),
@@ -280,7 +297,18 @@ export const api = {
   },
   settings: {
     get: () => req<any>('/settings'),
-    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) })
+    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) }),
+    setDefaultWorkdir: (path: string) =>
+      req<any>('/settings/default_workdir', { method: 'PUT', body: JSON.stringify({ default_workdir: path }) }),
+    // —— 能力分组（独立文件存储）——
+    getCapabilityGroups: (type: string) =>
+      req<Record<string, string[]>>(`/settings/capability_groups/${encodeURIComponent(type)}`),
+    setCapabilityGroups: (type: string, groups: Record<string, string[]>) =>
+      req(`/settings/capability_groups/${encodeURIComponent(type)}`, { method: 'PUT', body: JSON.stringify(groups) }),
+    // —— 组合技（跨类型能力组合，独立文件存储）——
+    getCombos: () => req<Record<string, ComboRecord>>('/settings/combos'),
+    setCombos: (combos: Record<string, ComboRecord>) =>
+      req('/settings/combos', { method: 'PUT', body: JSON.stringify(combos) })
   },
   backgrounds: {
     list: () => req<any[]>('/backgrounds'),

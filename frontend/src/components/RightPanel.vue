@@ -3130,9 +3130,17 @@ async function deleteSelected() {
   await convs.removeMany(selectedIds.value)
   exitSel()
 }
-function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true }
+function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx() }
 function onDocKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
+    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
+}
+// 点击对话区空白 → toggle 对话记录浮窗；点击消息气泡/按钮等有具体交互的元素则不触发
+function onChatBoxClick(e: MouseEvent) {
+  const t = e.target as HTMLElement | null
+  if (!t) return
+  // 如果点击了消息气泡本身、按钮、链接、输入框、textarea 等可交互元素，则不触发折叠
+  if (t.closest('.msg, button, a, input, textarea, select, label, .chat-attach, .chat-img-wrap, .viz-slot')) return
+  convsCollapsed.value = !convsCollapsed.value
 }
 
 /** 聊天消息内附件点击事件委托（冒泡到 document 处理，支持 v-html 渲染的附件卡片） */
@@ -3346,16 +3354,15 @@ onBeforeUnmount(() => {
   <div class="right-panel glass">
     <!-- 画布列表 -->
     <div class="canvases-pane">
-      <div class="section-title">
+      <div class="section-title clickable" @click="canvasesCollapsed = !canvasesCollapsed" :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
         <button class="collapse-btn" type="button"
-                @click.stop="canvasesCollapsed = !canvasesCollapsed"
                 :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
           {{ canvasesCollapsed ? '▸' : '▾' }}
         </button>
         <span>画布列表</span>
         <span class="conv-count">{{ canvases.list.length }}</span>
         <span class="flex-spacer"></span>
-        <button class="btn sm add-canvas-btn" @click="canvases.create()" title="新建画布">+</button>
+        <button class="btn sm add-canvas-btn" @click.stop="canvases.create()" title="新建画布">+</button>
       </div>
       <div class="cv-list" v-show="!canvasesCollapsed">
         <div v-for="c in canvases.list" :key="c.id"
@@ -3642,7 +3649,7 @@ onBeforeUnmount(() => {
       <Teleport to="body">
         <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
       </Teleport>
-      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll">
+      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll" @click="onChatBoxClick">
         <div v-if="!conv" class="no-conv">请新建对话</div>
         <!-- ============ 消息列表 ============
              tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
@@ -4124,6 +4131,8 @@ onBeforeUnmount(() => {
 .canvases-pane { padding: 4px 0; flex-shrink: 0; }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
+.section-title.clickable { cursor: pointer; border-radius: 6px; transition: background .15s; }
+.section-title.clickable:hover { background: rgba(var(--surface-rgb), 0.06); }
 .section-title .add-canvas-btn { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: calc(16px * var(--font-scale)); font-weight: 500; line-height: 1; color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.10); border: 1px solid rgba(var(--accent-rgb), 0.26); border-radius: 7px; cursor: pointer; transition: background .2s ease, border-color .2s ease, color .2s ease; }
 .section-title .add-canvas-btn:hover { background: rgba(var(--accent-rgb), 0.20); border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent-light); }
 .section-title .add-canvas-btn:active { background: rgba(var(--accent-rgb), 0.28); }
@@ -4364,6 +4373,10 @@ onBeforeUnmount(() => {
 .process-body::-webkit-scrollbar { width: 5px; }
 .process-body::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.28); border-radius: 999px; }
 .process-body::-webkit-scrollbar-track { background: transparent; }
+/* 关键修复：防止 flex 子项在父容器 max-height 限制下被 flex-shrink:1 压扁，
+   导致 bubble/think-stream/tool-row 高度收缩为零并互相遮挡。
+   flex-shrink:0 让子元素保持自然高度，超出部分由 overflow-y:auto 滚动显示。 */
+.process-body > * { flex-shrink: 0; }
 
 .col-wrap { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
 .head-row { display: flex; align-items: center; gap: 6px; }
@@ -4976,6 +4989,8 @@ onBeforeUnmount(() => {
    事件条目按类型着色（轮次灰 / 调用蓝 / 完成 绿红 / 提示黄） */
 .sub-proc-block { padding: 4px 7px; }
 .sub-proc { display: flex; flex-direction: column; gap: 2px; padding: 3px 5px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.12); border: 1px solid rgba(var(--surface-rgb), 0.06); font-size: calc(10px * var(--font-scale)); max-height: 220px; overflow-y: auto; }
+/* 同 .process-body：防止 max-height + flex-shrink:1 把事件条目压缩 */
+.sub-proc > * { flex-shrink: 0; }
 .sp-item { display: flex; align-items: baseline; gap: 5px; line-height: 1.5; min-width: 0; flex-wrap: wrap; }
 .sp-round { color: rgba(var(--text-rgb), 0.62); font-size: calc(9px * var(--font-scale)); }
 .sp-txt { color: rgba(var(--text-rgb), 0.85); }
@@ -5045,6 +5060,10 @@ onBeforeUnmount(() => {
 </style>
 
 <style>
+/* —— 滚动容器内 flex 子项禁止压缩（防止 max-height 限制下 flex-shrink:1 把气泡/思考行压扁）—— */
+.process-body > * { flex-shrink: 0; }
+.sub-proc > * { flex-shrink: 0; }
+
 /* —— 泡泡内 Markdown（v-html 注入的元素无法被 scoped 命中，必须用全局样式）—— */
 .bubble.markdown { white-space: normal; word-break: break-word; overflow-wrap: anywhere; line-height: 1.6; }
 .bubble.markdown > :first-child { margin-top: 0 !important; }

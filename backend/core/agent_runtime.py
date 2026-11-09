@@ -753,9 +753,53 @@ def _cancel_pending_child_tasks(turn: dict | None) -> None:
             t.cancel()
 
 
+def _agent_expanded_caps(agent: dict) -> tuple[list, list, list | None]:
+    """把 agent 配置的「组合技（combos）」展开合并进命令/技能/插件能力列表。
+
+    返回 (commands, plugins, skills)：
+      - commands/plugins 直接合并 combo 成员
+      - skills 保持原有语义：None=全部技能（旧数据兼容），[]=不注入，
+        列表=合并 combo 里的技能；有 combo 技能时自动并入
+    """
+    commands = list(agent.get("commands") or [])
+    plugins = list(agent.get("plugins") or [])
+    skills = agent.get("skills")
+    combos = agent.get("combos") or []
+    if not combos:
+        return commands, plugins, skills
+
+    try:
+        combo_map = store.load_combos()
+    except Exception:
+        return commands, plugins, skills
+
+    combo_commands: list[str] = []
+    combo_plugins: list[str] = []
+    combo_skills: list[str] = []
+    for name in combos:
+        rec = (combo_map or {}).get(name) or {}
+        for m in rec.get("members") or []:
+            t, key = m.get("type"), m.get("key")
+            if not key:
+                continue
+            if t == "commands" and key not in commands and key not in combo_commands:
+                combo_commands.append(key)
+            elif t == "plugins" and key not in plugins and key not in combo_plugins:
+                combo_plugins.append(key)
+            elif t == "skills" and key not in combo_skills and (skills is None or key not in skills):
+                combo_skills.append(key)
+    commands.extend(combo_commands)
+    plugins.extend(combo_plugins)
+    if skills is not None and combo_skills:
+        # 技能索引合并：None=全部技能（combo 技能自然包含）；显式列表（含空）则并入 combo 技能
+        skills = list(skills) + combo_skills
+    return commands, plugins, skills
+
+
 def _agent_tools(agent: dict) -> list:
-    return filter_tools(agent.get("commands", []), agent.get("plugins", []), PLUGIN_REGISTRY,
-                        agent.get("skills"), agent=agent)
+    commands, plugins, skills = _agent_expanded_caps(agent)
+    return filter_tools(commands, plugins, PLUGIN_REGISTRY,
+                        skills, agent=agent)
 
 
 def _tool_capability_brief(tools: list) -> str:
@@ -871,7 +915,9 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         # 范围：agent 显式配置了 skills 就用配置的子集；
         #   None（旧数据/从未保存过）→ 回退到全部已注册技能索引；
         #   []（用户明确不勾选）→ 不注入任何技能索引（skill.invoke 常驻工具仍可用）
-        wanted = agent.get("skills")
+        # 组合技（combos）里的技能也并入索引。
+        _, _, expanded_skills = _agent_expanded_caps(agent)
+        wanted = expanded_skills
         names = sorted(SKILL_REGISTRY.keys()) if wanted is None else [s for s in wanted if SKILL_REGISTRY.get(s)]
         skill_index = []
         for s in names:
@@ -924,13 +970,14 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         parts.append(f"\n【集群上下文】{cluster_context}")
     prompt = "\n".join(parts)
     # —— 动态替换存储路径占位符 ——
-    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root}，
+    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root} / {capability_groups_path}，
     # 与 store.ROOT 保持同步（用户在设置里切换存储根后自动生效）。
     try:
         _root = str(store.ROOT)
         prompt = prompt.replace("{skills_dir}", str(store.ROOT / "skills"))
         prompt = prompt.replace("{plugins_dir}", str(store.ROOT / "plugins"))
         prompt = prompt.replace("{bg_dir}", str(store.ROOT / "backgrounds"))
+        prompt = prompt.replace("{capability_groups_path}", str(store.ROOT_CAPABILITY_GROUPS))
         prompt = prompt.replace("{storage_root}", _root)
     except Exception:
         pass

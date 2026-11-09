@@ -85,7 +85,7 @@ def create_shortcut(ico: Path):
         raise FileNotFoundError(f"找不到 launcher.py: {launcher}")
 
     pythonw = _find_pythonw()
-    lnk_path = ROOT / "AgentCluster.lnk"
+    lnk_path = ROOT / "Agent Cluster.lnk"
 
     pythoncom.CoInitialize()
     shell = Dispatch("WScript.Shell")

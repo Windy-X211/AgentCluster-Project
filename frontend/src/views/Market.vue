@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api } from '@/api'
 import { loadExtensions } from '@/extensions/loader'
-import { useAgentStore, useCanvasStore } from '@/stores'
+import { useAgentStore, useCanvasStore, useSettingsStore } from '@/stores'
 
 interface KindInfo { key: string; label: string; count: number }
 interface MarketItem {
@@ -15,12 +15,12 @@ interface MarketItem {
 }
 
 const KIND_ICON: Record<string, string> = {
-  agent: '🤖', canvas: '🗺', background: '🎨', skill: '🧠', plugin: '🔧', extension: '🧩',
+  agent: '🤖', canvas: '🗺', background: '🎨', skill: '🧠', plugin: '🔧', combo: '🎯', extension: '🧩',
 }
 const EXECUTION_MODE_LABEL: Record<string, string> = {
   serial: '串行', parallel: '并行', hybrid: '混合',
 }
-const LOCAL_KINDS = ['skill', 'plugin', 'background', 'extension']
+const LOCAL_KINDS = ['skill', 'plugin', 'background', 'extension', 'combo']
 
 const kinds = ref<KindInfo[]>([])
 const mineCount = ref(0)
@@ -59,6 +59,7 @@ const loggingIn = ref(false)
 
 const agents = useAgentStore()
 const canvases = useCanvasStore()
+const settings = useSettingsStore()
 
 const activeLabel = computed(() => {
   if (activeKind.value === 'mine') return '📤 我的发布'
@@ -199,6 +200,7 @@ async function refreshLocal(kind: string) {
     if (kind === 'agent') await agents.fetch()
     else if (kind === 'canvas') await canvases.fetch()
     else if (kind === 'extension') await loadExtensions(true)
+    else if (kind === 'combo') await settings.reloadCombos()
     // 技能/插件：后端安装时已做非阻塞热重载，这里不再触发（避免同步安装依赖阻塞 UI）
   } catch {
     /* 局部刷新失败不阻断下载结果 */
@@ -691,6 +693,16 @@ function formatSize(bytes: number): string {
   let n = bytes
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+// —— 组合技成员类型图标/标签 ——
+const COMBO_TYPE_ICON: Record<string, string> = { commands: '⌨', skills: '✨', plugins: '🧩' }
+const COMBO_TYPE_LABEL: Record<string, string> = { commands: '命令', skills: '技能', plugins: '插件' }
+function comboTypeIcon(type: string): string {
+  return COMBO_TYPE_ICON[type] || '📦'
+}
+function comboTypeLabel(type: string): string {
+  return COMBO_TYPE_LABEL[type] || type
 }
 
 // —— 画布缩略图计算 ——
@@ -1388,6 +1400,28 @@ onBeforeUnmount(() => {
                 </div>
               </template>
 
+              <!-- Combo 组合技预览 -->
+              <template v-else-if="previewData.preview.kind === 'combo'">
+                <div class="pv-section">
+                  <div class="pv-section-title">🎯 组合技成员（{{ previewData.preview.combo?.member_count || 0 }} 项）</div>
+                  <div class="pv-row">
+                    <div v-if="previewData.preview.combo?.summary" class="pv-field"><label>构成</label><span>{{ previewData.preview.combo.summary }}</span></div>
+                  </div>
+                </div>
+                <div class="pv-section">
+                  <div class="pv-section-title">📋 成员明细</div>
+                  <div v-for="(m, i) in previewData.preview.combo?.members" :key="i" class="pv-combo-member">
+                    <span class="pv-combo-type">{{ comboTypeIcon(m.type) }} {{ comboTypeLabel(m.type) }}</span>
+                    <code class="pv-combo-key">{{ m.key }}</code>
+                  </div>
+                  <div v-if="!(previewData.preview.combo?.members || []).length" class="mm-empty">（无成员）</div>
+                </div>
+                <div v-if="previewData.preview.combo?.description" class="pv-section">
+                  <div class="pv-section-title">📖 说明</div>
+                  <div class="pv-desc">{{ previewData.preview.combo.description }}</div>
+                </div>
+              </template>
+
               <!-- Extension 预览 -->
               <template v-else-if="previewData.preview.kind === 'extension'">
                 <div class="pv-section">
@@ -1682,6 +1716,16 @@ span.pv-author-avatar { display: inline-flex; align-items: center; justify-conte
 .pv-stat strong { font-size: 20px; font-weight: 700; color: var(--accent-light, #9db4ff); opacity: 1; }
 
 .pv-chip-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.pv-combo-member {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-radius: 6px; margin-bottom: 4px;
+  background: rgba(var(--surface-rgb), 0.06); font-size: calc(12px * var(--font-scale));
+}
+.pv-combo-type { flex-shrink: 0; font-weight: 600; }
+.pv-combo-key {
+  font-family: Consolas, monospace; font-size: calc(11px * var(--font-scale));
+  opacity: .6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .pv-chip {
   font-size: 11px; padding: 3px 9px; border-radius: 8px;
   background: rgba(var(--surface-rgb), .08); color: rgba(var(--text-rgb), .65);

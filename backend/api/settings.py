@@ -1,5 +1,8 @@
 from fastapi import APIRouter, HTTPException
-from core.store import load, save
+from core.store import (
+    load, save, load_capability_groups, save_capability_groups,
+    load_combos, save_combos,
+)
 
 router = APIRouter()
 
@@ -67,3 +70,52 @@ def _invalidate_cache() -> None:
         invalidate_default_workdir_cache()
     except Exception:
         pass
+
+
+# ==============================================================
+# 能力分组（独立文件存储，不放在 settings.json 中）
+# ==============================================================
+_VALID_TYPES = ("commands", "skills", "plugins")
+
+
+@router.get("/capability_groups/{type_}")
+def get_capability_groups(type_: str):
+    """读取某类型（commands / skills / plugins）的用户自定义分组。"""
+    if type_ not in _VALID_TYPES:
+        raise HTTPException(400, f"type 必须是 {_VALID_TYPES} 之一")
+    return load_capability_groups(type_)
+
+
+@router.put("/capability_groups/{type_}")
+def set_capability_groups(type_: str, data: dict):
+    """保存某类型（commands / skills / plugins）的用户自定义分组。
+
+    body：{"组名": ["能力名1", "能力名2"], ...}
+    """
+    if type_ not in _VALID_TYPES:
+        raise HTTPException(400, f"type 必须是 {_VALID_TYPES} 之一")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "body 必须是 {组名: [能力名, ...]} 的对象")
+    save_capability_groups(type_, data)
+    return {"ok": True, "type": type_, "groups": data}
+
+
+# ==============================================================
+# 组合技（跨类型能力组合）
+# ==============================================================
+@router.get("/combos")
+def get_combos():
+    """读取用户自定义「组合技」（可同时包含命令/技能/插件）。"""
+    return load_combos()
+
+
+@router.put("/combos")
+def set_combos(data: dict):
+    """保存用户自定义「组合技」。
+
+    body：{"组合名": {"description": str, "members": [{"type","key"}, ...]}, ...}
+    """
+    if not isinstance(data, dict):
+        raise HTTPException(400, "body 必须是 {组合名: {description, members}} 的对象")
+    save_combos(data)
+    return {"ok": True, "combos": load_combos()}

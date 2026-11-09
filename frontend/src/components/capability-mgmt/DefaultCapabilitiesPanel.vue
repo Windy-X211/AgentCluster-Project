@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref, computed } from 'vue'
 import { useSettingsStore } from '@/stores'
+import { api } from '@/api'
 
 const settings = useSettingsStore()
 
@@ -62,18 +63,49 @@ const availableByType = (type: string) => {
 }
 const currentPickerItems = computed(() => pickerOpen.value ? availableByType(pickerOpen.value) : [])
 
-const currentPickerGroups = computed(() => {
-  if (!pickerOpen.value || pickerOpen.value !== 'commands') return null
-  const items = availableByType('commands')
-  const byGroup = new Map<string, any[]>()
-  for (const it of items) {
-    const g = (settings.commandsMeta[it.key] || {}).group || '其他'
-    if (!byGroup.has(g)) byGroup.set(g, [])
-    byGroup.get(g)!.push(it)
+// 用户自定义分组（技能/插件按 capability_groups 分组；命令走内置命令组）
+const userCapGroups = ref<Record<string, Record<string, string[]>>>({})
+async function loadUserGroups(type?: string) {
+  const types = type ? [type] : ['skills', 'plugins']
+  for (const t of types) {
+    try {
+      const g = await api.settings.getCapabilityGroups(t)
+      userCapGroups.value = { ...userCapGroups.value, [t]: { ...(g || {}) } }
+    } catch { userCapGroups.value = { ...userCapGroups.value, [t]: {} } }
   }
-  const order = [...(settings.commandGroups || [])]
-  for (const g of byGroup.keys()) if (!order.includes(g)) order.push(g)
-  return order.filter(g => byGroup.has(g)).map(g => ({ name: g, items: byGroup.get(g)! }))
+}
+
+const currentPickerGroups = computed(() => {
+  if (!pickerOpen.value) return null
+  const type = pickerOpen.value
+  const items = availableByType(type)
+  if (type === 'commands') {
+    const byGroup = new Map<string, any[]>()
+    for (const it of items) {
+      const g = (settings.commandsMeta[it.key] || {}).group || '其他'
+      if (!byGroup.has(g)) byGroup.set(g, [])
+      byGroup.get(g)!.push(it)
+    }
+    const order = [...(settings.commandGroups || [])]
+    for (const g of byGroup.keys()) if (!order.includes(g)) order.push(g)
+    return order.filter(g => byGroup.has(g)).map(g => ({ name: g, items: byGroup.get(g)! }))
+  }
+  // skills / plugins：按用户自定义分组组织，未分组归到「未分组」
+  const userGroups = userCapGroups.value[type] || {}
+  const byGroup = new Map<string, any[]>()
+  for (const [gname, keys] of Object.entries(userGroups)) {
+    for (const k of keys) {
+      const it = items.find(i => i.key === k)
+      if (!it) continue
+      if (!byGroup.has(gname)) byGroup.set(gname, [])
+      byGroup.get(gname)!.push(it)
+    }
+  }
+  const groupedKeys = new Set([...byGroup.values()].flatMap(a => a.map(i => i.key)))
+  const ungrouped = items.filter(i => !groupedKeys.has(i.key))
+  let groups = [...byGroup.entries()].map(([name, gItems]) => ({ name, items: gItems }))
+  if (ungrouped.length) groups.push({ name: '未分组', items: ungrouped })
+  return groups
 })
 function toggleGroupExpand(name: string) {
   const s = new Set(collapsedGroups.value)
@@ -103,6 +135,8 @@ function openPicker(type: string) {
   selectedKeys.value = new Set()
   pickerOpen.value = type
   collapsedGroups.value = type === 'commands' ? new Set(settings.commandGroups || []) : new Set()
+  // 技能/插件每次打开刷新用户分组（命令走内置无需加载）
+  if (type !== 'commands') loadUserGroups(type)
 }
 function closePicker() { pickerOpen.value = null; selectedKeys.value = new Set() }
 function togglePick(key: string) {
@@ -235,7 +269,10 @@ function displayLabel(type: string, key: string): string {
                          :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
                     <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
                     <div class="pi-body">
-                      <div class="pi-label">{{ item.label }}</div>
+                      <div class="pi-label">
+                        {{ item.label }}
+                        <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
+                      </div>
                       <div class="pi-key">{{ item.key }}</div>
                       <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
                     </div>
