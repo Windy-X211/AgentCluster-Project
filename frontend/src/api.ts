@@ -116,19 +116,20 @@ export const api = {
     list: () => req<any[]>('/agents'),
     create: (d: any) => req('/agents', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
+    setAvatarColor: (id: number, color: string) => req(`/agents/${id}/avatar-color`, { method: 'PUT', body: JSON.stringify({ color }) }),
     remove: (id: number) => req(`/agents/${id}`, { method: 'DELETE' }),
-    reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) }),
-    setAvatarColor: (id: number, color: string) =>
-      req(`/agents/${id}/avatar-color`, { method: 'PUT', body: JSON.stringify({ avatar_color: color }) })
+    reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
   agent_groups: {
     list: () => req<any[]>('/agent_groups'),
     create: (d: any) => req('/agent_groups', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agent_groups/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/agent_groups/${id}`, { method: 'DELETE' }),
-    reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) }),
+    // 清空分组：保留组，组内智能体移回「全部」
     clear: (id: number) => req(`/agent_groups/${id}/clear`, { method: 'POST' }),
-    purge: (id: number) => req(`/agent_groups/${id}/purge`, { method: 'DELETE' })
+    // 删除组和智能体：组与组内智能体一并彻底删除（含画布节点/连线清理）
+    purge: (id: number) => req(`/agent_groups/${id}/purge`, { method: 'DELETE' }),
+    reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
   canvases: {
     list: () => req<any[]>('/canvases'),
@@ -298,8 +299,12 @@ export const api = {
   settings: {
     get: () => req<any>('/settings'),
     update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) }),
+    /** 设置全局默认工作区（空串=清除）；后端会归一化为绝对路径并自动创建目录 */
     setDefaultWorkdir: (path: string) =>
-      req<any>('/settings/default_workdir', { method: 'PUT', body: JSON.stringify({ default_workdir: path }) }),
+      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir', { method: 'PUT', body: JSON.stringify({ default_workdir: path }) }),
+    /** 读取默认工作区及其目录存在状态（设置页回显用） */
+    getDefaultWorkdir: () =>
+      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir'),
     // —— 能力分组（独立文件存储）——
     getCapabilityGroups: (type: string) =>
       req<Record<string, string[]>>(`/settings/capability_groups/${encodeURIComponent(type)}`),
@@ -344,6 +349,26 @@ export const api = {
     reload: () => req<any>('/commands/reload', { method: 'POST' }),
     run: (d: any) => req('/commands/run', { method: 'POST', body: JSON.stringify(d), timeout: 600_000 }),
     dependencies: () => req<any>('/commands/dependencies'),
+  },
+  memory: {
+    overview: () => req<any[]>('/memory/overview'),
+    shared: () => req<any>('/memory/shared'),
+    addEntry: (content: string, pinned = false) =>
+      req<any>('/memory/entries', { method: 'POST', body: JSON.stringify({ content, pinned }) }),
+    updateEntry: (entryId: string, d: { content?: string; pinned?: boolean }) =>
+      req<any>(`/memory/entries/${entryId}`, { method: 'PUT', body: JSON.stringify(d) }),
+    deleteEntry: (entryId: string) =>
+      req<any>(`/memory/entries/${entryId}`, { method: 'DELETE' }),
+    updateSummary: (content: string) =>
+      req<any>('/memory/summary', { method: 'PUT', body: JSON.stringify({ content }) }),
+    clear: (keepPinned = true) =>
+      req<any>('/memory/clear', { method: 'POST', body: JSON.stringify({ keep_pinned: keepPinned }) }),
+    setMode: (agentId: number, mode: string) =>
+      req<any>(`/memory/${agentId}/mode`, { method: 'PUT', body: JSON.stringify({ mode }) }),
+    batchMode: (agentIds: number[], mode: string) =>
+      req<any>('/memory/batch', { method: 'POST', body: JSON.stringify({ agent_ids: agentIds, mode }) }),
+    setGlobal: (enabled: boolean) =>
+      req<any>('/memory/global', { method: 'PUT', body: JSON.stringify({ enabled }) }),
   },
   presets: {
     list: () => req<any[]>('/param_presets'),

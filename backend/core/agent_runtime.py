@@ -901,6 +901,16 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
     if rules:
         numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(rules, 1))
         parts.append(f"\n## 规章制度（集群工作流程与规则，必须遵守）\n{numbered}")
+    # 长期记忆（记忆技能：全局开关开 + memory_mode ∈ {manual, summary} 时注入
+    # 记忆内容与使用规则；关闭的智能体无此段、也无 memory.* 工具，彼此记忆隔离）
+    try:
+        from core.memory import memory_mode_of, memory_prompt_block
+        if memory_mode_of(agent) != "off":
+            _mem_block = memory_prompt_block(agent)
+            if _mem_block:
+                parts.append(_mem_block)
+    except Exception as e:
+        print(f"[agent_runtime] WARN 记忆注入失败：{e}")
     # 技能 prompt 拼接（渐进式加载）
     # Level 1（发现）：只把 name + description 放进 system prompt，零 token 成本，让模型知道有哪些技能可用。
     # Level 2（激活）：SKILL.md 正文**不**自动拼入 system prompt；模型判断相关时必须用 skill.invoke
@@ -2491,6 +2501,15 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     yield f"F:{final_text}\n"
     # 接力前先落库当前智能体产出，避免下游脏写覆盖
     await upsert_async("conversations", fresh_conv)
+
+    # —— 摘要记忆：本智能体完成回复后，异步把本轮对话整理进其长期记忆（不阻塞收尾） ——
+    # 仅摘要记忆模式触发；手动记忆模式完全由用户主动要求（智能体调 memory.write）。
+    try:
+        from core.memory import memory_mode_of, summarize_and_store
+        if memory_mode_of(agent) == "summary":
+            asyncio.create_task(summarize_and_store(agent, interface, model, user_input, final_text))
+    except Exception as e:
+        print(f"[agent_runtime] WARN 摘要记忆任务启动失败：{e}")
 
 
     # ===== 消息接力：cluster.send_message 在任意 relay 层级都处理

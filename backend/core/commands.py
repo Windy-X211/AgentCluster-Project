@@ -1385,6 +1385,112 @@ def cmd_workspace_search(query: str,
         return {"error": str(e)}
 
 
+# ==============================================================
+# 长期记忆命令（记忆技能）：由智能体 memory_mode 控制注入（filter_tools），
+# 不走 commands 白名单；核心实现见 core/memory.py
+# ==============================================================
+def _memory_agent_id() -> int | None:
+    """当前工具调用的 agent_id（_execute_tool 执行前注入 BACKUP_CTX）。"""
+    try:
+        ctx = BACKUP_CTX.get() or {}
+    except Exception:
+        ctx = {}
+    aid = ctx.get("agent_id")
+    try:
+        return int(aid) if aid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def cmd_memory_read() -> dict:
+    """读取长期记忆（所有智能体共享一份，拥有记忆技能才可读）。"""
+    from core.memory import read_memory, memory_mode_of
+    from core.store import get_by
+    aid = _memory_agent_id()
+    if aid is None:
+        return {"error": "缺少运行上下文（agent_id），无法读取记忆"}
+    agent = get_by("agents", aid) or {}
+    if memory_mode_of(agent) == "off":
+        return {"error": "当前智能体未启用记忆技能（memory_mode=off）"}
+    return read_memory()
+
+
+def cmd_memory_write(content: str, pinned: bool = False) -> dict:
+    """写入一条长期记忆（共享库）；pinned=true 表示用户主动要求记住、永不遗忘的固定记忆。"""
+    from core.memory import add_entry, memory_mode_of
+    from core.store import get_by
+    aid = _memory_agent_id()
+    if aid is None:
+        return {"error": "缺少运行上下文（agent_id），无法写入记忆"}
+    agent = get_by("agents", aid) or {}
+    mode = memory_mode_of(agent)
+    if mode == "off":
+        return {"error": "当前智能体未启用记忆技能（memory_mode=off）"}
+    entry = add_entry(content, pinned=bool(pinned),
+                      source="user_request" if pinned else mode)
+    if not entry:
+        return {"error": "写入失败：记忆内容为空"}
+    return {"ok": True, "entry_id": entry["id"], "pinned": entry["pinned"],
+            "message": "已写入固定记忆（永不遗忘）" if entry["pinned"] else "已写入记忆"}
+
+
+def cmd_memory_delete(entry_id: str) -> dict:
+    """删除一条长期记忆（共享库；固定记忆除非用户明确要求，否则不要删除）。"""
+    from core.memory import delete_entry, memory_mode_of
+    from core.store import get_by
+    aid = _memory_agent_id()
+    if aid is None:
+        return {"error": "缺少运行上下文（agent_id），无法删除记忆"}
+    agent = get_by("agents", aid) or {}
+    if memory_mode_of(agent) == "off":
+        return {"error": "当前智能体未启用记忆技能（memory_mode=off）"}
+    ok = delete_entry(entry_id)
+    return {"ok": bool(ok), "message": "已删除" if ok else f"未找到记忆条目: {entry_id}"}
+
+
+# memory.* 工具 schema：注入由 filter_tools 按 agent.memory_mode 控制；
+# COMMAND_META 中标记 hidden（能力选择器不展示，避免「勾选无效」的困惑）
+MEMORY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "memory.read",
+            "description": "读取你自己的长期记忆（固定记忆条目 + 摘要记忆 + 其他条目）。当用户问到过往交互过的信息、或 system prompt 的记忆段落没有你要的内容时调用。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory.write",
+            "description": "写入一条长期记忆。content 为要记住的内容（一句话、具体明确）；pinned=true 表示用户明确要求记住、永不遗忘的固定记忆——只有用户主动说「记住这个 / 帮我记着」时才设 true；固定记忆不会被系统摘要整理触碰。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "要记住的内容，简洁明确"},
+                    "pinned": {"type": "boolean", "description": "是否固定记忆（用户明确要求记住时 true，默认 false）"},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory.delete",
+            "description": "删除一条长期记忆（entry_id 来自 memory.read 的返回）。固定记忆（pinned）除非用户明确要求，否则不要删除。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry_id": {"type": "string", "description": "要删除的记忆条目 id"},
+                },
+                "required": ["entry_id"],
+            },
+        },
+    },
+]
+
+
 def cmd_skill_invoke(skill_name: str) -> dict:
     """显式调用指定的技能。返回技能内容供LLM参考使用。
 
@@ -1896,6 +2002,9 @@ COMMAND_CN_LABELS = {
     "cluster.get_conversation": "🗨️ 查看对话记录",
     "cluster.handoff": "🤝 A2A 移交",
     "cluster.send_message": "📨 发送消息",
+    "memory.read": "🧠 读取记忆",
+    "memory.write": "💾 写入记忆",
+    "memory.delete": "🗑 删除记忆",
 }
 
 # 保留旧字典格式兼容（label 用中文，未覆盖的仍用原名）
@@ -1951,6 +2060,19 @@ def filter_tools(command_names: list, plugin_names: list, plugin_registry: dict,
                     if t["function"]["name"] == inject_name:
                         result.append(_seal_schema(t))
                         break
+    # —— 长期记忆命令（记忆技能）：由 agent.memory_mode 控制注入，不走 commands 白名单 ——
+    # （拥有记忆技能 = 全局开关开 + memory_mode ∈ {manual, summary}；关闭的智能体拿不到
+    #   memory.* 工具、system prompt 也不注入记忆，彼此记忆互不可读写）
+    if agent is not None:
+        try:
+            from core.memory import memory_mode_of, MEMORY_COMMANDS
+            if memory_mode_of(agent) != "off":
+                _have = {(t.get("function") or {}).get("name") for t in result}
+                for t in COMMAND_TOOLS:
+                    if t["function"]["name"] in MEMORY_COMMANDS and t["function"]["name"] not in _have:
+                        result.append(_seal_schema(t))
+        except Exception as e:
+            print(f"[commands] 记忆工具注入失败：{e}")
     for pname in (plugin_names or []):
         meta = plugin_registry.get(pname)
         if meta:
@@ -3650,6 +3772,10 @@ COMMAND_TOOLS.append(SMART_SEARCH_TOOL)
 # 派生子智能体命令（主智能体自定义临时子 agent 并配置能力）
 COMMAND_TOOLS.append(SUBAGENT_TOOL)
 
+# 长期记忆命令（记忆技能）：schema 进 COMMAND_TOOLS（COMMAND_META/hidden 统一生效），
+# 实际注入由 filter_tools 按 agent.memory_mode 控制
+COMMAND_TOOLS.extend(MEMORY_TOOLS)
+
 # ---- 命令分组（前端命令选择器按组展示，可整组勾选或展开后单独勾选）----
 # 顺序即展示顺序；未列入分组的命令归入「其他」。
 COMMAND_GROUPS = [
@@ -3678,7 +3804,10 @@ COMMAND_GROUPS = [
 ]
 
 # 运行时自动注入的常驻工具：不在智能体配置/默认命令选择器里展示（无需也无法手动勾选）。
-RUNTIME_INJECTED_COMMANDS = {"skill.invoke", "skill.read_section", "cluster.send_message", "cluster.handoff"}
+RUNTIME_INJECTED_COMMANDS = {
+    "skill.invoke", "skill.read_section", "cluster.send_message", "cluster.handoff",
+    "memory.read", "memory.write", "memory.delete",  # 记忆技能：由 memory_mode 控制注入
+}
 
 _NAME_TO_GROUP: dict[str, str] = {}
 for _gname, _names in COMMAND_GROUPS:

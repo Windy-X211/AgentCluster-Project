@@ -26,6 +26,7 @@ class AgentIn(BaseModel):
     sort_order: int | None = None  # 列表排序权重；None=未排序，按 id 兜底排到末尾
     group_id: int | None = None  # 所属分组 id；None=未分组（在"全部"组中）
     avatar_color: str | None = None  # 自定义头像色（#rrggbb）；None=跟随默认配色，""=清除自定义
+    memory_mode: str = "off"  # 记忆技能：off=关闭 / manual=手动记忆 / summary=摘要记忆
 
 
 class ReorderReq(BaseModel):
