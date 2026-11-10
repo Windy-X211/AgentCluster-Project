@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api } from '@/api'
 import { loadExtensions } from '@/extensions/loader'
@@ -13,10 +13,17 @@ interface MarketItem {
   installed?: boolean; enabled?: boolean
 }
 
-const market = ref<MarketItem[]>([])
 const loading = ref(false)
 const busy = ref<string>('')   // 正在操作的拓展 id
 const toast = ref('')
+
+// 已安装的拓展卡片（支持拖拽排序，顺序持久化到 localStorage）
+const installedCards = ref<MarketItem[]>([])
+
+// 拖拽状态
+const dragging = ref(false)
+const dragIndex = ref(-1)
+const dragOverIdx = ref(-1)
 
 // 拓展自带配置页弹窗（manifest.config_page 指向拓展目录内 HTML，由拓展后端 /config 下发）
 const configTarget = ref<MarketItem | null>(null)
@@ -39,13 +46,24 @@ function onKeydown(e: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
-const hasInstalled = computed(() => market.value.some(m => m.installed))
+function loadOrder(): string[] {
+  try { return JSON.parse(localStorage.getItem('ext_order') || '[]') } catch { return [] }
+}
+function saveOrder(ids: string[]) {
+  try { localStorage.setItem('ext_order', JSON.stringify(ids)) } catch {}
+}
+function applyOrder(list: MarketItem[], order: string[]): MarketItem[] {
+  if (!order.length) return list
+  const map = new Map(order.map((id, i) => [id, i]))
+  return [...list].sort((a, b) => (map.get(a.id) ?? 9999) - (map.get(b.id) ?? 9999))
+}
 
 async function refresh() {
   loading.value = true
   try {
     const res = await api.extensions.list()
-    market.value = res.market || []
+    // 只展示已安装的拓展；未安装的直接去「市场」页面下载
+    installedCards.value = applyOrder((res.market || []).filter(x => x.installed), loadOrder())
   } catch (e) {
     toast.value = '加载失败：' + (e as Error).message
   } finally {
@@ -53,17 +71,40 @@ async function refresh() {
   }
 }
 
-async function install(m: MarketItem) {
-  busy.value = m.id
-  try {
-    await api.extensions.install(m.id)
-    toast.value = `已安装：${m.name}`
-    await refresh()
-    await loadExtensions(true)
-  } catch (e) {
-    toast.value = '安装失败：' + (e as Error).message
-  } finally { busy.value = '' }
+// —— 拖拽排序（已安装分组内）——
+function onDragStart(idx: number, e: DragEvent) {
+  dragging.value = true
+  dragIndex.value = idx
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', String(idx))
+  }
 }
+function onDragOver(idx: number, e: DragEvent) {
+  if (!dragging.value) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  dragOverIdx.value = idx
+}
+function onDragLeave() { dragOverIdx.value = -1 }
+function onDrop(idx: number, e: DragEvent) {
+  e.preventDefault()
+  if (dragging.value && dragIndex.value >= 0 && dragIndex.value !== idx) {
+    const arr = [...installedCards.value]
+    const [moved] = arr.splice(dragIndex.value, 1)
+    arr.splice(idx, 0, moved)
+    installedCards.value = arr
+    saveOrder(arr.map(x => x.id))
+  }
+  resetDrag()
+}
+function onDragEnd() { resetDrag() }
+function resetDrag() {
+  dragging.value = false
+  dragIndex.value = -1
+  dragOverIdx.value = -1
+}
+
 async function enable_(m: MarketItem) {
   busy.value = m.id
   try {
@@ -126,11 +167,19 @@ onMounted(refresh)
 
     <div class="body">
       <div v-if="loading" class="empty">加载中…</div>
-      <div v-else-if="!market.length" class="empty">暂无可用拓展</div>
+      <div v-else-if="!installedCards.length" class="empty">还没有安装任何拓展，去「市场」页面下载吧</div>
       <template v-else>
-        <!-- 已安装分组 -->
-        <div v-if="hasInstalled" class="group-title">已安装</div>
-        <div v-for="m in market.filter(x => x.installed)" :key="m.id" class="ext-card glass" :class="{ disabled: !m.enabled }">
+        <!-- 已安装（组内支持拖动排序） -->
+        <div class="group-title">已安装 <span class="drag-hint">按住卡片拖动可排序</span></div>
+        <div v-for="(m, i) in installedCards" :key="m.id"
+             class="ext-card glass"
+             :class="{ disabled: !m.enabled, dragging: dragging && dragIndex === i, 'drag-over': dragging && dragOverIdx === i && dragIndex !== i }"
+             draggable="true"
+             @dragstart="onDragStart(i, $event)"
+             @dragover="onDragOver(i, $event)"
+             @dragleave="onDragLeave"
+             @drop="onDrop(i, $event)"
+             @dragend="onDragEnd">
           <div class="ec-head">
             <span class="ec-icon">{{ m.icon || '🧩' }}</span>
             <div class="ec-title-wrap">
@@ -154,30 +203,6 @@ onMounted(refresh)
           </div>
         </div>
 
-        <!-- 可安装分组 -->
-        <div class="group-title">可安装</div>
-        <div v-for="m in market.filter(x => !x.installed)" :key="m.id" class="ext-card glass">
-          <div class="ec-head">
-            <span class="ec-icon">{{ m.icon || '🧩' }}</span>
-            <div class="ec-title-wrap">
-              <div class="ec-title">{{ m.name }}</div>
-              <div class="ec-desc">{{ m.description }}</div>
-            </div>
-            <span v-if="m.status === 'preview'" class="ec-badge">预览</span>
-          </div>
-          <div class="ec-meta">
-            <span class="tag">v{{ m.version }}</span>
-            <span class="tag">{{ typeLabel(m.type) }}</span>
-            <span v-if="m.author" class="tag dim">{{ m.author }}</span>
-            <span v-for="t in (m.tags || [])" :key="t" class="tag dim">#{{ t }}</span>
-            <span v-if="m.viz_types && m.viz_types.length" class="tag dim">viz: {{ m.viz_types.join(', ') }}</span>
-          </div>
-          <div class="ec-actions">
-            <button class="act primary" :disabled="busy === m.id || m.status === 'preview'" @click="install(m)">
-              {{ m.status === 'preview' ? '待开发' : '安装' }}
-            </button>
-          </div>
-        </div>
       </template>
     </div>
 
@@ -229,6 +254,10 @@ onMounted(refresh)
 
 .ext-card { padding: 12px 14px; border-radius: 10px; transition: opacity .2s; }
 .ext-card.disabled { opacity: .6; }
+.ext-card { cursor: grab; }
+.ext-card.dragging { opacity: .35; }
+.ext-card.drag-over { border-color: rgba(var(--accent-rgb,120,140,255),.6); box-shadow: 0 0 0 1px rgba(var(--accent-rgb,120,140,255),.4); }
+.drag-hint { font-size: 11px; font-weight: 400; opacity: .5; margin-left: 6px; }
 .ec-head { display: flex; align-items: flex-start; gap: 10px; }
 .ec-icon { font-size: 22px; line-height: 1; flex-shrink: 0; }
 .ec-title-wrap { flex: 1; min-width: 0; }

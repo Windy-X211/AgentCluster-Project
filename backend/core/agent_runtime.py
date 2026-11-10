@@ -1073,7 +1073,15 @@ def _execute_tool(name: str, arguments: dict,
             try:
                 from core.external_tools import owner_of as _ext_owner, dispatch as _ext_dispatch
                 if _ext_owner(name):
-                    return _ext_dispatch(name, arguments or {}, None)
+                    # 传入当前智能体（含 memory_mode 等拓展所需字段），
+                    # 否则拓展 call_fn 收到 None，按"未启用"处理导致工具执行失败。
+                    _ext_agent = None
+                    if agent_id is not None:
+                        try:
+                            _ext_agent = get_by("agents", agent_id)
+                        except Exception:
+                            _ext_agent = None
+                    return _ext_dispatch(name, arguments or {}, _ext_agent)
             except Exception as e:
                 return {"error": f"外部工具分发失败：{type(e).__name__}: {e}"}
             # 插件执行：注入能力参数预设的固定参数（模型不可见、不可改，固定值优先覆盖）
@@ -1634,7 +1642,13 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # （{summary_msg, split}），该智能体视图 = [自己的摘要] + messages[split:]；
     # 任何异常都不阻断本轮对话
     from core.ctx_compress import maybe_compress, agent_view
-    await maybe_compress(conv, agent, interface, model, system_prompt_base)
+    _init_cinfo = await maybe_compress(conv, agent, interface, model, system_prompt_base)
+    if _init_cinfo:
+        # 组装阶段已压缩：实时通知前端补写 conv.agent_compactions，让遮挡摘要卡片在流式
+        # 一开始就显示（streaming 期间 refreshConv 提前返回，前端不会自动拉取到最新状态）
+        yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
+                                 'summary_msg': _init_cinfo['summary_msg'],
+                                 'split': _init_cinfo['split']}, ensure_ascii=False)}\n")
     if _wf_mode in ("plan", "spec", "goal") and _wf:
         system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})
@@ -1980,7 +1994,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     _limit = int(_mw_fn(interface, model) * _cs["threshold"])
                     _total = _et(messages[0].get("content")) + sum(_emt(m) for m in messages[1:])
                     if _limit > 0 and _total > _limit:
-                        _cinfo = await _mc(conv, agent, interface, model, system_prompt_base)
+                        # force=True：本轮实际发给 LLM 的上下文（_total，含纠错反馈/图片 followup 等
+                        # 仅在内存 messages、尚未落库的瞬态消息）已确认超线；maybe_compress 内部会再用
+                        # agent_view（仅 conv.messages 已落库历史）重算 total，可能比 _total 小而导致
+                        # 误判"未达线"跳过压缩。此处跳过该冗余判定，只保留"是否存在可压缩区间"的安全检查。
+                        _cinfo = await _mc(conv, agent, interface, model, system_prompt_base, force=True)
                         if _cinfo:
                             _rebuilt = [messages[0]]
                             for m in _av(conv, agent.get("id")):
@@ -1992,6 +2010,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                             _tool_round_start = len(messages)
                             yield (f"RN:（上下文达到压缩线：已把 {_cinfo['dropped']} 条较早历史压缩为摘要，"
                                    f"压缩前估算 {_cinfo['tokens_before']} token，继续当前任务）\n")
+                            # CX: 携带该智能体压缩状态 → 前端即时补写 conv.agent_compactions，
+                            # 让流式中的历史压缩遮挡摘要卡片立即显示（无需等 streaming 结束）
+                            yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
+                                                     'summary_msg': _cinfo['summary_msg'],
+                                                     'split': _cinfo['split']}, ensure_ascii=False)}\n")
                             logger.info("[agent_runtime] 运行中压缩 round=%d conv=%s dropped=%s",
                                         round_idx, conversation_id, _cinfo['dropped'])
             except Exception as _ce:

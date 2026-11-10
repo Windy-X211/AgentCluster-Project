@@ -143,11 +143,36 @@ def list_extensions():
     _ensure_dirs()
     market = _load_market()
     installed = _load_installed()
+    market_ids = {item.get("id") for item in market}
     for item in market:
         eid = item.get("id", "")
         st = installed.get(eid)
         item["installed"] = bool(st)
         item["enabled"] = bool(st and st.get("enabled"))
+    # 把"已安装但不在市场清单里"的拓展（本地手动安装）也塞进 market 数组，
+    # 让前端 ExtensionManagement.vue 能渲染。有 manifest 才展示，避免漏兜 installed.json 条目。
+    for eid, st in installed.items():
+        if eid in market_ids:
+            continue
+        mf = _read_manifest(eid)
+        if not mf:
+            continue
+        market.append({
+            "id": eid,
+            "name": mf.get("name") or eid,
+            "version": mf.get("version") or st.get("version", "0.0.0"),
+            "type": mf.get("type") or "hybrid",
+            "author": mf.get("author"),
+            "description": mf.get("description", ""),
+            "icon": mf.get("icon"),
+            "tags": mf.get("tags") or [],
+            "frontend_files": mf.get("frontend_files") or [],
+            "viz_types": mf.get("viz_types") or [],
+            "config_page": mf.get("config_page"),
+            "source": "local",
+            "installed": True,
+            "enabled": bool(st.get("enabled")),
+        })
     installed_view: dict[str, dict] = {}
     for eid, st in installed.items():
         mf = _read_manifest(eid)
@@ -395,6 +420,24 @@ async def mount_extension_backends(app: Any) -> int:
             if router is None:
                 print(f"[extensions] 拓展 {eid} 的 {stem}.py 未定义 router，跳过后端挂载")
                 continue
+            # 统一注入 /config 路由：manifest 声明 config_page 的拓展自动返回该 HTML 页面。
+            # 拓展自己的 backend.py 若已定义 /config 则先注册、优先匹配，此处不覆盖。
+            config_page = mf.get("config_page")
+            if config_page and "/" not in config_page and not config_page.startswith("."):
+                _cfg_fp = _ext_dir(eid) / config_page
+                if _cfg_fp.exists() and _cfg_fp.stat().st_size <= _MAX_FILE_BYTES:
+                    def _make_cfg(fp):
+                        from fastapi.responses import HTMLResponse
+                        def _config():
+                            try:
+                                return HTMLResponse(fp.read_text(encoding="utf-8"))
+                            except UnicodeDecodeError:
+                                try:
+                                    return HTMLResponse(fp.read_text(encoding="gbk"))
+                                except Exception:
+                                    return HTMLResponse("", status_code=500)
+                        return _config
+                    router.add_api_route("/config", _make_cfg(_cfg_fp), methods=["GET"])
             app.include_router(router, prefix=f"/api/ext/{eid}", tags=[f"ext-{eid}"])
             _EXT_BACKEND_MODULES[eid] = mod
             mounted += 1

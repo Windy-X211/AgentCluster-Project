@@ -1524,7 +1524,13 @@ const visibleMsgs = computed(() => {
     if (sm) {
       const split = Math.max(0, Math.min(Number(state.split) || 0, all.length))
       let pos = 0
-      for (let k = 0; k < pairs.length; k++) if (pairs[k][1] < split) pos = k + 1
+      // split 是后端落库 conv.messages 的原始下标；水合后 c.messages 的数组下标已与原始不一致
+      // （tool 消息被提取为 tool_call/tool_result 配对、数组变长），用 _rawIdx（水合时打的原始
+      // 落库下标）对齐 split；流式新消息未水合、无 _rawIdx → 回退数组下标（流式时两者一致）
+      for (let k = 0; k < pairs.length; k++) {
+        const rawIdx = (pairs[k][0] as any)?._rawIdx
+        if ((rawIdx != null ? rawIdx : pairs[k][1]) < split) pos = k + 1
+      }
       pairs.splice(pos, 0, [sm, -1] as const)
     }
   }
@@ -2239,6 +2245,36 @@ function shrinkToDataUrl(file: File, max = 256): Promise<string> {
 
 // —— 删除单条消息：截断到这条之前 ——
 const msgOpStatus = ref('')
+// —— 复制文本到剪贴板：优先 Clipboard API，失败时回退 textarea+execCommand ——
+// Electron 中 navigator.clipboard.writeText 常因失焦/权限受限而 reject，
+// 此时必须回退到 execCommand 才能真正写入剪贴板，而不是直接报失败。
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // 落入下方 fallback
+    }
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.top = '0'
+    ta.style.left = '0'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 // —— 复制消息文本到剪贴板（用户/智能体消息通用） ——
 async function copyMessageFromCtx() {
   const menu = msgCtxMenu.value
@@ -2251,23 +2287,8 @@ async function copyMessageFromCtx() {
     setTimeout(() => { msgOpStatus.value = '' }, 2000)
     return
   }
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-    } else {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    msgOpStatus.value = '✅ 已复制到剪贴板'
-  } catch {
-    msgOpStatus.value = '❌ 复制失败'
-  }
+  const ok = await copyTextToClipboard(text)
+  msgOpStatus.value = ok ? '✅ 已复制到剪贴板' : '❌ 复制失败'
   setTimeout(() => { msgOpStatus.value = '' }, 2000)
 }
 async function deleteMessageFromCtx() {
@@ -2721,6 +2742,19 @@ async function onCtxBadgeClick() {
     if (res && res.compressed === false) {
       // force 下仍返回 false：没有可压缩区间（历史太短）或摘要生成失败
       alert('没有可压缩的历史区间（历史太短或摘要生成失败），本次未压缩。')
+    } else {
+      // 压缩成功。会话仍在流式时 refreshConv 会提前返回（conversation.ts 内
+      // streamingConvIds.has(cid) → 直接返回，不拉取后端最新 conv），
+      // 导致本地 conv.agent_compactions 保持旧值 → 压缩遮挡摘要卡片不显示。
+      // 压缩后端一定会把 agent_compactions 落库 → 直接 GET 最新 conv 轻量合并该字段，
+      // 触发 visibleMsgs 重新注入摘要卡片（不整包替换，避免打断流式渲染）。
+      try {
+        const fresh = await api.convs.get(cid)
+        if (fresh?.agent_compactions && convs.current === cid) {
+          const c = convs.currentData() as any
+          if (c) c.agent_compactions = fresh.agent_compactions
+        }
+      } catch { /* 后端短暂不可达 → 等流式结束后 refreshConv 载入 */ }
     }
     await convs.refreshConv(cid)
     await refreshCtx()
@@ -3645,10 +3679,10 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </Teleport>
-      <!-- 消息操作状态提示（删除/撤销的即时反馈） -->
-      <Teleport to="body">
-        <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
-      </Teleport>
+      <!-- 对话滚动区包裹层：让状态提示可固定在对话区顶部中央，不随消息滚动、不产生布局位移 -->
+      <div class="chat-scroll-wrap">
+      <!-- 消息操作状态提示（复制/删除/撤销的即时反馈）：固定在对话区顶部中央 -->
+      <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
       <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll" @click="onChatBoxClick">
         <div v-if="!conv" class="no-conv">请新建对话</div>
         <!-- ============ 消息列表 ============
@@ -3881,6 +3915,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </template>
+      </div>
       </div>
 
       <!-- 图片浮窗：8 方向边界改大小，滚轮只缩放图片不动窗口 -->
@@ -4241,6 +4276,7 @@ onBeforeUnmount(() => {
 .conv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
 
+.chat-scroll-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .chat-box { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
 .no-conv { text-align: center; opacity: .7; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
@@ -5239,10 +5275,11 @@ onBeforeUnmount(() => {
 
 /* 消息操作状态提示（右上角浮动） */
 .msg-op-status {
-  position: fixed;
-  top: 14px;
-  right: 14px;
-  z-index: 2000;
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
   padding: 8px 14px;
   border-radius: 8px;
   background: rgba(var(--node-bg-rgb), 0.95);
@@ -5253,8 +5290,9 @@ onBeforeUnmount(() => {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   animation: toastFadeIn .2s ease-out;
+  pointer-events: none;
 }
-@keyframes toastFadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastFadeIn { from { opacity: 0; transform: translate(-50%, -4px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
 /* —— 文件操作历史还原对话框 —— */
 .modal-backdrop {

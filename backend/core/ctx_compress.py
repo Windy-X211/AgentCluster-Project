@@ -269,7 +269,10 @@ async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, s
         _logger.info("conv=%s agent=%s 智能体上下文压缩：%d 条历史 → 摘要（压缩前估算 %d token，窗口 %d，压缩线 %d）",
                      conv.get("id"), agent_id, len(dropped), total, window, limit)
         return {"dropped": len(dropped), "tokens_before": total, "window": window,
-                "limit": limit, "agent_id": agent_id}
+                "limit": limit, "agent_id": agent_id,
+                # 压缩状态回传：调用方（运行中 CX: 事件 / 手动压缩 API）据此同步前端 conv.agent_compactions，
+                # 使流式中的遮挡摘要卡片即时显示（无需等待 streaming 结束后 refreshConv 拉取落库 conv）
+                "split": states[str(agent_id)]["split"], "summary_msg": summary_msg}
     except Exception as e:  # 压缩任何异常都不阻断本轮对话
         _logger.warning("上下文压缩失败（忽略，继续用原历史）：%s", e)
         return None

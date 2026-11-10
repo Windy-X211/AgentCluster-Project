@@ -1900,6 +1900,18 @@ export const useConvStore = defineStore('conv', {
           agent_id: env?.to?.agent_id ?? curAgent ?? undefined,   // 主 agent_id 存接收方，给接收方节点显示
           from_agent_id: env?.from?.agent_id ?? undefined,       // 发送方，给源节点也显示"我发的"
         } as any)
+      } else if (line.startsWith('CX:')) {
+        // 运行中上下文压缩事件（后端在把较早历史压成摘要后实时发出）：
+        // 携带 {agent_id, summary_msg, split}，前端即时补写 conv.agent_compactions，
+        // 让流式中的历史压缩遮挡摘要卡片立即显示（streaming 期间 refreshConv 提前返回、
+        // 不会拉取后端最新 conv，若不在此补写卡片要等流式结束后才会出现）
+        let st: any = null
+        try { st = JSON.parse(line.slice(3)) } catch { st = null }
+        const stAid = st?.agent_id
+        if (stAid != null && st?.summary_msg && Number.isFinite(Number(st?.split))) {
+          if (!c.agent_compactions) c.agent_compactions = {}
+          c.agent_compactions[String(stAid)] = { summary_msg: st.summary_msg, split: Number(st.split), ts: st.summary_msg.ts }
+        }
       }
       c.messages = msgs
     }
