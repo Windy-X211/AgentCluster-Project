@@ -350,26 +350,6 @@ export const api = {
     run: (d: any) => req('/commands/run', { method: 'POST', body: JSON.stringify(d), timeout: 600_000 }),
     dependencies: () => req<any>('/commands/dependencies'),
   },
-  memory: {
-    overview: () => req<any[]>('/memory/overview'),
-    shared: () => req<any>('/memory/shared'),
-    addEntry: (content: string, pinned = false) =>
-      req<any>('/memory/entries', { method: 'POST', body: JSON.stringify({ content, pinned }) }),
-    updateEntry: (entryId: string, d: { content?: string; pinned?: boolean }) =>
-      req<any>(`/memory/entries/${entryId}`, { method: 'PUT', body: JSON.stringify(d) }),
-    deleteEntry: (entryId: string) =>
-      req<any>(`/memory/entries/${entryId}`, { method: 'DELETE' }),
-    updateSummary: (content: string) =>
-      req<any>('/memory/summary', { method: 'PUT', body: JSON.stringify({ content }) }),
-    clear: (keepPinned = true) =>
-      req<any>('/memory/clear', { method: 'POST', body: JSON.stringify({ keep_pinned: keepPinned }) }),
-    setMode: (agentId: number, mode: string) =>
-      req<any>(`/memory/${agentId}/mode`, { method: 'PUT', body: JSON.stringify({ mode }) }),
-    batchMode: (agentIds: number[], mode: string) =>
-      req<any>('/memory/batch', { method: 'POST', body: JSON.stringify({ agent_ids: agentIds, mode }) }),
-    setGlobal: (enabled: boolean) =>
-      req<any>('/memory/global', { method: 'PUT', body: JSON.stringify({ enabled }) }),
-  },
   presets: {
     list: () => req<any[]>('/param_presets'),
     create: (d: any) => req('/param_presets', { method: 'POST', body: JSON.stringify(d) }),

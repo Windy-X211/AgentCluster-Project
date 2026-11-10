@@ -901,16 +901,6 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
     if rules:
         numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(rules, 1))
         parts.append(f"\n## 规章制度（集群工作流程与规则，必须遵守）\n{numbered}")
-    # 长期记忆（记忆技能：全局开关开 + memory_mode ∈ {manual, summary} 时注入
-    # 记忆内容与使用规则；关闭的智能体无此段、也无 memory.* 工具，彼此记忆隔离）
-    try:
-        from core.memory import memory_mode_of, memory_prompt_block
-        if memory_mode_of(agent) != "off":
-            _mem_block = memory_prompt_block(agent)
-            if _mem_block:
-                parts.append(_mem_block)
-    except Exception as e:
-        print(f"[agent_runtime] WARN 记忆注入失败：{e}")
     # 技能 prompt 拼接（渐进式加载）
     # Level 1（发现）：只把 name + description 放进 system prompt，零 token 成本，让模型知道有哪些技能可用。
     # Level 2（激活）：SKILL.md 正文**不**自动拼入 system prompt；模型判断相关时必须用 skill.invoke
@@ -980,10 +970,15 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         parts.append(f"\n【集群上下文】{cluster_context}")
     prompt = "\n".join(parts)
     # —— 动态替换存储路径占位符 ——
-    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root} / {capability_groups_path}，
+    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root} / {capability_groups_path} / {spec_dir}，
     # 与 store.ROOT 保持同步（用户在设置里切换存储根后自动生效）。
+    # {spec_dir} 指向项目内统一规范文档目录 doc/spec（技能/插件/拓展/背景规范，随项目走）。
     try:
         _root = str(store.ROOT)
+        _spec_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "doc", "spec")
+        )
+        prompt = prompt.replace("{spec_dir}", _spec_dir)
         prompt = prompt.replace("{skills_dir}", str(store.ROOT / "skills"))
         prompt = prompt.replace("{plugins_dir}", str(store.ROOT / "plugins"))
         prompt = prompt.replace("{bg_dir}", str(store.ROOT / "backgrounds"))
@@ -1647,8 +1642,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         # 组装阶段已压缩：实时通知前端补写 conv.agent_compactions，让遮挡摘要卡片在流式
         # 一开始就显示（streaming 期间 refreshConv 提前返回，前端不会自动拉取到最新状态）
         yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
-                                 'summary_msg': _init_cinfo['summary_msg'],
-                                 'split': _init_cinfo['split']}, ensure_ascii=False)}\n")
+                                 'entry': _init_cinfo['entry']}, ensure_ascii=False)}\n")
     if _wf_mode in ("plan", "spec", "goal") and _wf:
         system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})
@@ -2013,8 +2007,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                             # CX: 携带该智能体压缩状态 → 前端即时补写 conv.agent_compactions，
                             # 让流式中的历史压缩遮挡摘要卡片立即显示（无需等 streaming 结束）
                             yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
-                                                     'summary_msg': _cinfo['summary_msg'],
-                                                     'split': _cinfo['split']}, ensure_ascii=False)}\n")
+                                                     'entry': _cinfo['entry']}, ensure_ascii=False)}\n")
                             logger.info("[agent_runtime] 运行中压缩 round=%d conv=%s dropped=%s",
                                         round_idx, conversation_id, _cinfo['dropped'])
             except Exception as _ce:
@@ -2524,15 +2517,6 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     yield f"F:{final_text}\n"
     # 接力前先落库当前智能体产出，避免下游脏写覆盖
     await upsert_async("conversations", fresh_conv)
-
-    # —— 摘要记忆：本智能体完成回复后，异步把本轮对话整理进其长期记忆（不阻塞收尾） ——
-    # 仅摘要记忆模式触发；手动记忆模式完全由用户主动要求（智能体调 memory.write）。
-    try:
-        from core.memory import memory_mode_of, summarize_and_store
-        if memory_mode_of(agent) == "summary":
-            asyncio.create_task(summarize_and_store(agent, interface, model, user_input, final_text))
-    except Exception as e:
-        print(f"[agent_runtime] WARN 摘要记忆任务启动失败：{e}")
 
 
     # ===== 消息接力：cluster.send_message 在任意 relay 层级都处理

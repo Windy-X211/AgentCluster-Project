@@ -7,7 +7,7 @@
 
 目录结构：
   <数据根>/extensions/
-    EXTENSION_SPEC.md            ← 代码规范文档（随仓库首发）
+    EXTENSION_SPEC.md            ← 代码规范文档（随仓库首发，规范统一在项目 doc/spec/extension-spec.md）
     extensions_market.json       ← 旧版市场清单（已废弃，保留兼容兜底）
     installed.json               ← 已安装拓展状态（运行时维护）
     <ext_id>/                    ← 每个已安装拓展一个目录

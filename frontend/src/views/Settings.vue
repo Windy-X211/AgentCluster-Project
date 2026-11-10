@@ -762,7 +762,7 @@ const agentGroupOptions = computed(() => {
           </div>
           <input ref="bgFileInput" type="file" multiple style="display:none" @change="onBgFiles" />
           <div class="hint-empty" style="margin-top: 8px">
-            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见 AppData/backgrounds/spec.md
+            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见项目 doc/spec/background-spec.md
           </div>
         </div>
       </div>

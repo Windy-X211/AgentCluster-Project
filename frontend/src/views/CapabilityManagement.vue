@@ -6,16 +6,14 @@ import ParamPresetsPanel from '@/components/capability-mgmt/ParamPresetsPanel.vu
 import PluginDebugPanel from '@/components/plugin-debug/PluginDebugPanel.vue'
 import DependencyInstallPanel from '@/components/capability-mgmt/DependencyInstallPanel.vue'
 import CapabilityListPanel from '@/components/capability-mgmt/CapabilityListPanel.vue'
-import MemoryManager from '@/views/MemoryManager.vue'
 
-type TabKey = 'list' | 'defaults' | 'presets' | 'debug' | 'deps' | 'memory'
+type TabKey = 'list' | 'defaults' | 'presets' | 'debug' | 'deps'
 const tabs: { key: TabKey; label: string; icon: string; desc: string }[] = [
   { key: 'defaults', label: '默认能力',   icon: '⚡', desc: '新建智能体时自动勾选的命令 / 技能 / 插件' },
   { key: 'list',     label: '能力列表',   icon: '📋', desc: '按类型浏览全部命令 / 技能 / 插件，支持分组与拖拽' },
   { key: 'presets',  label: '能力参数预设', icon: '🔐', desc: '为插件/技能预填固定参数和可选参数描述' },
   { key: 'debug',    label: '插件调试',   icon: '🧪', desc: '选择插件目录 → 加载 → 填参数 → 运行调试' },
   { key: 'deps',     label: '依赖安装',   icon: '📦', desc: '查看插件/技能的 pip/npm/external 依赖状态与下载链接' },
-  { key: 'memory',   label: '记忆管理',   icon: '🧠', desc: '每个智能体的记忆开关 / 手动·摘要模式 / 记忆内容查看与批量调整' },
 ]
 const activeTab = ref<TabKey>('defaults')
 const activeTabDesc = () => tabs.find(t => t.key === activeTab.value)?.desc || ''
@@ -53,7 +51,6 @@ const activeTabDesc = () => tabs.find(t => t.key === activeTab.value)?.desc || '
       <ParamPresetsPanel        v-else-if="activeTab === 'presets'" />
       <PluginDebugPanel         v-else-if="activeTab === 'debug'" class="debug-panel" />
       <DependencyInstallPanel   v-else-if="activeTab === 'deps'" />
-      <MemoryManager            v-else-if="activeTab === 'memory'" />
     </div>
   </div>
 </template>

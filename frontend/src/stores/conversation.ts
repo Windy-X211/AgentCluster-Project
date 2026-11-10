@@ -554,12 +554,16 @@ function _stampRaw(m: any, rawIdx: number): any {
 /** 段内合成一对 tool_call/tool_result 并推入 out（agent_id 归属所属 assistant） */
 function _pushSynthPair(out: any[], tcId: string, name: string, args: any, result: any,
   images: any[] | null, agentId: number | undefined, ts: string | undefined,
-  subProcess?: any[] | null) {
+  subProcess?: any[] | null, rawIdx?: number) {
   const tcMsg: any = { role: 'tool_call', content: '', name, tool_call_id: tcId, args: args || {}, ts, agent_id: agentId ?? undefined }
+  // 继承父 assistant 的原始落库下标：供压缩摘要按 split 隐藏时把同段合成配对一起隐藏
+  // （合成配对无独立落库行；右键菜单/撤销只作用于 assistant/user 消息，不会误用此下标）
+  if (rawIdx != null) tcMsg._rawIdx = rawIdx
   // agent.spawn 的子智能体运行事件（后端落库在 tool 消息 sub_process 字段）→ 挂回合成 tool_call
   if (Array.isArray(subProcess) && subProcess.length) tcMsg.sub_process = subProcess
   out.push(tcMsg)
   const rMsg: any = { role: 'tool_result', content: '', tool_call_id: tcId, result: result ?? {}, ts, agent_id: agentId ?? undefined }
+  if (rawIdx != null) rMsg._rawIdx = rawIdx
   if (Array.isArray(images) && images.length) rMsg.image_refs = images
   out.push(rMsg)
 }
@@ -597,7 +601,7 @@ export function hydrateHistoryMsgs(raw: any[]): any[] {
           _pushSynthPair(out,
             t?.m?.tool_call_id || `hist-${k}-${nextTool}`,
             h?.name || '?', h?.args || {}, h?.result ?? {},
-            t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null)
+            t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null, k)
         }
       } else if (!hasFinal && Array.isArray(m.tool_calls) && m.tool_calls.length) {
         // 无最终回复的段（运行中断）：按中间轮 OpenAI tool_calls 精确 id 配对
@@ -612,7 +616,7 @@ export function hydrateHistoryMsgs(raw: any[]): any[] {
           let result: any = {}
           const rc = t?.m?.content
           if (rc != null) { try { result = JSON.parse(rc) } catch { result = { _raw: rc } } }
-          _pushSynthPair(out, tcId, tc?.function?.name || '?', args, result, t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null)
+          _pushSynthPair(out, tcId, tc?.function?.name || '?', args, result, t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null, k)
         }
       }
     }
@@ -1908,9 +1912,14 @@ export const useConvStore = defineStore('conv', {
         let st: any = null
         try { st = JSON.parse(line.slice(3)) } catch { st = null }
         const stAid = st?.agent_id
-        if (stAid != null && st?.summary_msg && Number.isFinite(Number(st?.split))) {
+        const entry = st?.entry
+        // entry = {summary_msg, split, ts}：把新卡片追加进该智能体的卡片列表（旧卡片保留）
+        if (stAid != null && entry?.summary_msg && Number.isFinite(Number(entry?.split))) {
           if (!c.agent_compactions) c.agent_compactions = {}
-          c.agent_compactions[String(stAid)] = { summary_msg: st.summary_msg, split: Number(st.split), ts: st.summary_msg.ts }
+          const list = c.agent_compactions[String(stAid)]
+          if (Array.isArray(list)) list.push(entry)
+          else if (list) c.agent_compactions[String(stAid)] = [list, entry]  // 旧版单卡 → 升级为列表
+          else c.agent_compactions[String(stAid)] = [entry]
         }
       }
       c.messages = msgs

@@ -124,23 +124,43 @@ def compress_settings(settings: dict | None = None) -> dict:
 # ==============================================================
 # 智能体历史视图
 # ==============================================================
+def _compaction_entries(conv: dict | None, agent_id) -> list:
+    """该智能体的压缩卡片列表（兼容旧版单个 dict 存储）。
+
+    新版：agent_compactions[agent_id] = [ {summary_msg, split, ts}, ... ]（按时间升序，
+    每次压缩追加一张新卡片；旧卡片保留，仅最新卡片参与 LLM 上下文）。
+    旧版：单卡 dict {summary_msg, split, ts} → 包成单元素列表。
+    """
+    if not conv:
+        return []
+    state = (conv.get("agent_compactions") or {}).get(str(agent_id))
+    if not state:
+        return []
+    if isinstance(state, list):
+        return state
+    return [state]
+
+
 def agent_view(conv: dict | None, agent_id) -> list:
-    """某智能体的有效历史视图：[自己的压缩摘要] + 共享历史未压缩部分。
+    """某智能体的有效历史视图：[最新压缩摘要] + 共享历史未压缩部分（旧卡片已折叠进最新摘要）。
 
     压缩是智能体级的：conv.messages（集群共享历史）永不改写，每个智能体在
-    conv.agent_compactions[agent_id] 维护自己的压缩状态 {summary_msg, split}。
-    split = 该智能体已压缩到的共享历史下标（摘要覆盖 msgs[:split]）。
+    conv.agent_compactions[agent_id] 维护压缩卡片列表；仅最新一张卡片的
+    split（该次压缩覆盖的共享历史终点下标）参与视图裁剪。
     """
     if not conv:
         return []
     msgs = conv.get("messages") or []
-    state = (conv.get("agent_compactions") or {}).get(str(agent_id)) or {}
+    entries = _compaction_entries(conv, agent_id)
+    latest = entries[-1] if entries else None
+    if not latest:
+        return list(msgs)
     try:
-        split = int(state.get("split", 0) or 0)
+        split = int(latest.get("split", 0) or 0)
     except (TypeError, ValueError):
         split = 0
     split = max(0, min(split, len(msgs)))
-    sm = state.get("summary_msg")
+    sm = latest.get("summary_msg")
     return ([sm] if sm else []) + list(msgs[split:])
 
 
@@ -173,8 +193,9 @@ def context_stats(conv: dict, agent: dict, canvas: dict | None) -> dict:
     window = model_window(asb["interface"], asb["model"])
     limit = int(window * cs["threshold"])
     tokens = asb["tokens"]
-    state = ((conv or {}).get("agent_compactions") or {}).get(str(agent.get("id"))) or {}
-    sm = state.get("summary_msg")
+    entries = _compaction_entries(conv, agent.get("id"))
+    latest = entries[-1] if entries else None
+    sm = latest.get("summary_msg") if latest else None
     return {
         "tokens": tokens,
         "window": window,
@@ -184,8 +205,8 @@ def context_stats(conv: dict, agent: dict, canvas: dict | None) -> dict:
         "enabled": cs["enabled"],
         "keep_recent": cs["keep_recent"],
         "model": asb["model"],
-        # 该智能体自身的压缩状态（无则为 None）
-        "compacted": ({"count": sm.get("compressed_count"), "ts": state.get("ts")} if sm else None),
+        # 该智能体自身的压缩状态（最新卡片；无则为 None）
+        "compacted": ({"count": sm.get("compressed_count"), "ts": latest.get("ts")} if sm else None),
     }
 
 
@@ -219,9 +240,12 @@ async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, s
         msgs = conv.get("messages") or []
         agent_id = agent.get("id")
         states = conv.setdefault("agent_compactions", {})
-        state = states.get(str(agent_id)) or {}
-        old_split = min(int(state.get("split", 0) or 0), len(msgs))
-        old_summary = state.get("summary_msg")
+        # 卡片列表（兼容旧版单卡 dict）：每次压缩「上一张最新卡片的摘要 + 其 split 之后的新上下文」
+        # 一起压缩成新摘要，并追加为新卡片；旧卡片保留（前端仍可见），仅最新卡片进入 LLM 视图
+        entries = _compaction_entries(conv, agent_id)
+        latest = entries[-1] if entries else None
+        old_split = min(int(latest.get("split", 0) or 0), len(msgs)) if latest else 0
+        old_summary = latest.get("summary_msg") if latest else None
         offset = 1 if old_summary else 0
         view = ([old_summary] if old_summary else []) + list(msgs[old_split:])
         if not view:
@@ -260,19 +284,20 @@ async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, s
             "ts": datetime.utcnow().isoformat(),
         }
         # view 下标 p（p>=offset）对应共享历史下标 old_split + (p - offset)
-        states[str(agent_id)] = {
+        entry = {
             "summary_msg": summary_msg,
             "split": old_split + split - offset,
             "ts": datetime.utcnow().isoformat(),
         }
+        # 追加为新卡片（旧卡片保留）；旧版单卡 dict 在此升级为列表
+        entries.append(entry)
+        states[str(agent_id)] = entries
         upsert("conversations", conv)
-        _logger.info("conv=%s agent=%s 智能体上下文压缩：%d 条历史 → 摘要（压缩前估算 %d token，窗口 %d，压缩线 %d）",
-                     conv.get("id"), agent_id, len(dropped), total, window, limit)
+        _logger.info("conv=%s agent=%s 智能体上下文压缩：%d 条历史 → 摘要（压缩前估算 %d token，窗口 %d，压缩线 %d，累计 %d 张卡片）",
+                     conv.get("id"), agent_id, len(dropped), total, window, limit, len(entries))
         return {"dropped": len(dropped), "tokens_before": total, "window": window,
-                "limit": limit, "agent_id": agent_id,
-                # 压缩状态回传：调用方（运行中 CX: 事件 / 手动压缩 API）据此同步前端 conv.agent_compactions，
-                # 使流式中的遮挡摘要卡片即时显示（无需等待 streaming 结束后 refreshConv 拉取落库 conv）
-                "split": states[str(agent_id)]["split"], "summary_msg": summary_msg}
+                "limit": limit, "agent_id": agent_id, "entry": entry, "entries": entries,
+                "split": entry["split"], "summary_msg": summary_msg}
     except Exception as e:  # 压缩任何异常都不阻断本轮对话
         _logger.warning("上下文压缩失败（忽略，继续用原历史）：%s", e)
         return None

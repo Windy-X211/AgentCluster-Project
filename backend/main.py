@@ -11,7 +11,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
 
 from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, ROOT
-from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions, market, memory
+from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions, market
 
 from datetime import datetime
 
@@ -317,7 +317,6 @@ ROUTES = [
     ("backgrounds", backgrounds.router),
     ("extensions", extensions.router),
     ("market", market.router),
-    ("memory", memory.router),
 ]
 for name, r in ROUTES:
     app.include_router(r, prefix=f"/api/{name}", tags=[name])

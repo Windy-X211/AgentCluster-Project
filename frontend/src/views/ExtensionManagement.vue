@@ -160,8 +160,8 @@ onMounted(refresh)
     <div class="info glass">
       <span class="info-ico">📖</span>
       <span class="info-text">
-        拓展代码保存在数据存储位置的 <code>extensions\</code> 目录下，开发规范见
-        <code>extensions\EXTENSION_SPEC.md</code>。
+        拓展代码保存在数据存储位置的 <code>extensions\</code> 目录下，开发规范统一见
+        项目 <code>doc/spec/extension-spec.md</code>。
       </span>
     </div>
 
