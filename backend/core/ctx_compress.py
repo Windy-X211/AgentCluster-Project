@@ -262,11 +262,13 @@ async def maybe_compress(conv: dict, agent: dict, interface: dict, model: str, s
         if len(rend) <= keep:
             return None  # 历史太短，没有可压缩的区间
         split = rend[-keep]
-        # 保留段起点向前对齐到最近的 user 消息（tool 配对完整性）
+        # 保留段起点向前对齐到 user/assistant 边界：避免保留段以 tool 开头（工具结果失去配对）。
+        # 单条 user 之后跟大量 assistant/tool 回合时，若只对齐到 user 会一路回退到 offset，
+        # 误判「无可压缩区间」；assistant 边界同样能保证 tool_calls 与 tool 结果不被拦腰截断。
         j = split
-        while j > 0 and view[j].get("role") != "user":
+        while j > offset and view[j].get("role") not in ("user", "assistant"):
             j -= 1
-        if view[j].get("role") == "user":
+        if j > offset and view[j].get("role") in ("user", "assistant"):
             split = j
         if split <= offset:
             return None  # 除旧摘要外已无可压缩的历史

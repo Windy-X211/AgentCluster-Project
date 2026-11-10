@@ -319,34 +319,47 @@ function _sanitizeToolName(name: string | undefined): string {
   s = s.replace(_COMMENTARY_TAIL_RE, '')
   s = s.replace(_TRAILING_JUNK_RE, '').trim().replace(/[:\-_]+$/g, '')
 
-  // —— 阶段 2：有 known names → 子串匹配兜底 ——
-  const known = new Set<string>()
+  // —— 阶段 2：有 known names → 规范化 + 子串匹配兜底 ——
+  // 后端 meta key 用点号（file.read / cmd.run），但 LLM function name 因 API 限制只能是
+  // 下划线（file_read / cmd_run）。这里把下划线/连字符变体映射回点号规范名，才能命中
+  // 中文 label（COMMAND_CN_LABELS）与特殊工具判断（skill.invoke / agent.spawn 等）。
+  const knownMap = new Map<string, string>()
   try {
     const st = useSettingsStore()
     for (const meta of [st.commandsMeta, st.pluginsMeta, st.skillsMeta]) {
-      if (meta) {
-        for (const k of Object.keys(meta)) known.add(k)
-        for (const k of Object.keys(meta)) {
-          if (k.includes('_')) known.add(k.replace(/_/g, '-'))
-          if (k.includes('-')) known.add(k.replace(/-/g, '_'))
-        }
+      if (!meta) continue
+      for (const k of Object.keys(meta)) {
+        knownMap.set(k, k)
+        knownMap.set(k.replace(/\./g, '_'), k)
+        knownMap.set(k.replace(/\./g, '-'), k)
+        knownMap.set(k.replace(/_/g, '-'), k)
+        knownMap.set(k.replace(/_/g, '.'), k)
       }
     }
   } catch { /* store 还没初始化 → 跳过阶段 2 */ }
 
-  if (known.size) {
-    if (known.has(s)) return s
-    for (const candidate of [...known].sort((a, b) => b.length - a.length)) {
-      if (candidate && s.includes(candidate)) return candidate
+  if (knownMap.size) {
+    if (knownMap.has(s)) return knownMap.get(s)!
+    // 子串兜底：按变体长度降序匹配（长变体优先，避免短名误吃长名片段）
+    for (const [variant, orig] of [...knownMap.entries()].sort((a, b) => b[0].length - a[0].length)) {
+      if (variant && s.includes(variant)) return orig
     }
   }
   return s || name
 }
 
-// 工具名 → 能力元数据（直接按清洗后的名字查；别名兼容已在 _sanitizeToolName 里处理）
+// 工具名 → 能力元数据（按清洗后的名字查；别名兼容已在 _sanitizeToolName 里处理。
+// 兜底再做下划线↔点号变体查询，防止个别场景仍拿到下划线形式）
 function _resolveToolMeta(name: string): any {
   const s = useSettingsStore()
-  return s.commandsMeta?.[name] || s.pluginsMeta?.[name] || s.skillsMeta?.[name]
+  const variants = [name]
+  if (name.includes('_')) variants.push(name.replace(/_/g, '.'))
+  if (name.includes('.')) variants.push(name.replace(/\./g, '_'))
+  for (const n of variants) {
+    const m = s.commandsMeta?.[n] || s.pluginsMeta?.[n] || s.skillsMeta?.[n]
+    if (m) return m
+  }
+  return undefined
 }
 /** 从原始（可能不完整的）JSON 字符串片段里正则提取 skill_name 值。 */
 const _RAW_SKILL_NAME_RE = /"skill_name"\s*:\s*"((?:[^"\\]|\\.)*)"?/

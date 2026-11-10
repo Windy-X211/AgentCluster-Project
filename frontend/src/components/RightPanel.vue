@@ -1502,17 +1502,17 @@ const visibleMsgs = computed(() => {
     (m.a2a_input === true || (typeof m.content === 'string' && m.content.startsWith('【A2A 协议消息】')))
   const fromOf = (m: any): number | null => m.from_agent_id ?? m.envelope?.from?.agent_id ?? null
   const toOf = (m: any): number | null => m.envelope?.to?.agent_id ?? null
-  // 当前智能体的压缩状态：有摘要时，被压缩的历史（原始下标 < split）不再逐条展示，
-  // 整段由独立摘要卡片替代；卡片插在保留消息（split 之后）之前，即"开始压缩处"的上方。
+  // 该智能体的压缩卡片列表（兼容旧版单卡 dict）：历史全部保留可见，每张卡片作为独立
+  // 边界标记插在它所覆盖区间的末尾（split = 该次压缩覆盖的共享历史终点下标）之后。
   const state = cur != null ? (conv.value as any)?.agent_compactions?.[String(cur)] : null
-  const sm = state?.summary_msg
+  const entries = state
+    ? (Array.isArray(state) ? state : [state]).filter((e: any) => e?.summary_msg)
+    : []
   // split 是后端落库 conv.messages 的原始下标；水合后 c.messages 数组下标与原始不一致
   // （tool 消息被提取为 tool_call/tool_result 配对、数组变长），用 _rawIdx（水合时打的
   // 原始落库下标）对齐 split；流式新消息未水合、无 _rawIdx → 回退数组下标（流式时两者一致）
-  const split = sm ? Math.max(0, Math.min(Number(state.split) || 0, all.length)) : -1
   const rawOf = (m: any, idx: number): number => (m?._rawIdx != null ? m._rawIdx : idx)
-  const keep = (m: any, idx: number): boolean => {
-    if (split >= 0 && rawOf(m, idx) < split) return false  // 已被该智能体压缩覆盖 → 整段隐藏，由摘要卡片代理
+  const keep = (m: any): boolean => {
     if (m.compressed_summary) return true
     if (cur == null) return !isA2aInput(m)
     if (m.role === 'user') return !isA2aInput(m) && (m.to_agent_id == null || m.to_agent_id === cur)
@@ -1524,11 +1524,22 @@ const visibleMsgs = computed(() => {
     return m.agent_id === cur
   }
   // 过滤时保留原始下标，供压缩摘要定位（split 是共享历史下标）
-  const pairs = all.map((m: any, idx: number) => [m, idx] as const).filter(([m, idx]) => keep(m, idx))
-  // 注入当前智能体的独立压缩摘要卡片：置于覆盖区间之后第一条保留消息之前。
-  // 卡片为独立元素（role=system + compressed_summary），renderItems 单独输出 ctx-summary
-  // 项，不会混入任何智能体的过程框 / 消息泡泡
-  if (sm) pairs.splice(0, 0, [sm, -1] as const)
+  const pairs = all.map((m: any, idx: number) => [m, idx] as const).filter(([m]) => keep(m))
+  // 为每张压缩卡片计算插入位置（split = 该次压缩覆盖的共享历史终点）；
+  // 从后往前插入，避免前面的插入偏移后面的位置。所有消息原样保留可见。
+  if (entries.length) {
+    const injections = entries.map((e: any) => {
+      const splitE = Math.max(0, Math.min(Number(e.split) || 0, all.length))
+      let pos = 0
+      for (let k = 0; k < pairs.length; k++) {
+        if (rawOf(pairs[k][0] as any, pairs[k][1] as number) < splitE) pos = k + 1
+      }
+      return { sm: e.summary_msg, pos }
+    })
+    for (let j = injections.length - 1; j >= 0; j--) {
+      pairs.splice(injections[j].pos, 0, [injections[j].sm, -1] as const)
+    }
+  }
   return pairs.map(([m]) => m)
 })
 
@@ -3169,7 +3180,7 @@ function onChatBoxClick(e: MouseEvent) {
   const t = e.target as HTMLElement | null
   if (!t) return
   // 如果点击了消息气泡本身、按钮、链接、输入框、textarea 等可交互元素，则不触发折叠
-  if (t.closest('.msg, button, a, input, textarea, select, label, .chat-attach, .chat-img-wrap, .viz-slot')) return
+  if (t.closest('.msg, button, a, input, textarea, select, label, .chat-attach, .chat-img-wrap, .viz-slot, .ctx-summary-card')) return
   convsCollapsed.value = !convsCollapsed.value
 }
 
@@ -3806,7 +3817,9 @@ onBeforeUnmount(() => {
                         <span v-if="isStreamingMsg(ch.msg)" class="think-cursor">▌</span>
                         <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
                       </div>
-                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full">
+                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full"
+                           @dblclick.stop="toggleThink(ch.idx)"
+                           title="双击收起思考过程">
                         <pre class="think-full-text">{{ stripContinueTag(ch.msg.reasoning) }}</pre>
                       </div>
 
@@ -3854,7 +3867,9 @@ onBeforeUnmount(() => {
                               </span>
                               <span class="tr-toggle">{{ toolDetailIsOpen(ch.idx, t.tool_call_id) ? '▾' : '▸' }}</span>
                             </div>
-                            <div v-if="toolDetailIsOpen(ch.idx, t.tool_call_id)" class="tr-detail">
+                            <div v-if="toolDetailIsOpen(ch.idx, t.tool_call_id)" class="tr-detail"
+                                 @dblclick.stop="toggleToolDetail(ch.idx, t.tool_call_id)"
+                                 title="双击收起工具详情">
                               <div class="tr-block">
                                 <div class="tr-block-title">参数</div>
                                 <!-- 虚拟 pill（参数流式中）：直接流式打印累计的原始 JSON 片段（打字机效果） -->
