@@ -305,6 +305,14 @@ DEFAULT_SETTINGS = {
     "context_compress_threshold": 0.8,   # 压缩线 = 模型上下文窗口 × 该比例
     "context_keep_recent": 20,           # 压缩时保留最近 N 条完整对话
     "context_window_default": 128000,    # 模型未在接口里配置窗口时的默认窗口（token）
+    # —— 权限设置（设置页「权限设置」面板，执行端见 core/permissions.py）——
+    # 操作权限模式：manual 手动确认（每次弹窗问用户） / auto 自动审核（默认，放行并记录）
+    #               / full 完全权限（不做任何检查）
+    "permission_mode": "auto",
+    # 工作范围：workspace 仅限工作区（默认） / custom 指定范围 / global 电脑全局
+    "work_scope_mode": "workspace",
+    # 指定范围的目录列表（work_scope_mode=custom 时生效；为空则回退「仅限工作区」）
+    "scope_paths": [],
 }
 
 

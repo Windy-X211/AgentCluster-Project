@@ -709,6 +709,19 @@ def _snapshot(path: str, op_name: str, snapshot_kind: str = "write") -> None:
         print(f"[backup] WARN snapshot failed for {path}: {_e}")
 
 
+def _scope_guard(path: str, op: str = "此操作") -> str | None:
+    """工作范围校验（settings.work_scope_mode）：返回 None = 放行，否则返回错误文案。
+
+    只拦「会改磁盘 / 起进程」的命令（file.write/delete/replace/patch、cmd.run），
+    只读命令不受限。权限模块自身异常时放行 —— 不能因为设置读挂了就写不了文件。
+    """
+    try:
+        from core.permissions import check_path
+        return check_path(path, op)
+    except Exception:
+        return None
+
+
 def run_command(command_name: str, **kwargs) -> Any:
     fn = globals().get(f"cmd_{command_name.replace('.','_')}")
     return fn(**kwargs) if fn else {"error": f"unknown command: {command_name}"}
@@ -1010,6 +1023,9 @@ def cmd_file_read(path: str, encoding: str = "utf-8", max_chars: int = 8000,
 def cmd_file_write(path: str, content: str, mode: str = "overwrite") -> dict:
     try:
         p = _resolve(path)
+        _err = _scope_guard(str(p), "写文件")
+        if _err:
+            return {"error": _err, "path": str(p)}
         # 快照（无论 overwrite 还是 append 都记录）
         _snapshot(str(p), "file.write")
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1025,6 +1041,9 @@ def cmd_file_write(path: str, content: str, mode: str = "overwrite") -> dict:
 def cmd_file_delete(path: str, recursive: bool = False) -> dict:
     try:
         p = _resolve(path)
+        _err = _scope_guard(str(p), "删除文件")
+        if _err:
+            return {"error": _err, "path": str(p)}
         # 快照（记录被删前状态）
         _snapshot(str(p), "file.delete", snapshot_kind="delete")
         if p.is_file(): p.unlink()
@@ -1039,6 +1058,9 @@ def cmd_file_delete(path: str, recursive: bool = False) -> dict:
 def cmd_file_replace(path: str, old: str, new: str, max_replacements: int = -1) -> dict:
     try:
         p = _resolve(path)
+        _err = _scope_guard(str(p), "修改文件")
+        if _err:
+            return {"error": _err, "path": str(p)}
         text = p.read_text(encoding="utf-8")
         count = text.count(old)
         if count == 0:
@@ -1070,6 +1092,9 @@ def cmd_file_patch(path: str, old: str, new: str, mode: str = "replace") -> dict
     """
     try:
         p = _resolve(path)
+        _err = _scope_guard(str(p), "修改文件")
+        if _err:
+            return {"error": _err, "path": str(p)}
         if not old:
             return {"error": "old（锚点）不能为空", "path": str(p)}
         if mode not in ("replace", "delete", "insert_after", "insert_before"):
@@ -1519,6 +1544,11 @@ def cmd_cmd_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = T
             cwd_eff = wd if wd else os.getcwd()
         else:
             cwd_eff = str(_resolve(cwd))
+
+        # 工作范围：命令的执行目录也必须落在允许范围内（scope只管「落盘/起进程」类操作）
+        _err = _scope_guard(cwd_eff, "运行命令")
+        if _err:
+            return {"error": _err, "command": command, "cwd": cwd_eff}
 
         # —— 判断是否需要后台启动 ——
         # 两类情况都要后台/立即返回：

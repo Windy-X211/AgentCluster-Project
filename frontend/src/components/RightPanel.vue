@@ -1502,17 +1502,8 @@ const visibleMsgs = computed(() => {
     (m.a2a_input === true || (typeof m.content === 'string' && m.content.startsWith('【A2A 协议消息】')))
   const fromOf = (m: any): number | null => m.from_agent_id ?? m.envelope?.from?.agent_id ?? null
   const toOf = (m: any): number | null => m.envelope?.to?.agent_id ?? null
-  // 该智能体的压缩卡片列表（兼容旧版单卡 dict）：历史全部保留可见，每张卡片作为独立
-  // 边界标记插在它所覆盖区间的末尾（split = 该次压缩覆盖的共享历史终点下标）之后。
-  const state = cur != null ? (conv.value as any)?.agent_compactions?.[String(cur)] : null
-  const entries = state
-    ? (Array.isArray(state) ? state : [state]).filter((e: any) => e?.summary_msg)
-    : []
-  // split 是后端落库 conv.messages 的原始下标；水合后 c.messages 数组下标与原始不一致
-  // （tool 消息被提取为 tool_call/tool_result 配对、数组变长），用 _rawIdx（水合时打的
-  // 原始落库下标）对齐 split；流式新消息未水合、无 _rawIdx → 回退数组下标（流式时两者一致）
-  const rawOf = (m: any, idx: number): number => (m?._rawIdx != null ? m._rawIdx : idx)
   const keep = (m: any): boolean => {
+    // 历史压缩摘要卡片：会话级，不受智能体视角过滤
     if (m.compressed_summary) return true
     if (cur == null) return !isA2aInput(m)
     if (m.role === 'user') return !isA2aInput(m) && (m.to_agent_id == null || m.to_agent_id === cur)
@@ -1525,19 +1516,16 @@ const visibleMsgs = computed(() => {
   }
   // 过滤时保留原始下标，供压缩摘要定位（split 是共享历史下标）
   const pairs = all.map((m: any, idx: number) => [m, idx] as const).filter(([m]) => keep(m))
-  // 为每张压缩卡片计算插入位置（split = 该次压缩覆盖的共享历史终点）；
-  // 从后往前插入，避免前面的插入偏移后面的位置。所有消息原样保留可见。
-  if (entries.length) {
-    const injections = entries.map((e: any) => {
-      const splitE = Math.max(0, Math.min(Number(e.split) || 0, all.length))
+  // 注入当前智能体的压缩摘要（agent_compactions[agent_id].summary_msg，覆盖 msgs[:split]）：
+  // 插在摘要覆盖区间最后一条可见消息（= 开始压缩前的最后一条消息泡泡）之后，沿用原摘要卡片样式
+  if (cur != null) {
+    const state = (conv.value as any)?.agent_compactions?.[String(cur)]
+    const sm = state?.summary_msg
+    if (sm) {
+      const split = Math.max(0, Math.min(Number(state.split) || 0, all.length))
       let pos = 0
-      for (let k = 0; k < pairs.length; k++) {
-        if (rawOf(pairs[k][0] as any, pairs[k][1] as number) < splitE) pos = k + 1
-      }
-      return { sm: e.summary_msg, pos }
-    })
-    for (let j = injections.length - 1; j >= 0; j--) {
-      pairs.splice(injections[j].pos, 0, [injections[j].sm, -1] as const)
+      for (let k = 0; k < pairs.length; k++) if (pairs[k][1] < split) pos = k + 1
+      pairs.splice(pos, 0, [sm, -1] as const)
     }
   }
   return pairs.map(([m]) => m)
@@ -1574,11 +1562,10 @@ const renderItems = computed(() => {
     const m = msgs[i] as any
     if (m.compressed_summary) { out.push({ type: 'ctx-summary', msg: m, idx: i }); i++; continue }
     if (m.role === 'user') { out.push({ type: 'user', msg: m, idx: i }); i++; continue }
-    // 一轮智能体输出：从 user 消息之后开始，直到下一条 user 消息或独立摘要卡片为止
-    // （卡片是独立元素，绝不能混入本过程框；遇到即断开当前段，交由外层单独渲染 ctx-summary）
+    // 一轮智能体输出：从 user 消息之后开始，直到下一条 user 消息为止
     const start = i
     const children: any[] = []
-    while (i < msgs.length && (msgs[i] as any).role !== 'user' && !(msgs[i] as any).compressed_summary) {
+    while (i < msgs.length && (msgs[i] as any).role !== 'user') {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result' || m2.role === 'tool') { i++; continue }
       if (m2.role === 'a2a') {
@@ -2252,36 +2239,6 @@ function shrinkToDataUrl(file: File, max = 256): Promise<string> {
 
 // —— 删除单条消息：截断到这条之前 ——
 const msgOpStatus = ref('')
-// —— 复制文本到剪贴板：优先 Clipboard API，失败时回退 textarea+execCommand ——
-// Electron 中 navigator.clipboard.writeText 常因失焦/权限受限而 reject，
-// 此时必须回退到 execCommand 才能真正写入剪贴板，而不是直接报失败。
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  if (navigator.clipboard && window.isSecureContext) {
-    try {
-      await navigator.clipboard.writeText(text)
-      return true
-    } catch {
-      // 落入下方 fallback
-    }
-  }
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.top = '0'
-    ta.style.left = '0'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.focus()
-    ta.select()
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
-    return ok
-  } catch {
-    return false
-  }
-}
-
 // —— 复制消息文本到剪贴板（用户/智能体消息通用） ——
 async function copyMessageFromCtx() {
   const menu = msgCtxMenu.value
@@ -2294,8 +2251,23 @@ async function copyMessageFromCtx() {
     setTimeout(() => { msgOpStatus.value = '' }, 2000)
     return
   }
-  const ok = await copyTextToClipboard(text)
-  msgOpStatus.value = ok ? '✅ 已复制到剪贴板' : '❌ 复制失败'
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    msgOpStatus.value = '✅ 已复制到剪贴板'
+  } catch {
+    msgOpStatus.value = '❌ 复制失败'
+  }
   setTimeout(() => { msgOpStatus.value = '' }, 2000)
 }
 async function deleteMessageFromCtx() {
@@ -2749,19 +2721,6 @@ async function onCtxBadgeClick() {
     if (res && res.compressed === false) {
       // force 下仍返回 false：没有可压缩区间（历史太短）或摘要生成失败
       alert('没有可压缩的历史区间（历史太短或摘要生成失败），本次未压缩。')
-    } else {
-      // 压缩成功。会话仍在流式时 refreshConv 会提前返回（conversation.ts 内
-      // streamingConvIds.has(cid) → 直接返回，不拉取后端最新 conv），
-      // 导致本地 conv.agent_compactions 保持旧值 → 压缩遮挡摘要卡片不显示。
-      // 压缩后端一定会把 agent_compactions 落库 → 直接 GET 最新 conv 轻量合并该字段，
-      // 触发 visibleMsgs 重新注入摘要卡片（不整包替换，避免打断流式渲染）。
-      try {
-        const fresh = await api.convs.get(cid)
-        if (fresh?.agent_compactions && convs.current === cid) {
-          const c = convs.currentData() as any
-          if (c) c.agent_compactions = fresh.agent_compactions
-        }
-      } catch { /* 后端短暂不可达 → 等流式结束后 refreshConv 载入 */ }
     }
     await convs.refreshConv(cid)
     await refreshCtx()
@@ -3171,17 +3130,9 @@ async function deleteSelected() {
   await convs.removeMany(selectedIds.value)
   exitSel()
 }
-function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx() }
+function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true }
 function onDocKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
-}
-// 点击对话区空白 → toggle 对话记录浮窗；点击消息气泡/按钮等有具体交互的元素则不触发
-function onChatBoxClick(e: MouseEvent) {
-  const t = e.target as HTMLElement | null
-  if (!t) return
-  // 如果点击了消息气泡本身、按钮、链接、输入框、textarea 等可交互元素，则不触发折叠
-  if (t.closest('.msg, button, a, input, textarea, select, label, .chat-attach, .chat-img-wrap, .viz-slot, .ctx-summary-card')) return
-  convsCollapsed.value = !convsCollapsed.value
+    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
 }
 
 /** 聊天消息内附件点击事件委托（冒泡到 document 处理，支持 v-html 渲染的附件卡片） */
@@ -3395,15 +3346,16 @@ onBeforeUnmount(() => {
   <div class="right-panel glass">
     <!-- 画布列表 -->
     <div class="canvases-pane">
-      <div class="section-title clickable" @click="canvasesCollapsed = !canvasesCollapsed" :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
+      <div class="section-title">
         <button class="collapse-btn" type="button"
+                @click.stop="canvasesCollapsed = !canvasesCollapsed"
                 :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
           {{ canvasesCollapsed ? '▸' : '▾' }}
         </button>
         <span>画布列表</span>
         <span class="conv-count">{{ canvases.list.length }}</span>
         <span class="flex-spacer"></span>
-        <button class="btn sm add-canvas-btn" @click.stop="canvases.create()" title="新建画布">+</button>
+        <button class="btn sm add-canvas-btn" @click="canvases.create()" title="新建画布">+</button>
       </div>
       <div class="cv-list" v-show="!canvasesCollapsed">
         <div v-for="c in canvases.list" :key="c.id"
@@ -3686,11 +3638,11 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </Teleport>
-      <!-- 对话滚动区包裹层：让状态提示可固定在对话区顶部中央，不随消息滚动、不产生布局位移 -->
-      <div class="chat-scroll-wrap">
-      <!-- 消息操作状态提示（复制/删除/撤销的即时反馈）：固定在对话区顶部中央 -->
-      <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
-      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll" @click="onChatBoxClick">
+      <!-- 消息操作状态提示（删除/撤销的即时反馈） -->
+      <Teleport to="body">
+        <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
+      </Teleport>
+      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll">
         <div v-if="!conv" class="no-conv">请新建对话</div>
         <!-- ============ 消息列表 ============
              tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
@@ -3817,9 +3769,7 @@ onBeforeUnmount(() => {
                         <span v-if="isStreamingMsg(ch.msg)" class="think-cursor">▌</span>
                         <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
                       </div>
-                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full"
-                           @dblclick.stop="toggleThink(ch.idx)"
-                           title="双击收起思考过程">
+                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full">
                         <pre class="think-full-text">{{ stripContinueTag(ch.msg.reasoning) }}</pre>
                       </div>
 
@@ -3867,9 +3817,7 @@ onBeforeUnmount(() => {
                               </span>
                               <span class="tr-toggle">{{ toolDetailIsOpen(ch.idx, t.tool_call_id) ? '▾' : '▸' }}</span>
                             </div>
-                            <div v-if="toolDetailIsOpen(ch.idx, t.tool_call_id)" class="tr-detail"
-                                 @dblclick.stop="toggleToolDetail(ch.idx, t.tool_call_id)"
-                                 title="双击收起工具详情">
+                            <div v-if="toolDetailIsOpen(ch.idx, t.tool_call_id)" class="tr-detail">
                               <div class="tr-block">
                                 <div class="tr-block-title">参数</div>
                                 <!-- 虚拟 pill（参数流式中）：直接流式打印累计的原始 JSON 片段（打字机效果） -->
@@ -3926,7 +3874,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </template>
-      </div>
       </div>
 
       <!-- 图片浮窗：8 方向边界改大小，滚轮只缩放图片不动窗口 -->
@@ -4177,8 +4124,6 @@ onBeforeUnmount(() => {
 .canvases-pane { padding: 4px 0; flex-shrink: 0; }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
-.section-title.clickable { cursor: pointer; border-radius: 6px; transition: background .15s; }
-.section-title.clickable:hover { background: rgba(var(--surface-rgb), 0.06); }
 .section-title .add-canvas-btn { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: calc(16px * var(--font-scale)); font-weight: 500; line-height: 1; color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.10); border: 1px solid rgba(var(--accent-rgb), 0.26); border-radius: 7px; cursor: pointer; transition: background .2s ease, border-color .2s ease, color .2s ease; }
 .section-title .add-canvas-btn:hover { background: rgba(var(--accent-rgb), 0.20); border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent-light); }
 .section-title .add-canvas-btn:active { background: rgba(var(--accent-rgb), 0.28); }
@@ -4287,7 +4232,6 @@ onBeforeUnmount(() => {
 .conv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
 
-.chat-scroll-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .chat-box { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
 .no-conv { text-align: center; opacity: .7; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
@@ -4420,10 +4364,6 @@ onBeforeUnmount(() => {
 .process-body::-webkit-scrollbar { width: 5px; }
 .process-body::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.28); border-radius: 999px; }
 .process-body::-webkit-scrollbar-track { background: transparent; }
-/* 关键修复：防止 flex 子项在父容器 max-height 限制下被 flex-shrink:1 压扁，
-   导致 bubble/think-stream/tool-row 高度收缩为零并互相遮挡。
-   flex-shrink:0 让子元素保持自然高度，超出部分由 overflow-y:auto 滚动显示。 */
-.process-body > * { flex-shrink: 0; }
 
 .col-wrap { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
 .head-row { display: flex; align-items: center; gap: 6px; }
@@ -5036,8 +4976,6 @@ onBeforeUnmount(() => {
    事件条目按类型着色（轮次灰 / 调用蓝 / 完成 绿红 / 提示黄） */
 .sub-proc-block { padding: 4px 7px; }
 .sub-proc { display: flex; flex-direction: column; gap: 2px; padding: 3px 5px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.12); border: 1px solid rgba(var(--surface-rgb), 0.06); font-size: calc(10px * var(--font-scale)); max-height: 220px; overflow-y: auto; }
-/* 同 .process-body：防止 max-height + flex-shrink:1 把事件条目压缩 */
-.sub-proc > * { flex-shrink: 0; }
 .sp-item { display: flex; align-items: baseline; gap: 5px; line-height: 1.5; min-width: 0; flex-wrap: wrap; }
 .sp-round { color: rgba(var(--text-rgb), 0.62); font-size: calc(9px * var(--font-scale)); }
 .sp-txt { color: rgba(var(--text-rgb), 0.85); }
@@ -5107,10 +5045,6 @@ onBeforeUnmount(() => {
 </style>
 
 <style>
-/* —— 滚动容器内 flex 子项禁止压缩（防止 max-height 限制下 flex-shrink:1 把气泡/思考行压扁）—— */
-.process-body > * { flex-shrink: 0; }
-.sub-proc > * { flex-shrink: 0; }
-
 /* —— 泡泡内 Markdown（v-html 注入的元素无法被 scoped 命中，必须用全局样式）—— */
 .bubble.markdown { white-space: normal; word-break: break-word; overflow-wrap: anywhere; line-height: 1.6; }
 .bubble.markdown > :first-child { margin-top: 0 !important; }
@@ -5286,11 +5220,10 @@ onBeforeUnmount(() => {
 
 /* 消息操作状态提示（右上角浮动） */
 .msg-op-status {
-  position: absolute;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 20;
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 2000;
   padding: 8px 14px;
   border-radius: 8px;
   background: rgba(var(--node-bg-rgb), 0.95);
@@ -5301,9 +5234,8 @@ onBeforeUnmount(() => {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   animation: toastFadeIn .2s ease-out;
-  pointer-events: none;
 }
-@keyframes toastFadeIn { from { opacity: 0; transform: translate(-50%, -4px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes toastFadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
 
 /* —— 文件操作历史还原对话框 —— */
 .modal-backdrop {

@@ -315,6 +315,13 @@ export const api = {
     setCombos: (combos: Record<string, ComboRecord>) =>
       req('/settings/combos', { method: 'PUT', body: JSON.stringify(combos) })
   },
+  permissions: {
+    /** 当前挂起的「手动确认」请求（断线重连 / 刷新后补拉弹窗） */
+    pending: () => req<any[]>('/permissions/pending'),
+    /** 对危险操作点允许 / 拒绝（后端阻塞的工具执行据此继续或中止） */
+    confirm: (requestId: string, approve: boolean) =>
+      req<any>('/permissions/confirm', { method: 'POST', body: JSON.stringify({ request_id: requestId, approve }) })
+  },
   backgrounds: {
     list: () => req<any[]>('/backgrounds'),
     rawUrl: (id: string, file: string, v?: number) =>

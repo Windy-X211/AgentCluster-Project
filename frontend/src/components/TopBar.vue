@@ -40,7 +40,7 @@ async function close() { try { await windowAPI.close() } catch {} }
   <div class="topbar-content">
     <!-- 拖动区 1：品牌+图标 -->
     <div class="brand pywebview-drag-region">
-      <img class="logo" src="/icon.jpg" alt="AgentCluster" />
+      <img class="logo" src="/icon.png" alt="AgentCluster" />
       <div>
         <div class="title">智能体集群</div>
         <div class="subtitle">AgentCluster</div>

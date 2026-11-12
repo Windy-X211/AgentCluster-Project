@@ -3,6 +3,7 @@ import { api } from '@/api'
 import { useCanvasStore } from './canvas'
 import { useAgentStore } from './agent'
 import { useSettingsStore } from './settings'
+import { usePermissionStore } from './permission'
 import { playSuccess, playError } from '@/utils/sound'
 import { API_BASE } from '@/utils/env'
 
@@ -319,47 +320,34 @@ function _sanitizeToolName(name: string | undefined): string {
   s = s.replace(_COMMENTARY_TAIL_RE, '')
   s = s.replace(_TRAILING_JUNK_RE, '').trim().replace(/[:\-_]+$/g, '')
 
-  // —— 阶段 2：有 known names → 规范化 + 子串匹配兜底 ——
-  // 后端 meta key 用点号（file.read / cmd.run），但 LLM function name 因 API 限制只能是
-  // 下划线（file_read / cmd_run）。这里把下划线/连字符变体映射回点号规范名，才能命中
-  // 中文 label（COMMAND_CN_LABELS）与特殊工具判断（skill.invoke / agent.spawn 等）。
-  const knownMap = new Map<string, string>()
+  // —— 阶段 2：有 known names → 子串匹配兜底 ——
+  const known = new Set<string>()
   try {
     const st = useSettingsStore()
     for (const meta of [st.commandsMeta, st.pluginsMeta, st.skillsMeta]) {
-      if (!meta) continue
-      for (const k of Object.keys(meta)) {
-        knownMap.set(k, k)
-        knownMap.set(k.replace(/\./g, '_'), k)
-        knownMap.set(k.replace(/\./g, '-'), k)
-        knownMap.set(k.replace(/_/g, '-'), k)
-        knownMap.set(k.replace(/_/g, '.'), k)
+      if (meta) {
+        for (const k of Object.keys(meta)) known.add(k)
+        for (const k of Object.keys(meta)) {
+          if (k.includes('_')) known.add(k.replace(/_/g, '-'))
+          if (k.includes('-')) known.add(k.replace(/-/g, '_'))
+        }
       }
     }
   } catch { /* store 还没初始化 → 跳过阶段 2 */ }
 
-  if (knownMap.size) {
-    if (knownMap.has(s)) return knownMap.get(s)!
-    // 子串兜底：按变体长度降序匹配（长变体优先，避免短名误吃长名片段）
-    for (const [variant, orig] of [...knownMap.entries()].sort((a, b) => b[0].length - a[0].length)) {
-      if (variant && s.includes(variant)) return orig
+  if (known.size) {
+    if (known.has(s)) return s
+    for (const candidate of [...known].sort((a, b) => b.length - a.length)) {
+      if (candidate && s.includes(candidate)) return candidate
     }
   }
   return s || name
 }
 
-// 工具名 → 能力元数据（按清洗后的名字查；别名兼容已在 _sanitizeToolName 里处理。
-// 兜底再做下划线↔点号变体查询，防止个别场景仍拿到下划线形式）
+// 工具名 → 能力元数据（直接按清洗后的名字查；别名兼容已在 _sanitizeToolName 里处理）
 function _resolveToolMeta(name: string): any {
   const s = useSettingsStore()
-  const variants = [name]
-  if (name.includes('_')) variants.push(name.replace(/_/g, '.'))
-  if (name.includes('.')) variants.push(name.replace(/\./g, '_'))
-  for (const n of variants) {
-    const m = s.commandsMeta?.[n] || s.pluginsMeta?.[n] || s.skillsMeta?.[n]
-    if (m) return m
-  }
-  return undefined
+  return s.commandsMeta?.[name] || s.pluginsMeta?.[name] || s.skillsMeta?.[name]
 }
 /** 从原始（可能不完整的）JSON 字符串片段里正则提取 skill_name 值。 */
 const _RAW_SKILL_NAME_RE = /"skill_name"\s*:\s*"((?:[^"\\]|\\.)*)"?/
@@ -567,16 +555,12 @@ function _stampRaw(m: any, rawIdx: number): any {
 /** 段内合成一对 tool_call/tool_result 并推入 out（agent_id 归属所属 assistant） */
 function _pushSynthPair(out: any[], tcId: string, name: string, args: any, result: any,
   images: any[] | null, agentId: number | undefined, ts: string | undefined,
-  subProcess?: any[] | null, rawIdx?: number) {
+  subProcess?: any[] | null) {
   const tcMsg: any = { role: 'tool_call', content: '', name, tool_call_id: tcId, args: args || {}, ts, agent_id: agentId ?? undefined }
-  // 继承父 assistant 的原始落库下标：供压缩摘要按 split 隐藏时把同段合成配对一起隐藏
-  // （合成配对无独立落库行；右键菜单/撤销只作用于 assistant/user 消息，不会误用此下标）
-  if (rawIdx != null) tcMsg._rawIdx = rawIdx
   // agent.spawn 的子智能体运行事件（后端落库在 tool 消息 sub_process 字段）→ 挂回合成 tool_call
   if (Array.isArray(subProcess) && subProcess.length) tcMsg.sub_process = subProcess
   out.push(tcMsg)
   const rMsg: any = { role: 'tool_result', content: '', tool_call_id: tcId, result: result ?? {}, ts, agent_id: agentId ?? undefined }
-  if (rawIdx != null) rMsg._rawIdx = rawIdx
   if (Array.isArray(images) && images.length) rMsg.image_refs = images
   out.push(rMsg)
 }
@@ -614,7 +598,7 @@ export function hydrateHistoryMsgs(raw: any[]): any[] {
           _pushSynthPair(out,
             t?.m?.tool_call_id || `hist-${k}-${nextTool}`,
             h?.name || '?', h?.args || {}, h?.result ?? {},
-            t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null, k)
+            t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null)
         }
       } else if (!hasFinal && Array.isArray(m.tool_calls) && m.tool_calls.length) {
         // 无最终回复的段（运行中断）：按中间轮 OpenAI tool_calls 精确 id 配对
@@ -629,7 +613,7 @@ export function hydrateHistoryMsgs(raw: any[]): any[] {
           let result: any = {}
           const rc = t?.m?.content
           if (rc != null) { try { result = JSON.parse(rc) } catch { result = { _raw: rc } } }
-          _pushSynthPair(out, tcId, tc?.function?.name || '?', args, result, t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null, k)
+          _pushSynthPair(out, tcId, tc?.function?.name || '?', args, result, t?.m?.images || null, m.agent_id, m.ts, t?.m?.sub_process || null)
         }
       }
     }
@@ -1788,6 +1772,12 @@ export const useConvStore = defineStore('conv', {
             msgs.push({ role: 'assistant', content: '', streaming: true, ts: new Date().toISOString(), startedAt: Date.now(), agent_id: curAgent ?? undefined })
           }
         }
+      } else if (line.startsWith('P:')) {
+        // 危险操作手动确认（设置 → 权限设置 → 操作权限 = 手动确认）：P:{json 请求}
+        // 后端在派发工具前阻塞等本弹窗，点允许/拒绝后经 POST /api/permissions/confirm 唤醒
+        let preq: any = null
+        try { preq = JSON.parse(line.slice(2)) } catch { preq = null }
+        if (preq && typeof preq === 'object' && preq.id) usePermissionStore().push(preq)
       } else if (line.startsWith('SUB:')) {
         // 子智能体运行事件（agent.spawn 工具执行中实时发来）：tcId|{json ev}
         // 按工具调用归属：把事件追加到对应 tool_call 消息的 sub_process 数组，
@@ -1798,6 +1788,8 @@ export const useConvStore = defineStore('conv', {
         let ev: any = null
         try { ev = JSON.parse(evJson) } catch { ev = null }
         if (ev && typeof ev === 'object') {
+          // 子智能体内部的危险操作 → 同样弹全局确认窗（permission 事件）
+          if (ev.t === 'permission' && ev.id) usePermissionStore().push(ev)
           const tc = msgs.find((m: RichMsg) => m.role === 'tool_call' && m.tool_call_id === tcId)
           if (tc) {
             if (!Array.isArray(tc.sub_process)) tc.sub_process = []
@@ -1917,23 +1909,6 @@ export const useConvStore = defineStore('conv', {
           agent_id: env?.to?.agent_id ?? curAgent ?? undefined,   // 主 agent_id 存接收方，给接收方节点显示
           from_agent_id: env?.from?.agent_id ?? undefined,       // 发送方，给源节点也显示"我发的"
         } as any)
-      } else if (line.startsWith('CX:')) {
-        // 运行中上下文压缩事件（后端在把较早历史压成摘要后实时发出）：
-        // 携带 {agent_id, summary_msg, split}，前端即时补写 conv.agent_compactions，
-        // 让流式中的历史压缩遮挡摘要卡片立即显示（streaming 期间 refreshConv 提前返回、
-        // 不会拉取后端最新 conv，若不在此补写卡片要等流式结束后才会出现）
-        let st: any = null
-        try { st = JSON.parse(line.slice(3)) } catch { st = null }
-        const stAid = st?.agent_id
-        const entry = st?.entry
-        // entry = {summary_msg, split, ts}：把新卡片追加进该智能体的卡片列表（旧卡片保留）
-        if (stAid != null && entry?.summary_msg && Number.isFinite(Number(entry?.split))) {
-          if (!c.agent_compactions) c.agent_compactions = {}
-          const list = c.agent_compactions[String(stAid)]
-          if (Array.isArray(list)) list.push(entry)
-          else if (list) c.agent_compactions[String(stAid)] = [list, entry]  // 旧版单卡 → 升级为列表
-          else c.agent_compactions[String(stAid)] = [entry]
-        }
       }
       c.messages = msgs
     }

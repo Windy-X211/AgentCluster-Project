@@ -2,14 +2,14 @@
 
 功能拓展（Extension）与「能力管理」里的后端工具插件（AppData/plugins/）不同：
 拓展面向**前端/界面层**，用于扩展本程序的界面样式与交互形态（如可视化交互、
-精灵悬浮球、临时对话等）。所有拓展资源**从市场下载**到用户数据目录的
-``extensions/`` 下，项目源码仓库不再自带任何拓展实现（见 .gitignore）。
+屏幕答疑、打电话、屏幕共享等）。拓展代码保存在 ``AppData/extensions/`` 下。
 
 目录结构：
-  <数据根>/extensions/
-    EXTENSION_SPEC.md            ← 代码规范文档（随仓库首发，规范统一在项目 doc/spec/extension-spec.md）
-    extensions_market.json       ← 旧版市场清单（已废弃，保留兼容兜底）
+  AppData/extensions/
+    EXTENSION_SPEC.md            ← 代码规范文档（随仓库首发）
+    extensions_market.json       ← 内置市场清单（可安装的拓展元数据）
     installed.json               ← 已安装拓展状态（运行时维护）
+    _builtin/<ext_id>/           ← 随仓库分发的内置拓展源（安装时拷贝到正式目录）
     <ext_id>/                    ← 每个已安装拓展一个目录
       manifest.json              ← 拓展元数据
       renderer.js                ← 前端渲染器（viz-renderer 类拓展）
@@ -19,7 +19,7 @@
 接口契约：
 - ``GET  /api/extensions``                 → 市场清单 + 已安装状态合并视图
 - ``GET  /api/extensions/active``          → 已启用拓展清单（含 renderer 代码文本）
-- ``POST /api/extensions/install``         → 从市场清单安装指定拓展（走统一 market.install 流程）
+- ``POST /api/extensions/install``         → 从市场清单安装指定拓展（拷贝到 installed 目录）
 - ``POST /api/extensions/{ext_id}/enable`` → 启用
 - ``POST /api/extensions/{ext_id}/disable``→ 停用
 - ``DELETE /api/extensions/{ext_id}``      → 卸载
@@ -38,15 +38,17 @@ import core.store as _store
 
 router = APIRouter()
 
-# —— 存储根（用户数据目录）——
+# —— 存储根 ——
 EXT_ROOT = _store.ROOT / "extensions"
 INSTALLED_FILE = EXT_ROOT / "installed.json"
 
-# 市场资源目录：独立 git 仓库工作副本（不在项目源码仓库里）
+# 市场资源仓库（项目内、随程序分发）：拓展源与统一索引都在这里
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-MARKET_ROOT = _PROJECT_ROOT.parent / "market"
+MARKET_ROOT = _PROJECT_ROOT / "market"
 MARKET_FILE = MARKET_ROOT / "index.json"
-_MARKET_EXT_SRC = MARKET_ROOT / "extensions"
+
+# 市场清单中 source == "builtin" 的拓展，从该目录拷贝安装
+_BUILTIN_SRC = MARKET_ROOT / "extensions"
 
 # renderer.js 等前端文件大小上限（防读巨型文件打满内存）
 _MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -88,7 +90,7 @@ def _load_market() -> list[dict]:
                     if k not in ("kind", "dir", "updated_at")}
             # index 用 ext_type 存 manifest.type，转回市场清单的 type 字段
             meta["type"] = it.get("ext_type") or it.get("type") or "hybrid"
-            meta.setdefault("source", "market")   # 统一从市场下载
+            meta.setdefault("source", "builtin")
             out.append(meta)
         return out
     # —— 旧版清单兜底 ——
@@ -143,36 +145,11 @@ def list_extensions():
     _ensure_dirs()
     market = _load_market()
     installed = _load_installed()
-    market_ids = {item.get("id") for item in market}
     for item in market:
         eid = item.get("id", "")
         st = installed.get(eid)
         item["installed"] = bool(st)
         item["enabled"] = bool(st and st.get("enabled"))
-    # 把"已安装但不在市场清单里"的拓展（本地手动安装）也塞进 market 数组，
-    # 让前端 ExtensionManagement.vue 能渲染。有 manifest 才展示，避免漏兜 installed.json 条目。
-    for eid, st in installed.items():
-        if eid in market_ids:
-            continue
-        mf = _read_manifest(eid)
-        if not mf:
-            continue
-        market.append({
-            "id": eid,
-            "name": mf.get("name") or eid,
-            "version": mf.get("version") or st.get("version", "0.0.0"),
-            "type": mf.get("type") or "hybrid",
-            "author": mf.get("author"),
-            "description": mf.get("description", ""),
-            "icon": mf.get("icon"),
-            "tags": mf.get("tags") or [],
-            "frontend_files": mf.get("frontend_files") or [],
-            "viz_types": mf.get("viz_types") or [],
-            "config_page": mf.get("config_page"),
-            "source": "local",
-            "installed": True,
-            "enabled": bool(st.get("enabled")),
-        })
     installed_view: dict[str, dict] = {}
     for eid, st in installed.items():
         mf = _read_manifest(eid)
@@ -208,11 +185,7 @@ def list_active():
 
 @router.post("/install")
 def install_extension(payload: dict):
-    """从市场清单安装指定拓展。入参 ``{id: str}``。
-
-    实际拷贝源是市场目录（独立 git 仓库工作副本），调用前用户应已通过
-    市场管理完成同步（或首次使用前自动初始化）。
-    """
+    """从市场清单安装指定拓展。入参 ``{id: str}``。"""
     _ensure_dirs()
     ext_id = _safe_ext_id(payload.get("id", ""))
     market = _load_market()
@@ -221,23 +194,26 @@ def install_extension(payload: dict):
         raise HTTPException(404, f"市场清单中未找到拓展：{ext_id}")
 
     dest = _ext_dir(ext_id)
-    # 统一从市场目录拷贝（市场目录 = 独立 git 仓库工作副本，不在项目源码里）
-    src = _MARKET_EXT_SRC / ext_id
-    if not src.exists():
-        raise HTTPException(
-            500,
-            f"市场中未找到拓展源码：{src}，请先打开「市场管理」→「同步市场」下载最新资源。"
-        )
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    shutil.copytree(src, dest)
+    source = meta.get("source", "builtin")
+    if source == "builtin":
+        src = _BUILTIN_SRC / ext_id
+        if not src.exists():
+            raise HTTPException(500, f"内置拓展源不存在：{src}")
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(src, dest)
+    elif source == "local":
+        if not dest.exists():
+            raise HTTPException(400, f"本地拓展目录不存在：{dest}，请先手动放入")
+    else:
+        raise HTTPException(400, f"不支持的安装来源：{source}")
 
     installed = _load_installed()
     installed[ext_id] = {
         "enabled": True,
         "installed_at": datetime.utcnow().isoformat(),
         "version": meta.get("version", "0.0.0"),
-        "source": "market",
+        "source": source,
     }
     _save_installed(installed)
     return {"ok": True, "id": ext_id, "manifest": _read_manifest(ext_id)}
@@ -304,6 +280,42 @@ def read_extension_file(ext_id: str, path: str = Query(...)):
         except Exception as e:
             raise HTTPException(400, f"编码无法识别：{e}")
     return {"ok": True, "id": ext_id, "path": path, "content": content}
+
+def auto_install_first_time() -> None:
+    """首次启动（installed.json 不存在时）自动安装并启用所有 source=builtin 且
+    非 preview 的拓展，让用户开箱即用核心功能（如 visual_interaction）。
+    用户仍可在管理页卸载后重装体验完整流程。
+    """
+    _ensure_dirs()
+    if INSTALLED_FILE.exists():
+        return
+    market = _load_market()
+    installed: dict[str, dict] = {}
+    for meta in market:
+        if meta.get("source") != "builtin" or meta.get("status") == "preview":
+            continue
+        ext_id = meta.get("id", "")
+        if not ext_id:
+            continue
+        try:
+            src = _BUILTIN_SRC / ext_id
+            dest = _ext_dir(ext_id)
+            if not src.exists():
+                continue
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(src, dest)
+            installed[ext_id] = {
+                "enabled": True,
+                "installed_at": datetime.utcnow().isoformat(),
+                "version": meta.get("version", "0.0.0"),
+                "source": "builtin",
+            }
+            print(f"[extensions] 首次启动自动安装：{ext_id}")
+        except Exception as e:
+            print(f"[extensions] 自动安装 {ext_id} 失败：{e}")
+    if installed:
+        _save_installed(installed)
 
 # —— 拓展 system prompt 注入（通用机制）——
 # manifest 声明 system_prompt_file 的已启用拓展，其文件内容会被自动追加到
@@ -420,24 +432,6 @@ async def mount_extension_backends(app: Any) -> int:
             if router is None:
                 print(f"[extensions] 拓展 {eid} 的 {stem}.py 未定义 router，跳过后端挂载")
                 continue
-            # 统一注入 /config 路由：manifest 声明 config_page 的拓展自动返回该 HTML 页面。
-            # 拓展自己的 backend.py 若已定义 /config 则先注册、优先匹配，此处不覆盖。
-            config_page = mf.get("config_page")
-            if config_page and "/" not in config_page and not config_page.startswith("."):
-                _cfg_fp = _ext_dir(eid) / config_page
-                if _cfg_fp.exists() and _cfg_fp.stat().st_size <= _MAX_FILE_BYTES:
-                    def _make_cfg(fp):
-                        from fastapi.responses import HTMLResponse
-                        def _config():
-                            try:
-                                return HTMLResponse(fp.read_text(encoding="utf-8"))
-                            except UnicodeDecodeError:
-                                try:
-                                    return HTMLResponse(fp.read_text(encoding="gbk"))
-                                except Exception:
-                                    return HTMLResponse("", status_code=500)
-                        return _config
-                    router.add_api_route("/config", _make_cfg(_cfg_fp), methods=["GET"])
             app.include_router(router, prefix=f"/api/ext/{eid}", tags=[f"ext-{eid}"])
             _EXT_BACKEND_MODULES[eid] = mod
             mounted += 1

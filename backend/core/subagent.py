@@ -291,15 +291,32 @@ async def _run_async(name: str, role: str, task: str, allowed_commands: list,
                     _emit({"t": "call", "name": cmd,
                            "args_preview": json.dumps(args, ensure_ascii=False)[:_CALL_ARGS_PREVIEW_MAX]})
                     args = _sanitize_tool_arguments(cmd, args)
-                    if cmd in allowed_cmd_set:
-                        result = run_command(cmd, **(args or {}))
-                    else:
-                        # 插件执行：注入能力参数预设的固定参数（模型不可见、不可改，固定值优先覆盖）
-                        from core.param_presets import get_fixed_values
-                        fixed = get_fixed_values("plugin", cmd)
-                        if fixed:
-                            args = {**(args or {}), **fixed}
-                        result = run_plugin(cmd, **(args or {}))
+                    # —— 权限闸门（手动确认模式）：子智能体的危险操作同样要问用户 ——
+                    # 请求经事件队列发 permission 事件 → 主循环 SUB: 行 → 前端确认弹窗，
+                    # 用户点允许/拒绝后由 POST /api/permissions/confirm 唤醒本线程。
+                    from core import permissions
+                    _conv_id = None
+                    _sctx = SUBAGENT_CTX.get()
+                    if isinstance(_sctx, dict):
+                        _conv_id = _sctx.get("conv_id")
+                    _req = permissions.begin_request(cmd, args, conv_id=_conv_id)
+                    _denied = False
+                    if _req is not None:
+                        _emit({"t": "permission", **_req})
+                        if not permissions.wait_sync(_req["id"]):
+                            _denied = True
+                            result = {"error": f"用户拒绝执行：{cmd}（手动确认模式，"
+                                               f"本次调用未获授权，请先征得用户同意）"}
+                    if not _denied:
+                        if cmd in allowed_cmd_set:
+                            result = run_command(cmd, **(args or {}))
+                        else:
+                            # 插件执行：注入能力参数预设的固定参数（模型不可见、不可改，固定值优先覆盖）
+                            from core.param_presets import get_fixed_values
+                            fixed = get_fixed_values("plugin", cmd)
+                            if fixed:
+                                args = {**(args or {}), **fixed}
+                            result = run_plugin(cmd, **(args or {}))
                 except Exception as e:
                     result = {"error": f"工具 {cmd} 执行失败：{e}"}
                 _emit({"t": "done", "name": cmd,

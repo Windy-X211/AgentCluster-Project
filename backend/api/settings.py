@@ -15,9 +15,34 @@ def get_settings():
 @router.put("")
 def update_settings(data: dict):
     cur = load("settings")
+    _validate(data)
     cur.update(data)
     save("settings", cur)
+    # 权限设置改了要立刻生效（否则最多延迟 2s 缓存）
+    if any(k in data for k in ("permission_mode", "work_scope_mode", "scope_paths")):
+        try:
+            from core import permissions
+            permissions.invalidate_cache()
+        except Exception:
+            pass
     return cur
+
+
+def _validate(data: dict) -> None:
+    """校验权限设置的取值（其它键保持原有的「来什么存什么」宽松行为）。"""
+    if "permission_mode" in data:
+        from core.permissions import VALID_PERMISSION_MODES
+        if data["permission_mode"] not in VALID_PERMISSION_MODES:
+            raise HTTPException(400, f"permission_mode 必须是 {VALID_PERMISSION_MODES} 之一")
+    if "work_scope_mode" in data:
+        from core.permissions import VALID_SCOPE_MODES
+        if data["work_scope_mode"] not in VALID_SCOPE_MODES:
+            raise HTTPException(400, f"work_scope_mode 必须是 {VALID_SCOPE_MODES} 之一")
+    if "scope_paths" in data:
+        paths = data["scope_paths"]
+        if not isinstance(paths, list):
+            raise HTTPException(400, "scope_paths 必须是路径数组")
+        data["scope_paths"] = [str(p).strip() for p in paths if str(p or "").strip()]
 
 
 @router.get("/default_workdir")

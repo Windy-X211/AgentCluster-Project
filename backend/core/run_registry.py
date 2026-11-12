@@ -245,6 +245,12 @@ def stop(conv_id: int, agent_id: int | None = None) -> bool:
       不占独立 _RUNS 键）→ 取消对应 child task，B 的事件流补 STOP 行。
     - **全停（agent_id=None）**：先取消所有 child_tasks 再取消父 task，整条链终止。
     """
+    # 挂起的手动确认请求一并按「拒绝」收场（点停止后不该还有弹窗在等超时）
+    try:
+        from core import permissions
+        permissions.cancel_conversation(conv_id)
+    except Exception:
+        pass
     stopped = False
     for s in _find(conv_id):
         if agent_id is None:

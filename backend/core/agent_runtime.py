@@ -753,53 +753,9 @@ def _cancel_pending_child_tasks(turn: dict | None) -> None:
             t.cancel()
 
 
-def _agent_expanded_caps(agent: dict) -> tuple[list, list, list | None]:
-    """把 agent 配置的「组合技（combos）」展开合并进命令/技能/插件能力列表。
-
-    返回 (commands, plugins, skills)：
-      - commands/plugins 直接合并 combo 成员
-      - skills 保持原有语义：None=全部技能（旧数据兼容），[]=不注入，
-        列表=合并 combo 里的技能；有 combo 技能时自动并入
-    """
-    commands = list(agent.get("commands") or [])
-    plugins = list(agent.get("plugins") or [])
-    skills = agent.get("skills")
-    combos = agent.get("combos") or []
-    if not combos:
-        return commands, plugins, skills
-
-    try:
-        combo_map = store.load_combos()
-    except Exception:
-        return commands, plugins, skills
-
-    combo_commands: list[str] = []
-    combo_plugins: list[str] = []
-    combo_skills: list[str] = []
-    for name in combos:
-        rec = (combo_map or {}).get(name) or {}
-        for m in rec.get("members") or []:
-            t, key = m.get("type"), m.get("key")
-            if not key:
-                continue
-            if t == "commands" and key not in commands and key not in combo_commands:
-                combo_commands.append(key)
-            elif t == "plugins" and key not in plugins and key not in combo_plugins:
-                combo_plugins.append(key)
-            elif t == "skills" and key not in combo_skills and (skills is None or key not in skills):
-                combo_skills.append(key)
-    commands.extend(combo_commands)
-    plugins.extend(combo_plugins)
-    if skills is not None and combo_skills:
-        # 技能索引合并：None=全部技能（combo 技能自然包含）；显式列表（含空）则并入 combo 技能
-        skills = list(skills) + combo_skills
-    return commands, plugins, skills
-
-
 def _agent_tools(agent: dict) -> list:
-    commands, plugins, skills = _agent_expanded_caps(agent)
-    return filter_tools(commands, plugins, PLUGIN_REGISTRY,
-                        skills, agent=agent)
+    return filter_tools(agent.get("commands", []), agent.get("plugins", []), PLUGIN_REGISTRY,
+                        agent.get("skills"), agent=agent)
 
 
 def _tool_capability_brief(tools: list) -> str:
@@ -915,9 +871,7 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         # 范围：agent 显式配置了 skills 就用配置的子集；
         #   None（旧数据/从未保存过）→ 回退到全部已注册技能索引；
         #   []（用户明确不勾选）→ 不注入任何技能索引（skill.invoke 常驻工具仍可用）
-        # 组合技（combos）里的技能也并入索引。
-        _, _, expanded_skills = _agent_expanded_caps(agent)
-        wanted = expanded_skills
+        wanted = agent.get("skills")
         names = sorted(SKILL_REGISTRY.keys()) if wanted is None else [s for s in wanted if SKILL_REGISTRY.get(s)]
         skill_index = []
         for s in names:
@@ -970,19 +924,13 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         parts.append(f"\n【集群上下文】{cluster_context}")
     prompt = "\n".join(parts)
     # —— 动态替换存储路径占位符 ——
-    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root} / {capability_groups_path} / {spec_dir}，
+    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root}，
     # 与 store.ROOT 保持同步（用户在设置里切换存储根后自动生效）。
-    # {spec_dir} 指向项目内统一规范文档目录 doc/spec（技能/插件/拓展/背景规范，随项目走）。
     try:
         _root = str(store.ROOT)
-        _spec_dir = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "doc", "spec")
-        )
-        prompt = prompt.replace("{spec_dir}", _spec_dir)
         prompt = prompt.replace("{skills_dir}", str(store.ROOT / "skills"))
         prompt = prompt.replace("{plugins_dir}", str(store.ROOT / "plugins"))
         prompt = prompt.replace("{bg_dir}", str(store.ROOT / "backgrounds"))
-        prompt = prompt.replace("{capability_groups_path}", str(store.ROOT_CAPABILITY_GROUPS))
         prompt = prompt.replace("{storage_root}", _root)
     except Exception:
         pass
@@ -1068,15 +1016,7 @@ def _execute_tool(name: str, arguments: dict,
             try:
                 from core.external_tools import owner_of as _ext_owner, dispatch as _ext_dispatch
                 if _ext_owner(name):
-                    # 传入当前智能体（含 memory_mode 等拓展所需字段），
-                    # 否则拓展 call_fn 收到 None，按"未启用"处理导致工具执行失败。
-                    _ext_agent = None
-                    if agent_id is not None:
-                        try:
-                            _ext_agent = get_by("agents", agent_id)
-                        except Exception:
-                            _ext_agent = None
-                    return _ext_dispatch(name, arguments or {}, _ext_agent)
+                    return _ext_dispatch(name, arguments or {}, None)
             except Exception as e:
                 return {"error": f"外部工具分发失败：{type(e).__name__}: {e}"}
             # 插件执行：注入能力参数预设的固定参数（模型不可见、不可改，固定值优先覆盖）
@@ -1146,6 +1086,44 @@ async def _exec_spawn_with_events(tc_id: str, args: dict, out: dict):
         await task
     except Exception as e:  # noqa: BLE001
         out["result"] = {"ok": False, "error": f"子智能体执行异常：{type(e).__name__}: {e}"}
+
+
+async def _exec_tool_gated(tc_id: str, name: str, args: dict, out: dict, *,
+                           conv_id: int | None = None,
+                           agent_id: int | None = None) -> Any:
+    """带权限闸门的工具执行（快/慢通道共用）：产出需要**先**发给前端的行，
+    执行结果写入 out["result"]。
+
+    与直接 asyncio.to_thread(_execute_tool, ...) 的区别只有权限这一层：
+      - manual 模式且工具危险 → 先 yield `P:{json}` 确认请求行，阻塞等用户点
+        允许 / 拒绝（见 core/permissions.py），拒绝则直接把错误当工具结果返回；
+      - 其余模式零额外开销，行为与原路径完全一致。
+    agent.spawn 走 _exec_spawn_with_events（子智能体事件 SUB: 行实时转发），
+    但确认闸门同样覆盖 —— spawn 本身就是危险操作，子过程内部的危险工具则由
+    subagent 自己的事件队列再问一次。
+    """
+    out["result"] = None
+    from core import permissions
+    req = permissions.begin_request(name, args, conv_id=conv_id, agent_id=agent_id,
+                                    tool_call_id=tc_id)
+    if req is not None:
+        # ⚠️ JSON 行不做 _esc（与 R:/C: 同惯例）
+        yield f"P:{json.dumps(req, ensure_ascii=False)}\n"
+        if not await permissions.wait(req["id"]):
+            out["result"] = {
+                "error": f"用户拒绝执行：{name}（手动确认模式，本次调用未获授权，"
+                         f"请先征得用户同意再重试，或改用其它方式）",
+            }
+            return
+    if name == "agent.spawn":
+        _spawn_out: dict = {}
+        async for _sl in _exec_spawn_with_events(tc_id, args, _spawn_out):
+            yield _sl
+        out["result"] = _spawn_out.get("result") or {"ok": False, "error": "子智能体执行异常"}
+        return
+    out["result"] = await asyncio.to_thread(_execute_tool, name, args,
+                                            conv_id=conv_id, tool_call_id=tc_id,
+                                            agent_id=agent_id)
 
 
 def _extract_spawn_events(result: Any) -> list | None:
@@ -1558,6 +1536,8 @@ async def agent_reply(conversation_id: int, agent: dict, user_input: str, mode: 
         "commands": agent.get("commands") or [],
         "plugins": agent.get("plugins") or [],
         "max_tool_rounds": _max_tool_rounds(agent),
+        # 会话 id：子智能体里的权限确认请求挂到本会话，点「停止」时一并取消
+        "conv_id": conversation_id,
     })
 
     try:
@@ -1637,12 +1617,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # （{summary_msg, split}），该智能体视图 = [自己的摘要] + messages[split:]；
     # 任何异常都不阻断本轮对话
     from core.ctx_compress import maybe_compress, agent_view
-    _init_cinfo = await maybe_compress(conv, agent, interface, model, system_prompt_base)
-    if _init_cinfo:
-        # 组装阶段已压缩：实时通知前端补写 conv.agent_compactions，让遮挡摘要卡片在流式
-        # 一开始就显示（streaming 期间 refreshConv 提前返回，前端不会自动拉取到最新状态）
-        yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
-                                 'entry': _init_cinfo['entry']}, ensure_ascii=False)}\n")
+    await maybe_compress(conv, agent, interface, model, system_prompt_base)
     if _wf_mode in ("plan", "spec", "goal") and _wf:
         system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})
@@ -1830,17 +1805,13 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     args = json.loads(tc.get("arguments", "{}")) if isinstance(tc.get("arguments"), str) else (tc.get("arguments") or {})
                 except Exception:
                     args = {}
-                if tc["name"] == "agent.spawn":
-                    # 派生子智能体：运行事件实时 SUB: 行转发（前端子过程框）
-                    _spawn_out: dict = {}
-                    async for _sl in _exec_spawn_with_events(tc["id"], args, _spawn_out):
-                        yield _sl
-                    result = _spawn_out.get("result") or {"ok": False, "error": "子智能体执行异常"}
-                else:
-                    result = await asyncio.to_thread(_execute_tool, tc["name"], args,
-                                          conv_id=conversation_id,
-                                          tool_call_id=tc["id"],
-                                          agent_id=agent.get("id"))
+                # 权限闸门 + 执行（manual 模式先发 P: 确认行，spawn 走 SUB: 事件流）
+                _gated_out: dict = {}
+                async for _gl in _exec_tool_gated(tc["id"], tc["name"], args, _gated_out,
+                                                  conv_id=conversation_id,
+                                                  agent_id=agent.get("id")):
+                    yield _gl
+                result = _gated_out.get("result") or {"ok": False, "error": "工具执行异常"}
                 # 子智能体运行事件副本 → 落库字段（须在 truncate 前取出，避免进 R: JSON 被截断）
                 _spawn_events = _extract_spawn_events(result)
                 # 先判断是不是图片：一次调用同时给 truncate 和 followup 用，避免重复 I/O
@@ -1988,11 +1959,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     _limit = int(_mw_fn(interface, model) * _cs["threshold"])
                     _total = _et(messages[0].get("content")) + sum(_emt(m) for m in messages[1:])
                     if _limit > 0 and _total > _limit:
-                        # force=True：本轮实际发给 LLM 的上下文（_total，含纠错反馈/图片 followup 等
-                        # 仅在内存 messages、尚未落库的瞬态消息）已确认超线；maybe_compress 内部会再用
-                        # agent_view（仅 conv.messages 已落库历史）重算 total，可能比 _total 小而导致
-                        # 误判"未达线"跳过压缩。此处跳过该冗余判定，只保留"是否存在可压缩区间"的安全检查。
-                        _cinfo = await _mc(conv, agent, interface, model, system_prompt_base, force=True)
+                        _cinfo = await _mc(conv, agent, interface, model, system_prompt_base)
                         if _cinfo:
                             _rebuilt = [messages[0]]
                             for m in _av(conv, agent.get("id")):
@@ -2004,10 +1971,6 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                             _tool_round_start = len(messages)
                             yield (f"RN:（上下文达到压缩线：已把 {_cinfo['dropped']} 条较早历史压缩为摘要，"
                                    f"压缩前估算 {_cinfo['tokens_before']} token，继续当前任务）\n")
-                            # CX: 携带该智能体压缩状态 → 前端即时补写 conv.agent_compactions，
-                            # 让流式中的历史压缩遮挡摘要卡片立即显示（无需等 streaming 结束）
-                            yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
-                                                     'entry': _cinfo['entry']}, ensure_ascii=False)}\n")
                             logger.info("[agent_runtime] 运行中压缩 round=%d conv=%s dropped=%s",
                                         round_idx, conversation_id, _cinfo['dropped'])
             except Exception as _ce:
@@ -2330,18 +2293,13 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                                         ),
                                     }
                 else:
-                    # 非 send_message（串/并行一致）→ 走普通同步执行路径
-                    if fn["name"] == "agent.spawn":
-                        # 派生子智能体：运行事件实时 SUB: 行转发（前端子过程框）
-                        _spawn_out: dict = {}
-                        async for _sl in _exec_spawn_with_events(tc["id"], args, _spawn_out):
-                            yield _sl
-                        result = _spawn_out.get("result") or {"ok": False, "error": "子智能体执行异常"}
-                    else:
-                        result = await asyncio.to_thread(_execute_tool, fn["name"], args,
-                                              conv_id=conversation_id,
-                                              tool_call_id=tc["id"],
-                                              agent_id=agent.get("id"))
+                    # 非 send_message（串/并行一致）→ 走权限闸门 + 普通执行路径
+                    _gated_out: dict = {}
+                    async for _gl in _exec_tool_gated(tc["id"], fn["name"], args, _gated_out,
+                                                      conv_id=conversation_id,
+                                                      agent_id=agent.get("id")):
+                        yield _gl
+                    result = _gated_out.get("result") or {"ok": False, "error": "工具执行异常"}
                 # 子智能体运行事件副本 → 落库字段（须在 truncate 前取出，避免进 R: JSON 被截断）
                 _spawn_events = _extract_spawn_events(result)
 

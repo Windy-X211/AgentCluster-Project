@@ -912,10 +912,10 @@ let _snipScale = 1         // 主屏 DPI 缩放（CSS 逻辑坐标 → 物理像
 
 // 右键菜单窗内容：预读 menu.html 编码为 data URL，彻底消除每次右键的 HTTP 回环请求。
 // menu.html 是纯静态页面（皮肤选择、动作分发），不需要后端动态下发；
-// 从用户数据目录已安装的 fairy_ball 拓展中读取（拓展统一从市场下载到此处）。
+// 改动后重启 Electron 生效。
 let _menuDataUrl = ''
 try {
-  const _menuHtmlPath = path.join(app.getPath('userData'), 'extensions', FAIRY_ID, 'menu.html')
+  const _menuHtmlPath = path.join(PROJECT_ROOT, 'AppData', 'extensions', '_builtin', 'fairy_ball', 'menu.html')
   const _menuHtml = fs.readFileSync(_menuHtmlPath, 'utf-8')
   _menuDataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(_menuHtml)
 } catch (e) {
@@ -932,10 +932,8 @@ function createFairyWin() {
   if (fairyWin && !fairyWin.isDestroyed()) return fairyWin
   const wa = screen.getPrimaryDisplay().workAreaSize
   fairyWin = new BrowserWindow({
-    // 精灵容器 min-height 200px + 底部投影 40px + stage padding 28px ≈ 268px 高
-    // 220×260 足够装下精灵本体 + 呼吸动画 + 轮廓光 + 投影（scale 任何档位都可见）
-    width: 220, height: 260,
-    x: wa.width - 245, y: wa.height - 305,
+    width: 180, height: 170,
+    x: wa.width - 205, y: wa.height - 200,
     frame: false, transparent: true, alwaysOnTop: true,
     skipTaskbar: true, resizable: false, hasShadow: false,
     show: false,

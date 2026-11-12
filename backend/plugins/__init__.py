@@ -539,6 +539,14 @@ def run_plugin(name: str, **kwargs: Any) -> Any:
     except TypeError as e:
         # 参数不对友好提示
         return {"error": f"参数不匹配：{e}（需要的参数：{p.get('params', [])}）"}
+    except SystemExit as e:
+        # 插件内部调用 sys.exit()：绝不能让它把整个后端进程带走（SystemExit 是 BaseException，
+        # 普通 except Exception 拦不住；在 worker 线程里冒出会直接终止事件循环）
+        print(f"[plugins] WARN 插件 {name} 调用了 sys.exit({e.code})，已拦截", flush=True)
+        return {"error": f"插件 {name} 内部调用了 sys.exit()，已拦截防止进程退出"}
+    except KeyboardInterrupt:
+        print(f"[plugins] WARN 插件 {name} 收到 KeyboardInterrupt，已拦截", flush=True)
+        return {"error": f"插件 {name} 被中断"}
     except Exception as e:
         return {"error": str(e)}
 

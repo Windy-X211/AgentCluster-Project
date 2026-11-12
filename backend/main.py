@@ -11,7 +11,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
 
 from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, ROOT
-from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions, market
+from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions, market, permissions
 
 from datetime import datetime
 
@@ -43,21 +43,6 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是「集群编排师」，一位资深的 AI
 - **技能 (skills)**：专业工作流/领域能力，按需分配。例如「PPT 制作角色」→ `pptx`；「小说写作角色」→ `novel_writing` + `role_playing`；「网页 Demo 角色」→ `web_demo`。
 - **插件 (plugins)**：外部功能扩展。例如「浏览器操控/网页测试角色」→ `browser_control`；「桌面自动化角色」→ `desktop_control`；「邮件通知角色」→ `send_email`；「HTTP 请求角色」→ `http_request`；「AI 绘画角色」→ `sd_webui`。
 
-**能力清单的返回格式（重要！）：**
-调用 `cluster.list_capabilities` 返回的结构是：
-```
-{
-  commands: { "文件操作": [...], "智能命令": [...], "命令运行": [...], "集群编排": [...] },
-  skills:   { "写作类": [...], "PPT制作": [...], "未分组": [...] },  // 按用户自定义分组
-  plugins:  { "浏览器类": [...], "自动化类": [...], "未分组": [...] }, // 按用户自定义分组
-  _flat_skills:  [...],  // 技能扁平列表（不含分组，备用）
-  _flat_plugins: [...],  // 插件扁平列表（不含分组，备用）
-}
-```
-- **命令**已按内置功能分类：文件操作、智能命令、命令运行、集群编排——根据角色职责直接从对应分组里选即可。
-- **技能 / 插件**按用户在「能力列表」界面里拖出来的自定义分组组织，分组名一般已经暗示了用途（如"写作类""PPT制作""浏览器类"）。优先从匹配的分组里挑；所有不在任何自定义分组里的都归在"未分组"里。
-- 对完全陌生的能力，看它的 `description` 字段来判断是否合适，不要仅凭名字猜测。
-
 **常见角色 → 能力映射（参考）：**
 | 角色 | 建议配置的命令 | 建议的技能 | 建议的插件 |
 |------|--------------|-----------|-----------|
@@ -71,7 +56,7 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是「集群编排师」，一位资深的 AI
 | AI 绘图 | file.write, cmd.run | — | sd_webui |
 | HTTP API | file.read | — | http_request |
 
-先用 `cluster.list_capabilities` 查一下当前可用的具体名称和描述，再做选择。如果某类能力按职责明显属于某个用户自定义分组（如 PPT 角色对应"PPT制作"分组），优先从该分组里全部挑出，再按需补充。
+先用 `cluster.list_capabilities` 查一下当前可用的具体名称和描述，再做选择。
 
 ## 设计原则
 
@@ -207,7 +192,12 @@ async def lifespan(app: FastAPI):
         _ensure_orchestrator()
     except Exception as e:
         print(f"[main] WARN 编排师初始化失败（不阻断启动）：{e}", flush=True)
-    # 拓展统一从市场下载安装，不再随项目自动拷贝（见 extensions.py）
+    # 首次启动自动安装核心功能拓展（visual_interaction 等）
+    try:
+        from api.extensions import auto_install_first_time
+        auto_install_first_time()
+    except Exception as e:
+        print(f"[main] 自动安装拓展失败（不阻断启动）：{e}")
     # 挂载已启用拓展的后端服务路由（backend-service / hybrid 类拓展的 backend.py → /api/ext/<id>/）
     try:
         from api.extensions import mount_extension_backends
@@ -309,6 +299,7 @@ ROUTES = [
     ("conversations", conversations.router),
     ("model_interfaces", models.router),
     ("settings", settings.router),
+    ("permissions", permissions.router),
     ("commands", commands.router),
     ("rules", rules.router),
     ("param_presets", param_presets.router),

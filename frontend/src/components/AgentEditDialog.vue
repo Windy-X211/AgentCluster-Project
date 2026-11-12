@@ -1,9 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useAgentStore, useSettingsStore, useModelStore } from '@/stores'
-import { api } from '@/api'
-import { agentAvatarGradient } from '@/utils/avatar'
-import ColorSpectrumPopover from './ColorSpectrumPopover.vue'
 
 const props = defineProps<{ agent: any }>()
 const emit = defineEmits<{ close: [] }>()
@@ -11,29 +8,16 @@ const emit = defineEmits<{ close: [] }>()
 const agents = useAgentStore()
 const settings = useSettingsStore()
 const models = useModelStore()
-// 用户自定义能力分组（独立文件存储）：{ commands: {...}, skills: {...}, plugins: {...} }
-const userCapGroups = ref<Record<string, Record<string, string[]>>>({})
-async function loadUserGroups() {
-  const result: Record<string, Record<string, string[]>> = {}
-  for (const type of ['commands', 'skills', 'plugins'] as const) {
-    try { result[type] = (await api.settings.getCapabilityGroups(type)) || {} }
-    catch (e) { result[type] = {} }
-  }
-  userCapGroups.value = result
-}
 function initForm(a: any) {
   return {
     ...a,
     commands: [...(a?.commands || [])],
     skills: [...(a?.skills || [])],
     plugins: [...(a?.plugins || [])],
-    combos: [...(a?.combos || [])],
     perception_scope: a?.perception_scope || 'link',
     workflow_mode: a?.workflow_mode || 'none',
     group_id: a?.group_id ?? null,
     reasoning_level: a?.reasoning_level || 'off',
-    // 头像自定义色：空串 = 跟随全局头像风格（默认）；#rrggbb = 指定色
-    avatar_color: a?.avatar_color || '',
   }
 }
 const form = ref<any>(initForm(props.agent))
@@ -58,40 +42,10 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape') return
   if (confirmClose.value) { confirmClose.value = false; return }
   if (pickerOpen.value) { closePicker(); return }
-  if (colorPickerOpen.value) { colorPickerOpen.value = false; return }
-  if (comboPickerOpen.value) { closeComboPicker(); return }
   requestClose()
 }
-onMounted(async () => {
-  window.addEventListener('keydown', onKeydown)
-  // 确保组合技数据已就绪（设置未加载则全量拉取，否则仅刷新组合技）
-  if (!settings.loaded) await settings.fetch()
-  else await settings.reloadCombos()
-})
+onMounted(() => window.addEventListener('keydown', onKeydown))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
-
-// —— 头像配色（与画布调色板同一套色谱浮窗）——
-// 选中即写入表单，保存时随表单一起提交；「自动配色」→ 清空 = 跟随全局头像风格
-const colorPickerOpen = ref(false)
-const colorPickerPos = ref({ x: 0, y: 0 })
-const colorBtnEl = ref<HTMLElement | null>(null)
-// 头像预览：自定义色优先，否则按全局风格（与画布/列表/对话区显示一致）
-const avatarPreview = computed(() =>
-  agentAvatarGradient(
-    { id: form.value.id, avatar_color: form.value.avatar_color },
-    settings.data.avatar_mode || 'differentiated',
-  ),
-)
-function toggleColorPicker() {
-  if (colorPickerOpen.value) { colorPickerOpen.value = false; return }
-  const el = colorBtnEl.value
-  const r = el?.getBoundingClientRect()
-  colorPickerPos.value = { x: r ? r.left : 24, y: r ? r.bottom + 8 : 64 }
-  colorPickerOpen.value = true
-}
-function onColorChanged(hex: string) {
-  form.value.avatar_color = hex || ''
-}
 
 // 联动: 选中 interface_id 后，模型下拉自动填充该接口的 models
 const currentInterface = computed(() => models.list.find((m: any) => m.id === form.value.interface_id))
@@ -135,38 +89,19 @@ const availableByType = (type: string) => {
 }
 const currentPickerItems = computed(() => pickerOpen.value ? availableByType(pickerOpen.value) : [])
 
-// 命令选择器分组（按内置命令分组）；技能/插件按用户自定义分组（capability_groups），未分组归到「未分组」
+// 命令选择器分组（仅 commands；skills/plugins 返回 null 走扁平列表）
 const currentPickerGroups = computed(() => {
-  if (!pickerOpen.value) return null
-  const type = pickerOpen.value
-  const items = availableByType(type)
-  if (type === 'commands') {
-    const byGroup = new Map<string, any[]>()
-    for (const it of items) {
-      const g = (settings.commandsMeta[it.key] || {}).group || '其他'
-      if (!byGroup.has(g)) byGroup.set(g, [])
-      byGroup.get(g)!.push(it)
-    }
-    const order = [...(settings.commandGroups || [])]
-    for (const g of byGroup.keys()) if (!order.includes(g)) order.push(g)
-    return order.filter(g => byGroup.has(g)).map(g => ({ name: g, items: byGroup.get(g)! }))
-  }
-  // skills / plugins：按用户自定义分组组织
-  const userGroups = userCapGroups.value[type] || {}
+  if (!pickerOpen.value || pickerOpen.value !== 'commands') return null
+  const items = availableByType('commands')
   const byGroup = new Map<string, any[]>()
-  for (const [gname, keys] of Object.entries(userGroups)) {
-    for (const k of keys) {
-      const it = items.find(i => i.key === k)
-      if (!it) continue
-      if (!byGroup.has(gname)) byGroup.set(gname, [])
-      byGroup.get(gname)!.push(it)
-    }
+  for (const it of items) {
+    const g = (settings.commandsMeta[it.key] || {}).group || '其他'
+    if (!byGroup.has(g)) byGroup.set(g, [])
+    byGroup.get(g)!.push(it)
   }
-  const groupedKeys = new Set([...byGroup.values()].flatMap(a => a.map(i => i.key)))
-  const ungrouped = items.filter(i => !groupedKeys.has(i.key))
-  let groups = [...byGroup.entries()].map(([name, gItems]) => ({ name, items: gItems }))
-  if (ungrouped.length) groups.push({ name: '未分组', items: ungrouped })
-  return groups
+  const order = [...(settings.commandGroups || [])]
+  for (const g of byGroup.keys()) if (!order.includes(g)) order.push(g)
+  return order.filter(g => byGroup.has(g)).map(g => ({ name: g, items: byGroup.get(g)! }))
 })
 function toggleGroupExpand(name: string) {
   const s = new Set(collapsedGroups.value)
@@ -196,12 +131,8 @@ function pickerTitle(type: string) {
 function openPicker(type: string) {
   selectedKeys.value = new Set()
   pickerOpen.value = type
-  // 命令组默认折叠，点击展开后单独勾选；技能/插件默认展开，方便直接勾选整组或单个
+  // 命令组默认折叠，点击展开后单独勾选
   collapsedGroups.value = type === 'commands' ? new Set(settings.commandGroups || []) : new Set()
-  // 加载用户自定义分组（如果还没有加载过）
-  if (Object.keys(userCapGroups.value).length === 0) loadUserGroups()
-  // 技能/插件分组可能已有缓存但用户可能新加了分组，每次打开刷新
-  else if (type !== 'commands') loadUserGroups()
 }
 function closePicker() { pickerOpen.value = null; selectedKeys.value = new Set() }
 function togglePick(key: string) {
@@ -219,62 +150,6 @@ function confirmAdd() {
 function removeItem(type: string, key: string | number) {
   if (type === 'skills' && typeof key === 'number') form.value.skills.splice(key, 1)
   else form.value[type] = (form.value[type] || []).filter((k: any) => k !== key)
-}
-
-// —— 组合技（跨类型能力组合）——
-const comboPickerOpen = ref(false)
-const comboSelected = ref<Set<string>>(new Set())
-const comboSearch = ref('')
-
-const availableCombos = computed(() => {
-  const added = new Set((form.value.combos || []) as string[])
-  const q = comboSearch.value.trim().toLowerCase()
-  const meta = settings.combos || {}
-  return Object.entries(meta)
-    .filter(([name]) => !added.has(name))
-    .map(([name, rec]) => {
-      const members = rec?.members || []
-      const counts = { commands: 0, skills: 0, plugins: 0 }
-      for (const m of members) if (m.type in counts) counts[m.type]++
-      const summary: string[] = []
-      if (counts.commands) summary.push(`${counts.commands} 命令`)
-      if (counts.skills) summary.push(`${counts.skills} 技能`)
-      if (counts.plugins) summary.push(`${counts.plugins} 插件`)
-      return { name, description: rec?.description || '', summary: summary.join(' · ') || '暂无成员' }
-    })
-    .filter(c => !q || c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q))
-    .sort((a, b) => a.name.localeCompare(b.name, 'zh'))
-})
-
-function openComboPicker() {
-  comboSelected.value = new Set()
-  comboSearch.value = ''
-  comboPickerOpen.value = true
-}
-function closeComboPicker() { comboPickerOpen.value = false; comboSelected.value = new Set() }
-function toggleComboPick(name: string) {
-  const s = new Set(comboSelected.value)
-  if (s.has(name)) s.delete(name)
-  else s.add(name)
-  comboSelected.value = s
-}
-function confirmAddCombos() {
-  const list: string[] = form.value.combos || []
-  comboSelected.value.forEach(n => { if (!list.includes(n)) list.push(n) })
-  form.value.combos = list
-  closeComboPicker()
-}
-
-function comboMembersOf(name: string): string {
-  const rec = (settings.combos || {})[name]
-  const members = rec?.members || []
-  const counts = { commands: 0, skills: 0, plugins: 0 }
-  for (const m of members) if (m.type in counts) counts[m.type]++
-  const parts: string[] = []
-  if (counts.commands) parts.push(`${counts.commands} 命令`)
-  if (counts.skills) parts.push(`${counts.skills} 技能`)
-  if (counts.plugins) parts.push(`${counts.plugins} 插件`)
-  return parts.join(' · ') || '暂无成员'
 }
 
 function _metaOf(type: string, key: string): any {
@@ -304,7 +179,6 @@ async function save() {
   form.value.commands = form.value.commands || []
   form.value.skills = form.value.skills || []
   form.value.plugins = form.value.plugins || []
-  form.value.combos = form.value.combos || []
   form.value.perception_scope = form.value.perception_scope || 'link'
   form.value.workflow_mode = form.value.workflow_mode || 'none'
   // 工具调用最大轮数：空 = 跟随全局设置
@@ -330,24 +204,8 @@ async function remove() {
         <div class="modal-title">{{ form.id ? '编辑智能体' : '新建智能体' }}</div>
         <button class="dlg-close" @click="requestClose" title="关闭">✕</button>
       </div>
-      <div class="modal-body">
       <div class="grid">
         <label>名称<input class="input" v-model="form.name" /></label>
-        <label class="avatar-color-label">头像颜色
-          <div class="avatar-color-row">
-            <span class="avatar-preview" :style="{ background: avatarPreview }">
-              {{ (form.name || '?').slice(0, 1).toUpperCase() }}
-            </span>
-            <button ref="colorBtnEl" class="btn sm ghost color-btn"
-                    :class="{ active: colorPickerOpen }"
-                    @click="toggleColorPicker"
-                    title="打开色谱浮窗选择头像颜色">
-              🎨 {{ form.avatar_color ? form.avatar_color.toUpperCase() : '默认配色' }}
-            </button>
-            <button v-if="form.avatar_color" class="btn sm ghost color-reset"
-                    @click="form.avatar_color = ''" title="清除自定义色，回到默认配色">↺</button>
-          </div>
-        </label>
         <label>描述<input class="input" v-model="form.description" /></label>
         <label>模型接口
           <select class="input" v-model="form.interface_id" @change="onInterfaceChange(form.interface_id)">
@@ -440,27 +298,11 @@ async function remove() {
         </div>
       </div>
 
-      <!-- 组合技（跨类型能力组合） -->
-      <div class="cap-block">
-        <div class="cap-header">
-          <span class="cap-title">组合技</span>
-          <button class="btn sm ghost" @click="openComboPicker" :disabled="availableCombos.length === 0">+ 添加</button>
-        </div>
-        <div class="chip-row">
-          <div v-for="c in form.combos" :key="c" class="chip combo" :title="comboMembersOf(c)">
-            🎯 {{ c }} <span class="combo-chip-summary">{{ comboMembersOf(c) }}</span>
-            <span class="x" @click="removeItem('combos', c)">×</span>
-          </div>
-          <div v-if="!form.combos?.length" class="hint-empty">未添加，点击 "+ 添加" 选择组合技（命令/技能/插件自动展开）</div>
-        </div>
-      </div>
-
       <div class="actions">
         <button class="btn ghost" v-if="form.id" @click="remove">删除</button>
         <div style="flex:1" />
 
         <button class="btn" @click="save">保存</button>
-      </div>
       </div>
     </div>
     </div>
@@ -475,7 +317,7 @@ async function remove() {
             <span class="picker-sub">共 {{ currentPickerItems.length }} 项</span>
           </div>
           <div class="picker-list">
-            <!-- 全部按分组展示（命令=内置分组；技能/插件=用户自定义分组），可整组勾选或展开后单独勾选 -->
+            <!-- 命令：按分组展示，可整组勾选或展开后单独勾选 -->
             <template v-if="currentPickerGroups">
               <div v-for="g in currentPickerGroups" :key="g.name" class="picker-group">
                 <div class="pg-head" @click="toggleGroupExpand(g.name)">
@@ -492,10 +334,7 @@ async function remove() {
                          :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
                     <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
                     <div class="pi-body">
-                      <div class="pi-label">
-                        {{ item.label }}
-                        <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
-                      </div>
+                      <div class="pi-label">{{ item.label }}</div>
                       <div class="pi-key">{{ item.key }}</div>
                       <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
                     </div>
@@ -503,6 +342,23 @@ async function remove() {
                 </div>
               </div>
               <div v-if="currentPickerGroups.length === 0" class="hint-empty">全部已添加</div>
+            </template>
+
+            <!-- 技能 / 插件：扁平列表 -->
+            <template v-else>
+              <label v-for="item in currentPickerItems" :key="item.key"
+                     :class="['picker-item', { selected: selectedKeys.has(item.key) }]" @click="togglePick(item.key)">
+                <input type="checkbox" :checked="selectedKeys.has(item.key)" readonly />
+                <div class="pi-body">
+                  <div class="pi-label">
+                    {{ item.label }}
+                    <span v-if="item.extra" class="pi-extra">{{ item.extra }}</span>
+                  </div>
+                  <div class="pi-key">{{ item.key }}</div>
+                  <div v-if="item.desc" class="pi-desc">{{ item.desc }}</div>
+                </div>
+              </label>
+              <div v-if="currentPickerItems.length === 0" class="hint-empty">全部已添加</div>
             </template>
           </div>
           <div class="picker-actions">
@@ -513,48 +369,6 @@ async function remove() {
           </div>
         </div>
       </div>
-    </Teleport>
-
-    <!-- 组合技选择器 -->
-    <Teleport to="body">
-      <div v-if="comboPickerOpen" class="picker-mask">
-        <div class="picker-popup glass">
-          <div class="picker-title">
-            <span>选择组合技</span>
-            <span class="picker-sub">共 {{ availableCombos.length }} 项</span>
-          </div>
-          <input v-model="comboSearch" class="input combo-search" placeholder="搜索组合技…" />
-          <div class="picker-list">
-            <label v-for="c in availableCombos" :key="c.name"
-                   :class="['combo-item', { selected: comboSelected.has(c.name) }]"
-                   @click="toggleComboPick(c.name)">
-              <input type="checkbox" :checked="comboSelected.has(c.name)" readonly />
-              <div class="pi-body">
-                <div class="pi-label">🎯 {{ c.name }}</div>
-                <div class="pi-extra">{{ c.summary }}</div>
-                <div v-if="c.description" class="pi-desc">{{ c.description }}</div>
-              </div>
-            </label>
-            <div v-if="availableCombos.length === 0" class="hint-empty">全部已添加</div>
-          </div>
-          <div class="picker-actions">
-            <button class="btn ghost" @click="closeComboPicker">取消</button>
-            <button class="btn" @click="confirmAddCombos" :disabled="comboSelected.size === 0">
-              添加 ({{ comboSelected.size }})
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
-
-    <!-- 头像配色色谱浮窗（与画布调色板同一个组件；Teleport 到 body 避免被弹窗裁剪） -->
-    <Teleport to="body">
-      <ColorSpectrumPopover
-        v-if="colorPickerOpen"
-        :pos="colorPickerPos"
-        :initial="form.avatar_color || null"
-        @change="onColorChanged"
-        @close="colorPickerOpen = false" />
     </Teleport>
 
     <!-- 关闭确认（✕ / ESC 关闭时有未保存修改） -->
@@ -576,9 +390,8 @@ async function remove() {
 
 <style scoped>
 .modal-bg { position: fixed; inset: 0; background: rgba(var(--shadow-rgb), 0.5); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-.modal { width: 560px; max-height: 85vh; padding: 0; display: flex; flex-direction: column; }
-.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 20px 20px 0; margin-bottom: 16px; flex-shrink: 0; }
-.modal-body { overflow-y: auto; flex: 1; min-height: 0; padding: 0 20px 20px; }
+.modal { width: 560px; max-height: 85vh; overflow-y: auto; padding: 20px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; }
 .modal-title { font-size: calc(16px * var(--font-scale)); font-weight: 600; }
 .dlg-close { width: 26px; height: 26px; border-radius: 6px; cursor: pointer; border: 1px solid rgba(var(--surface-rgb), 0.16); background: transparent; color: rgba(var(--text-rgb), 0.75); font-size: 13px; line-height: 1; flex-shrink: 0; transition: background .15s, color .15s; }
 .dlg-close:hover { background: rgba(232, 92, 92, 0.14); color: #e85c5c; }
@@ -589,22 +402,6 @@ async function remove() {
   }
 }
 .ta { min-height: 80px; resize: vertical; }
-
-/* 头像颜色选择：预览 + 打开色谱浮窗的按钮 */
-.avatar-color-row { display: flex; align-items: center; gap: 8px; }
-.avatar-preview {
-  width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
-  display: flex; align-items: center; justify-content: center;
-  font-size: calc(12px * var(--font-scale)); font-weight: 600; color: #fff;
-  text-shadow: 0 1px 2px rgba(var(--shadow-rgb), 0.3);
-  box-shadow: inset 0 1px 1px rgba(255,255,255,0.4), 0 2px 6px rgba(var(--shadow-rgb), 0.35);
-}
-.color-btn {
-  font-family: Consolas, monospace; letter-spacing: .4px;
-  display: inline-flex; align-items: center; gap: 5px;
-}
-.color-btn.active { background: rgba(var(--accent-rgb), 0.22); border-color: rgba(var(--accent-rgb), 0.5); }
-.color-reset { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); }
 
 .cap-block { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(var(--surface-rgb), 0.06); }
 .cap-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
@@ -619,11 +416,8 @@ async function remove() {
   &.blue   { background: rgba(var(--accent-rgb), 0.18);  color: var(--accent-ink); border-color: rgba(var(--accent-rgb), 0.3); }
   &.purple { background: rgba(var(--accent2-rgb), 0.18); color: var(--purple-ink); border-color: rgba(var(--accent2-rgb), 0.3); }
   &.green  { background: rgba(100,220,160,0.18); color: var(--green-ink); border-color: rgba(100,220,160,0.3); }
-  &.combo  { background: rgba(255,190,90,0.16); color: var(--amber-ink, #e8b45a); border-color: rgba(255,190,90,0.3); }
   .x { margin-left: 4px; opacity: .7; font-weight: bold; cursor: pointer; padding: 0 2px; &:hover { opacity: 1; } }
 }
-.combo-chip-summary { font-size: calc(10px * var(--font-scale)); opacity: .6; margin-left: 2px; font-weight: normal; }
-.combo-search { margin-bottom: 10px; }
 .hint-empty { font-size: calc(12px * var(--font-scale)); opacity: .45; padding: 4px 0; }
 .actions { display: flex; gap: 8px; margin-top: 20px; padding-top: 14px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); }
 
@@ -664,11 +458,6 @@ async function remove() {
 .picker-item { display: flex; gap: 10px; padding: 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; border: 1px solid transparent; font-size: calc(12px * var(--font-scale));
   &:hover { background: rgba(var(--surface-rgb), 0.04); }
   &.selected { background: rgba(var(--accent-rgb), 0.15); border-color: rgba(var(--accent-rgb), 0.3); }
-  input { accent-color: var(--accent); flex-shrink: 0; margin-top: 3px; }
-}
-.combo-item { display: flex; gap: 10px; padding: 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; border: 1px solid transparent; font-size: calc(12px * var(--font-scale));
-  &:hover { background: rgba(var(--surface-rgb), 0.04); }
-  &.selected { background: rgba(255,190,90,0.12); border-color: rgba(255,190,90,0.3); }
   input { accent-color: var(--accent); flex-shrink: 0; margin-top: 3px; }
 }
 .pi-body { flex: 1; min-width: 0; }

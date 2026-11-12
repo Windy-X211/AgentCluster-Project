@@ -179,7 +179,7 @@ def assemble_context(conv: dict, agent: dict, canvas: dict | None):
     if mode == "linked" and canvas:
         cluster_context, _ = _build_cluster_context(canvas, agent)
     system_prompt = _system_prompt(agent, tools, cluster_context,
-                                   canvas.get("id") if canvas else None, canvas, None)
+                                   canvas.get("id") if canvas else None, canvas)
     tokens = estimate_tokens(system_prompt)
     for m in agent_view(conv, agent.get("id")):
         tokens += estimate_message_tokens(m)

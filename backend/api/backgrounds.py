@@ -1,7 +1,7 @@
 """背景管理 API：列出 / 读取 / 上传 / 删除界面背景。
 
 背景存放于 AppData/backgrounds/<id>/ 下，每个背景一个子文件夹，含 manifest.json。
-背景规范文档统一放在项目 ``doc/spec/background-spec.md``（唯一来源，随项目分发）。
+详见 AppData/backgrounds/spec.md。
 """
 import json
 import mimetypes

@@ -1,33 +1,28 @@
 # -*- coding: utf-8 -*-
-"""同步 fairy_ball 拓展（市场源）到运行时已安装目录并做静态校验。
+"""同步 fairy_ball 拓展（market 源）到运行时已安装目录并做静态校验。
 
-源：<项目父级>/market/extensions/fairy_ball（独立 git 仓库工作副本）
+源：market/extensions/fairy_ball（仓库内真源）
 目标：%LOCALAPPDATA%/AgentCluster/extensions/fairy_ball（已安装目录）
-所有拓展资源统一从市场下载，项目源码仓库不再自带。
+     与其 _builtin 副本（重装源）—— 两处都同步保持一致
 """
 import json
 import os
 import py_compile
 import shutil
-from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-SRC = str(PROJECT_ROOT.parent / 'market' / 'extensions' / 'fairy_ball')
+SRC = 'market/extensions/fairy_ball'
 _EXT_ROOT = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'AgentCluster', 'extensions')
 DST = os.path.join(_EXT_ROOT, 'fairy_ball')
+BUILTIN = os.path.join(_EXT_ROOT, '_builtin', 'fairy_ball')
 FILES = ['fairy.html', 'menu.html', 'backend.py', 'manifest.json', 'snip.html']
 
-if not os.path.isdir(SRC):
-    print(f'市场源不存在：{SRC}')
-    print('请先打开「市场管理」→「同步市场」下载资源。')
-    raise SystemExit(1)
-
-os.makedirs(os.path.join(DST, 'assets'), exist_ok=True)
-for f in FILES:
-    shutil.copy2(os.path.join(SRC, f), os.path.join(DST, f))
-for g in os.listdir(os.path.join(SRC, 'assets')):
-    shutil.copy2(os.path.join(SRC, 'assets', g), os.path.join(DST, 'assets', g))
-print('synced ->', DST)
+for base in (DST, BUILTIN):
+    os.makedirs(os.path.join(base, 'assets'), exist_ok=True)
+    for f in FILES:
+        shutil.copy2(os.path.join(SRC, f), os.path.join(base, f))
+    for g in os.listdir(os.path.join(SRC, 'assets')):
+        shutil.copy2(os.path.join(SRC, 'assets', g), os.path.join(base, 'assets', g))
+    print('synced ->', base)
 
 py_compile.compile(os.path.join(DST, 'backend.py'), doraise=True)
 print('backend.py 编译 OK')

@@ -214,6 +214,7 @@ onMounted(async () => {
   window.addEventListener('keydown', onIfaceKeydown)
   await Promise.all([models.fetch(), settings.fetch(), agents.fetch(), loadLaunchMode(), loadAutostart()])
   syncCtxSettings()
+  syncPermSettings()
   // 存储路径
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
@@ -423,6 +424,71 @@ async function saveCtx(k: string, v: any) {
   try { await settings.update({ [k]: v }) } catch { /* 保存失败静默，下次进入回读 */ }
 }
 const ctxCompressOn = computed(() => settings.data.context_compress_enabled !== false)
+
+// —— 权限设置（操作权限模式 + 工作范围，执行端见 backend/core/permissions.py）——
+const permMode = ref<'manual' | 'auto' | 'full'>('auto')
+const scopeMode = ref<'workspace' | 'custom' | 'global'>('workspace')
+const scopePathsText = ref('')
+const scopeSaving = ref(false)
+
+function syncPermSettings() {
+  const d = settings.data || {}
+  permMode.value = (d.permission_mode === 'manual' || d.permission_mode === 'full') ? d.permission_mode : 'auto'
+  scopeMode.value = (d.work_scope_mode === 'custom' || d.work_scope_mode === 'global') ? d.work_scope_mode : 'workspace'
+  scopePathsText.value = Array.isArray(d.scope_paths) ? d.scope_paths.join('\n') : ''
+}
+
+const permModeDesc = computed(() => {
+  if (permMode.value === 'manual') return {
+    title: '每次执行危险操作都先弹窗问你',
+    sub: '写/删文件、运行命令、调用插件、派生子智能体前都会暂停等待你点「允许」；120 秒未处理按拒绝处理。最安全，但会打断智能体节奏。',
+  }
+  if (permMode.value === 'full') return {
+    title: '不做任何检查，全部直接放行',
+    sub: '危险操作与工作范围限制同时关闭，智能体可任意操作这台电脑。仅在完全信任的自动化场景使用。',
+  }
+  return {
+    title: '危险操作自动放行（推荐）',
+    sub: '不打断运行；工作范围限制仍然生效，越界写文件 / 跑命令会被拒绝并告知智能体原因。',
+  }
+})
+
+const scopeModeDesc = computed(() => {
+  if (scopeMode.value === 'global') return {
+    title: '不限制目录，整台电脑可写可执行',
+    sub: '智能体可以在任意路径改文件、运行命令。',
+  }
+  if (scopeMode.value === 'custom') return {
+    title: '只允许在下方列出的目录里操作',
+    sub: '读取不受限；写文件 / 删除 / 运行命令的目录必须落在指定范围内。',
+  }
+  return {
+    title: '只允许在当前工作区内操作',
+    sub: '工作区 = 会话 / 画布选中的工作目录，未设置时为全局默认工作区（设置页上方），再没有则为程序所在目录。',
+  }
+})
+
+async function setPermMode(v: 'manual' | 'auto' | 'full') {
+  permMode.value = v
+  try { await settings.update({ permission_mode: v }) } catch { syncPermSettings() }
+}
+async function setScopeMode(v: 'workspace' | 'custom' | 'global') {
+  scopeMode.value = v
+  try { await settings.update({ work_scope_mode: v }) } catch { syncPermSettings() }
+}
+async function saveScopePaths() {
+  scopeSaving.value = true
+  try {
+    const list = scopePathsText.value.split('\n').map(s => s.trim()).filter(Boolean)
+    await settings.update({ scope_paths: list })
+    scopePathsText.value = list.join('\n')
+    showToast(list.length ? `已保存 ${list.length} 个范围目录` : '已清空指定范围（回退「仅限工作区」）')
+  } catch (e: any) {
+    showToast('保存失败：' + (e?.message || e), 'err')
+  } finally {
+    scopeSaving.value = false
+  }
+}
 
 // —— 外观设置 ——
 const avatarMode = computed({
@@ -762,7 +828,7 @@ const agentGroupOptions = computed(() => {
           </div>
           <input ref="bgFileInput" type="file" multiple style="display:none" @change="onBgFiles" />
           <div class="hint-empty" style="margin-top: 8px">
-            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见项目 doc/spec/background-spec.md
+            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见 AppData/backgrounds/spec.md
           </div>
         </div>
       </div>
@@ -979,6 +1045,82 @@ const agentGroupOptions = computed(() => {
         </table>
         <div v-if="!storagePaths" class="empty">后端未返回路径信息</div>
       </div>
+
+      <!-- 权限设置（危险操作授权 + 可操作范围，后端执行端见 core/permissions.py） -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span>🛡 权限设置</span>
+          <span class="hint">限制智能体的危险操作与可操作范围</span>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">操作权限</span>
+            <span class="hint">智能体执行危险操作（写/删文件、运行命令、插件、派生子智能体…）时如何授权</span>
+          </div>
+          <div class="appearance-row">
+            <label class="radio-label" :class="{ active: permMode === 'manual' }" @click="setPermMode('manual')">
+              <input type="radio" name="permissionMode" value="manual" :checked="permMode === 'manual'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">手动确认</span>
+            </label>
+            <label class="radio-label" :class="{ active: permMode === 'auto' }" @click="setPermMode('auto')">
+              <input type="radio" name="permissionMode" value="auto" :checked="permMode === 'auto'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">自动审核</span>
+            </label>
+            <label class="radio-label" :class="{ active: permMode === 'full' }" @click="setPermMode('full')">
+              <input type="radio" name="permissionMode" value="full" :checked="permMode === 'full'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">完全权限</span>
+            </label>
+          </div>
+          <div class="sound-desc">
+            <div class="sound-main">{{ permModeDesc.title }}</div>
+            <div class="sound-sub">{{ permModeDesc.sub }}</div>
+          </div>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">工作范围</span>
+            <span class="hint">智能体可以在哪些目录里改文件、跑命令</span>
+          </div>
+          <div class="appearance-row">
+            <label class="radio-label" :class="{ active: scopeMode === 'workspace' }" @click="setScopeMode('workspace')">
+              <input type="radio" name="workScopeMode" value="workspace" :checked="scopeMode === 'workspace'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">仅限工作区</span>
+            </label>
+            <label class="radio-label" :class="{ active: scopeMode === 'custom' }" @click="setScopeMode('custom')">
+              <input type="radio" name="workScopeMode" value="custom" :checked="scopeMode === 'custom'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">指定范围</span>
+            </label>
+            <label class="radio-label" :class="{ active: scopeMode === 'global' }" @click="setScopeMode('global')">
+              <input type="radio" name="workScopeMode" value="global" :checked="scopeMode === 'global'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">电脑全局</span>
+            </label>
+          </div>
+          <div class="sound-desc">
+            <div class="sound-main">{{ scopeModeDesc.title }}</div>
+            <div class="sound-sub">{{ scopeModeDesc.sub }}</div>
+          </div>
+
+          <div v-if="scopeMode === 'custom'" class="perm-paths">
+            <textarea class="input perm-paths-input" v-model="scopePathsText" rows="4"
+                      spellcheck="false"
+                      placeholder="每行一个绝对目录，例如：&#10;D:\Projects\我的工作区&#10;E:\素材"></textarea>
+            <div class="perm-paths-actions">
+              <button class="btn" :disabled="scopeSaving" @click="saveScopePaths">
+                {{ scopeSaving ? '保存中…' : '保存范围' }}
+              </button>
+              <span class="hint">目录不存在时会自动忽略；留空则回退到「仅限工作区」</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 接口编辑弹窗（popup-surface 实底：glass 的 blur+saturate 采样深色遮罩，浅色主题下整窗发灰） -->
@@ -1165,6 +1307,13 @@ const agentGroupOptions = computed(() => {
     .radio-dot { border-color: var(--accent); &::after { transform: translate(-50%, -50%) scale(1); } }
   }
 }
+.perm-paths { display: flex; flex-direction: column; gap: 8px; }
+.perm-paths-input {
+  width: 100%; resize: vertical; min-height: 76px;
+  font-family: Consolas, "JetBrains Mono", Menlo, monospace;
+  font-size: calc(12px * var(--font-scale)); line-height: 1.7;
+}
+.perm-paths-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .avatar-preview {
   display: flex; gap: 16px; align-items: flex-end; padding: 12px;
   background: rgba(var(--surface-rgb), 0.03); border-radius: 8px;
