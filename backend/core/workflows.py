@@ -16,13 +16,17 @@
 import json
 from pathlib import Path
 
-from core.store import ROOT, _atomic_write_json
+import core.store as _store
+from core.store import _atomic_write_json
 
-_WF_DIR = Path(ROOT) / "workflows"
+
+def _wf_dir() -> Path:
+    """工作流状态目录。每次读 store.ROOT，切换/迁移存储位置后自动跟随。"""
+    return Path(_store.ROOT) / "workflows"
 
 
 def _wf_path(conv_id: int, agent_id: int) -> Path:
-    return _WF_DIR / f"{conv_id}_{agent_id}.json"
+    return _wf_dir() / f"{conv_id}_{agent_id}.json"
 
 
 def init_workflow(mode: str) -> dict:
@@ -53,7 +57,7 @@ def load_workflow(conv_id: int, agent_id: int, mode: str) -> dict:
 
 
 def save_workflow(conv_id: int, agent_id: int, wf: dict) -> None:
-    _WF_DIR.mkdir(parents=True, exist_ok=True)
+    _wf_dir().mkdir(parents=True, exist_ok=True)
     _atomic_write_json(_wf_path(conv_id, agent_id), wf)
 
 

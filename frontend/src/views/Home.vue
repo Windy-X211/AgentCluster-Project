@@ -93,7 +93,12 @@ onMounted(async () => {
 // 已被 KeepAlive 移出文档，scrollTop 会被浏览器重置为 0）。
 onBeforeRouteLeave(() => {
   const chatBox = document.querySelector('.chat-box') as HTMLElement | null
-  if (chatBox) layout.chatMsgScrollTop = chatBox.scrollTop
+  if (chatBox) {
+    layout.chatMsgScrollTop = chatBox.scrollTop
+    // 签名与 RightPanel.onMessagesScroll 同源（convs.scrollSignature）：返回首页时据此判断
+    // 是不是同一个会话的同一份内容，是则恢复原位，否则贴底
+    layout.chatMsgScrollKey = convs.scrollSignature()
+  }
   const convList = document.querySelector('.conv-list-wrap') as HTMLElement | null
   if (convList) layout.convListScrollTop = convList.scrollTop
 })

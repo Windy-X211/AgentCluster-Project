@@ -34,19 +34,6 @@ export interface FailedEntry {
   load_error: string
 }
 
-/** 组合技成员：type ∈ commands | skills | plugins，key 为该类型下的能力标识 */
-export interface ComboMember {
-  type: 'commands' | 'skills' | 'plugins'
-  key: string
-}
-
-/** 组合技：跨类型能力组合（命令/技能/插件可混编） */
-export interface ComboRecord {
-  description: string
-  members: ComboMember[]
-  market_id?: string
-}
-
 export interface PluginScanResult {
   root_dir: string
   plugins: PluginEntry[]
@@ -116,7 +103,6 @@ export const api = {
     list: () => req<any[]>('/agents'),
     create: (d: any) => req('/agents', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
-    setAvatarColor: (id: number, color: string) => req(`/agents/${id}/avatar-color`, { method: 'PUT', body: JSON.stringify({ color }) }),
     remove: (id: number) => req(`/agents/${id}`, { method: 'DELETE' }),
     reorder: (ids: number[]) => req('/agents/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
@@ -125,10 +111,6 @@ export const api = {
     create: (d: any) => req('/agent_groups', { method: 'POST', body: JSON.stringify(d) }),
     update: (id: number, d: any) => req(`/agent_groups/${id}`, { method: 'PUT', body: JSON.stringify(d) }),
     remove: (id: number) => req(`/agent_groups/${id}`, { method: 'DELETE' }),
-    // 清空分组：保留组，组内智能体移回「全部」
-    clear: (id: number) => req(`/agent_groups/${id}/clear`, { method: 'POST' }),
-    // 删除组和智能体：组与组内智能体一并彻底删除（含画布节点/连线清理）
-    purge: (id: number) => req(`/agent_groups/${id}/purge`, { method: 'DELETE' }),
     reorder: (ids: number[]) => req('/agent_groups/reorder', { method: 'POST', body: JSON.stringify({ ids }) })
   },
   canvases: {
@@ -298,29 +280,7 @@ export const api = {
   },
   settings: {
     get: () => req<any>('/settings'),
-    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) }),
-    /** 设置全局默认工作区（空串=清除）；后端会归一化为绝对路径并自动创建目录 */
-    setDefaultWorkdir: (path: string) =>
-      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir', { method: 'PUT', body: JSON.stringify({ default_workdir: path }) }),
-    /** 读取默认工作区及其目录存在状态（设置页回显用） */
-    getDefaultWorkdir: () =>
-      req<{ default_workdir: string; exists: boolean }>('/settings/default_workdir'),
-    // —— 能力分组（独立文件存储）——
-    getCapabilityGroups: (type: string) =>
-      req<Record<string, string[]>>(`/settings/capability_groups/${encodeURIComponent(type)}`),
-    setCapabilityGroups: (type: string, groups: Record<string, string[]>) =>
-      req(`/settings/capability_groups/${encodeURIComponent(type)}`, { method: 'PUT', body: JSON.stringify(groups) }),
-    // —— 组合技（跨类型能力组合，独立文件存储）——
-    getCombos: () => req<Record<string, ComboRecord>>('/settings/combos'),
-    setCombos: (combos: Record<string, ComboRecord>) =>
-      req('/settings/combos', { method: 'PUT', body: JSON.stringify(combos) })
-  },
-  permissions: {
-    /** 当前挂起的「手动确认」请求（断线重连 / 刷新后补拉弹窗） */
-    pending: () => req<any[]>('/permissions/pending'),
-    /** 对危险操作点允许 / 拒绝（后端阻塞的工具执行据此继续或中止） */
-    confirm: (requestId: string, approve: boolean) =>
-      req<any>('/permissions/confirm', { method: 'POST', body: JSON.stringify({ request_id: requestId, approve }) })
+    update: (d: any) => req('/settings', { method: 'PUT', body: JSON.stringify(d) })
   },
   backgrounds: {
     list: () => req<any[]>('/backgrounds'),
@@ -347,7 +307,10 @@ export const api = {
     open: (path: string) => req<any>('/storage/open', { method: 'POST', body: JSON.stringify({ path }) }),
     pickFolder: (initial?: string, title?: string) =>
       req<{ path: string }>('/storage/pick_folder', { method: 'POST', body: JSON.stringify({ initial: initial || '', title: title || '' }) }),
-    setLocation: (path: string) => req<any>('/storage/set_location', { method: 'POST', body: JSON.stringify({ path }), timeout: 600_000 })
+    setLocation: (path: string) => req<any>('/storage/set_location', { method: 'POST', body: JSON.stringify({ path }), timeout: 600_000 }),
+    // 迁移用户数据到指定位置（dryRun 只统计，不写盘、不切根）
+    migrate: (path: string, dryRun = false) =>
+      req<any>('/storage/migrate', { method: 'POST', body: JSON.stringify({ path, dry_run: dryRun }), timeout: 600_000 })
   },
   capabilities: {
     all: () => req<any>('/commands'),          // 返回 {commands, skills, plugins}

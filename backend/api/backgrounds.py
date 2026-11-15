@@ -1,7 +1,7 @@
 """背景管理 API：列出 / 读取 / 上传 / 删除界面背景。
 
 背景存放于 AppData/backgrounds/<id>/ 下，每个背景一个子文件夹，含 manifest.json。
-详见 AppData/backgrounds/spec.md。
+背景规范文档统一放在项目 ``doc/spec/background-spec.md``（唯一来源，随项目分发）。
 """
 import json
 import mimetypes
@@ -13,10 +13,14 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 
-from core.store import ROOT
+import core.store as _store
 
 router = APIRouter()
-BG_ROOT = ROOT / "backgrounds"
+
+
+def _bg_root() -> Path:
+    """背景根目录。每次读 store.ROOT，切换/迁移存储位置后自动跟随新位置。"""
+    return _store.ROOT / "backgrounds"
 
 _MIME_FIX = {
     ".html": "text/html; charset=utf-8",
@@ -44,10 +48,11 @@ def _safe_id(bg_id: str) -> str:
 
 
 def _bg_dir(bg_id: str) -> Path:
-    """返回背景目录（已校验存在 + 在 BG_ROOT 内）"""
+    """返回背景目录（已校验存在 + 在 backgrounds 根内）"""
     _safe_id(bg_id)
-    root_resolved = BG_ROOT.resolve()
-    d = (BG_ROOT / bg_id).resolve()
+    root = _bg_root()
+    root_resolved = root.resolve()
+    d = (root / bg_id).resolve()
     try:
         inside = d.is_relative_to(root_resolved)
     except AttributeError:
@@ -61,9 +66,10 @@ def _bg_dir(bg_id: str) -> Path:
 def list_backgrounds():
     """列出所有背景（扫描 backgrounds/ 下每个子目录的 manifest.json）"""
     result = []
-    if not BG_ROOT.exists():
+    root = _bg_root()
+    if not root.exists():
         return result
-    for sub in sorted(BG_ROOT.iterdir(), key=lambda p: p.name):
+    for sub in sorted(root.iterdir(), key=lambda p: p.name):
         if not sub.is_dir():
             continue
         mf = sub / "manifest.json"
@@ -143,7 +149,7 @@ async def upload_background(
 
     # 生成 id（英文 + 时间戳，避免中文路径问题）
     bg_id = "bg_" + str(int(time.time())) + "_" + secrets.token_hex(3)
-    d = BG_ROOT / bg_id
+    d = _bg_root() / bg_id
     d.mkdir(parents=True, exist_ok=True)
 
     saved_names = []

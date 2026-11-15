@@ -42,6 +42,13 @@ const storageSaving = ref(false)
 const explorerOpen = ref(false)
 const explorerInitial = ref('')
 
+// 迁移弹窗：把当前用户数据复制到「存储位置」输入框的路径，成功后切换存储根
+const migrateOpen = ref(false)
+const migrateTarget = ref('')
+const migratePlan = ref<any>(null)   // dry-run 结果：copied / skipped / bytes / source / target
+const migrateScanning = ref(false)
+const migrating = ref(false)
+
 // 默认能力的本地镜像（方便实时编辑、再写回 settings）
 const defaults = ref<{ commands: string[]; skills: string[]; plugins: string[] }>({
   commands: [], skills: [], plugins: [],
@@ -262,12 +269,72 @@ async function persistStorageLocation() {
 async function browseStorage() {
   try {
     const r = await api.storage.pickFolder(storageLocation.value || storagePaths.value?.root)
-    if (r?.path) {
-      storageLocation.value = r.path
-      await persistStorageLocation()
-    }
+    // 只把所选目录填进输入框，不立即切换：切换/迁移由按钮或回车显式触发
+    if (r?.path) storageLocation.value = r.path
   } catch (e: any) {
     alert('打开选择器失败：' + (e?.message || e))
+  }
+}
+
+// —— 迁移用户数据到指定位置 ——
+function fmtBytes(n: number): string {
+  const v = Number(n) || 0
+  if (v < 1024) return v + ' B'
+  if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB'
+  if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + ' MB'
+  return (v / 1024 / 1024 / 1024).toFixed(2) + ' GB'
+}
+const normPath = (s: string) => String(s || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+
+async function openMigrate() {
+  const target = storageLocation.value.trim()
+  if (!target) { showToast('请先填写或选择目标位置', 'err'); return }
+  if (storagePaths.value?.root && normPath(target) === normPath(storagePaths.value.root)) {
+    showToast('该位置就是当前存储位置，无需迁移', 'err')
+    return
+  }
+  migrateTarget.value = target
+  migratePlan.value = null
+  migrateScanning.value = true
+  migrateOpen.value = true
+  try {
+    // dry-run：只统计，不写盘、不切根
+    migratePlan.value = await api.storage.migrate(target, true)
+    // 用后端解析后的绝对路径作准（相对路径也按项目根解析过了）
+    if (migratePlan.value?.target) migrateTarget.value = migratePlan.value.target
+  } catch (e: any) {
+    migrateOpen.value = false
+    alert('检查目标位置失败：' + (e?.message || e))
+  } finally {
+    migrateScanning.value = false
+  }
+}
+
+function closeMigrate() {
+  if (migrating.value) return
+  migrateOpen.value = false
+  migratePlan.value = null
+}
+
+async function doMigrate() {
+  if (migrating.value || migrateScanning.value || !migrateTarget.value) return
+  migrating.value = true
+  try {
+    const r = await api.storage.migrate(migrateTarget.value, false)
+    storagePaths.value = r?.paths ?? null
+    if (!storagePaths.value) {
+      try { storagePaths.value = await api.storage.paths() } catch {}
+    }
+    storageLocation.value = storagePaths.value?.root || migrateTarget.value
+    migrateOpen.value = false
+    migratePlan.value = null
+    // 新位置的 settings / 模型接口可能不同，同步刷新
+    await Promise.all([settings.fetch(), models.fetch()])
+    showToast(`已迁移 ${r?.copied ?? 0} 个文件（${fmtBytes(r?.bytes ?? 0)}）到 ${storagePaths.value?.root || migrateTarget.value}`)
+  } catch (e: any) {
+    showToast('迁移失败：' + (e?.message || e), 'err')
+  } finally {
+    migrating.value = false
   }
 }
 
@@ -828,7 +895,7 @@ const agentGroupOptions = computed(() => {
           </div>
           <input ref="bgFileInput" type="file" multiple style="display:none" @change="onBgFiles" />
           <div class="hint-empty" style="margin-top: 8px">
-            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见 AppData/backgrounds/spec.md
+            选择背景或上传自定义背景（图片 / 视频 / 动画 HTML）；动画背景可由智能体自由生成，规范见项目 doc/spec/background-spec.md
           </div>
         </div>
       </div>
@@ -986,9 +1053,12 @@ const agentGroupOptions = computed(() => {
           <input id="storageLoc" class="input mono storage-loc-input" v-model="storageLocation"
                  placeholder="默认：%LOCALAPPDATA%\AgentCluster"
                  @blur="persistStorageLocation" @keydown.enter.prevent="persistStorageLocation" />
-          <button class="btn sm ghost" @click="browseStorage" :disabled="storageSaving">浏览…</button>
+          <!-- mousedown.prevent：阻止输入框 blur 先把存储位置切走，否则迁移会变成「原地迁移」 -->
+          <button class="btn sm ghost" @mousedown.prevent @click="browseStorage" :disabled="storageSaving || migrating" title="选择目标目录（只填入路径，不立即切换）">浏览…</button>
+          <button class="btn sm ghost" @mousedown.prevent @click="openMigrate" :disabled="migrating"
+                  title="把当前用户数据复制到该位置并切换存储位置（源数据保留）">迁移到此处</button>
         </div>
-        <div class="storage-loc-tip">默认位置为用户数据目录（Windows：%LOCALAPPDATA%\AgentCluster，已在项目文件夹之外）；切换后应用会按新位置的现有数据接管</div>
+        <div class="storage-loc-tip">默认位置为用户数据目录（Windows：%LOCALAPPDATA%\AgentCluster，已在项目文件夹之外）；输入框回车/失焦 = 仅切换（按该位置现有数据接管），要把当前数据搬过去请点「迁移到此处」</div>
         <table class="tbl" v-if="storagePaths">
           <thead><tr><th>名称</th><th>类型</th><th>相对路径</th><th>数量</th><th style="width: 120px"></th></tr></thead>
           <tbody>
@@ -1188,6 +1258,36 @@ const agentGroupOptions = computed(() => {
       </div>
     </div>
 
+    <!-- 迁移用户数据确认弹窗 -->
+    <div class="modal-bg" v-if="migrateOpen">
+      <div class="modal popup-surface migrate-box">
+        <div class="modal-head">
+          <div class="modal-title">迁移用户数据</div>
+          <button type="button" class="dlg-close" title="关闭" :disabled="migrating" @click="closeMigrate">✕</button>
+        </div>
+        <div class="migrate-paths">
+          <div class="migrate-path"><span class="migrate-path-label">源</span><span class="mono">{{ migratePlan?.source || storagePaths?.root || '—' }}</span></div>
+          <div class="migrate-path"><span class="migrate-path-label">目标</span><span class="mono">{{ migratePlan?.target || migrateTarget }}</span></div>
+        </div>
+        <div v-if="migrateScanning" class="migrate-sum">正在统计目标位置…</div>
+        <div v-else-if="migratePlan" class="migrate-sum">
+          将复制 <b>{{ migratePlan.copied }}</b> 个文件（{{ fmtBytes(migratePlan.bytes) }}）<span
+            v-if="migratePlan.skipped">；目标已有 <b>{{ migratePlan.skipped }}</b> 个同名文件，将跳过、不覆盖</span><span
+            v-else>；目标为空，无同名文件</span>
+        </div>
+        <div class="migrate-note">
+          迁移只复制、不删除：原位置数据完整保留，确认新位置数据无误后可自行清理。<br />
+          _legacy 历史归档不在迁移范围；迁移完成后应用立即使用新位置。
+        </div>
+        <div class="actions">
+          <button class="btn ghost" :disabled="migrating" @click="closeMigrate">取消</button>
+          <button class="btn" :disabled="migrating || migrateScanning || !migratePlan" @click="doMigrate">
+            {{ migrating ? '迁移中…' : '开始迁移' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- 文件浏览器 -->
     <FileExplorerDialog
       v-model:visible="explorerOpen"
@@ -1223,6 +1323,17 @@ const agentGroupOptions = computed(() => {
 .storage-loc { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .storage-loc-label { font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); flex-shrink: 0; }
 .storage-loc-input { flex: 1; min-width: 0; width: auto; }
+.migrate-box { width: 560px; }
+.migrate-paths {
+  display: grid; gap: 6px; margin-bottom: 12px; padding: 10px 12px; border-radius: 10px;
+  background: rgba(var(--surface-rgb), 0.05); border: 1px solid rgba(var(--surface-rgb), 0.08);
+}
+.migrate-path { display: flex; gap: 8px; align-items: baseline; font-size: calc(12px * var(--font-scale)); word-break: break-all; }
+.migrate-path-label { flex-shrink: 0; opacity: .6; }
+.migrate-sum { font-size: calc(12px * var(--font-scale)); line-height: 1.6; }
+.migrate-note { margin-top: 10px; font-size: calc(11px * var(--font-scale)); line-height: 1.7; opacity: .6; }
+.migrate-box .actions { margin-top: 16px; }
+
 .storage-loc-tip { font-size: calc(11px * var(--font-scale)); opacity: .5; margin: 6px 0 0; }
 .empty { padding: 24px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }
 .tag-t { font-size: calc(10px * var(--font-scale)); padding: 2px 8px; border-radius: 4px; background: rgba(var(--accent-rgb), 0.15); color: var(--accent-light); border: 1px solid rgba(var(--accent-rgb), 0.25); font-family: Consolas, monospace; }

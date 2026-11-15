@@ -840,7 +840,7 @@ def set_root(new_path: str) -> dict:
     设置信息写入项目根目录的 .storage_location：位于项目内时存相对路径（便于整体迁移），
     位于项目外时存绝对路径；切回默认 AppData 则删除该文件。
     返回 get_store_paths() 的最新结果，供前端立即刷新展示。"""
-    global ROOT, LEGACY_DIR
+    global ROOT, LEGACY_DIR, ROOT_CAPABILITY_GROUPS
     p = Path(new_path).expanduser()
     if not p.is_absolute():
         p = _PROJECT_ROOT / p
@@ -866,9 +866,125 @@ def set_root(new_path: str) -> dict:
             _BOOTSTRAP_FILE.write_text(stored, encoding="utf-8")
         ROOT = p
         LEGACY_DIR = ROOT / "_legacy"
+        # 能力分组目录是模块级常量，切根后必须一起改，否则新位置的能力分组读不到/写不回
+        ROOT_CAPABILITY_GROUPS = ROOT / "capability_groups"
         _LIST_PAYLOAD_CACHE.clear()
         init_store()
     return get_store_paths()
+
+
+# ==============================================================
+# 迁移：把当前用户数据搬到指定位置
+# ==============================================================
+# 迁移跳过的目录：_legacy 是历史归档（只留在原处做备份）、__pycache__ 是解释器缓存
+_MIGRATE_SKIP_DIRS = {"_legacy", "__pycache__"}
+
+
+def _iter_data_files(root: Path):
+    """遍历需要迁移的数据文件，产出 (绝对路径, 相对 root 的路径)。
+
+    跳过 _legacy / __pycache__ / 隐藏文件 / *.tmp：*.tmp 是原子写的中间态，
+    可能正被其它请求写入，搬过去只会得到半截数据。
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _MIGRATE_SKIP_DIRS]
+        base = Path(dirpath)
+        for name in filenames:
+            if name.startswith(".") or name.endswith(".tmp"):
+                continue
+            fp = base / name
+            try:
+                yield fp, fp.relative_to(root)
+            except ValueError:
+                continue
+
+
+def _is_within(p: Path, root: Path) -> bool:
+    """p 是否位于 root 内（含相等）。"""
+    try:
+        p.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def migrate_to(new_path: str, dry_run: bool = False) -> dict:
+    """把当前 ROOT 下的用户数据复制到指定位置，随后把存储根切过去。
+
+    安全约定（迁移是不可逆风险点，全部按「不破坏数据」设计）：
+      - 只复制、不删除：源位置数据原样保留，复制中途失败也不会丢数据；
+      - 不覆盖：目标已有同名文件时跳过（避免用旧数据盖掉目标里的新数据），
+        目标为空 = 完整迁移，目标已有数据 = 合并（目标优先）；
+      - 拒绝同一位置 / 互相包含的目录（复制到自己内部会生成嵌套垃圾，包含关系还可能覆盖源文件）；
+      - dry_run 只统计，不建目录、不写文件、不切换 ROOT（供确认弹窗预估文件数）。
+
+    返回 {"source", "target", "copied", "skipped", "bytes", "dry_run", "switched", "paths"}。
+    """
+    raw = (new_path or "").strip()
+    if not raw:
+        raise ValueError("目标位置不能为空")
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        target = _PROJECT_ROOT / target
+    try:
+        target = target.resolve()
+    except OSError as e:
+        raise ValueError(f"目标位置无法解析：{new_path}（{e}）")
+    source = ROOT.resolve()
+
+    if target == source:
+        raise ValueError("目标位置与当前存储位置相同，无需迁移")
+    if _is_within(target, source) or _is_within(source, target):
+        raise ValueError("目标位置与当前存储位置互相包含，请选择独立目录")
+    if not source.is_dir():
+        raise ValueError(f"当前存储位置不存在：{source}")
+
+    copied = skipped = total = 0
+    with LOCK:
+        if not dry_run:
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                # 先探一次可写，避免复制到一半才发现没权限
+                probe = target / f".migrate_probe_{os.getpid()}"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink()
+            except OSError as e:
+                raise ValueError(f"目标位置不可写：{target}（{e}）")
+        for fp, rel in _iter_data_files(source):
+            dst = target / rel
+            if dst.exists():
+                skipped += 1
+                continue
+            copied += 1
+            try:
+                total += fp.stat().st_size
+            except OSError:
+                pass
+            if dry_run:
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(fp, dst)
+            except OSError as e:
+                raise ValueError(f"复制失败：{fp} → {dst}（{e}）")
+
+    result = {
+        "source": str(source),
+        "target": str(target),
+        "copied": copied,
+        "skipped": skipped,
+        "bytes": total,
+        "dry_run": dry_run,
+        "switched": False,
+        "paths": get_store_paths(),
+    }
+    if dry_run:
+        return result
+
+    result["paths"] = set_root(str(target))   # 切根后 paths 指向新位置
+    result["switched"] = True
+    print(f"[store] 已迁移用户数据：{source} → {target}（复制 {copied} 个，跳过 {skipped} 个）")
+    return result
 
 
 def _count_skill_dirs() -> int:

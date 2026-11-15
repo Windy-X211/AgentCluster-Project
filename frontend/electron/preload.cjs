@@ -48,6 +48,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   api: {
     health: () => ipcRenderer.invoke('api:health'),
   },
+  // 剪贴板读写（对话输入框右键菜单「粘贴 / 复制」用）
+  clipboard: {
+    /** 读剪贴板纯文本（无内容返回 ''） */
+    readText: () => ipcRenderer.invoke('clip:readText'),
+    /** 写纯文本到剪贴板，成功返回 true */
+    writeText: (text) => ipcRenderer.invoke('clip:writeText', text),
+  },
   // 精灵悬浮球拓展（fairy_ball）：球窗/小对话窗/选区窗共用的桥
   fairy: {
     /** 打开主窗口（route 可选，如 '#/settings'） */

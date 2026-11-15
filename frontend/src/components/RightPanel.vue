@@ -1502,8 +1502,17 @@ const visibleMsgs = computed(() => {
     (m.a2a_input === true || (typeof m.content === 'string' && m.content.startsWith('【A2A 协议消息】')))
   const fromOf = (m: any): number | null => m.from_agent_id ?? m.envelope?.from?.agent_id ?? null
   const toOf = (m: any): number | null => m.envelope?.to?.agent_id ?? null
+  // 该智能体的压缩卡片列表（兼容旧版单卡 dict）：历史全部保留可见，每张卡片作为独立
+  // 边界标记插在它所覆盖区间的末尾（split = 该次压缩覆盖的共享历史终点下标）之后。
+  const state = cur != null ? (conv.value as any)?.agent_compactions?.[String(cur)] : null
+  const entries = state
+    ? (Array.isArray(state) ? state : [state]).filter((e: any) => e?.summary_msg)
+    : []
+  // split 是后端落库 conv.messages 的原始下标；水合后 c.messages 数组下标与原始不一致
+  // （tool 消息被提取为 tool_call/tool_result 配对、数组变长），用 _rawIdx（水合时打的
+  // 原始落库下标）对齐 split；流式新消息未水合、无 _rawIdx → 回退数组下标（流式时两者一致）
+  const rawOf = (m: any, idx: number): number => (m?._rawIdx != null ? m._rawIdx : idx)
   const keep = (m: any): boolean => {
-    // 历史压缩摘要卡片：会话级，不受智能体视角过滤
     if (m.compressed_summary) return true
     if (cur == null) return !isA2aInput(m)
     if (m.role === 'user') return !isA2aInput(m) && (m.to_agent_id == null || m.to_agent_id === cur)
@@ -1516,16 +1525,19 @@ const visibleMsgs = computed(() => {
   }
   // 过滤时保留原始下标，供压缩摘要定位（split 是共享历史下标）
   const pairs = all.map((m: any, idx: number) => [m, idx] as const).filter(([m]) => keep(m))
-  // 注入当前智能体的压缩摘要（agent_compactions[agent_id].summary_msg，覆盖 msgs[:split]）：
-  // 插在摘要覆盖区间最后一条可见消息（= 开始压缩前的最后一条消息泡泡）之后，沿用原摘要卡片样式
-  if (cur != null) {
-    const state = (conv.value as any)?.agent_compactions?.[String(cur)]
-    const sm = state?.summary_msg
-    if (sm) {
-      const split = Math.max(0, Math.min(Number(state.split) || 0, all.length))
+  // 为每张压缩卡片计算插入位置（split = 该次压缩覆盖的共享历史终点）；
+  // 从后往前插入，避免前面的插入偏移后面的位置。所有消息原样保留可见。
+  if (entries.length) {
+    const injections = entries.map((e: any) => {
+      const splitE = Math.max(0, Math.min(Number(e.split) || 0, all.length))
       let pos = 0
-      for (let k = 0; k < pairs.length; k++) if (pairs[k][1] < split) pos = k + 1
-      pairs.splice(pos, 0, [sm, -1] as const)
+      for (let k = 0; k < pairs.length; k++) {
+        if (rawOf(pairs[k][0] as any, pairs[k][1] as number) < splitE) pos = k + 1
+      }
+      return { sm: e.summary_msg, pos }
+    })
+    for (let j = injections.length - 1; j >= 0; j--) {
+      pairs.splice(injections[j].pos, 0, [injections[j].sm, -1] as const)
     }
   }
   return pairs.map(([m]) => m)
@@ -1562,10 +1574,11 @@ const renderItems = computed(() => {
     const m = msgs[i] as any
     if (m.compressed_summary) { out.push({ type: 'ctx-summary', msg: m, idx: i }); i++; continue }
     if (m.role === 'user') { out.push({ type: 'user', msg: m, idx: i }); i++; continue }
-    // 一轮智能体输出：从 user 消息之后开始，直到下一条 user 消息为止
+    // 一轮智能体输出：从 user 消息之后开始，直到下一条 user 消息或独立摘要卡片为止
+    // （卡片是独立元素，绝不能混入本过程框；遇到即断开当前段，交由外层单独渲染 ctx-summary）
     const start = i
     const children: any[] = []
-    while (i < msgs.length && (msgs[i] as any).role !== 'user') {
+    while (i < msgs.length && (msgs[i] as any).role !== 'user' && !(msgs[i] as any).compressed_summary) {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result' || m2.role === 'tool') { i++; continue }
       if (m2.role === 'a2a') {
@@ -1677,11 +1690,18 @@ function hasTools(idx: number): boolean {
 }
 /** 提取 assistant 消息下 tool_result 的所有图片引用（data_url / file 路径），供对话区缩略图渲染。
  *  覆盖：后端 I: 行 image_refs、历史持久化 images 字段、以及兜底 legacy 的 image_data_url 字段。 */
+const _IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
 function imageRefsOfAssistant(idx: number): Array<{ type: 'data_url' | 'file'; src: string }> {
   const out: Array<{ type: 'data_url' | 'file'; src: string }> = []
   const seen = new Set<string>()
   const add = (r: { type: 'data_url' | 'file'; src: string }) => {
     if (r.src && !seen.has(r.src)) { seen.add(r.src); out.push(r) }
+  }
+  const isValidFileImg = (r: any): boolean => {
+    // file 路径必须是图片扩展名（防御历史坏数据：.motion3.json / .pdf 等不应触发 <img>）
+    if (r?.type !== 'file') return true
+    const ext = (String(r.src).split('.').pop() || '').toLowerCase()
+    return _IMAGE_EXTS.has('.' + ext)
   }
   const tools = toolsOfAssistant(idx)
   for (const t of tools) {
@@ -1690,7 +1710,7 @@ function imageRefsOfAssistant(idx: number): Array<{ type: 'data_url' | 'file'; s
     const refs = t.image_refs || t.images
     if (Array.isArray(refs)) {
       for (const r of refs) {
-        if (r?.type === 'data_url' || r?.type === 'file') add(r)
+        if ((r?.type === 'data_url' || r?.type === 'file') && isValidFileImg(r)) add(r)
       }
     }
     // 2) 兜底 legacy：顶层 image_data_url（browser_control share 模式）
@@ -2122,6 +2142,7 @@ const msgMenuEl = ref<HTMLElement | null>(null)
 
 function onMsgContextMenu(e: MouseEvent, idx: number) {
   e.preventDefault()
+  closeInputCtx()
   const menuW = 260
   const menuH = 60
   const pad = 8
@@ -2146,6 +2167,132 @@ function onMsgContextMenu(e: MouseEvent, idx: number) {
 }
 function closeMsgCtx() { msgCtxMenu.value = null }
 
+// —— 对话输入框右键菜单：粘贴 / 复制 / 清空 ——
+// 记录右键时刻的选区（菜单项用 mousedown.prevent，输入框不失焦、选区不丢）
+const inputCtxMenu = ref<{ x: number; y: number; selStart: number; selEnd: number; hasSel: boolean; hasText: boolean } | null>(null)
+const inputMenuEl = ref<HTMLElement | null>(null)
+
+function onInputContextMenu(e: MouseEvent) {
+  e.preventDefault()
+  // 同一时刻只留一个菜单
+  closeMsgCtx(); closeAvatarCtx(); closeCtx(); closeCvCtx()
+  const ta = taRef.value
+  const selStart = ta ? ta.selectionStart : input.value.length
+  const selEnd = ta ? ta.selectionEnd : input.value.length
+  const menuW = 210
+  const menuH = 128
+  const pad = 8
+  const x = Math.max(pad, Math.min(e.clientX, window.innerWidth - menuW - pad))
+  const y = Math.max(pad, Math.min(e.clientY, window.innerHeight - menuH - pad))
+  inputCtxMenu.value = { x, y, selStart, selEnd, hasSel: selEnd > selStart, hasText: !!input.value }
+  // 渲染后按实际尺寸精确校正，避免估算偏差导致超出屏幕
+  nextTick(() => {
+    const el = inputMenuEl.value
+    const v = inputCtxMenu.value
+    if (!el || !v) return
+    const r = el.getBoundingClientRect()
+    let nx = v.x
+    let ny = v.y
+    if (r.right > window.innerWidth - pad) nx = Math.max(pad, window.innerWidth - r.width - pad)
+    if (r.bottom > window.innerHeight - pad) ny = Math.max(pad, window.innerHeight - r.height - pad)
+    if (nx !== v.x || ny !== v.y) inputCtxMenu.value = { ...v, x: nx, y: ny }
+  })
+}
+function closeInputCtx() { inputCtxMenu.value = null }
+
+/** 对话区顶部临时提示（复用消息操作状态浮层） */
+function flashMsgStatus(text: string, ms = 1600) {
+  msgOpStatus.value = text
+  setTimeout(() => { if (msgOpStatus.value === text) msgOpStatus.value = '' }, ms)
+}
+
+/** 读剪贴板文本：Electron 主进程 clipboard 最可靠；浏览器模式回退 navigator.clipboard */
+async function readClipboardText(): Promise<string> {
+  const api = (window as any).electronAPI?.clipboard
+  if (api?.readText) {
+    try { return String((await api.readText()) ?? '') } catch { /* 继续回退 */ }
+  }
+  try {
+    if (navigator.clipboard?.readText) return await navigator.clipboard.readText()
+  } catch { /* 无权限 */ }
+  return ''
+}
+
+/** 写剪贴板文本：优先 Electron clipboard，回退 navigator / execCommand */
+async function writeClipboardText(text: string): Promise<boolean> {
+  const api = (window as any).electronAPI?.clipboard
+  if (api?.writeText) {
+    try {
+      const ok = await api.writeText(text)
+      if (ok !== false) return true
+    } catch { /* 继续回退 */ }
+  }
+  return await copyTextToClipboard(text)
+}
+
+/** 恢复输入框焦点并把光标放到指定位置 */
+async function focusInputAt(pos: number) {
+  await nextTick()
+  const ta = taRef.value
+  if (!ta) return
+  ta.focus()
+  const p = Math.max(0, Math.min(pos, input.value.length))
+  try { ta.setSelectionRange(p, p) } catch { /* 忽略 */ }
+}
+
+/** 粘贴：把剪贴板文本插入右键位置（有选区则替换选区） */
+async function pasteFromInputCtx() {
+  const m = inputCtxMenu.value
+  closeInputCtx()
+  if (!m) return
+  const text = await readClipboardText()
+  if (!text) {
+    flashMsgStatus('剪贴板里没有可粘贴的文字')
+    await focusInputAt(m.selStart)
+    return
+  }
+  const len = input.value.length
+  const start = Math.max(0, Math.min(m.selStart, len))
+  const end = Math.max(start, Math.min(m.selEnd, len))
+  input.value = input.value.slice(0, start) + text + input.value.slice(end)
+  await focusInputAt(start + text.length)
+  flashMsgStatus('✅ 已粘贴')
+}
+
+/** 复制：有选区复制选区，没有选区复制输入框全部内容 */
+async function copyFromInputCtx() {
+  const m = inputCtxMenu.value
+  closeInputCtx()
+  if (!m) return
+  const text = m.hasSel ? input.value.slice(m.selStart, m.selEnd) : input.value
+  if (!text) {
+    flashMsgStatus('输入框为空，没有可复制的文字')
+    await focusInputAt(m.selStart)
+    return
+  }
+  const ok = await writeClipboardText(text)
+  flashMsgStatus(ok ? `✅ 已复制${m.hasSel ? '选中内容' : '输入框全部内容'}` : '❌ 复制失败')
+  await nextTick()
+  const ta = taRef.value
+  if (ta) {
+    ta.focus()
+    try { ta.setSelectionRange(m.selStart, m.selEnd) } catch { /* 忽略 */ }
+  }
+}
+
+/** 清空：清掉输入框文本（附件/智能体选择等保持不变） */
+async function clearFromInputCtx() {
+  closeInputCtx()
+  if (!input.value) {
+    flashMsgStatus('输入框已经是空的')
+    await focusInputAt(0)
+    return
+  }
+  input.value = ''
+  await focusInputAt(0)
+  flashMsgStatus('已清空输入框')
+}
+
 // —— 用户头像右键菜单：设置/更换头像照片 ——
 const avatarCtxMenu = ref<{ x: number; y: number } | null>(null)
 const avatarMenuEl = ref<HTMLElement | null>(null)
@@ -2153,6 +2300,7 @@ const userAvatarPhoto = computed(() => (settings.data.user_avatar as string) || 
 
 function onAvatarContextMenu(e: MouseEvent) {
   e.preventDefault()
+  closeInputCtx()
   const menuW = 240
   const menuH = userAvatarPhoto.value ? 88 : 44
   const pad = 8
@@ -2239,6 +2387,36 @@ function shrinkToDataUrl(file: File, max = 256): Promise<string> {
 
 // —— 删除单条消息：截断到这条之前 ——
 const msgOpStatus = ref('')
+// —— 复制文本到剪贴板：优先 Clipboard API，失败时回退 textarea+execCommand ——
+// Electron 中 navigator.clipboard.writeText 常因失焦/权限受限而 reject，
+// 此时必须回退到 execCommand 才能真正写入剪贴板，而不是直接报失败。
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // 落入下方 fallback
+    }
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.top = '0'
+    ta.style.left = '0'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 // —— 复制消息文本到剪贴板（用户/智能体消息通用） ——
 async function copyMessageFromCtx() {
   const menu = msgCtxMenu.value
@@ -2251,23 +2429,8 @@ async function copyMessageFromCtx() {
     setTimeout(() => { msgOpStatus.value = '' }, 2000)
     return
   }
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-    } else {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    msgOpStatus.value = '✅ 已复制到剪贴板'
-  } catch {
-    msgOpStatus.value = '❌ 复制失败'
-  }
+  const ok = await copyTextToClipboard(text)
+  msgOpStatus.value = ok ? '✅ 已复制到剪贴板' : '❌ 复制失败'
   setTimeout(() => { msgOpStatus.value = '' }, 2000)
 }
 async function deleteMessageFromCtx() {
@@ -2721,6 +2884,19 @@ async function onCtxBadgeClick() {
     if (res && res.compressed === false) {
       // force 下仍返回 false：没有可压缩区间（历史太短）或摘要生成失败
       alert('没有可压缩的历史区间（历史太短或摘要生成失败），本次未压缩。')
+    } else {
+      // 压缩成功。会话仍在流式时 refreshConv 会提前返回（conversation.ts 内
+      // streamingConvIds.has(cid) → 直接返回，不拉取后端最新 conv），
+      // 导致本地 conv.agent_compactions 保持旧值 → 压缩遮挡摘要卡片不显示。
+      // 压缩后端一定会把 agent_compactions 落库 → 直接 GET 最新 conv 轻量合并该字段，
+      // 触发 visibleMsgs 重新注入摘要卡片（不整包替换，避免打断流式渲染）。
+      try {
+        const fresh = await api.convs.get(cid)
+        if (fresh?.agent_compactions && convs.current === cid) {
+          const c = convs.currentData() as any
+          if (c) c.agent_compactions = fresh.agent_compactions
+        }
+      } catch { /* 后端短暂不可达 → 等流式结束后 refreshConv 载入 */ }
     }
     await convs.refreshConv(cid)
     await refreshCtx()
@@ -2988,6 +3164,7 @@ function startRenameCanvas(id: number, name: string) { renameId.value = id; rena
 function onCanvasContext(e: MouseEvent, id: number) {
   e.preventDefault()
   e.stopPropagation()
+  closeInputCtx()
   cvCtxMenu.value = { show: true, x: e.clientX, y: e.clientY, id }
   closeCtx()
 }
@@ -3103,6 +3280,7 @@ function onCvDrop(e: DragEvent, c: any) {
 // —— 右键菜单 / 多选删除 ——
 function onConvContext(e: MouseEvent, id: number) {
   e.preventDefault()
+  closeInputCtx()
   ctxMenu.value = { show: true, x: e.clientX, y: e.clientY, id }
 }
 function closeCtx() { ctxMenu.value = { ...ctxMenu.value, show: false } }
@@ -3130,9 +3308,17 @@ async function deleteSelected() {
   await convs.removeMany(selectedIds.value)
   exitSel()
 }
-function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true }
+function onDocClick() { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); closeInputCtx() }
 function onDocKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); convsCollapsed.value = true; if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
+    if (e.key === 'Escape') { closeCtx(); closeCvCtx(); closeMsgCtx(); closeAvatarCtx(); closeInputCtx(); if (selMode.value) exitSel(); modelDdOpen.value = false; reasoningDdOpen.value = false }
+}
+// 点击对话区空白 → toggle 对话记录浮窗；点击消息气泡/按钮等有具体交互的元素则不触发
+function onChatBoxClick(e: MouseEvent) {
+  const t = e.target as HTMLElement | null
+  if (!t) return
+  // 如果点击了消息气泡本身、按钮、链接、输入框、textarea 等可交互元素，则不触发折叠
+  if (t.closest('.msg, button, a, input, textarea, select, label, .chat-attach, .chat-img-wrap, .viz-slot, .ctx-summary-card')) return
+  convsCollapsed.value = !convsCollapsed.value
 }
 
 /** 聊天消息内附件点击事件委托（冒泡到 document 处理，支持 v-html 渲染的附件卡片） */
@@ -3346,16 +3532,15 @@ onBeforeUnmount(() => {
   <div class="right-panel glass">
     <!-- 画布列表 -->
     <div class="canvases-pane">
-      <div class="section-title">
+      <div class="section-title clickable" @click="canvasesCollapsed = !canvasesCollapsed" :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
         <button class="collapse-btn" type="button"
-                @click.stop="canvasesCollapsed = !canvasesCollapsed"
                 :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
           {{ canvasesCollapsed ? '▸' : '▾' }}
         </button>
         <span>画布列表</span>
         <span class="conv-count">{{ canvases.list.length }}</span>
         <span class="flex-spacer"></span>
-        <button class="btn sm add-canvas-btn" @click="canvases.create()" title="新建画布">+</button>
+        <button class="btn sm add-canvas-btn" @click.stop="canvases.create()" title="新建画布">+</button>
       </div>
       <div class="cv-list" v-show="!canvasesCollapsed">
         <div v-for="c in canvases.list" :key="c.id"
@@ -3638,11 +3823,36 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </Teleport>
-      <!-- 消息操作状态提示（删除/撤销的即时反馈） -->
+      <!-- 对话输入框右键菜单：粘贴 / 复制 / 清空（mousedown.prevent 保证输入框不失焦、选区不丢） -->
       <Teleport to="body">
-        <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
+        <div v-if="inputCtxMenu"
+             ref="inputMenuEl"
+             class="msg-ctx-menu input-ctx-menu"
+             :style="{ left: inputCtxMenu.x + 'px', top: inputCtxMenu.y + 'px' }"
+             @click.stop @mousedown.stop>
+          <div class="msg-ctx-item" @mousedown.prevent.stop @click.stop="pasteFromInputCtx">
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4" width="14" height="18" rx="2"/><path d="M9 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1"/><path d="M9 12h6"/><path d="M9 16h4"/></svg></span>
+            <span>粘贴</span>
+            <span class="msg-ctx-kbd">Ctrl+V</span>
+          </div>
+          <div class="msg-ctx-item" :class="{ 'is-disabled': !inputCtxMenu.hasText }"
+               @mousedown.prevent.stop @click.stop="copyFromInputCtx">
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
+            <span>{{ inputCtxMenu.hasSel ? '复制选中内容' : '复制全部内容' }}</span>
+            <span class="msg-ctx-kbd">Ctrl+C</span>
+          </div>
+          <div class="msg-ctx-item" :class="{ 'is-disabled': !inputCtxMenu.hasText }"
+               @mousedown.prevent.stop @click.stop="clearFromInputCtx">
+            <span class="msg-ctx-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></span>
+            <span>清空输入框</span>
+          </div>
+        </div>
       </Teleport>
-      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll">
+      <!-- 对话滚动区包裹层：让状态提示可固定在对话区顶部中央，不随消息滚动、不产生布局位移 -->
+      <div class="chat-scroll-wrap">
+      <!-- 消息操作状态提示（复制/删除/撤销的即时反馈）：固定在对话区顶部中央 -->
+      <div v-if="msgOpStatus" class="msg-op-status">{{ msgOpStatus }}</div>
+      <div class="chat-box" ref="msgBox" :style="{ '--chat-avatar-size': chatAvatarSize + 'px' }" @scroll.passive="onMessagesScroll" @click="onChatBoxClick">
         <div v-if="!conv" class="no-conv">请新建对话</div>
         <!-- ============ 消息列表 ============
              tool_call/tool_result 不单独出块，归属到紧接其前的 assistant；
@@ -3769,7 +3979,9 @@ onBeforeUnmount(() => {
                         <span v-if="isStreamingMsg(ch.msg)" class="think-cursor">▌</span>
                         <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
                       </div>
-                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full">
+                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full"
+                           @dblclick.stop="toggleThink(ch.idx)"
+                           title="双击收起思考过程">
                         <pre class="think-full-text">{{ stripContinueTag(ch.msg.reasoning) }}</pre>
                       </div>
 
@@ -3817,7 +4029,9 @@ onBeforeUnmount(() => {
                               </span>
                               <span class="tr-toggle">{{ toolDetailIsOpen(ch.idx, t.tool_call_id) ? '▾' : '▸' }}</span>
                             </div>
-                            <div v-if="toolDetailIsOpen(ch.idx, t.tool_call_id)" class="tr-detail">
+                            <div v-if="toolDetailIsOpen(ch.idx, t.tool_call_id)" class="tr-detail"
+                                 @dblclick.stop="toggleToolDetail(ch.idx, t.tool_call_id)"
+                                 title="双击收起工具详情">
                               <div class="tr-block">
                                 <div class="tr-block-title">参数</div>
                                 <!-- 虚拟 pill（参数流式中）：直接流式打印累计的原始 JSON 片段（打字机效果） -->
@@ -3874,6 +4088,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </template>
+      </div>
       </div>
 
       <!-- 图片浮窗：8 方向边界改大小，滚轮只缩放图片不动窗口 -->
@@ -4098,7 +4313,7 @@ onBeforeUnmount(() => {
             <span class="edge edge-left"    :style="edgeStyle?.left"></span>
             <span class="ctx-text">{{ ctxCompressing ? '压缩中…' : ctxBadgeText }}</span>
           </div>
-          <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true"></textarea>
+          <textarea ref="taRef" class="input input-ta" v-model="input" placeholder="输入消息或指令..." @keydown.enter.exact.prevent="send" @focus="canvasesCollapsed = true" @contextmenu.prevent.stop="onInputContextMenu"></textarea>
           <button v-if="settings.asrAvailable && settings.asrEnabled" class="btn voice-btn" :class="{ recording: isRecording }" @click="toggleVoiceInput" :title="isRecording ? '停止同声传译' : '同声传译'" aria-label="语音输入">
             <span class="voice-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" aria-hidden="true">
@@ -4124,6 +4339,8 @@ onBeforeUnmount(() => {
 .canvases-pane { padding: 4px 0; flex-shrink: 0; }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
+.section-title.clickable { cursor: pointer; border-radius: 6px; transition: background .15s; }
+.section-title.clickable:hover { background: rgba(var(--surface-rgb), 0.06); }
 .section-title .add-canvas-btn { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: calc(16px * var(--font-scale)); font-weight: 500; line-height: 1; color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.10); border: 1px solid rgba(var(--accent-rgb), 0.26); border-radius: 7px; cursor: pointer; transition: background .2s ease, border-color .2s ease, color .2s ease; }
 .section-title .add-canvas-btn:hover { background: rgba(var(--accent-rgb), 0.20); border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent-light); }
 .section-title .add-canvas-btn:active { background: rgba(var(--accent-rgb), 0.28); }
@@ -4232,6 +4449,7 @@ onBeforeUnmount(() => {
 .conv-item .del { opacity: 0; font-size: calc(14px * var(--font-scale)); flex-shrink: 0; }
 .conv-item:hover .del { opacity: .6; }
 
+.chat-scroll-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .chat-box { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
 .no-conv { text-align: center; opacity: .7; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
@@ -4364,6 +4582,10 @@ onBeforeUnmount(() => {
 .process-body::-webkit-scrollbar { width: 5px; }
 .process-body::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), 0.28); border-radius: 999px; }
 .process-body::-webkit-scrollbar-track { background: transparent; }
+/* 关键修复：防止 flex 子项在父容器 max-height 限制下被 flex-shrink:1 压扁，
+   导致 bubble/think-stream/tool-row 高度收缩为零并互相遮挡。
+   flex-shrink:0 让子元素保持自然高度，超出部分由 overflow-y:auto 滚动显示。 */
+.process-body > * { flex-shrink: 0; }
 
 .col-wrap { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
 .head-row { display: flex; align-items: center; gap: 6px; }
@@ -4976,6 +5198,8 @@ onBeforeUnmount(() => {
    事件条目按类型着色（轮次灰 / 调用蓝 / 完成 绿红 / 提示黄） */
 .sub-proc-block { padding: 4px 7px; }
 .sub-proc { display: flex; flex-direction: column; gap: 2px; padding: 3px 5px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.12); border: 1px solid rgba(var(--surface-rgb), 0.06); font-size: calc(10px * var(--font-scale)); max-height: 220px; overflow-y: auto; }
+/* 同 .process-body：防止 max-height + flex-shrink:1 把事件条目压缩 */
+.sub-proc > * { flex-shrink: 0; }
 .sp-item { display: flex; align-items: baseline; gap: 5px; line-height: 1.5; min-width: 0; flex-wrap: wrap; }
 .sp-round { color: rgba(var(--text-rgb), 0.62); font-size: calc(9px * var(--font-scale)); }
 .sp-txt { color: rgba(var(--text-rgb), 0.85); }
@@ -5045,6 +5269,10 @@ onBeforeUnmount(() => {
 </style>
 
 <style>
+/* —— 滚动容器内 flex 子项禁止压缩（防止 max-height 限制下 flex-shrink:1 把气泡/思考行压扁）—— */
+.process-body > * { flex-shrink: 0; }
+.sub-proc > * { flex-shrink: 0; }
+
 /* —— 泡泡内 Markdown（v-html 注入的元素无法被 scoped 命中，必须用全局样式）—— */
 .bubble.markdown { white-space: normal; word-break: break-word; overflow-wrap: anywhere; line-height: 1.6; }
 .bubble.markdown > :first-child { margin-top: 0 !important; }
@@ -5217,13 +5445,24 @@ onBeforeUnmount(() => {
 }
 .msg-ctx-item:hover { background: rgba(var(--accent-rgb), 0.2); }
 .msg-ctx-icon { font-size: calc(14px * var(--font-scale)); }
+/* —— 对话输入框右键菜单：更紧凑，右侧挂快捷键提示 —— */
+.input-ctx-menu { min-width: 200px; max-width: 260px; }
+.msg-ctx-kbd {
+  margin-left: auto;
+  font-family: Consolas, monospace;
+  font-size: calc(11px * var(--font-scale));
+  opacity: .45;
+  letter-spacing: .3px;
+}
+.msg-ctx-item.is-disabled { opacity: .45; }
 
 /* 消息操作状态提示（右上角浮动） */
 .msg-op-status {
-  position: fixed;
-  top: 14px;
-  right: 14px;
-  z-index: 2000;
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
   padding: 8px 14px;
   border-radius: 8px;
   background: rgba(var(--node-bg-rgb), 0.95);
@@ -5234,8 +5473,9 @@ onBeforeUnmount(() => {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   animation: toastFadeIn .2s ease-out;
+  pointer-events: none;
 }
-@keyframes toastFadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastFadeIn { from { opacity: 0; transform: translate(-50%, -4px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
 /* —— 文件操作历史还原对话框 —— */
 .modal-backdrop {

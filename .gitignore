@@ -52,4 +52,8 @@ Thumbs.db
 /_market_backup_*/
 # 根目录临时调试/测试产物（以 _ 开头的临时文件）
 /_*
-
+# 本地 G2P 模型（152MB，仅本机保留）与语音测试素材
+/g2pW/
+/workspace/tts_probe/
+# 备份文件（*.bak、*.bak_YYYYMMDD、*.bak.md 等）
+*.bak*

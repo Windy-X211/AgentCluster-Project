@@ -363,8 +363,12 @@ def _extract_image_refs(result: Any) -> list[dict]:
         if url_entry:
             _add(url_entry)
         else:
-            # 转不成 data URL → 保留 file 路径（前端走 /api/fs/image）
-            _add({"type": "file", "src": p})
+            # 转不成 data URL → 仅当扩展名匹配已知图片格式时，保留 file 路径
+            # （前端走 /api/fs/image）。排除 .motion3.json / .pdf / .mp4 等非图片路径，
+            # 避免桌宠控制等工具返回的非图片文件被误当作图片缩略图渲染。
+            ext = os.path.splitext(p)[1].lower()
+            if ext in _IMAGE_EXT_TO_MIME:
+                _add({"type": "file", "src": p})
 
     # —— data URL ——
     for url in _extract_data_urls(result):
@@ -753,9 +757,53 @@ def _cancel_pending_child_tasks(turn: dict | None) -> None:
             t.cancel()
 
 
+def _agent_expanded_caps(agent: dict) -> tuple[list, list, list | None]:
+    """把 agent 配置的「组合技（combos）」展开合并进命令/技能/插件能力列表。
+
+    返回 (commands, plugins, skills)：
+      - commands/plugins 直接合并 combo 成员
+      - skills 保持原有语义：None=全部技能（旧数据兼容），[]=不注入，
+        列表=合并 combo 里的技能；有 combo 技能时自动并入
+    """
+    commands = list(agent.get("commands") or [])
+    plugins = list(agent.get("plugins") or [])
+    skills = agent.get("skills")
+    combos = agent.get("combos") or []
+    if not combos:
+        return commands, plugins, skills
+
+    try:
+        combo_map = store.load_combos()
+    except Exception:
+        return commands, plugins, skills
+
+    combo_commands: list[str] = []
+    combo_plugins: list[str] = []
+    combo_skills: list[str] = []
+    for name in combos:
+        rec = (combo_map or {}).get(name) or {}
+        for m in rec.get("members") or []:
+            t, key = m.get("type"), m.get("key")
+            if not key:
+                continue
+            if t == "commands" and key not in commands and key not in combo_commands:
+                combo_commands.append(key)
+            elif t == "plugins" and key not in plugins and key not in combo_plugins:
+                combo_plugins.append(key)
+            elif t == "skills" and key not in combo_skills and (skills is None or key not in skills):
+                combo_skills.append(key)
+    commands.extend(combo_commands)
+    plugins.extend(combo_plugins)
+    if skills is not None and combo_skills:
+        # 技能索引合并：None=全部技能（combo 技能自然包含）；显式列表（含空）则并入 combo 技能
+        skills = list(skills) + combo_skills
+    return commands, plugins, skills
+
+
 def _agent_tools(agent: dict) -> list:
-    return filter_tools(agent.get("commands", []), agent.get("plugins", []), PLUGIN_REGISTRY,
-                        agent.get("skills"), agent=agent)
+    commands, plugins, skills = _agent_expanded_caps(agent)
+    return filter_tools(commands, plugins, PLUGIN_REGISTRY,
+                        skills, agent=agent)
 
 
 def _tool_capability_brief(tools: list) -> str:
@@ -808,7 +856,7 @@ def _rules_for_agent(agent_id, canvas_id=None) -> list[str]:
 
 
 def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_id=None, canvas: dict | None = None, wd_probe=None) -> str:
-    parts = [agent.get("system_prompt") or "你是一个有用的智能体。"]
+    parts = [agent.get("system_prompt") or "你是一个智能体。"]
     agent_name = agent.get("name", "智能体")
     if agent_name: parts.append(f"\n你的名字: {agent_name}")
 
@@ -829,8 +877,7 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
             f"- 所有 file.read / file.write / file.structure / cmd.run 会以它为基准解析相对路径；"
             f"- 保存文件**一律用相对路径**，例如 file.write(path='report.md', content='...') "
             f"会写入 `{wd}\\report.md`；\n"
-            f"- ⚠️ **禁止写入 backend/、frontend/、AppData/、node_modules/ 等系统目录**——"
-            f"即使你手搓了绝对路径也会污染项目，请始终用相对路径让文件自动落在工作区内；"
+            f"请始终用相对路径让文件自动落在工作区内；"
             f"- 不要在后端目录下生成任何产出物，所有产出集中在 `{wd}` 方便用户统一查看。"
             + ("\n- 系统已自动创建此目录。" if not dir_ok else "")
             + probe_note
@@ -871,7 +918,9 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         # 范围：agent 显式配置了 skills 就用配置的子集；
         #   None（旧数据/从未保存过）→ 回退到全部已注册技能索引；
         #   []（用户明确不勾选）→ 不注入任何技能索引（skill.invoke 常驻工具仍可用）
-        wanted = agent.get("skills")
+        # 组合技（combos）里的技能也并入索引。
+        _, _, expanded_skills = _agent_expanded_caps(agent)
+        wanted = expanded_skills
         names = sorted(SKILL_REGISTRY.keys()) if wanted is None else [s for s in wanted if SKILL_REGISTRY.get(s)]
         skill_index = []
         for s in names:
@@ -924,13 +973,19 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
         parts.append(f"\n【集群上下文】{cluster_context}")
     prompt = "\n".join(parts)
     # —— 动态替换存储路径占位符 ——
-    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root}，
+    # agent.system_prompt 中可用 {skills_dir} / {plugins_dir} / {bg_dir} / {storage_root} / {capability_groups_path} / {spec_dir}，
     # 与 store.ROOT 保持同步（用户在设置里切换存储根后自动生效）。
+    # {spec_dir} 指向项目内统一规范文档目录 doc/spec（技能/插件/拓展/背景规范，随项目走）。
     try:
         _root = str(store.ROOT)
+        _spec_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "doc", "spec")
+        )
+        prompt = prompt.replace("{spec_dir}", _spec_dir)
         prompt = prompt.replace("{skills_dir}", str(store.ROOT / "skills"))
         prompt = prompt.replace("{plugins_dir}", str(store.ROOT / "plugins"))
         prompt = prompt.replace("{bg_dir}", str(store.ROOT / "backgrounds"))
+        prompt = prompt.replace("{capability_groups_path}", str(store.ROOT_CAPABILITY_GROUPS))
         prompt = prompt.replace("{storage_root}", _root)
     except Exception:
         pass
@@ -1016,7 +1071,15 @@ def _execute_tool(name: str, arguments: dict,
             try:
                 from core.external_tools import owner_of as _ext_owner, dispatch as _ext_dispatch
                 if _ext_owner(name):
-                    return _ext_dispatch(name, arguments or {}, None)
+                    # 传入当前智能体（含 memory_mode 等拓展所需字段），
+                    # 否则拓展 call_fn 收到 None，按"未启用"处理导致工具执行失败。
+                    _ext_agent = None
+                    if agent_id is not None:
+                        try:
+                            _ext_agent = get_by("agents", agent_id)
+                        except Exception:
+                            _ext_agent = None
+                    return _ext_dispatch(name, arguments or {}, _ext_agent)
             except Exception as e:
                 return {"error": f"外部工具分发失败：{type(e).__name__}: {e}"}
             # 插件执行：注入能力参数预设的固定参数（模型不可见、不可改，固定值优先覆盖）
@@ -1617,7 +1680,12 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # （{summary_msg, split}），该智能体视图 = [自己的摘要] + messages[split:]；
     # 任何异常都不阻断本轮对话
     from core.ctx_compress import maybe_compress, agent_view
-    await maybe_compress(conv, agent, interface, model, system_prompt_base)
+    _init_cinfo = await maybe_compress(conv, agent, interface, model, system_prompt_base)
+    if _init_cinfo:
+        # 组装阶段已压缩：实时通知前端补写 conv.agent_compactions，让遮挡摘要卡片在流式
+        # 一开始就显示（streaming 期间 refreshConv 提前返回，前端不会自动拉取到最新状态）
+        yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
+                                 'entry': _init_cinfo['entry']}, ensure_ascii=False)}\n")
     if _wf_mode in ("plan", "spec", "goal") and _wf:
         system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})
@@ -1959,7 +2027,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     _limit = int(_mw_fn(interface, model) * _cs["threshold"])
                     _total = _et(messages[0].get("content")) + sum(_emt(m) for m in messages[1:])
                     if _limit > 0 and _total > _limit:
-                        _cinfo = await _mc(conv, agent, interface, model, system_prompt_base)
+                        # force=True：本轮实际发给 LLM 的上下文（_total，含纠错反馈/图片 followup 等
+                        # 仅在内存 messages、尚未落库的瞬态消息）已确认超线；maybe_compress 内部会再用
+                        # agent_view（仅 conv.messages 已落库历史）重算 total，可能比 _total 小而导致
+                        # 误判"未达线"跳过压缩。此处跳过该冗余判定，只保留"是否存在可压缩区间"的安全检查。
+                        _cinfo = await _mc(conv, agent, interface, model, system_prompt_base, force=True)
                         if _cinfo:
                             _rebuilt = [messages[0]]
                             for m in _av(conv, agent.get("id")):
@@ -1971,6 +2043,10 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                             _tool_round_start = len(messages)
                             yield (f"RN:（上下文达到压缩线：已把 {_cinfo['dropped']} 条较早历史压缩为摘要，"
                                    f"压缩前估算 {_cinfo['tokens_before']} token，继续当前任务）\n")
+                            # CX: 携带该智能体压缩状态 → 前端即时补写 conv.agent_compactions，
+                            # 让流式中的历史压缩遮挡摘要卡片立即显示（无需等 streaming 结束）
+                            yield (f"CX:{json.dumps({'agent_id': agent.get('id'),
+                                                     'entry': _cinfo['entry']}, ensure_ascii=False)}\n")
                             logger.info("[agent_runtime] 运行中压缩 round=%d conv=%s dropped=%s",
                                         round_idx, conversation_id, _cinfo['dropped'])
             except Exception as _ce:
