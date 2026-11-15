@@ -1,0 +1,63 @@
+# screen_control 插件 —— 屏幕控制（基于 vercel-labs/agent-desktop）
+
+version: "1.0.0"
+type: "plugin"
+name: "screen_control"
+label:
+  zh_Hans: "屏幕控制"
+  en_US: "Screen Control"
+author: "q737843-source"
+description:
+  zh_Hans: |
+    屏幕控制插件，基于 vercel-labs/agent-desktop（Apache-2.0），通过操作系统无障碍 API
+    （Windows UI Automation）以语义方式查看并操控桌面应用：读取窗口控件树、按 ref 精准点击/输入，
+    不需要截图与像素匹配，默认不移动鼠标指针、不抢焦点，用户可随时正常使用电脑。
+
+    ★ 核心能力 ★
+    1. 观察：snapshot 控件树快照（每个可交互元素带 ref）、find 按角色/文本搜索元素、
+       readElement 读取元素属性与状态、screenshot 窗口截图（自动落盘）
+    2. 操作：click/双击/三击/右键、type 文本输入、setValue 直接赋值、
+       refAction（clear/focus/toggle/check/uncheck/expand/collapse/select）、scroll 滚动、
+       pressKey 按键组合
+    3. 应用与窗口：launch 启动应用、closeApp 关闭、listApps/listWindows 枚举、
+       windowOp（聚焦/缩放/移动/最小化/最大化/还原）
+    4. 系统交互：clipboard 剪贴板读写、notifications 通知管理（dismiss 强制校验通知归属应用）、
+       surfaces 系统表面（开始菜单/任务栏/通知中心）、physical 物理鼠标（hover/移动/坐标点击，需 headed）
+    5. 可靠性：wait 等待元素/窗口/文本出现、batch 批量执行任意 CLI 命令、getGuide 内置使用规范
+
+    ★ 工作循环 ★
+    snapshot 取 ref → click/type/... 作用于 ref → 再 snapshot 验证结果。
+    ref 形如 @<snapshot_id>:eN 必须完整携带快照 id；界面变化后 CLI 返回 STALE_REF /
+    AMBIGUOUS_TARGET 时必须重新 snapshot，绝不盲目重试（插件已附中文处理提示）。
+
+    ★ 与「桌面控制」的关系 ★
+    「桌面控制」(desktop_control) 是像素级路线（坐标点击/录屏/音频）；本插件是无障碍语义路线，
+    两者互补：优先用本插件做精准 UI 操作，录屏与未知界面坐标操作用「桌面控制」。
+
+    ★ 依赖 ★
+    需要本机安装 agent-desktop CLI（npm 全局包，Windows 10 1809+ 可用）。
+    首次使用可执行 action=setup 自动安装；安装后状态存储于 ~/.agent-desktop。
+
+    ★ 安全提示 ★
+    快照、剪贴板读取、截图可能包含屏幕上的隐私内容，请勿上传到公开渠道；
+    通知删除动作强制要求 app 参数校验归属；headed=true 的物理输入会真实移动鼠标。
+  en_US: |
+    Screen control plugin based on vercel-labs/agent-desktop (Apache-2.0). Reads desktop app
+    accessibility trees and operates UI elements by ref via the OS accessibility API
+    (UI Automation on Windows) - no screenshots or pixel matching, headless by default.
+
+    Core: snapshot/find/readElement/screenshot, click/type/setValue/refAction/scroll/pressKey,
+    launch/closeApp/listApps/listWindows/windowOp, clipboard/notifications/surfaces/physical,
+    wait/batch/getGuide. Loop: snapshot -> act on ref -> verify. Stale refs require re-snapshot.
+
+    Requires agent-desktop CLI (npm global package, Windows 10 1809+). Run action=setup to
+    install automatically. State stored under ~/.agent-desktop.
+version_code: 1
+icon: "🎛️"
+tags: ["desktop", "accessibility", "automation", "computer-use", "agent-desktop", "ui"]
+
+dependencies:
+  external:
+    - name: "agent-desktop CLI"
+      url: "https://github.com/vercel-labs/agent-desktop"
+      description: "npm 全局安装：npm install -g agent-desktop --allow-scripts=agent-desktop（也可在对话中让智能体执行 action=setup 自动安装）"

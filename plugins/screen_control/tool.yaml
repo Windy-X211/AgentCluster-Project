@@ -1,0 +1,219 @@
+# screen_control 插件的 tool 定义 —— 屏幕控制（基于 vercel-labs/agent-desktop）
+
+identity:
+  name: "screen_control"
+  author: "q737843-source"
+version: "1.0.0"
+
+description:
+  zh_Hans: |
+    屏幕控制：通过系统无障碍树语义查看并操控桌面应用（无需截图/坐标，默认不抢焦点不占鼠标）。
+
+    ═══════════════════════════════════════════════════════
+    ★★★ 核心工作循环（务必遵循） ★★★
+    ═══════════════════════════════════════════════════════
+    1. snapshot 拍快照 → 每个可交互元素带 ref（形如 @<snapshot_id>:eN）
+    2. click/type/setValue/... 作用于此前的 ref
+    3. 再 snapshot 验证结果
+    ref 必须完整携带快照 id；出现 STALE_REF / AMBIGUOUS_TARGET 时必须重新 snapshot 取新 ref，
+    绝不盲目重试（返回里的 hint 字段有对应中文处置提示）。
+    首次使用或不确定规范时，先调 getGuide(guide="desktop") 读官方操作规范。
+
+    ═══════════════════════════════════════════════════════
+    ★★★ 观察（只读） ★★★
+    ═══════════════════════════════════════════════════════
+    status() — 平台/权限/状态根，排障第一步
+    snapshot(app="记事本", interactiveOnly=true, compact=true) — 控件树快照；
+      无 app 时读当前聚焦窗口；多窗口应用需 windowId（来自 listWindows）；
+      interactiveOnly 只保留可交互元素、compact 折叠单子节点、rootRef 钻取局部、
+      surface 可选 taskbar/start-menu/notification-center/system-tray 等系统表面
+    find(app="x", text="设置", role="button") — 按 role/text 搜索元素并返回 ref；
+      resultMode: first/last/count/nth(配 nth)/all
+    readElement(ref="@s8f3k2p9:e5", property="text") — 读属性：text/value/title/bounds/role/states；
+      property 取 visible/enabled/checked/focused/expanded/selected 时查询布尔状态
+    screenshot(app="x") — 窗口截图 PNG，自动保存到 outputs/screen_control/ 并返回路径
+      （不回传 base64，避免撑爆上下文）；可用 outPath 指定保存路径
+    listApps() / listWindows(app="x") — 枚举运行中应用 / 可见窗口（拿 windowId）
+
+    ═══════════════════════════════════════════════════════
+    ★★★ 元素操作（作用于 ref） ★★★
+    ═══════════════════════════════════════════════════════
+    click(ref="@s8f3k2p9:e5") — 单击；clickType=double/triple 需传 headed=true（物理输入）；
+      clickType=right 打开右键菜单（语义方式无需 headed）
+    type(ref=..., text="你好 world") — 向文本目标插入文本（Unicode 安全，无需输入法）
+    setValue(ref=..., value="直接赋值") — 经无障碍属性直接设值，最快最稳
+    refAction(ref=..., subAction="clear|focus|toggle|check|uncheck|expand|collapse|select",
+      value=...) — 其余元素动作；select 需 value
+    scroll(ref=..., direction="down|up|left|right", amount=3) — 滚动（作用于滚动容器 ref）
+    pressKey(key="ctrl+s") — 按键组合；键名 return/escape/tab/space/delete/up/down/...，
+      修饰键 ctrl/alt/shift/cmd(=Win 键)；可加 app 让按键直达该进程不抢焦点
+
+    ═══════════════════════════════════════════════════════
+    ★★★ 应用与窗口 ★★★
+    ═══════════════════════════════════════════════════════
+    launch(app="notepad", activate=true, arg=["C:/a.txt"]) — 启动应用（可重复 arg 传参数）
+    closeApp(app="notepad") — 优雅退出；force=true 强杀
+    windowOp(subAction="focus", app="x" 或 windowId=...) — 聚焦（可用 title 模糊匹配）
+    windowOp(subAction="resize", width=800, height=600, windowId=...)
+    windowOp(subAction="move", x=100, y=100, windowId=...)
+    windowOp(subAction="minimize|maximize|restore", windowId=...)
+
+    ═══════════════════════════════════════════════════════
+    ★★★ 系统交互 ★★★
+    ═══════════════════════════════════════════════════════
+    clipboard(subAction="get|set|clear", text=...) — 剪贴板
+    notifications(subAction="list", app=可选) — 列出通知中心通知
+    notifications(subAction="dismiss", index=1, app="来源应用名") — 删除单条（app 必填校验归属，防误删）
+    notifications(subAction="dismissAll", app=可选) / (subAction="action", index=1, actionName="打开")
+    surfaces(subAction="list") / (subAction="open", surface="start-menu|taskbar|action-center|system-tray")
+    physical(subAction="hover|move|click", xy="500,300", button="left", headed=true) —
+      物理鼠标（自动 headed）：ref 无法区分孪生元素时的坐标兜底；会真实移动指针
+
+    ═══════════════════════════════════════════════════════
+    ★★★ 可靠性与兜底 ★★★
+    ═══════════════════════════════════════════════════════
+    wait(ms=1000) — 固定等待
+    wait(ref=..., predicate="exists|enabled|visible|actionable|value", value=..., timeoutMs=5000) —
+      等元素就绪（代替盲目 sleep）
+    wait(title="窗口标题", timeoutMs=10000) / wait(text="加载完成", app="x") — 等窗口/文本出现
+    batch(commands=[{"command":"snapshot","args":["--app","x","--skeleton"]}, ...], timeoutMs=60000) —
+      顺序执行任意 CLI 原生命令（本工具未结构化的能力如 drag/mouse-wheel/list-displays/高级 snapshot
+      参数等都走这里，命令名与 flag 与 agent-desktop CLI 一致）
+    getGuide(guide="desktop"|"platform") — 读取内置官方操作规范
+    setup() — 自动安装/检测 agent-desktop CLI（npm install -g）
+    timeoutMs 默认 30000；headed=true 才允许抢焦点/物理输入，默认无头语义操作。
+  en_US: |
+    Screen control via OS accessibility tree (semantic, headless, no pixel matching).
+
+    Loop: snapshot -> act on ref (@<snapshot_id>:eN) -> snapshot to verify. On STALE_REF /
+    AMBIGUOUS_TARGET always re-snapshot. Actions: status/snapshot/find/readElement/screenshot/
+    click/type/setValue/refAction/scroll/pressKey/launch/closeApp/listApps/listWindows/windowOp/
+    clipboard/notifications/surfaces/physical/wait/batch/getGuide/setup.
+    Unstructured CLI commands go through batch. headless by default; headed=true allows
+    physical input and focus changes.
+parameters:
+  - name: "action"
+    type: "string"
+    required: true
+    description: "操作类型"
+    enum: ["status", "snapshot", "find", "readElement", "screenshot", "click", "type", "setValue", "refAction", "pressKey", "scroll", "launch", "closeApp", "listApps", "listWindows", "windowOp", "clipboard", "notifications", "physical", "wait", "batch", "getGuide", "surfaces", "setup"]
+  - name: "app"
+    type: "string"
+    description: "目标应用名（精确匹配，listApps 可查）；snapshot/find/pressKey/launch/closeApp/listApps/listWindows/windowOp/notifications/wait 使用"
+  - name: "windowId"
+    type: "string"
+    description: "窗口 id（listWindows 返回），多窗口应用消歧或指定窗口操作"
+  - name: "ref"
+    type: "string"
+    description: "快照元素引用，完整格式 @<snapshot_id>:eN（必须来自最近一次 snapshot/find 返回）"
+  - name: "text"
+    type: "string"
+    description: "type 的输入文本 / find 的子串过滤 / clipboard set 内容 / wait 等待出现的文本 / notifications 文本过滤"
+  - name: "value"
+    type: "string"
+    description: "setValue 的赋值 / refAction select 的选项 / wait predicate=value 的期望值"
+  - name: "property"
+    type: "string"
+    description: "readElement 读取项：text/value/title/bounds/role/states（默认 text），或状态 visible/enabled/checked/focused/expanded/selected"
+  - name: "role"
+    type: "string"
+    description: "find 按无障碍角色过滤：button/textfield/checkbox/combobox/link/menuitem/tab 等"
+  - name: "resultMode"
+    type: "string"
+    description: "find 结果裁剪：first/last/count/nth/all（默认返回全部匹配，上限 50）"
+    enum: ["first", "last", "count", "nth", "all"]
+  - name: "nth"
+    type: "number"
+    description: "resultMode=nth 时返回第 N 个匹配（0 起始）"
+  - name: "clickType"
+    type: "string"
+    description: "click 的点击方式：single（默认）/double/triple/right；double 与 triple 需 headed=true"
+    enum: ["single", "double", "triple", "right"]
+  - name: "key"
+    type: "string"
+    description: "pressKey 的按键组合，如 ctrl+s / return / escape / shift+tab"
+  - name: "direction"
+    type: "string"
+    description: "scroll 方向：down/up/left/right（默认 down）"
+    enum: ["down", "up", "left", "right"]
+  - name: "amount"
+    type: "number"
+    description: "scroll 滚动格数（默认 3）"
+  - name: "subAction"
+    type: "string"
+    description: "二级操作：refAction 用 clear/focus/toggle/check/uncheck/expand/collapse/select；windowOp 用 focus/resize/move/minimize/maximize/restore；clipboard 用 get/set/clear；notifications 用 list/dismiss/dismissAll/action；physical 用 hover/move/click；surfaces 用 list/open"
+  - name: "surface"
+    type: "string"
+    description: "snapshot/find 观察的系统表面，或 surfaces open 打开的表面：window(默认)/taskbar/start-menu/notification-center/action-center/system-tray/menu 等"
+  - name: "rootRef"
+    type: "string"
+    description: "snapshot/find 从该 ref 的子树开始（局部钻取，控件树过大时用）"
+  - name: "title"
+    type: "string"
+    description: "windowOp focus 的窗口标题模糊匹配 / wait 等待出现的窗口标题"
+  - name: "index"
+    type: "number"
+    description: "notifications dismiss/action 的 1 起始序号（list 返回）"
+  - name: "actionName"
+    type: "string"
+    description: "notifications action 要点击的按钮名（如 Reply/Open）"
+  - name: "outPath"
+    type: "string"
+    description: "screenshot 保存路径（缺省自动存到 outputs/screen_control/ 并返回路径）"
+  - name: "x"
+    type: "number"
+    description: "windowOp move 的目标 X"
+  - name: "y"
+    type: "number"
+    description: "windowOp move 的目标 Y"
+  - name: "width"
+    type: "number"
+    description: "windowOp resize 的宽度"
+  - name: "height"
+    type: "number"
+    description: "windowOp resize 的高度"
+  - name: "xy"
+    type: "string"
+    description: "physical 的屏幕绝对坐标 x,y"
+  - name: "button"
+    type: "string"
+    description: "physical click 的鼠标键：left（默认）/right/middle"
+    enum: ["left", "right", "middle"]
+  - name: "arg"
+    type: "array"
+    description: "launch 传给应用的命令行参数数组（每项一个参数）"
+  - name: "force"
+    type: "boolean"
+    description: "closeApp 强制终止进程（默认优雅退出）"
+  - name: "activate"
+    type: "boolean"
+    description: "launch 是否前置应用并等待窗口出现（默认 true 由 CLI 语义决定；显式 false 不前置）"
+  - name: "interactiveOnly"
+    type: "boolean"
+    description: "snapshot 只返回可交互元素（大幅缩小树，常用）"
+  - name: "compact"
+    type: "boolean"
+    description: "snapshot 折叠单子节点包装层（缩小树，常用）"
+  - name: "timeoutMs"
+    type: "number"
+    description: "操作超时毫秒（默认 30000；wait 系列与 batch 也用它）"
+  - name: "waitFor"
+    type: "string"
+    description: "动作后轮询等待的选择器 role:text（如 button:保存），成功后返回新快照；仅 snapshot 与 ref 类动作支持"
+  - name: "headed"
+    type: "boolean"
+    description: "允许物理输入与焦点副作用（double/triple 点击、physical 必需；默认无头语义模式）"
+  - name: "ms"
+    type: "number"
+    description: "wait 固定等待毫秒"
+  - name: "predicate"
+    type: "string"
+    description: "wait 元素等待条件：exists/enabled/visible/actionable/value"
+    enum: ["exists", "enabled", "visible", "actionable", "value"]
+  - name: "commands"
+    type: "array"
+    description: "batch 的命令数组，每项 {command: CLI命令, args: [--flag, value]}；也可传 JSON 字符串"
+  - name: "guide"
+    type: "string"
+    description: "getGuide 读取的指南：desktop（快照/ref 循环规范）或 platform（当前系统差异）"
+    enum: ["desktop", "platform"]
