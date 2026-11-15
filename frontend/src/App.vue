@@ -3,6 +3,7 @@ import { watch, computed } from 'vue'
 import { RouterView, useRoute } from 'vue-router'
 import { useLayoutStore, useConvStore, useCanvasStore, FONT_FAMILIES } from '@/stores'
 import GuideManager from '@/components/guide/GuideManager.vue'
+import PermissionConfirm from '@/components/PermissionConfirm.vue'
 import BackgroundLayer from '@/components/BackgroundLayer.vue'
 import WindowControls from '@/components/WindowControls.vue'
 import ResizeHandles from '@/components/ResizeHandles.vue'
@@ -54,4 +55,6 @@ watch(() => canvases.current?.id, v => {
     </KeepAlive>
   </RouterView>
   <GuideManager v-if="!isQuickChat" />
+  <!-- 危险操作手动确认弹窗（权限设置 = 手动确认时全局拦截） -->
+  <PermissionConfirm />
 </template>

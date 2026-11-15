@@ -41,8 +41,9 @@ export const usePermissionStore = defineStore('permission', {
       if (this.hydrated) return
       this.hydrated = true
       try {
-        const list = await api.permissions.pending()
-        for (const r of list || []) this.push(r)
+        const r = await api.permissions.pending()
+        // 后端返回 { requests: [...] }，不是裸数组
+        for (const it of (r?.requests || [])) this.push(it)
       } catch { /* 后端没起 / 无挂起请求，忽略 */ }
     },
     /** 后端已超时/已停止的请求：本地移除（弹窗消失） */

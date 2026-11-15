@@ -234,7 +234,7 @@ const availableCombos = computed(() => {
     .filter(([name]) => !added.has(name))
     .map(([name, rec]) => {
       const members = rec?.members || []
-      const counts = { commands: 0, skills: 0, plugins: 0 }
+      const counts: Record<string, number> = { commands: 0, skills: 0, plugins: 0 }
       for (const m of members) if (m.type in counts) counts[m.type]++
       const summary: string[] = []
       if (counts.commands) summary.push(`${counts.commands} 命令`)
@@ -268,7 +268,7 @@ function confirmAddCombos() {
 function comboMembersOf(name: string): string {
   const rec = (settings.combos || {})[name]
   const members = rec?.members || []
-  const counts = { commands: 0, skills: 0, plugins: 0 }
+  const counts: Record<string, number> = { commands: 0, skills: 0, plugins: 0 }
   for (const m of members) if (m.type in counts) counts[m.type]++
   const parts: string[] = []
   if (counts.commands) parts.push(`${counts.commands} 命令`)
