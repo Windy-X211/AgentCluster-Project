@@ -3,7 +3,7 @@
     <div v-if="file" class="fv glass" :style="floatStyle"
          @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
       <div class="fv-head" @mousedown="startDrag">
-        <span class="fv-ico">{{ icon }}</span>
+        <span class="fv-ico"><AppIcon :name="icon" /></span>
         <!-- 同目录快速切换（仅当宿主下发可切换列表时显示） -->
         <div v-if="canNav" class="fv-nav">
           <button class="fv-btn nav" @click.stop="requestNav(-1)" title="上一个文件（同目录，首尾循环）">←</button>
@@ -21,7 +21,7 @@
         <button class="fv-btn" @click.stop="openSystem" title="用系统默认程序打开">↗️ 打开</button>
       </div>
       <!-- 关闭按钮固定在窗口右上角（不随标题栏内容流动） -->
-      <button class="fv-close" @click.stop="requestClose" title="关闭（Esc）">✕</button>
+      <button class="fv-close" @click.stop="requestClose" title="关闭（Esc）"><AppIcon name="x" /></button>
 
       <div ref="bodyEl" class="fv-body"
            :class="{ editing: mode === 'edit', 'img-view': kind === 'image' }"
@@ -62,7 +62,7 @@
         </template>
 
         <template v-else-if="kind === 'office' && officeFallback">
-          <div class="fv-notice">⚠ PDF 转换不可用，以下为文本提取内容</div>
+          <div class="fv-notice"><AppIcon name="alert-triangle" /> PDF 转换不可用，以下为文本提取内容</div>
           <div class="fv-doc">
             <div v-for="(l, i) in docLines" :key="i" class="fv-line">{{ l }}</div>
           </div>
@@ -95,10 +95,10 @@
         </template>
 
         <template v-else-if="kind === 'pptx' && pptxFallback">
-          <div class="fv-notice">⚠ 图形渲染失败，以下为文本提取内容</div>
+          <div class="fv-notice"><AppIcon name="alert-triangle" /> 图形渲染失败，以下为文本提取内容</div>
           <div class="fv-doc">
             <div v-for="s in slides" :key="s.idx" class="fv-slide">
-              <div class="fv-slide-no">🎞 幻灯片 {{ s.idx }}</div>
+              <div class="fv-slide-no"><AppIcon name="film" /> 幻灯片 {{ s.idx }}</div>
               <div v-for="(l, i) in s.lines" :key="i" class="fv-line">{{ l }}</div>
             </div>
           </div>

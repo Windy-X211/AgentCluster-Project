@@ -3562,7 +3562,7 @@ onBeforeUnmount(() => {
                    ref="r => setTimeout(() => (r as HTMLInputElement)?.focus(), 10)" />
           </template>
           <template v-else>
-            <span class="cv-label" @dblclick.stop="startRenameCanvas(c.id, c.name)">🎨 {{ c.name }}</span>
+            <span class="cv-label" @dblclick.stop="startRenameCanvas(c.id, c.name)"><AppIcon name="palette" /> {{ c.name }}</span>
             <span v-if="runningCanvasId === c.id" class="cv-running" title="正在运行">●</span>
             <span class="cv-count">{{ c.nodes?.length || 0 }}</span>
           </template>
@@ -3612,7 +3612,7 @@ onBeforeUnmount(() => {
               {{ convDesc ? '↓' : '↑' }}
             </button>
             <span class="flex-spacer"></span>
-            <button class="collapse-btn" type="button" @click.stop="convsCollapsed = true" title="折叠">✕</button>
+            <button class="collapse-btn" type="button" @click.stop="convsCollapsed = true" title="折叠"><AppIcon name="x" /></button>
           </div>
           <!-- 分类栏：无分类 / 按集群（画布）/ 按工作区；选择自动记忆 -->
           <div class="conv-group-bar">
@@ -3711,7 +3711,7 @@ onBeforeUnmount(() => {
           </div>
           <!-- 修改（仅用户最新一条消息） -->
           <div v-if="msgCtxMenu.role === 'user' && isLastUserMsg(msgCtxMenu.msgIdx)" class="msg-ctx-item" @click.stop="editMessageFromCtx">
-            <span class="msg-ctx-icon">✏️</span>
+            <span class="msg-ctx-icon"><AppIcon name="✏" /></span>
             <span>修改此消息并重新发送</span>
           </div>
           <!-- 删除消息（所有消息通用） -->
@@ -3734,8 +3734,8 @@ onBeforeUnmount(() => {
         <div v-if="fileOpsDlg.open" class="modal-backdrop" @click.self="fileOpsDlg.open = false">
           <div class="modal file-ops-modal" @click.stop>
             <div class="modal-header">
-              <span class="modal-title">🔄 文件操作历史与还原</span>
-              <button class="btn sm ghost" @click="fileOpsDlg.open = false">✕</button>
+              <span class="modal-title"><AppIcon name="refresh-cw" /> 文件操作历史与还原</span>
+              <button class="btn sm ghost" @click="fileOpsDlg.open = false"><AppIcon name="x" /></button>
             </div>
             <div class="modal-sub">
               来源消息：「{{ fileOpsDlg.msgContent || '（空）' }}」 之后智能体对文件的操作
@@ -3789,8 +3789,8 @@ onBeforeUnmount(() => {
         <div v-if="editDlg.open" class="modal-backdrop" @click.self="editDlg.open = false">
           <div class="modal edit-msg-modal" @click.stop>
             <div class="modal-header">
-              <span class="modal-title">✏️ 修改消息并重新发送</span>
-              <button class="btn sm ghost" @click="editDlg.open = false">✕</button>
+              <span class="modal-title"><AppIcon name="pencil" /> 修改消息并重新发送</span>
+              <button class="btn sm ghost" @click="editDlg.open = false"><AppIcon name="x" /></button>
             </div>
             <div class="modal-sub">
               保存后将撤销这条用户消息及其后智能体的回复（含还原文件操作），并把新内容重新发送给智能体。
@@ -3872,7 +3872,7 @@ onBeforeUnmount(() => {
           <!-- ===== 历史压缩摘要卡片（会话级，居中）===== -->
           <div v-else-if="it.type === 'ctx-summary'" class="ctx-summary-card">
             <div class="ctx-summary-head" @click="toggleCtxSummary(it.idx)">
-              <span class="ctx-summary-ico">🗜</span>
+              <span class="ctx-summary-ico"><AppIcon name="settings-2" /></span>
               <span class="ctx-summary-title">历史已压缩</span>
               <span v-if="ctxSummaryMeta(it.msg)" class="ctx-summary-meta">{{ ctxSummaryMeta(it.msg) }}</span>
               <span class="ctx-summary-chev">{{ expandedCtxSummary.has(it.idx) ? '▾' : '▸' }}</span>
@@ -3911,7 +3911,7 @@ onBeforeUnmount(() => {
                        v-html="renderChatMarkdown(trimMsgContent(extractEnvelopeText(ch.msg.envelope)))" />
                   <template v-for="(p, pi) in (ch.msg.envelope?.parts || []).filter((pp: any) => pp.type === 'artifact')" :key="'art-' + pi">
                     <details class="tc-body" open>
-                      <summary>📎 {{ p.name }}（{{ p.mime_type }}）</summary>
+                      <summary><AppIcon name="paperclip" /> {{ p.name }}（{{ p.mime_type }}）</summary>
                       <pre>{{ p.content }}</pre>
                     </details>
                   </template>
@@ -3931,7 +3931,7 @@ onBeforeUnmount(() => {
                       <!-- 多条时的组摘要头 -->
                       <div v-if="ch.items.length > 1" class="tool-card a2a a2a-group" :class="{ open: isA2aGroupOpen(ch.key) }">
                         <div class="tc-header a2a-toggle" @click="toggleA2aGroup(ch.key)">
-                          <span class="tc-ico">🤝</span>
+                          <span class="tc-ico"><AppIcon name="handshake" /></span>
                           <span class="tc-name">连续信封 ×{{ ch.items.length }}</span>
                           <span class="a2a-route">{{ ch.latest?.from?.name }} → {{ ch.latest?.to?.name }}</span>
                           <span class="tg-chev">{{ isA2aGroupOpen(ch.key) ? '▾' : '▸' }}</span>
@@ -3955,7 +3955,7 @@ onBeforeUnmount(() => {
                             <template v-for="(p, pi) in sub.msg.envelope?.parts || []" :key="pi">
                               <div v-if="p.type === 'text'" class="a2a-text">{{ p.text }}</div>
                               <details v-else-if="p.type === 'artifact'" class="tc-body" open>
-                                <summary>📎 {{ p.name }}（{{ p.mime_type }}）</summary>
+                                <summary><AppIcon name="paperclip" /> {{ p.name }}（{{ p.mime_type }}）</summary>
                                 <pre>{{ p.content }}</pre>
                               </details>
                             </template>
@@ -3974,7 +3974,7 @@ onBeforeUnmount(() => {
                            :class="{ open: thinkIsOpen(ch.idx) }"
                            @click.stop="toggleThink(ch.idx)"
                            :title="thinkIsOpen(ch.idx) ? '点击收起思考过程' : '点击展开思考过程'">
-                        <span class="think-icon">🧠</span>
+                        <span class="think-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg></span>
                         <span class="think-text">{{ isStreamingMsg(ch.msg) ? cyclicWindow(stripContinueTag(ch.msg.reasoning), 70) : '思考' }}</span>
                         <span v-if="isStreamingMsg(ch.msg)" class="think-cursor">▌</span>
                         <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
@@ -4042,14 +4042,14 @@ onBeforeUnmount(() => {
                               </div>
                               <!-- 子智能体过程框（agent.spawn 专用）：实时/历史显示子智能体运行事件 -->
                               <div v-if="subProcessOf(t).length" class="tr-block sub-proc-block">
-                                <div class="tr-block-title">🐣 {{ subProcessTitle(t) }}</div>
+                                <div class="tr-block-title"><AppIcon name="egg" /> {{ subProcessTitle(t) }}</div>
                                 <div class="sub-proc"
                                      :ref="(el) => onSubProcBox(el as HTMLElement | null)"
                                      @scroll.passive="onSubProcScroll($event)">
                                   <div v-for="(ev, si) in subProcessOf(t)" :key="si" class="sp-item" :class="'sp-' + ev.t">
-                                    <template v-if="ev.t === 'round'"><span class="sp-round">▶</span><span class="sp-txt">第 {{ ev.n }}/{{ ev.of }} 轮</span></template>
+                                    <template v-if="ev.t === 'round'"><span class="sp-round"><AppIcon name="chevron-right" /></span><span class="sp-txt">第 {{ ev.n }}/{{ ev.of }} 轮</span></template>
                                     <template v-else-if="ev.t === 'call'">
-                                      <span class="sp-ico" :class="{ spinning: subCallRunning(t, si) }">🔧</span>
+                                      <span class="sp-ico" :class="{ spinning: subCallRunning(t, si) }"><AppIcon name="wrench" /></span>
                                       <span class="sp-txt">{{ toolLabel(ev.name) }}</span>
                                       <pre v-if="ev.args_preview" class="sp-args">{{ ev.args_preview }}</pre>
                                     </template>
@@ -4059,16 +4059,16 @@ onBeforeUnmount(() => {
                                       <pre v-if="ev.preview" class="sp-args">{{ ev.preview }}</pre>
                                     </template>
                                     <template v-else-if="ev.t === 'text'">
-                                      <span class="sp-ico">💬</span><span class="sp-round">第 {{ ev.round }} 轮输出</span>
+                                      <span class="sp-ico"><AppIcon name="message-square" /></span><span class="sp-round">第 {{ ev.round }} 轮输出</span>
                                       <pre class="sp-text">{{ ev.text }}</pre>
                                     </template>
-                                    <template v-else-if="ev.t === 'note'"><span class="sp-ico">⚠️</span><span class="sp-txt">{{ ev.text }}</span></template>
+                                    <template v-else-if="ev.t === 'note'"><span class="sp-ico"><AppIcon name="alert-triangle" /></span><span class="sp-txt">{{ ev.text }}</span></template>
                                   </div>
                                   <div v-if="toolIsRunning(t)" class="sp-item sp-running"><span class="ti-spinner"></span><span>子智能体运行中…</span></div>
                                 </div>
                               </div>
                               <template v-for="res in toolsOfAssistant(ch.idx).filter(x => x.role === 'tool_result' && x.tool_call_id === t.tool_call_id)" :key="res.tool_call_id + '-r'">
-                                <div class="tr-block"><div class="tr-block-title">📥 结果</div><pre>{{ prettyResult(res.result) }}</pre></div>
+                                <div class="tr-block"><div class="tr-block-title"><AppIcon name="clipboard-paste" /> 结果</div><pre>{{ prettyResult(res.result) }}</pre></div>
                               </template>
                               <div v-if="toolIsRunning(t)" class="tr-block running">
                                 <span class="ti-spinner"></span><span>执行中…{{ speakingTool?.phase === 'args' ? '（参数流式中）' : '' }}</span>
@@ -4097,9 +4097,9 @@ onBeforeUnmount(() => {
              class="lb-float"
              :style="{ left: lightboxX + 'px', top: lightboxY + 'px', width: lightboxW + 'px', height: lightboxH + 'px' }">
           <div class="lb-titlebar" @mousedown="onLbDragStart">
-            <span class="lb-titlebar-icon">🖼</span>
+            <span class="lb-titlebar-icon"><AppIcon name="image" /></span>
             <span class="lb-titlebar-text">图片预览 <span class="lb-zoom-pct">{{ Math.round(lbScale * 100) }}%</span></span>
-            <button class="lb-close" type="button" @mousedown.stop @click.stop="closeLightbox" title="关闭 (Esc)">✕</button>
+            <button class="lb-close" type="button" @mousedown.stop @click.stop="closeLightbox" title="关闭 (Esc)"><AppIcon name="x" /></button>
           </div>
           <div class="lb-body" ref="lbBodyRef"
                @wheel="onLbWheel" @mousedown="onLbPanStart" @dblclick="onLbBodyDblClick"
@@ -4130,7 +4130,7 @@ onBeforeUnmount(() => {
           <div class="agent-dd">
             <button type="button" class="agent-dd-trigger" ref="agentTriggerEl" @click.stop="toggleAgentDd"
                     :title="currentAgentName()">
-              <span class="dd-icon">🧠</span>
+              <span class="dd-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg></span>
               <span class="dd-name">{{ currentAgentName() }}</span>
               <span class="dd-chev" :class="{ open: agentDdOpen }">▾</span>
             </button>
@@ -4172,16 +4172,16 @@ onBeforeUnmount(() => {
                    :style="{ left: ddCtx.x + 'px', top: ddCtx.y + 'px' }"
                    @click.stop @contextmenu.prevent.stop>
                 <div class="dd-ctx-title">{{ ddCtx.a.name }}</div>
-                <div class="dd-ctx-item" @click="ddCtxEdit">✏️ 编辑</div>
-                <div class="dd-ctx-item danger" @click="ddCtxDelete">🗑 删除</div>
+                <div class="dd-ctx-item" @click="ddCtxEdit"><AppIcon name="pencil" /> 编辑</div>
+                <div class="dd-ctx-item danger" @click="ddCtxDelete"><AppIcon name="trash-2" /> 删除</div>
                 <div class="dd-ctx-sep"></div>
                 <div class="dd-ctx-sub">归纳到分组</div>
                 <div class="dd-ctx-item" @click="ddCtxNewGroupAndAssign">➕ 新建组…</div>
                 <div class="dd-ctx-item" @click="ddCtxAssign(null)">
-                  未分组<span v-if="ddCtx.a.group_id == null" class="dd-ctx-cur">✓</span>
+                  未分组<span v-if="ddCtx.a.group_id == null" class="dd-ctx-cur"><AppIcon name="circle-check" /></span>
                 </div>
                 <div class="dd-ctx-item" v-for="g in agents.groups" :key="g.id" @click="ddCtxAssign(g.id)">
-                  {{ g.name }}<span v-if="ddCtx.a.group_id === g.id" class="dd-ctx-cur">✓</span>
+                  {{ g.name }}<span v-if="ddCtx.a.group_id === g.id" class="dd-ctx-cur"><AppIcon name="circle-check" /></span>
                 </div>
               </div>
             </Teleport>
@@ -4193,7 +4193,7 @@ onBeforeUnmount(() => {
                     :disabled="!currentAgent"
                     :title="currentAgent ? '切换当前智能体使用的模型' : '请先选择智能体'"
                     @click.stop="toggleModelDd">
-              <span class="dd-icon">🔌</span>
+              <span class="dd-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6"/><path d="M15 2v6"/><path d="M6 8h12"/><path d="M19 12v2a7 7 0 0 1-14 0v-2"/><rect x="12" y="14" width="4" height="8" rx="1"/></svg></span>
               <span class="dd-name">{{ currentModelLabel() }}</span>
               <span class="dd-chev" :class="{ open: modelDdOpen }">▾</span>
             </button>
@@ -4229,7 +4229,7 @@ onBeforeUnmount(() => {
                          @click.stop="selectReasoningLevel(opt.value)">
                       <span class="reasoning-opt-name">{{ opt.label }}</span>
                       <span class="reasoning-opt-desc">{{ opt.desc }}</span>
-                      <span v-if="(currentAgent?.reasoning_level || 'off') === opt.value" class="reasoning-check">✓</span>
+                      <span v-if="(currentAgent?.reasoning_level || 'off') === opt.value" class="reasoning-check"><AppIcon name="circle-check" /></span>
                     </div>
                   </div>
                 </div>
@@ -4242,7 +4242,7 @@ onBeforeUnmount(() => {
                     :disabled="!conv"
                     :title="convWorkdir ? '会话工作区：' + convWorkdir : '设置会话工作区（智能体文件生成目标；未设置时跟随画布/全局默认）'"
                     @click.stop="toggleWdDd">
-              <span class="dd-icon">📁</span>
+              <span class="dd-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg></span>
               <span class="dd-name">{{ convWorkdir ? (wdBasename(convWorkdir) || convWorkdir) : '工作区' }}</span>
               <span class="dd-chev" :class="{ open: wdDdOpen }">▾</span>
             </button>
@@ -4260,10 +4260,10 @@ onBeforeUnmount(() => {
                   <span class="dd-item-dot"></span>
                   <span class="wd-item-name">{{ wdBasename(p) || p }}</span>
                   <button type="button" class="wd-del" title="移除该工作区记录（不影响会话当前设置）"
-                          @click.stop="removeWdRecord(p)">✕</button>
+                          @click.stop="removeWdRecord(p)"><AppIcon name="x" /></button>
                 </div>
                 <div v-if="!wdHistory.length" class="dd-empty">暂无记录，点下方「浏览…」添加</div>
-                <div class="wd-browse" @click="browseWdDir">📂 浏览…</div>
+                <div class="wd-browse" @click="browseWdDir"><AppIcon name="folder-open" /> 浏览…</div>
               </div>
             </Teleport>
           </div>
@@ -4273,13 +4273,13 @@ onBeforeUnmount(() => {
         <div v-if="attachments.length" class="attachments-bar">
           <div v-for="a in attachments" :key="a.id"
                class="att-card" :class="{ error: a.status === 'error', uploading: a.status === 'uploading' }">
-            <button type="button" class="att-remove" @click="removeAttachment(a.id)" :title="'移除 ' + a.name">✕</button>
+            <button type="button" class="att-remove" @click="removeAttachment(a.id)" :title="'移除 ' + a.name"><AppIcon name="x" /></button>
             <!-- 图片：缩略图预览 -->
             <template v-if="isImageFile(a.name)">
               <div class="att-thumb">
                 <img v-if="a.previewUrl" :src="a.previewUrl" :alt="a.name" />
                 <span v-if="a.status === 'uploading'" class="att-spinner"></span>
-                <span v-if="a.status === 'error'" class="att-err-ico">⚠️</span>
+                <span v-if="a.status === 'error'" class="att-err-ico"><AppIcon name="alert-triangle" /></span>
               </div>
               <div class="att-info">
                 <div class="att-name" :title="a.name">{{ a.name }}</div>
@@ -4495,6 +4495,7 @@ onBeforeUnmount(() => {
 .think-stream.clickable:hover { background: rgba(var(--accent2-rgb), 0.15); border-color: rgba(var(--accent2-rgb), 0.38); }
 .think-stream.open { border-color: rgba(var(--accent2-rgb), 0.42); }
 .think-icon { flex-shrink: 0; font-size: calc(11px * var(--font-scale)); }
+.think-icon svg { display: inline-block; vertical-align: -2px; line-height: 1; }
 .think-text {
   flex: 1; min-width: 0;
   overflow: hidden; white-space: nowrap;
@@ -4841,6 +4842,7 @@ onBeforeUnmount(() => {
 }
 .agent-dd-trigger:hover { background: rgba(var(--accent-rgb), 0.18); border-color: rgba(var(--accent-rgb), 0.45); }
 .agent-dd-trigger .dd-icon { font-size: calc(12px * var(--font-scale)); flex-shrink: 0; }
+.agent-dd-trigger .dd-icon svg { display: inline-block; vertical-align: -2px; line-height: 1; }
 .agent-dd-trigger .dd-name {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   max-width: 200px;

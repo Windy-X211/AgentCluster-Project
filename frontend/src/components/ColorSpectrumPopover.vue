@@ -172,8 +172,8 @@ function pickAuto() {
     <div class="csp-title csp-drag"
          title="按住拖动可移动浮窗"
          @pointerdown="onTitleDown" @pointermove="onTitleMove" @pointerup="onTitleUp" @pointercancel="onTitleUp">
-      <span>🎨 头像配色</span>
-      <button class="csp-x" @click.stop="emit('close')" @pointerdown.stop title="关闭">✕</button>
+      <span><AppIcon name="palette" /> 头像配色</span>
+      <button class="csp-x" @click.stop="emit('close')" @pointerdown.stop title="关闭"><AppIcon name="x" /></button>
     </div>
 
     <!-- 预览 + 十六进制 -->

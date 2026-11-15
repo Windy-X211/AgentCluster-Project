@@ -5,18 +5,18 @@
     <div class="ws-panel glass" :style="panelStyle" :class="{ embedded: pinned }" ref="panelEl"
          @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
       <div class="ws-head" @mousedown="startDrag" @wheel.stop.prevent="onHeadWheel">
-        <span class="ws-ico">🗂</span>
+        <span class="ws-ico"><AppIcon name="folder" /></span>
         <div class="ws-titles">
           <div class="ws-title">工作区</div>
           <div class="ws-path" :title="workdir || ''">{{ workdir || '未设置工作区文件夹' }}</div>
         </div>
         <div class="ws-head-actions">
           <button class="ws-btn pin" :class="{ active: pinned }"
-                  @click.stop="onPinToggle" :title="pinned ? '取消钉住，恢复浮动' : '钉住到画布（随画布移动/缩放）'">📌</button>
+                  @click.stop="onPinToggle" :title="pinned ? '取消钉住，恢复浮动' : '钉住到画布（随画布移动/缩放）'"><AppIcon name="pin" /></button>
           <button class="ws-btn" @click.stop="refresh" :disabled="loading" title="刷新">⟳</button>
           <button class="ws-btn trash" :class="{ active: trashOpen }" @click.stop="toggleTrash"
-                  :title="trashOpen ? '收起回收站' : '回收站（被删除的文件）'">🗑</button>
-          <button class="ws-btn" @click.stop="$emit('close')" title="关闭">✕</button>
+                  :title="trashOpen ? '收起回收站' : '回收站（被删除的文件）'"><AppIcon name="trash-2" /></button>
+          <button class="ws-btn" @click.stop="$emit('close')" title="关闭"><AppIcon name="x" /></button>
         </div>
       </div>
 
@@ -66,8 +66,8 @@
 
       <div class="ws-foot">
         <span class="ws-count">{{ rows.length }} 项</span>
-        <span v-if="copiedPath" class="ws-copy-hint">📋 已复制：{{ copiedName }}</span>
-        <span v-else-if="copyPathHint" class="ws-copy-hint" :title="copyPathHint">🔗 地址已复制：{{ copyPathHint }}</span>
+        <span v-if="copiedPath" class="ws-copy-hint"><AppIcon name="clipboard-list" /> 已复制：{{ copiedName }}</span>
+        <span v-else-if="copyPathHint" class="ws-copy-hint" :title="copyPathHint"><AppIcon name="link" /> 地址已复制：{{ copyPathHint }}</span>
         <span class="ws-legend" :class="{ on: !compact }" :title="compact ? '点击显示 大小·修改时间·参与者' : '点击隐藏 大小·修改时间·参与者（文件名更多空间）'"
               @click="compact = !compact">大小·修改时间·参与者</span>
       </div>
@@ -77,14 +77,14 @@
     <div v-if="trashOpen" class="ws-trash glass" :class="{ embedded: pinned }" :style="trashStyle"
          @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
       <div class="wt-head" @mousedown="startTrashDrag">
-        <span class="wt-ico">🗑</span>
+        <span class="wt-ico"><AppIcon name="trash-2" /></span>
         <span class="wt-title">回收站 · {{ trashItems.length }}</span>
         <div class="wt-actions">
           <button class="ws-btn" @click.stop="selectAll" :disabled="!trashItems.length">全选</button>
           <button class="ws-btn" @click.stop="clearSel" :disabled="!selected.size">清空选择</button>
           <button class="ws-btn ok" @click.stop="restoreSelected" :disabled="!selected.size || busy">↩ 还原</button>
-          <button class="ws-btn danger" @click.stop="purgeSelected" :disabled="!selected.size || busy">🗑 彻底删除</button>
-          <button class="ws-btn" @click.stop="trashOpen = false" title="收起回收站">✕</button>
+          <button class="ws-btn danger" @click.stop="purgeSelected" :disabled="!selected.size || busy"><AppIcon name="trash-2" /> 彻底删除</button>
+          <button class="ws-btn" @click.stop="trashOpen = false" title="收起回收站"><AppIcon name="x" /></button>
         </div>
       </div>
       <div class="wt-body">
@@ -121,24 +121,24 @@
         <div class="ws-ctx-title">{{ ctxMenu.row.is_dir ? '📁' : '📄' }} {{ ctxMenu.row.name }}</div>
         <template v-if="!ctxMenu.row.is_dir">
           <div v-if="canPreview(ctxMenu.row.name)" class="ws-ctx-item" @click="actPreview"
-               title="用内置简易查看器预览（双击文件同样打开）">👁 预览</div>
+               title="用内置简易查看器预览（双击文件同样打开）"><AppIcon name="eye" /> 预览</div>
           <div class="ws-ctx-item" @click="actRun"
                :title="rowIsPy(ctxMenu.row) ? '双击 .py 文件同样打开控制台' : '用系统默认程序打开（双击非程序文件则用内置查看器预览）'">
             {{ rowIsPy(ctxMenu.row) ? '🖥 控制台运行' : '↗️ 默认程序打开' }}
           </div>
-          <div class="ws-ctx-item" @click="actEdit">✏️ 编辑</div>
-          <div class="ws-ctx-item" @click="actCopy">📋 复制</div>
+          <div class="ws-ctx-item" @click="actEdit"><AppIcon name="pencil" /> 编辑</div>
+          <div class="ws-ctx-item" @click="actCopy"><AppIcon name="clipboard-list" /> 复制</div>
         </template>
         <template v-else>
-          <div class="ws-ctx-item" :class="{ disabled: !copiedPath }" @click="actPaste">📥 粘贴{{ copiedPath ? '' : '（先复制文件）' }}</div>
+          <div class="ws-ctx-item" :class="{ disabled: !copiedPath }" @click="actPaste"><AppIcon name="clipboard-paste" /> 粘贴{{ copiedPath ? '' : '（先复制文件）' }}</div>
         </template>
-        <div class="ws-ctx-item" @click="actRename">✏️ 重命名</div>
-        <div class="ws-ctx-item" @click="actCopyPath" title="复制绝对路径到系统剪贴板">🔗 复制文件地址</div>
+        <div class="ws-ctx-item" @click="actRename"><AppIcon name="pencil" /> 重命名</div>
+        <div class="ws-ctx-item" @click="actCopyPath" title="复制绝对路径到系统剪贴板"><AppIcon name="link" /> 复制文件地址</div>
         <div class="ws-ctx-divider" />
-        <div class="ws-ctx-item danger" @click="actDelete">🗑 删除（进入回收站）</div>
+        <div class="ws-ctx-item danger" @click="actDelete"><AppIcon name="trash-2" /> 删除（进入回收站）</div>
       </template>
       <template v-else>
-        <div class="ws-ctx-item" :class="{ disabled: !copiedPath }" @click="actPasteRoot">📥 粘贴到工作区根目录</div>
+        <div class="ws-ctx-item" :class="{ disabled: !copiedPath }" @click="actPasteRoot"><AppIcon name="clipboard-paste" /> 粘贴到工作区根目录</div>
       </template>
     </div>
   </Teleport>
@@ -148,10 +148,10 @@
     <div v-if="editor" class="ws-edit-float glass" :style="editFloatStyle"
          @contextmenu.stop.prevent @mousedown.stop @wheel.stop>
       <div class="ws-edit-float-head" @mousedown="startEditDrag">
-        <span class="ws-modal-title">📄 {{ editor.name }}</span>
+        <span class="ws-modal-title"><AppIcon name="file-text" /> {{ editor.name }}</span>
         <span class="ws-modal-meta">{{ formatSize(editor.size) }} · {{ editor.ext || 'txt' }}</span>
         <span v-if="dirty" class="ws-modal-dirty">● 未保存</span>
-        <button class="ws-btn" @click.stop="closeEditor" title="关闭">✕</button>
+        <button class="ws-btn" @click.stop="closeEditor" title="关闭"><AppIcon name="x" /></button>
       </div>
       <textarea class="ws-editor-text" v-model="editContent" spellcheck="false"
                 :placeholder="editor.ext ? '' : '（不支持在线编辑的二进制文件，已只读）'"
@@ -172,14 +172,14 @@
         <span class="ws-modal-meta" :class="pyConsole.exitCode && pyConsole.exitCode !== 0 ? 'warn' : 'ok'">
           <template v-if="pyConsole.starting">⏳ 启动中…</template>
           <template v-else-if="pyConsole.running">● 运行中{{ pyConsole.pid ? ' · PID ' + pyConsole.pid : '' }}</template>
-          <template v-else-if="pyConsole.exitCode === 0">✓ 已退出（正常）</template>
-          <template v-else>⚠ 已退出（退出码 {{ pyConsole.exitCode ?? '?' }}）</template>
+          <template v-else-if="pyConsole.exitCode === 0"><AppIcon name="circle-check" /> 已退出（正常）</template>
+          <template v-else><AppIcon name="alert-triangle" /> 已退出（退出码 {{ pyConsole.exitCode ?? '?' }}）</template>
         </span>
         <button class="ws-btn ok" @click.stop="startConsole"
-                :disabled="pyConsole.starting || pyConsole.running" title="运行 / 重新运行">▶️ 运行</button>
+                :disabled="pyConsole.starting || pyConsole.running" title="运行 / 重新运行"><AppIcon name="play" /> 运行</button>
         <button class="ws-btn danger" @click.stop="stopConsole"
-                :disabled="!pyConsole.running" title="停止（含子进程）">⏹ 停止</button>
-        <button class="ws-btn" @click.stop="closeConsole" title="关闭">✕</button>
+                :disabled="!pyConsole.running" title="停止（含子进程）"><AppIcon name="square" /> 停止</button>
+        <button class="ws-btn" @click.stop="closeConsole" title="关闭"><AppIcon name="x" /></button>
       </div>
       <pre class="ws-console-output" ref="consoleOutEl">{{ pyConsole.output || '（等待程序输出…）' }}</pre>
       <div class="ws-console-input">

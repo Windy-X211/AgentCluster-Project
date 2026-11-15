@@ -423,3 +423,12 @@ html.desktop-frameless .pywebview-drag-region {
   justify-content: space-between;
   align-items: center;
 }
+
+/* —— AppIcon（@lucide/vue 图标）全局对齐 —— */
+.app-icon {
+  display: inline-block;
+  vertical-align: -3px;
+  line-height: 1;
+  flex-shrink: 0;
+  color: inherit;
+}

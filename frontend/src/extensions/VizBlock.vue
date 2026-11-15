@@ -28,7 +28,7 @@ const renderer = computed(() => getVizRenderer(props.type))
     :extAPI="extAPI"
   />
   <div v-else class="viz-slot-fallback">
-    <div class="vsf-head">⚠️ 未注册的可视化类型: <code>{{ type }}</code></div>
+    <div class="vsf-head"><AppIcon name="alert-triangle" /> 未注册的可视化类型: <code>{{ type }}</code></div>
     <pre class="vsf-raw">{{ raw || JSON.stringify(data, null, 2) }}</pre>
   </div>
 </template>

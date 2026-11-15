@@ -142,7 +142,7 @@ onMounted(loadPresets)
   <div class="pp-panel">
     <div class="panel glass">
       <div class="panel-title">
-        <span>🔐 能力参数预设</span>
+        <span><AppIcon name="lock" /> 能力参数预设</span>
         <button class="btn" @click="openNewPreset">+ 新建预设</button>
       </div>
       <div class="hint" style="margin-bottom: 10px">
@@ -159,7 +159,7 @@ onMounted(loadPresets)
           <div v-if="p.note" class="pc-note">{{ p.note }}</div>
           <div class="pc-counts">
             <span class="cnt red">🔒 固定 {{ (p.fixed || []).length }}</span>
-            <span class="cnt blue">📝 可选 {{ (p.optional || []).length }}</span>
+            <span class="cnt blue"><AppIcon name="file-text" /> 可选 {{ (p.optional || []).length }}</span>
           </div>
           <div class="pc-actions">
             <button class="btn sm ghost" @click="togglePreset(p)">{{ p.enabled ? '停用' : '启用' }}</button>
@@ -178,8 +178,8 @@ onMounted(loadPresets)
         <div class="grid">
           <label>类型
             <select class="input" v-model="presetForm.target_type" @change="presetForm.target_name = ''">
-              <option value="plugin">🧩 插件</option>
-              <option value="skill">⚡ 技能</option>
+              <option value="plugin"><AppIcon name="puzzle" /> 插件</option>
+              <option value="skill"><AppIcon name="zap" /> 技能</option>
             </select>
           </label>
           <label>目标能力
@@ -197,7 +197,7 @@ onMounted(loadPresets)
         <!-- 固定参数 -->
         <div class="preset-block">
           <div class="preset-block-title">
-            <span>🔒 固定参数</span>
+            <span><AppIcon name="lock" /> 固定参数</span>
             <span class="hint">敏感值加密保存 · 明确选项明文保存 · 模型不可见、不可更改</span>
           </div>
           <div v-for="(row, i) in presetForm.fixed" :key="'f' + i" class="kv-row">
@@ -221,7 +221,7 @@ onMounted(loadPresets)
         <!-- 可选参数 -->
         <div class="preset-block">
           <div class="preset-block-title">
-            <span>📝 可选参数</span>
+            <span><AppIcon name="file-text" /> 可选参数</span>
             <span class="hint">文字描述仅供模型参考选择</span>
           </div>
           <div v-for="(row, i) in presetForm.optional" :key="'o' + i" class="kv-row">

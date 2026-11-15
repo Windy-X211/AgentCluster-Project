@@ -158,7 +158,7 @@ function skip() { emit('close') }
           <div class="fg-step">{{ idx + 1 }} / {{ steps.length }}</div>
         </div>
         <div class="fg-head">
-          <span class="fg-icon">{{ currentStep.icon }}</span>
+          <span class="fg-icon"><AppIcon :name="currentStep.icon" /></span>
           <span class="fg-title">{{ currentStep.title }}</span>
         </div>
         <div class="fg-text">{{ currentStep.text }}</div>

@@ -14,13 +14,13 @@ const emit = defineEmits<{ (e: 'start-flow'): void; (e: 'start-region'): void; (
         </div>
         <div class="gw-cards">
           <div class="gw-card" @click="emit('start-flow')">
-            <div class="gc-icon">🗺️</div>
+            <div class="gc-icon"><AppIcon name="map" /></div>
             <div class="gc-name">使用流程引导</div>
             <div class="gc-desc">按操作流程一步步提示，箭头指引每个区域的功能与用法，适合首次了解整体流程</div>
             <div class="gc-btn">开始引导</div>
           </div>
           <div class="gw-card" @click="emit('start-region')">
-            <div class="gc-icon">🖱️</div>
+            <div class="gc-icon"><AppIcon name="mouse" /></div>
             <div class="gc-name">区域功能引导</div>
             <div class="gc-desc">将鼠标移至任意区域，自动显示该区域的功能说明，适合自由探索各模块</div>
             <div class="gc-btn">开始引导</div>

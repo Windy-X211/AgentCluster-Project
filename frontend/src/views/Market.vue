@@ -905,7 +905,7 @@ onBeforeUnmount(() => {
     <div class="mk-top glass">
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
       <div class="top-drag pywebview-drag-region">
-        <h2>🛒 市场</h2>
+        <h2><AppIcon name="shopping-cart" /> 市场</h2>
         <span class="sub">下载走大陆镜像，上传推送远程仓库</span>
       </div>
       <div class="mk-actions">
@@ -921,7 +921,7 @@ onBeforeUnmount(() => {
           {{ syncing ? '同步中…' : '同步最新' }}
         </button>
         <span v-if="cacheInfo" class="cache-indicator" :title="cacheIndicatorTitle">
-          💾 {{ cacheIndicatorText }}
+          <AppIcon name="save" /> {{ cacheIndicatorText }}
 
           <button class="cache-clean-btn" @click="cleanCache" :disabled="cleaningCache"
             title="清理市场缓存（保留索引和用户数据）">
@@ -947,7 +947,11 @@ onBeforeUnmount(() => {
           :class="{ active: activeKind === k.key, mine: k.key === 'mine' }"
           @click="selectKind(k)"
         >
-          <span class="kind-name">{{ k.key === 'mine' ? '📤 我的发布' : (k.key === 'all' ? '🔥 推荐' : k.label) }}</span>
+          <span class="kind-name">
+            <template v-if="k.key === 'mine'"><AppIcon name="upload" /> 我的发布</template>
+            <template v-else-if="k.key === 'all'"><AppIcon name="flame" /> 推荐</template>
+            <template v-else>{{ k.label }}</template>
+          </span>
           <span class="kind-count">{{ k.count }}</span>
         </button>
       </aside>
@@ -955,7 +959,7 @@ onBeforeUnmount(() => {
       <section class="mk-content">
         <div class="search-row">
           <div class="search-box glass">
-            <span class="search-ico">🔍</span>
+            <span class="search-ico"><AppIcon name="search" /></span>
             <input
               v-model="keyword" class="search-input" :placeholder="searchPlaceholder"
               @input="onSearchInput"

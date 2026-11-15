@@ -61,7 +61,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey, true))
   <div v-if="current" class="perm-mask" @click.self="decide(false)">
     <div class="perm-card" role="dialog" aria-modal="true" aria-label="危险操作确认">
       <div class="perm-head">
-        <span class="perm-badge">🛡 危险操作确认</span>
+        <span class="perm-badge"><AppIcon name="shield-check" /> 危险操作确认</span>
         <span class="perm-left" :class="{ warn: left <= 15 }">{{ left }}s</span>
       </div>
 

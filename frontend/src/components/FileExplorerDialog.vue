@@ -3,9 +3,9 @@
     <div v-if="visible" class="modal-bg" @click.self="close">
       <div class="modal file-explorer">
         <div class="modal-header">
-          <span class="modal-title">📂 数据文件浏览器</span>
+          <span class="modal-title"><AppIcon name="folder-open" /> 数据文件浏览器</span>
           <div class="path-bar">{{ currentPath }}</div>
-          <button class="btn sm ghost" @click="close">✕</button>
+          <button class="btn sm ghost" @click="close"><AppIcon name="x" /></button>
         </div>
         <div class="modal-body">
           <!-- 左侧：目录树 -->
@@ -35,18 +35,18 @@
           <!-- 右侧：编辑区 -->
           <div class="editor-pane">
             <div v-if="!editing" class="editor-empty">
-              <div class="empty-big">🗂️</div>
+              <div class="empty-big"><AppIcon name="folder" /></div>
               <div class="empty-hint">双击左侧文件打开编辑</div>
               <div class="empty-hint sm">支持 json / yaml / md / py / txt / toml 等文本格式</div>
             </div>
             <div v-else class="editor-area">
               <div class="editor-bar">
-                <span class="editor-file">📄 {{ editing.name }}</span>
+                <span class="editor-file"><AppIcon name="file-text" /> {{ editing.name }}</span>
                 <span class="editor-meta mono">{{ formatSize(editing.size) }} · {{ editing.ext }}</span>
                 <span v-if="isDirty" class="editor-dirty">● 未保存</span>
                 <div class="editor-actions">
                   <button class="btn sm ghost" @click="revert" :disabled="!isDirty">↺ 还原</button>
-                  <button class="btn sm ghost danger" @click="confirmDelete">🗑</button>
+                  <button class="btn sm ghost danger" @click="confirmDelete"><AppIcon name="trash-2" /></button>
                   <button class="btn sm primary" @click="save" :disabled="!isDirty || saving">
                     {{ saving ? '保存中…' : '💾 保存' }}
                   </button>

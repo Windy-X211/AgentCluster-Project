@@ -99,15 +99,15 @@ onBeforeUnmount(() => {
     <div v-if="open" class="rg-mask">
       <div class="rg-panel popup-surface" :style="{ left: panelPos.x + 'px', top: panelPos.y + 'px' }">
         <div class="rg-head" @mousedown="onHeadDown">
-          <span class="rg-title">🖱️ 区域功能引导</span>
-          <button class="rg-close" @click="emit('close')">✕</button>
+          <span class="rg-title"><AppIcon name="mouse" /> 区域功能引导</span>
+          <button class="rg-close" @click="emit('close')"><AppIcon name="x" /></button>
         </div>
         <div class="rg-hint">将鼠标移至任一区域，此处自动显示其功能说明（可拖动本窗口）</div>
         <div class="rg-body">
           <template v-if="current">
             <div class="rg-card" :key="current.selector">
               <div class="rg-card-head">
-                <span class="rg-card-icon">{{ current.icon }}</span>
+                <span class="rg-card-icon"><AppIcon :name="current.icon" /></span>
                 <span class="rg-card-name">{{ current.name }}</span>
               </div>
               <div class="rg-card-text">{{ current.text }}</div>

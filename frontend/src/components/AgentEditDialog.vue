@@ -328,7 +328,7 @@ async function remove() {
     <div class="modal glass">
       <div class="modal-head">
         <div class="modal-title">{{ form.id ? '编辑智能体' : '新建智能体' }}</div>
-        <button class="dlg-close" @click="requestClose" title="关闭">✕</button>
+        <button class="dlg-close" @click="requestClose" title="关闭"><AppIcon name="x" /></button>
       </div>
       <div class="modal-body">
       <div class="grid">
@@ -530,7 +530,7 @@ async function remove() {
                    @click="toggleComboPick(c.name)">
               <input type="checkbox" :checked="comboSelected.has(c.name)" readonly />
               <div class="pi-body">
-                <div class="pi-label">🎯 {{ c.name }}</div>
+                <div class="pi-label"><AppIcon name="target" /> {{ c.name }}</div>
                 <div class="pi-extra">{{ c.summary }}</div>
                 <div v-if="c.description" class="pi-desc">{{ c.description }}</div>
               </div>

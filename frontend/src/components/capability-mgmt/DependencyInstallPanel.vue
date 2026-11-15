@@ -99,8 +99,8 @@ function sortEntries(map: Record<string, DepEntry> | undefined): { key: string; 
 
 // 两列结构：左列插件 / 右列技能
 const columns = computed(() => [
-  { id: 'plugins', title: '🧩 插件', cls: 'col-plugins', entries: sortEntries(data.value?.plugins) },
-  { id: 'skills', title: '⚡ 技能', cls: 'col-skills', entries: sortEntries(data.value?.skills) },
+  { id: 'plugins', title: '插件', icon: 'puzzle', cls: 'col-plugins', entries: sortEntries(data.value?.plugins) },
+  { id: 'skills', title: '技能', icon: 'zap', cls: 'col-skills', entries: sortEntries(data.value?.skills) },
 ])
 
 // 有异常（依赖缺失 / 加载失败）的条目总数
@@ -131,11 +131,11 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
     <!-- 头部汇总 -->
     <div class="dep-header">
       <div class="dep-summary" v-if="data">
-        <span class="ds-chip">📦 共 {{ data.summary.total }} 项</span>
-        <span class="ds-chip pip">🐍 pip {{ data.summary.with_pip }} 项</span>
-        <span class="ds-chip npm">📦 npm {{ data.summary.with_npm }} 项</span>
-        <span class="ds-chip ext">🔗 外部应用 {{ data.summary.with_external }} 项需下载</span>
-        <span v-if="errorCount" class="ds-chip err">⚠ {{ errorCount }} 项异常</span>
+        <span class="ds-chip"><AppIcon name="package" /> 共 {{ data.summary.total }} 项</span>
+        <span class="ds-chip pip"><AppIcon name="terminal" /> pip {{ data.summary.with_pip }} 项</span>
+        <span class="ds-chip npm"><AppIcon name="package" /> npm {{ data.summary.with_npm }} 项</span>
+        <span class="ds-chip ext"><AppIcon name="link" /> 外部应用 {{ data.summary.with_external }} 项需下载</span>
+        <span v-if="errorCount" class="ds-chip err"><AppIcon name="alert-triangle" /> {{ errorCount }} 项异常</span>
       </div>
       <button class="btn sm ghost" @click="reload" :disabled="refreshLoading" :title="'重新扫描 + 同步安装缺失依赖'">
         <span v-if="refreshLoading">⟳ 扫描并安装中…</span>
@@ -155,13 +155,13 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
     <div v-else class="dep-cols">
       <section v-for="col in columns" :key="col.id" class="dep-col" :class="col.cls">
         <header class="col-head">
-          <h3>{{ col.title }}</h3>
+          <h3><AppIcon :name="col.icon" /> {{ col.title }}</h3>
           <span v-if="columnSummary(col.entries)" class="col-summary">
             {{ columnSummary(col.entries)!.total }} 项
-            · 🐍 {{ columnSummary(col.entries)!.with_pip }}
-            · 🔗 {{ columnSummary(col.entries)!.with_external }}
+            · <AppIcon name="terminal" /> {{ columnSummary(col.entries)!.with_pip }}
+            · <AppIcon name="link" /> {{ columnSummary(col.entries)!.with_external }}
             <template v-if="columnSummary(col.entries)!.with_errors">
-              · ⚠ {{ columnSummary(col.entries)!.with_errors }} 异常
+              · <AppIcon name="alert-triangle" /> {{ columnSummary(col.entries)!.with_errors }} 异常
             </template>
           </span>
         </header>
@@ -171,7 +171,8 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
             <!-- 卡片头部 -->
             <div class="dc-head">
               <span class="dc-type" :class="item.deps.type === 'plugin' ? 'tp' : 'ts'">
-                {{ item.deps.type === 'plugin' ? '🧩 插件' : '⚡ 技能' }}
+                <template v-if="item.deps.type === 'plugin'"><AppIcon name="puzzle" /> 插件</template>
+                <template v-else><AppIcon name="zap" /> 技能</template>
               </span>
               <span class="dc-label">{{ item.deps.label || item.key }}</span>
               <span class="dc-key mono">{{ item.key }}</span>
@@ -189,12 +190,12 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
 
             <!-- pip 依赖 -->
             <div class="dc-section">
-              <div class="dc-sec-title">🐍 pip 依赖</div>
+              <div class="dc-sec-title"><AppIcon name="terminal" /> pip 依赖</div>
               <div v-if="item.deps.pip?.length" class="dc-pip-list">
                 <div v-for="spec in item.deps.pip" :key="spec" class="pip-item"
                      :class="pipStatus(spec, item.deps)">
                   <span class="pip-spec mono">{{ spec }}</span>
-                  <span v-if="pipStatus(spec, item.deps) === 'missing'" class="pip-badge missing">⚠ 缺失</span>
+                  <span v-if="pipStatus(spec, item.deps) === 'missing'" class="pip-badge missing"><AppIcon name="alert-triangle" /> 缺失</span>
                   <span v-else-if="pipStatus(spec, item.deps) === 'new'" class="pip-badge new">本次新安装</span>
                   <span v-else class="pip-badge ok">已满足</span>
                 </div>
@@ -204,18 +205,18 @@ function columnSummary(entries: { key: string; deps: DepEntry }[]) {
 
             <!-- npm 状态 -->
             <div class="dc-section">
-              <div class="dc-sec-title">📦 npm 依赖</div>
+              <div class="dc-sec-title"><AppIcon name="package" /> npm 依赖</div>
               <div v-if="item.deps.npm_installed === null" class="dc-none">— 未声明 —</div>
-              <div v-else-if="item.deps.npm_installed" class="npm-badge ok">✓ npm 依赖已就绪</div>
-              <div v-else-if="item.deps.npm_missing" class="npm-badge unavail">⚠ npm 不可用或安装失败</div>
-              <div v-else class="npm-badge err">✗ npm 依赖安装失败</div>
+              <div v-else-if="item.deps.npm_installed" class="npm-badge ok"><AppIcon name="circle-check" /> npm 依赖已就绪</div>
+              <div v-else-if="item.deps.npm_missing" class="npm-badge unavail"><AppIcon name="alert-triangle" /> npm 不可用或安装失败</div>
+              <div v-else class="npm-badge err"><AppIcon name="circle-x" /> npm 依赖安装失败</div>
             </div>
 
             <!-- external 下载链接 -->
             <div v-if="item.deps.external?.length" class="dc-section dc-ext">
-              <div class="dc-sec-title">🔗 外部应用（需手动安装）</div>
+              <div class="dc-sec-title"><AppIcon name="link" /> 外部应用（需手动安装）</div>
               <div v-for="ext in item.deps.external" :key="ext.name" class="ext-item">
-                <div class="ext-name">📥 {{ ext.name }}</div>
+                <div class="ext-name"><AppIcon name="clipboard-paste" /> {{ ext.name }}</div>
                 <div v-if="ext.description" class="ext-desc">{{ ext.description }}</div>
                 <a v-if="ext.url" :href="ext.url" target="_blank" rel="noopener" class="ext-link">
                   下载 → {{ ext.url }}

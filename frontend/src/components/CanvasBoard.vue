@@ -3961,21 +3961,21 @@ defineExpose({ viewportRef, computeNodeBbox })
           <button class="btn ghost palette-btn" ref="paletteAnchor"
                   @click.stop="togglePalette" @mousedown.stop
                   :class="{ active: paletteOpen }"
-                  title="选择颜色后点击智能体节点，即可更改该智能体的头像颜色">🎨</button>
+                  title="选择颜色后点击智能体节点，即可更改该智能体的头像颜色"><AppIcon name="palette" /></button>
           <span class="canvas-mini" :title="'当前画布：' + canvas?.name">{{ canvas?.name }}</span>
         </div>
         <div class="toolbar-right">
           <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
                   @click.stop="toggleRun">
             <span v-if="runningOnThisCanvas" class="stop-icon" aria-hidden="true"></span>
-            <template v-else>▶</template>
+            <template v-else><AppIcon name="chevron-right" /></template>
           </button>
           <button class="btn ghost em-collapsed" @click.stop="toggleExecMode"
                   :class="{ pending: !!pendingExecMode }"
                   :title="displayExecMode === 'parallel' ? '并行 → 点击切换串行' : '串行 → 点击切换并行'">
             {{ displayExecMode === 'parallel' ? '⇉' : '⇥' }}
           </button>
-          <button class="btn ghost close-btn collapsed-close" @click.stop="canvases.closeCurrent()" title="关闭画布（自动保存）">✕</button>
+          <button class="btn ghost close-btn collapsed-close" @click.stop="canvases.closeCurrent()" title="关闭画布（自动保存）"><AppIcon name="x" /></button>
         </div>
       </template>
       <!-- 展开态：完整按钮组 -->
@@ -3985,7 +3985,7 @@ defineExpose({ viewportRef, computeNodeBbox })
           <button class="btn ghost palette-btn" ref="paletteAnchor"
                   @click.stop="togglePalette" @mousedown.stop
                   :class="{ active: paletteOpen }"
-                  title="选择颜色后点击智能体节点，即可更改该智能体的头像颜色">🎨</button>
+                  title="选择颜色后点击智能体节点，即可更改该智能体的头像颜色"><AppIcon name="palette" /></button>
           <template v-if="renameEdit">
             <input class="input sm rename-input" :value="renameValue" @input="renameValue = ($event.target as HTMLInputElement).value"
                    @keydown.enter.prevent="commitRename" @keydown.esc="renameEdit = false"
@@ -4001,7 +4001,7 @@ defineExpose({ viewportRef, computeNodeBbox })
                   @click.stop="toggleRun"
                   :title="runningOnThisCanvas ? '停止：中止定时触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时）运行集群'">
             <template v-if="runningOnThisCanvas"><span class="stop-icon" aria-hidden="true"></span>停止</template>
-            <template v-else>▶ 运行</template>
+            <template v-else><AppIcon name="chevron-right" /> 运行</template>
           </button>
           <div class="exec-mode-toggle" @click.stop="toggleExecMode"
                :class="{ pending: !!pendingExecMode }"
@@ -4018,12 +4018,12 @@ defineExpose({ viewportRef, computeNodeBbox })
                   :title="canvas?.workdir ? '📁 工作区已设置：' + canvas.workdir : '📁 设置工作区文件夹（智能体文件生成目标）'">
             📁 {{ canvas?.workdir ? '已设' : '工作区' }}
           </button>
-          <button class="btn ghost" @click.stop="rulesOpen = true" title="📋 规章制度">📋 规则</button>
+          <button class="btn ghost" @click.stop="rulesOpen = true" title="📋 规章制度"><AppIcon name="clipboard-list" /> 规则</button>
           <span class="zoom-indicator" :class="{ panning: spaceDown }">
-            🔍 {{ Math.round(scale * 100) }}%
+            <AppIcon name="search" :size="12" /> {{ Math.round(scale * 100) }}%
           </span>
           <button class="btn ghost" @click.stop="confirmRemoveCanvas" title="删除此画布">删除</button>
-          <button class="btn ghost close-btn" @click.stop="canvases.closeCurrent()" title="关闭画布（自动保存）">✕</button>
+          <button class="btn ghost close-btn" @click.stop="canvases.closeCurrent()" title="关闭画布（自动保存）"><AppIcon name="x" /></button>
         </div>
       </template>
     </div>
@@ -4036,7 +4036,7 @@ defineExpose({ viewportRef, computeNodeBbox })
       <span class="draw-hint-badge">第 {{ drawSegNo }} 段</span>
       <span>当前线型：<b>{{ segLabel(drawType) }}</b></span>
       <span class="draw-hint-tip">左键落点确认一段 · 右键切换线型 · 点击节点结束 · Esc 取消</span>
-      <button class="btn xs ghost" @click.stop="cancelDraw()">✕ 取消</button>
+      <button class="btn xs ghost" @click.stop="cancelDraw()"><AppIcon name="x" /> 取消</button>
     </div>
 
     <!-- 色谱浮窗（调色板按钮）：Teleport 到 body，避免被画布缩放层裁剪 -->
@@ -4129,7 +4129,7 @@ defineExpose({ viewportRef, computeNodeBbox })
                  class="b-chunk" :class="'b-' + chunk.kind">
               <template v-if="chunk.kind === 'reasoning'">
                 <div class="b-think">
-                  <span class="b-think-icon">🧠</span>
+                  <span class="b-think-icon"><AppIcon name="brain" /></span>
                   <span class="b-think-text">{{ cyclicWindow(chunk.text || '', 50) }}</span>
                   <span class="b-think-cursor">▌</span>
                 </div>
@@ -4156,8 +4156,8 @@ defineExpose({ viewportRef, computeNodeBbox })
             <span v-if="agentById(n.agent_id)?.enabled === false" class="off-tag" title="已停用">⏸</span>
           </div>
           <div class="node-actions">
-            <button class="btn xs ghost ctx-action" @click.stop="doChat(n)">💬 对话</button>
-            <button class="btn xs ghost ctx-action" @mousedown.stop @click.stop="startLink($event, n.id)">🔗 连线</button>
+            <button class="btn xs ghost ctx-action" @click.stop="doChat(n)"><AppIcon name="message-square" /> 对话</button>
+            <button class="btn xs ghost ctx-action" @mousedown.stop @click.stop="startLink($event, n.id)"><AppIcon name="link" /> 连线</button>
           </div>
         </div>
 
@@ -4202,11 +4202,11 @@ defineExpose({ viewportRef, computeNodeBbox })
       <div v-if="bgMenu" class="ctx-menu glass" :style="{ left: bgMenu.x + 'px', top: bgMenu.y + 'px' }" @click.stop>
         <template v-if="selectedNodeIds.size">
           <div class="ctx-title">已选 {{ selectedNodeIds.size }} 个智能体</div>
-          <div class="ctx-item" @click="copySelection(); closeMenus()">📋 复制 <span class="ctx-kbd">Ctrl+C</span></div>
-          <div class="ctx-item" @click="cutSelection(); closeMenus()">✂️ 剪切 <span class="ctx-kbd">Ctrl+X</span></div>
+          <div class="ctx-item" @click="copySelection(); closeMenus()"><AppIcon name="clipboard-list" /> 复制 <span class="ctx-kbd">Ctrl+C</span></div>
+          <div class="ctx-item" @click="cutSelection(); closeMenus()"><AppIcon name="scissors" /> 剪切 <span class="ctx-kbd">Ctrl+X</span></div>
           <div class="ctx-item" :class="{ disabled: !canvases.clipboard }"
-               @click="canvases.clipboard && pasteClipboard(clientToCanvas(bgMenu.x, bgMenu.y))">📥 粘贴 <span class="ctx-kbd">Ctrl+V</span></div>
-          <div class="ctx-item sel-create-canvas" @click="createCanvasFromSelection()">🎨 用选中的智能体创建画布…</div>
+               @click="canvases.clipboard && pasteClipboard(clientToCanvas(bgMenu.x, bgMenu.y))"><AppIcon name="clipboard-paste" /> 粘贴 <span class="ctx-kbd">Ctrl+V</span></div>
+          <div class="ctx-item sel-create-canvas" @click="createCanvasFromSelection()"><AppIcon name="palette" /> 用选中的智能体创建画布…</div>
           <div class="ctx-divider" />
         </template>
         <div class="ctx-item" :class="{ disabled: !undoStack.length }" @click="undoCanvas()">↶ 撤销 <span class="ctx-kbd">Ctrl+Z</span></div>
@@ -4226,11 +4226,11 @@ defineExpose({ viewportRef, computeNodeBbox })
           </div>
         </div>
         <div class="ctx-divider" />
-        <div class="ctx-item" @click="toggleWorkspace()">🗂 显示/隐藏工作区</div>
-        <div class="ctx-item" @click="closeMenus(); wdPath = canvas?.workdir || ''; wdOpen = true">📁 设置工作区文件夹…</div>
+        <div class="ctx-item" @click="toggleWorkspace()"><AppIcon name="folder" /> 显示/隐藏工作区</div>
+        <div class="ctx-item" @click="closeMenus(); wdPath = canvas?.workdir || ''; wdOpen = true"><AppIcon name="folder" /> 设置工作区文件夹…</div>
         <div class="ctx-divider" />
-        <div class="ctx-item" @click="closeMenus(); hideAllBubblesForce()">🙈 隐藏所有消息泡泡</div>
-        <div class="ctx-item" @click="closeMenus(); hideAllBubbles()">👁 显示所有消息泡泡</div>
+        <div class="ctx-item" @click="closeMenus(); hideAllBubblesForce()"><AppIcon name="eye-off" /> 隐藏所有消息泡泡</div>
+        <div class="ctx-item" @click="closeMenus(); hideAllBubbles()"><AppIcon name="eye" /> 显示所有消息泡泡</div>
       </div>
     </Teleport>
 
@@ -4240,17 +4240,17 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div class="ctx-title">
           {{ selectedNodeIds.size > 1 ? `已选 ${selectedNodeIds.size} 个智能体` : (agentById(ctxMenu.node.agent_id)?.name || '未知') }}
         </div>
-        <div class="ctx-item" @click="copySelection(); closeMenus()">📋 复制 <span class="ctx-kbd">Ctrl+C</span></div>
-        <div class="ctx-item" @click="cutSelection(); closeMenus()">✂️ 剪切 <span class="ctx-kbd">Ctrl+X</span></div>
+        <div class="ctx-item" @click="copySelection(); closeMenus()"><AppIcon name="clipboard-list" /> 复制 <span class="ctx-kbd">Ctrl+C</span></div>
+        <div class="ctx-item" @click="cutSelection(); closeMenus()"><AppIcon name="scissors" /> 剪切 <span class="ctx-kbd">Ctrl+X</span></div>
         <div class="ctx-item" :class="{ disabled: !canvases.clipboard }"
-             @click="canvases.clipboard && pasteClipboard(clientToCanvas(ctxMenu.x, ctxMenu.y))">📥 粘贴 <span class="ctx-kbd">Ctrl+V</span></div>
-        <div class="ctx-item sel-create-canvas" @click="createCanvasFromSelection()">🎨 用选中的智能体创建画布…</div>
+             @click="canvases.clipboard && pasteClipboard(clientToCanvas(ctxMenu.x, ctxMenu.y))"><AppIcon name="clipboard-paste" /> 粘贴 <span class="ctx-kbd">Ctrl+V</span></div>
+        <div class="ctx-item sel-create-canvas" @click="createCanvasFromSelection()"><AppIcon name="palette" /> 用选中的智能体创建画布…</div>
         <div class="ctx-divider" />
-        <div class="ctx-item" @click="openAgentEdit(ctxMenu.node)">✏️ 编辑智能体…</div>
-        <div class="ctx-item" @click="toggleBubble(ctxMenu.node); closeMenus()">💬 显示/隐藏消息泡泡</div>
+        <div class="ctx-item" @click="openAgentEdit(ctxMenu.node)"><AppIcon name="pencil" /> 编辑智能体…</div>
+        <div class="ctx-item" @click="toggleBubble(ctxMenu.node); closeMenus()"><AppIcon name="message-square" /> 显示/隐藏消息泡泡</div>
         <div class="ctx-divider" />
         <div class="ctx-item submenu" @click.stop>
-          <div class="submenu-label">👁 感知范围</div>
+          <div class="submenu-label"><AppIcon name="eye" /> 感知范围</div>
           <div class="submenu-body">
             <div class="sub-item" :class="{ checked: perceptionScopeOf(ctxMenu.node) === 'link' }"
                  @click="setPerceptionScope(ctxMenu.node, 'link')">仅连线邻居（默认）</div>
@@ -4304,7 +4304,7 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div v-else-if="hasWaypoints(edgeMenu.edge)" class="ctx-item edge-reset" @click="resetEdgeWaypoints(edgeMenu.edge)">↺ 恢复自动布线</div>
         <div v-if="hasManualAnchors(edgeMenu.edge)" class="ctx-item edge-reset-anchors" @click="resetEdgeAnchors(edgeMenu.edge)">⌖ 恢复锚点默认位置</div>
         <div class="ctx-divider" />
-        <div class="ctx-item danger edge-delete" @click="removeEdge(edgeMenu.edge.id); closeMenus()">🗑 删除连线</div>
+        <div class="ctx-item danger edge-delete" @click="removeEdge(edgeMenu.edge.id); closeMenus()"><AppIcon name="trash-2" /> 删除连线</div>
       </div>
     </Teleport>
 
@@ -4319,7 +4319,7 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div class="ctx-item" :class="{ checked: drawType === 'arc' }" @click="chooseSegType('arc')">◠ 圆弧</div>
         <div class="ctx-item" :class="{ checked: drawType === 'vert' }" @click="chooseSegType('vert')">⊥ 垂线（垂直于上一段）</div>
         <div class="ctx-divider" />
-        <div class="ctx-item" @click="cancelDraw()">✕ 取消绘制 <span class="ctx-kbd">Esc</span></div>
+        <div class="ctx-item" @click="cancelDraw()"><AppIcon name="x" /> 取消绘制 <span class="ctx-kbd">Esc</span></div>
         <div class="seg-menu-note">右键位置决定曲线 / 圆弧的弯向；垂线从上一段末尾垂直引出（第一段垂直于起点所在边），左键落点决定长度与朝向。左键确认本段后可继续画下一段</div>
       </div>
     </Teleport>
@@ -4380,13 +4380,13 @@ defineExpose({ viewportRef, computeNodeBbox })
     <!-- 工作区文件夹对话框 -->
     <div v-if="wdOpen" class="modal-bg" @click.self="wdOpen = false">
       <div class="modal-card" style="width: 500px;">
-        <div class="modal-title">📁 设置工作区文件夹</div>
+        <div class="modal-title"><AppIcon name="folder" /> 设置工作区文件夹</div>
         <div class="modal-body">
           <p class="hint">画布中所有智能体的文件操作会以此目录为 cwd，生成的文件直接存放到这里。</p>
           <div class="wd-row">
             <input v-model="wdPath" class="input wd-input" placeholder="例：C:\Users\你\Desktop\agent-out">
             <button class="btn ghost wd-browse" @click.stop="browseWorkdir" title="弹出系统文件夹选择框"
-                    :disabled="browsing">📂 {{ browsing ? '…' : '浏览' }}</button>
+                    :disabled="browsing"><AppIcon name="folder-open" /> {{ browsing ? '…' : '浏览' }}</button>
           </div>
           <div class="wd-existing" v-if="wdPath.trim() === ''">当前无工作区 — 粘贴路径或点右边「浏览」</div>
         </div>

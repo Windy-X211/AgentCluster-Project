@@ -11,10 +11,10 @@ type GroupMap = Record<string, string[]>          // { groupName: [capKey, ...] 
 interface GroupedList { groups: { name: string; keys: string[] }[]; ungrouped: string[] }
 
 const TYPE_TABS: { key: CapType; label: string; icon: string }[] = [
-  { key: 'commands', label: '命令', icon: '⌨️' },
-  { key: 'skills',   label: '技能', icon: '✨' },
-  { key: 'plugins',  label: '插件', icon: '🧩' },
-  { key: 'combos',   label: '组合技', icon: '🎯' },
+  { key: 'commands', label: '命令', icon: 'keyboard' },
+  { key: 'skills',   label: '技能', icon: 'sparkles' },
+  { key: 'plugins',  label: '插件', icon: 'puzzle' },
+  { key: 'combos',   label: '组合技', icon: 'target' },
 ]
 
 const activeType = ref<CapType>('commands')
@@ -648,7 +648,7 @@ function commitAddMember() {
         <button v-for="t in TYPE_TABS" :key="t.key"
                 class="type-tab" :class="{ active: activeType === t.key }"
                 @click="activeType = t.key">
-          <span class="tt-icon">{{ t.icon }}</span>
+          <span class="tt-icon"><AppIcon :name="t.icon" /></span>
           <span>{{ t.label }}</span>
           <span class="tt-count">{{ t.key === 'combos' ? comboList.length : Object.keys(metaFor(t.key)).length }}</span>
         </button>

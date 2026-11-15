@@ -668,7 +668,7 @@ const agentGroupOptions = computed(() => {
       <!-- 历史上下文压缩 -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>🗜 历史上下文压缩</span>
+          <span><AppIcon name="save" /> 历史上下文压缩</span>
           <span class="hint">达到压缩线时自动把较早历史压缩成摘要</span>
         </div>
         <div class="cap-block">
@@ -696,7 +696,7 @@ const agentGroupOptions = computed(() => {
       <!-- 默认智能体 -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>🤖 默认智能体</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><rect width="18" height="10" x="3" y="7" rx="2"/><path d="M12 11v4"/><path d="M8 11v4"/><path d="M16 11v4"/></svg>默认智能体</span>
           <span class="hint">新建对话时自动选中</span>
         </div>
         <div class="cap-block">
@@ -718,7 +718,7 @@ const agentGroupOptions = computed(() => {
       <!-- 外观设置 -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>🎨 外观设置</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>外观设置</span>
           <span class="hint">界面外观偏好</span>
         </div>
         <div class="cap-block">
@@ -859,9 +859,9 @@ const agentGroupOptions = computed(() => {
           <div class="cap-header">
             <span class="cap-title">背景</span>
             <div class="bg-upload-btns">
-              <button class="btn sm ghost" @click="pickBackgroundFiles('image')" :disabled="bgUploading">🖼️ 图片</button>
-              <button class="btn sm ghost" @click="pickBackgroundFiles('video')" :disabled="bgUploading">🎬 视频</button>
-              <button class="btn sm ghost" @click="pickBackgroundFiles('animation')" :disabled="bgUploading">✨ 动画</button>
+              <button class="btn sm ghost" @click="pickBackgroundFiles('image')" :disabled="bgUploading"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>图片</button>
+              <button class="btn sm ghost" @click="pickBackgroundFiles('video')" :disabled="bgUploading"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2" ry="2"/></svg>视频</button>
+              <button class="btn sm ghost" @click="pickBackgroundFiles('animation')" :disabled="bgUploading"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 3v18"/><path d="m16.6 7.6-2.4 4.4-4.8 5.4 2.4-4.4 4.8-5.4"/></svg>动画</button>
             </div>
           </div>
           <div class="bg-grid">
@@ -872,7 +872,7 @@ const agentGroupOptions = computed(() => {
             <div v-for="bg in bgList" :key="bg.id" class="bg-card" :class="{ active: layout.backgroundId === bg.id }" @click="layout.setBackground(bg.id)">
               <div class="bg-preview" :style="bgThumbStyle(bg)">
                 <span class="bg-type-tag">{{ bg.type === 'animation' ? '动画' : bg.type === 'video' ? '视频' : '图片' }}</span>
-                <button v-if="!bg.builtin" class="bg-del" @click.stop="deleteBackground(bg)" title="删除">✕</button>
+                <button v-if="!bg.builtin" class="bg-del" @click.stop="deleteBackground(bg)" title="删除"><AppIcon name="x" /></button>
               </div>
               <div class="bg-name">{{ bg.name }}</div>
             </div>
@@ -903,7 +903,7 @@ const agentGroupOptions = computed(() => {
       <!-- 新手引导 -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>📖 新手引导</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>新手引导</span>
           <span class="hint">再次查看引导说明</span>
         </div>
         <div class="cap-block">
@@ -911,8 +911,8 @@ const agentGroupOptions = computed(() => {
             <span class="cap-title">引导方式</span>
           </div>
           <div class="guide-actions">
-            <button class="btn" @click="startGuide('flow')">🗺️ 使用流程引导</button>
-            <button class="btn" @click="startGuide('region')">🖱️ 区域功能引导</button>
+            <button class="btn" @click="startGuide('flow')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21 3 6"/><line x1="9" x2="9" y1="3" y2="18"/><line x1="15" x2="15" y1="6" y2="21"/></svg>使用流程引导</button>
+            <button class="btn" @click="startGuide('region')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M5.121 19 19 5.121"/><path d="M15 5v14"/><path d="M11 7v10"/><path d="M7 9v6"/><path d="M19 5H5"/><path d="M19 5v14H5"/></svg>区域功能引导</button>
           </div>
           <div class="hint-empty" style="margin-top: 8px">
             流程引导：按步骤箭头指引各区域用法；区域引导：鼠标移至区域自动显示说明
@@ -923,7 +923,7 @@ const agentGroupOptions = computed(() => {
           <span class="hint">任务结束时的声音反馈</span>
       <div class="panel glass">
         <div class="panel-title">
-          <span>🔔 提示音</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>提示音</span>
           <span class="hint">画布运行结束时的声音反馈</span>
         </div>
         <div class="cap-block">
@@ -937,8 +937,8 @@ const agentGroupOptions = computed(() => {
             </div>
           </div>
           <div v-if="soundEnabled" class="sound-test-row">
-            <button class="btn sm ghost" @click="testSuccess">🎵 试听完成音</button>
-            <button class="btn sm ghost" @click="testError">⚠️ 试听错误音</button>
+            <button class="btn sm ghost" @click="testSuccess"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>试听完成音</button>
+            <button class="btn sm ghost" @click="testError"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>试听错误音</button>
           </div>
           <div class="hint-empty" style="margin-top: 8px">
             提示音使用浏览器 Web Audio 合成，无需加载外部音频文件
@@ -949,7 +949,7 @@ const agentGroupOptions = computed(() => {
       <!-- 语音识别 -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>🎙️ 语音识别</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>语音识别</span>
           <span class="hint">SenseVoice 同声传译</span>
         </div>
         <div class="cap-block">
@@ -957,11 +957,11 @@ const agentGroupOptions = computed(() => {
             <span class="cap-title">安装状态</span>
           </div>
           <div v-if="settings.asrAvailable" class="asr-status asr-ok">
-            <span class="asr-badge asr-badge-ok">✓ 已安装</span>
+            <span class="asr-badge asr-badge-ok"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:2px"><polyline points="20 6 9 17 4 12"/></svg>已安装</span>
             <span class="asr-desc">语音识别已就绪。</span>
           </div>
           <div v-else class="asr-status asr-missing">
-            <span class="asr-badge asr-badge-no">✗ 未安装</span>
+            <span class="asr-badge asr-badge-no"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:2px"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>未安装</span>
             <span class="asr-desc">安装后可在对话框中使用 🎤 按钮进行同声传译输入。</span>
           </div>
           <div v-if="!settings.asrAvailable" class="asr-install">
@@ -978,7 +978,8 @@ const agentGroupOptions = computed(() => {
           </div>
           <div v-if="settings.asrAvailable" class="asr-uninstall-row">
             <button class="btn sm ghost asr-uninstall-btn" @click="uninstallASR" :disabled="asrUninstalling">
-              {{ asrUninstalling ? '卸载中…' : '🗑 卸载模型' }}
+              <template v-if="asrUninstalling">卸载中…</template>
+              <template v-else><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>卸载模型</template>
             </button>
             <span class="asr-uninstall-hint">删除 SenseVoiceSmall 模型文件（约 936MB），释放磁盘空间。依赖包保留，重新使用时自动重新下载</span>
           </div>
@@ -988,7 +989,7 @@ const agentGroupOptions = computed(() => {
       <!-- 启动方式 -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>🚀 启动方式</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.9A12.8 12.8 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>启动方式</span>
           <span class="hint">下次双击 start.bat 时的行为</span>
         </div>
         <div class="cap-block">
@@ -999,12 +1000,12 @@ const agentGroupOptions = computed(() => {
             <label class="radio-label" :class="{ active: launchMode === 'client' }" @click="!launchModeSaving && saveLaunchMode('client')">
               <input type="radio" name="launchMode" value="client" :checked="launchMode === 'client'" />
               <span class="radio-dot"></span>
-              <span class="radio-text">🖥️ 桌面客户端</span>
+              <span class="radio-text"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><rect width="16" height="10" x="4" y="2" rx="2" ry="2"/><path d="M2 20h20"/><path d="M7 20v-4"/><path d="M17 20v-4"/></svg>桌面客户端</span>
             </label>
             <label class="radio-label" :class="{ active: launchMode === 'web' }" @click="!launchModeSaving && saveLaunchMode('web')">
               <input type="radio" name="launchMode" value="web" :checked="launchMode === 'web'" />
               <span class="radio-dot"></span>
-              <span class="radio-text">🌐 浏览器网页</span>
+              <span class="radio-text"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>浏览器网页</span>
             </label>
           </div>
           <div class="hint-empty" style="margin-top: 8px">
@@ -1045,7 +1046,7 @@ const agentGroupOptions = computed(() => {
       <!-- 数据存储 -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>📂 数据存储</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>数据存储</span>
           <span class="hint">v2 · 每条记录一个 json</span>
         </div>
         <div class="storage-loc">
@@ -1063,49 +1064,49 @@ const agentGroupOptions = computed(() => {
           <thead><tr><th>名称</th><th>类型</th><th>相对路径</th><th>数量</th><th style="width: 120px"></th></tr></thead>
           <tbody>
             <tr>
-              <td>⚙️ 配置设置</td>
+              <td><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>配置设置</td>
               <td class="tag-t">单文件</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.settings_file) }}</td>
               <td class="mono">1</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.root)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.root)">打开</button></td>
             </tr>
             <tr>
-              <td>🧠 智能体</td>
+              <td><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg>智能体</td>
               <td class="tag-t">每 agent 一个 json</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.agents_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.agents ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.agents_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.agents_dir)">打开</button></td>
             </tr>
             <tr>
-              <td>🎨 画布（集群编排）</td>
+              <td><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>画布（集群编排）</td>
               <td class="tag-t">每 canvas 一个 json</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.canvases_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.canvases ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.canvases_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.canvases_dir)">打开</button></td>
             </tr>
             <tr>
-              <td>💬 聊天记录</td>
+              <td><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天记录</td>
               <td class="tag-t">每 conversation 一个 json</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.conversations_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.conversations ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.conversations_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.conversations_dir)">打开</button></td>
             </tr>
             <tr>
-              <td>🔌 模型接口</td>
+              <td><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M9 2v6"/><path d="M15 2v6"/><path d="M6 8h12"/><path d="M19 12v2a7 7 0 0 1-14 0v-2"/><rect x="12" y="14" width="4" height="8" rx="1"/></svg>模型接口</td>
               <td class="tag-t">每 interface 一个 json</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.model_interfaces_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.model_interfaces ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.model_interfaces_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.model_interfaces_dir)">打开</button></td>
             </tr>
             <tr>
-              <td>⚡ 自定义技能</td>
+              <td><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>自定义技能</td>
               <td class="tag-t">每技能一个文件夹</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.skills_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.skills ?? '-' }}</td>
               <td class="actions"><button class="btn sm ghost" @click="openExplorer(storagePaths.skills_dir)">编辑</button><button class="btn sm ghost" @click="openPath(storagePaths.skills_dir)">打开</button></td>
             </tr>
             <tr>
-              <td>🧩 自定义插件</td>
+              <td><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M15.5 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8.5L15.5 3Z"/><path d="M15 3v6h6"/><path d="M10 12h4"/><path d="M10 16h4"/></svg>自定义插件</td>
               <td class="tag-t">每插件一个文件夹</td>
               <td class="mono sm-cell">{{ relPath(storagePaths.plugins_dir) }}</td>
               <td class="mono">{{ storagePaths.stats?.plugins ?? '-' }}</td>
@@ -1119,7 +1120,7 @@ const agentGroupOptions = computed(() => {
       <!-- 权限设置（危险操作授权 + 可操作范围，后端执行端见 core/permissions.py） -->
       <div class="panel glass">
         <div class="panel-title">
-          <span>🛡 权限设置</span>
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>权限设置</span>
           <span class="hint">限制智能体的危险操作与可操作范围</span>
         </div>
 
@@ -1198,21 +1199,21 @@ const agentGroupOptions = computed(() => {
       <div class="modal popup-surface">
         <div class="modal-head">
           <div class="modal-title">{{ isEditing ? '编辑接口' : '新建接口' }}</div>
-          <button type="button" class="dlg-close" title="关闭" @click="requestClose">✕</button>
+          <button type="button" class="dlg-close" title="关闭" @click="requestClose"><AppIcon name="x" /></button>
         </div>
         <div class="grid">
           <label class="full">
             <span class="field-head"><span>URL</span></span>
             <span class="iface-presets">
               <button type="button" class="iface-preset" :class="{ hover: hoverPreset === p }" v-for="p in BUILTIN_PRESETS" :key="p.name" :title="p.url" @mouseenter="hoverPreset = p" @mouseleave="hoverPreset = null" @click="applyPreset(p, $event)">{{ p.name }}</button>
-              <button type="button" class="iface-preset" :class="{ hover: hoverPreset === p }" v-for="(p, i) in customPresets" :key="'c' + i" :title="p.url" @mouseenter="hoverPreset = p" @mouseleave="hoverPreset = null" @click="applyPreset(p, $event)">{{ p.name }}<span class="preset-x" title="删除预设" @click.stop="removePreset(i)">✕</span></button>
+              <button type="button" class="iface-preset" :class="{ hover: hoverPreset === p }" v-for="(p, i) in customPresets" :key="'c' + i" :title="p.url" @mouseenter="hoverPreset = p" @mouseleave="hoverPreset = null" @click="applyPreset(p, $event)">{{ p.name }}<span class="preset-x" title="删除预设" @click.stop="removePreset(i)"><AppIcon name="x" /></span></button>
               <button type="button" class="iface-preset add" :class="{ hover: hoverPreset === 'add' }" @mouseenter="hoverPreset = 'add'" @mouseleave="hoverPreset = null" @click="openPresetForm">＋预设</button>
             </span>
             <span v-if="showPresetForm" class="preset-form">
               <input class="input" v-model="presetName" placeholder="预设名称" @keydown.enter="addPreset" />
               <input class="input" v-model="presetUrl" placeholder="https://..." @keydown.enter="addPreset" />
               <button type="button" class="btn sm ghost" @click="addPreset">添加</button>
-              <button type="button" class="dlg-close" title="取消" @click="showPresetForm = false">✕</button>
+              <button type="button" class="dlg-close" title="取消" @click="showPresetForm = false"><AppIcon name="x" /></button>
             </span>
             <input class="input" v-model="ifaceForm.url" placeholder="https://api.openai.com/v1" />
           </label>
@@ -1263,7 +1264,7 @@ const agentGroupOptions = computed(() => {
       <div class="modal popup-surface migrate-box">
         <div class="modal-head">
           <div class="modal-title">迁移用户数据</div>
-          <button type="button" class="dlg-close" title="关闭" :disabled="migrating" @click="closeMigrate">✕</button>
+          <button type="button" class="dlg-close" title="关闭" :disabled="migrating" @click="closeMigrate"><AppIcon name="x" /></button>
         </div>
         <div class="migrate-paths">
           <div class="migrate-path"><span class="migrate-path-label">源</span><span class="mono">{{ migratePlan?.source || storagePaths?.root || '—' }}</span></div>

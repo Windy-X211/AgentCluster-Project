@@ -6,7 +6,7 @@ const store = usePluginDebugStore()
 
 <template>
   <div class="plugin-list">
-    <div v-if="store.scanError" class="scan-error">⚠ {{ store.scanError }}</div>
+    <div v-if="store.scanError" class="scan-error"><AppIcon name="alert-triangle" /> {{ store.scanError }}</div>
     <div v-else-if="store.scanning" class="empty">正在扫描…</div>
     <div v-else-if="!store.plugins.length && !store.failed.length" class="empty">
       未在所选目录下发现可用插件
@@ -21,13 +21,13 @@ const store = usePluginDebugStore()
         @click="store.selectPlugin(p.name)"
       >
         <div class="item-head">
-          <span class="icon">{{ p.icon || '🔌' }}</span>
+          <span class="icon"><AppIcon :name="p.icon || 'plug'" /></span>
           <span class="label">{{ p.label }}</span>
           <span class="version" v-if="p.version">v{{ p.version }}</span>
         </div>
         <div class="desc" v-if="p.description">{{ p.description }}</div>
         <div class="meta">
-          <span v-if="p.author" class="author">👤 {{ p.author }}</span>
+          <span v-if="p.author" class="author"><AppIcon name="paw" /> {{ p.author }}</span>
           <span class="tag" v-for="t in p.tags" :key="t">{{ t }}</span>
         </div>
         <div class="name">name: {{ p.name }}</div>
@@ -37,7 +37,7 @@ const store = usePluginDebugStore()
     <div v-if="store.failed.length" class="failed-block">
       <div class="failed-title">加载失败（{{ store.failed.length }}）</div>
       <div v-for="f in store.failed" :key="f.dir_name" class="failed-item">
-        <span class="failed-name">📁 {{ f.dir_name }}</span>
+        <span class="failed-name"><AppIcon name="folder" /> {{ f.dir_name }}</span>
         <span class="failed-reason">{{ f.load_error }}</span>
       </div>
     </div>

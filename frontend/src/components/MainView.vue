@@ -126,7 +126,7 @@ const setupWdSignal = ref(0)
                  @open-workspace="onOpenWorkspace"
                  @close-workspace="onCloseWorkspace" />
     <div v-else class="empty-center glass">
-      <div style="font-size: calc(24px * var(--font-scale)); margin-bottom:8px">🎨</div>
+      <div style="font-size: calc(24px * var(--font-scale)); margin-bottom:8px"><AppIcon name="palette" /></div>
       <template v-if="canvases.list.length">
         <div style="font-size: calc(15px * var(--font-scale)); margin-bottom:8px">画布已关闭</div>
         <div style="font-size: calc(12px * var(--font-scale)); opacity:.6">在右侧「画布列表」点击画布名可重新打开</div>

@@ -344,7 +344,7 @@ function onGroupDrop(e: DragEvent, g: any) {
           <!-- 全部组（虚拟，固定置顶，不可右键） -->
           <div class="group-card glass-soft" @click="enterGroup('all')" @dragover.prevent @drop.prevent>
             <div class="group-head">
-              <span class="group-icon">📁</span>
+              <span class="group-icon"><AppIcon name="folder" /></span>
               <span class="group-name">全部</span>
               <span class="group-count">{{ agents.list.length }}</span>
               <span class="group-arrow">▸</span>
@@ -374,7 +374,7 @@ function onGroupDrop(e: DragEvent, g: any) {
             @dragleave="onGroupDragLeave(g)"
             @drop="onGroupDrop($event, g)">
             <div class="group-head">
-              <span class="group-icon">📁</span>
+              <span class="group-icon"><AppIcon name="folder" /></span>
               <span class="group-name">{{ g.name }}</span>
               <span class="group-count">{{ agentsOfGroup(g.id).length }}</span>
               <span class="group-arrow">▸</span>
@@ -447,16 +447,16 @@ function onGroupDrop(e: DragEvent, g: any) {
     <Teleport to="body">
       <div v-if="ctx" ref="ctxEl" class="agent-ctx glass" :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }" @click.stop>
         <div class="ctx-title">{{ ctx.a.name }}</div>
-        <div class="ctx-item" @click="ctxEdit">✏️ 编辑</div>
-        <div class="ctx-item danger" @click="ctxDelete">🗑 删除</div>
+        <div class="ctx-item" @click="ctxEdit"><AppIcon name="pencil" /> 编辑</div>
+        <div class="ctx-item danger" @click="ctxDelete"><AppIcon name="trash-2" /> 删除</div>
         <div class="ctx-sep"></div>
         <div class="ctx-sub">归纳到分组</div>
         <div class="ctx-item" @click="ctxNewGroupAndAssign">➕ 新建组…</div>
         <div class="ctx-item" @click="ctxAssign(null)">
-          全部<span v-if="ctx.a.group_id == null" class="ctx-cur">✓</span>
+          全部<span v-if="ctx.a.group_id == null" class="ctx-cur"><AppIcon name="circle-check" /></span>
         </div>
         <div class="ctx-item" v-for="g in agents.groups" :key="g.id" @click="ctxAssign(g.id)">
-          {{ g.name }}<span v-if="ctx.a.group_id === g.id" class="ctx-cur">✓</span>
+          {{ g.name }}<span v-if="ctx.a.group_id === g.id" class="ctx-cur"><AppIcon name="circle-check" /></span>
         </div>
       </div>
     </Teleport>
@@ -465,13 +465,13 @@ function onGroupDrop(e: DragEvent, g: any) {
     <Teleport to="body">
       <div v-if="groupCtx" ref="groupCtxEl" class="agent-ctx glass" :style="{ left: groupCtx.x + 'px', top: groupCtx.y + 'px' }" @click.stop>
         <div class="ctx-title">{{ groupCtx.g.name }}</div>
-        <div class="ctx-item" @click="ctxRenameGroup">✏️ 重命名</div>
+        <div class="ctx-item" @click="ctxRenameGroup"><AppIcon name="pencil" /> 重命名</div>
         <div class="ctx-item" @click="ctxNewAgentInGroup">➕ 新建智能体</div>
         <div class="ctx-sep"></div>
         <div class="ctx-sub">删除 / 清空</div>
-        <div class="ctx-item danger" @click="ctxDeleteGroup" title="删除该分组，组内智能体移回「全部」组（智能体保留）">🗑 删除分组</div>
+        <div class="ctx-item danger" @click="ctxDeleteGroup" title="删除该分组，组内智能体移回「全部」组（智能体保留）"><AppIcon name="trash-2" /> 删除分组</div>
         <div class="ctx-item" @click="ctxClearGroup" title="保留该分组，组内智能体移回「全部」组（智能体保留）">🧹 清空分组</div>
-        <div class="ctx-item danger danger-strong" @click="ctxPurgeGroup" title="彻底删除分组及组内所有智能体，画布节点/连线一并清理，不可恢复">⚠️ 删除组和智能体</div>
+        <div class="ctx-item danger danger-strong" @click="ctxPurgeGroup" title="彻底删除分组及组内所有智能体，画布节点/连线一并清理，不可恢复"><AppIcon name="alert-triangle" /> 删除组和智能体</div>
       </div>
     </Teleport>
   </div>

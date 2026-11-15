@@ -152,13 +152,13 @@ onMounted(refresh)
     <div class="top glass">
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
       <div class="top-drag pywebview-drag-region">
-        <h2>🧩 功能拓展</h2>
+        <h2><AppIcon name="puzzle" /> 功能拓展</h2>
         <span class="sub">安装 / 启用 / 卸载界面与功能拓展插件</span>
       </div>
     </div>
 
     <div class="info glass">
-      <span class="info-ico">📖</span>
+      <span class="info-ico"><AppIcon name="book-open" /></span>
       <span class="info-text">
         拓展代码保存在数据存储位置的 <code>extensions\</code> 目录下，开发规范统一见
         项目 <code>doc/spec/extension-spec.md</code>。

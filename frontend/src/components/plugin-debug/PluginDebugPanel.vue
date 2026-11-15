@@ -69,7 +69,7 @@ async function run() {
   <div class="panel">
     <aside class="pane-left glass">
       <div class="folder-bar">
-        <button class="btn" :disabled="store.scanning" @click="pick">📁 选择文件夹</button>
+        <button class="btn" :disabled="store.scanning" @click="pick"><AppIcon name="folder" /> 选择文件夹</button>
         <button class="btn ghost" :disabled="store.scanning || !store.rootDir" @click="rescan">⟳ 重新扫描</button>
       </div>
       <div class="path" :title="store.rootDir">{{ store.rootDir || '未选择目录' }}</div>

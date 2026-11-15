@@ -117,9 +117,9 @@ onMounted(() => {
     <div v-if="open" class="rules-overlay" @click.self="emit('close')">
       <div class="rules-dialog glass">
         <div class="rules-head">
-          <span class="rules-title">📋 规章制度</span>
+          <span class="rules-title"><AppIcon name="clipboard-list" /> 规章制度</span>
           <span class="rules-hint">画布「{{ canvasName || '未选择' }}」· 按画布独立设置，注入该集群智能体</span>
-          <button class="btn ghost sm" type="button" @click="emit('close')">✕</button>
+          <button class="btn ghost sm" type="button" @click="emit('close')"><AppIcon name="x" /></button>
         </div>
 
         <div v-if="canvasId == null" class="rules-empty">
@@ -179,7 +179,7 @@ onMounted(() => {
               </div>
               <div class="rule-actions">
                 <button class="btn ghost sm" type="button" title="编辑" @click="startEdit(r)">✎</button>
-                <button class="btn ghost sm" type="button" title="删除" @click="removeRule(r.id)">🗑</button>
+                <button class="btn ghost sm" type="button" title="删除" @click="removeRule(r.id)"><AppIcon name="trash-2" /></button>
               </div>
             </div>
             <div v-if="!rules.list.length" class="rules-empty">
