@@ -716,7 +716,86 @@ async function createMainWindow() {
 
 let tray = null
 let _trayRefreshTimer = null
-let _trayStatus = '⏹ 已停止'
+let _trayStatus = '已停止'
+
+// ---------- 托盘菜单 SVG 图标 ----------
+// 原生菜单不能直接内嵌 SVG（nativeImage 只解码位图），这里把 electron/icons/*.svg
+// 在 offscreen 窗口里光栅化为 32×32 nativeImage 再挂到菜单项 icon 上；
+// 任一图标渲染失败仅该项退化为纯文本，不影响菜单其它功能。
+const TRAY_ICON_DIR = path.join(__dirname, 'icons')
+const TRAY_ICON_DEFS = {
+  statusRunning: 'status-running.svg',
+  statusStopped: 'status-stopped.svg',
+  statusPartial: 'status-partial.svg',
+  start: 'start.svg',
+  restart: 'restart.svg',
+  stop: 'stop.svg',
+  window: 'window.svg',
+  globe: 'globe.svg',
+  settings: 'settings.svg',
+  exit: 'exit.svg',
+}
+const _trayIcons = {}
+let _iconRenderWin = null
+
+async function _rasterizeSvgIcon(svgFile, timeoutMs = 2000) {
+  const svg = fs.readFileSync(path.join(TRAY_ICON_DIR, svgFile), 'utf-8')
+  const svgUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)
+  if (!_iconRenderWin || _iconRenderWin.isDestroyed()) {
+    _iconRenderWin = new BrowserWindow({
+      width: 64, height: 64, show: false, frame: false, resizable: false, skipTaskbar: true,
+      webPreferences: { backgroundThrottling: false },
+    })
+    await _iconRenderWin.loadURL('about:blank')
+  }
+  // 实测 offscreen/hidden 窗口 capturePage 连续截图会返回 0×0 空图，
+  // 故改为页面内 canvas 绘制 SVG 再导出 PNG dataURL，不依赖窗口渲染管线。
+  // 尺寸对齐 emoji：16×16 按 1x 标记（菜单图标标准逻辑尺寸），32×32 按 2x 标记（高 DPI 清晰）；
+  // 此前只给 32×32 且按 1x 标记，菜单按 32 逻辑像素绘制，比 emoji 大一倍
+  const js = `(async () => {
+    const img = new Image()
+    img.src = ${JSON.stringify(svgUrl)}
+    await img.decode()
+    const out = []
+    for (const size of [16, 32]) {
+      const c = document.createElement('canvas')
+      c.width = size; c.height = size
+      c.getContext('2d').drawImage(img, 0, 0, size, size)
+      out.push(c.toDataURL('image/png'))
+    }
+    return out
+  })()`
+  const pair = await Promise.race([
+    _iconRenderWin.webContents.executeJavaScript(js, true),
+    new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+  ])
+  if (!Array.isArray(pair) || !pair[0] || !pair[0].startsWith('data:image/png') || !pair[1] || !pair[1].startsWith('data:image/png')) return null
+  const img = nativeImage.createEmpty()
+  img.addRepresentation({ scaleFactor: 1.0, dataURL: pair[0] })
+  img.addRepresentation({ scaleFactor: 2.0, dataURL: pair[1] })
+  return img.isEmpty() ? null : img
+}
+
+async function _renderTrayIcons() {
+  let ok = 0
+  for (const [key, file] of Object.entries(TRAY_ICON_DEFS)) {
+    try {
+      const img = await _rasterizeSvgIcon(file)
+      if (img) { _trayIcons[key] = img; ok++ }
+      else _log(`[tray] 图标渲染为空: ${file}`)
+    } catch (e) {
+      _log(`[tray] 图标渲染失败 ${file}: ${e.message}`)
+    }
+  }
+  try { if (_iconRenderWin) { _iconRenderWin.destroy(); _iconRenderWin = null } } catch { }
+  _log(`[tray] SVG 菜单图标就绪 ${ok}/${Object.keys(TRAY_ICON_DEFS).length}`)
+}
+
+function _statusIcon(statusText) {
+  if (statusText.includes('部分失败')) return _trayIcons.statusPartial
+  if (statusText.includes('运行中')) return _trayIcons.statusRunning
+  return _trayIcons.statusStopped
+}
 
 async function _checkHealth() {
   const result = { backend: false, frontend: false }
@@ -732,19 +811,19 @@ function _buildTrayMenuTemplate(statusText) {
   if (TRAY_ONLY) {
     // Web 模式：后端+dist server 由 start.bat 启动
     return [
-      { label: `Web 模式 · ${statusText}`, enabled: false },
+      { label: `Web 模式 · ${statusText}`, enabled: false, icon: _statusIcon(statusText) },
       { type: 'separator' },
-      { label: '🌐 打开浏览器', default: true, click: () => shell.openExternal(`http://localhost:5173`) },
+      { label: '打开浏览器', default: true, icon: _trayIcons.globe, click: () => shell.openExternal(`http://localhost:5173`) },
       {
-        label: '🔄 重启全部', click: async () => {
+        label: '重启全部', icon: _trayIcons.restart, click: async () => {
           _dialogSync('重启提示', '请直接关闭 start.bat 窗口后重新运行')
         }
       },
       { type: 'separator' },
-      { label: '⚙ 打开设置', click: () => shell.openExternal(`http://localhost:5173/#/settings`) },
+      { label: '打开设置', icon: _trayIcons.settings, click: () => shell.openExternal(`http://localhost:5173/#/settings`) },
       { type: 'separator' },
       {
-        label: '❌ 退出并停止服务', click: () => {
+        label: '退出并停止服务', icon: _trayIcons.exit, click: () => {
           _killWebProcesses()
           app.quit()
         }
@@ -752,10 +831,10 @@ function _buildTrayMenuTemplate(statusText) {
     ]
   }
   return [
-    { label: `状态: ${statusText}`, enabled: false },
+    { label: `状态: ${statusText}`, enabled: false, icon: _statusIcon(statusText) },
     { type: 'separator' },
     {
-      label: '🚀 启动服务', click: () => {
+      label: '启动服务', icon: _trayIcons.start, click: () => {
         // Electron 下默认就是启动了（app.whenReady 已经自动拉了后端+窗口），
         // 如果用户手动关了窗口，这里重新打开
         if (!mainWindow || !mainWindow.isVisible()) {
@@ -765,7 +844,7 @@ function _buildTrayMenuTemplate(statusText) {
       }
     },
     {
-      label: '🔄 重启全部', click: async () => {
+      label: '重启全部', icon: _trayIcons.restart, click: async () => {
         splashStep('正在重启服务...', 10); createSplash()
         stopBackend()
         splashStep('正在重启后端...', 35)
@@ -780,25 +859,25 @@ function _buildTrayMenuTemplate(statusText) {
       }
     },
     {
-      label: '⏹ 停止全部服务', click: () => {
+      label: '停止全部服务', icon: _trayIcons.stop, click: () => {
         stopBackend()
         if (mainWindow) { mainWindow.close() }
-        _updateTrayStatus('⏹ 已停止')
+        _updateTrayStatus('已停止')
       }
     },
     { type: 'separator' },
     {
-      label: '🌐 打开界面', default: true, click: async () => {
+      label: '打开界面', default: true, icon: _trayIcons.window, click: async () => {
         if (!mainWindow) { await createMainWindow().catch(() => { }) }
         else if (!mainWindow.isVisible()) { mainWindow.show() }
         mainWindow?.focus()
       }
     },
-    { label: '🌐 用浏览器打开', click: () => shell.openExternal(IS_DEV ? DEV_URL : DEV_URL) },
+    { label: '用浏览器打开', icon: _trayIcons.globe, click: () => shell.openExternal(IS_DEV ? DEV_URL : DEV_URL) },
 
     { type: 'separator' },
     {
-      label: '❌ 退出程序', click: () => {
+      label: '退出程序', icon: _trayIcons.exit, click: () => {
         stopBackend()
         app.quit()
       }
@@ -871,7 +950,7 @@ function createTray() {
 
   tray = new Tray(img)
   tray.setToolTip('AgentCluster  正在启动...\n双击打开界面 · 右键管理程序')
-  tray.setContextMenu(Menu.buildFromTemplate(_buildTrayMenuTemplate('⏹ 已停止')))
+  tray.setContextMenu(Menu.buildFromTemplate(_buildTrayMenuTemplate('已停止')))
 
   // 左键 = 打开界面（default: true 的项）
   tray.on('click', async () => {
@@ -889,9 +968,9 @@ function createTray() {
   _trayRefreshTimer = setInterval(async () => {
     const h = await _checkHealth()
     let status
-    if (h.backend && h.frontend) status = '✅ 运行中'
-    else if (!h.backend && !h.frontend) status = '⏹ 已停止'
-    else status = `⚠️ 部分失败 (后端=${h.backend ? 'OK' : 'FAIL'}, 前端=${h.frontend ? 'OK' : 'FAIL'})`
+    if (h.backend && h.frontend) status = '运行中'
+    else if (!h.backend && !h.frontend) status = '已停止'
+    else status = `部分失败 (后端=${h.backend ? 'OK' : 'FAIL'}, 前端=${h.frontend ? 'OK' : 'FAIL'})`
     _updateTrayStatus(status)
   }, 3000)
 }
@@ -1368,6 +1447,7 @@ if (app.isPackaged && !NO_SINGLE_INSTANCE) {
 app.whenReady().then(async () => {
   if (TRAY_ONLY) {
     _log('=== TRAY-ONLY 模式：不启动后端/不建主窗口 ===')
+    await _renderTrayIcons()
     createTray()
     return
   }
@@ -1415,6 +1495,7 @@ app.whenReady().then(async () => {
     splashStep('正在准备界面...', 70)
     if (_startupAborted) return
     await createMainWindow()
+    await _renderTrayIcons()
     createTray()
     registerIPC()
     // 精灵悬浮球拓展（fairy_ball）：IPC 注册 + 轮询拓展启用状态决定球窗开关
