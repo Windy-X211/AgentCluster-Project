@@ -2023,14 +2023,35 @@ function sideAnchors(a: any, b: any): { p1: { x: number; y: number }; p2: { x: n
   const acx = a.x + NODE_W / 2, acy = a.y + NODE_H / 2
   const bcx = b.x + NODE_W / 2, bcy = b.y + NODE_H / 2
   const dx = bcx - acx, dy = bcy - acy
+  let result: { p1: Pt; p2: Pt; horizontal: boolean }
   if (Math.abs(dx) >= Math.abs(dy)) {
-    return dx >= 0
+    result = dx >= 0
       ? { p1: { x: a.x + NODE_W, y: acy }, p2: { x: b.x, y: bcy }, horizontal: true }
       : { p1: { x: a.x, y: acy }, p2: { x: b.x + NODE_W, y: bcy }, horizontal: true }
+  } else {
+    result = dy >= 0
+      ? { p1: { x: acx, y: a.y + NODE_H }, p2: { x: bcx, y: b.y }, horizontal: false }
+      : { p1: { x: acx, y: a.y }, p2: { x: bcx, y: b.y + NODE_H }, horizontal: false }
   }
-  return dy >= 0
-    ? { p1: { x: acx, y: a.y + NODE_H }, p2: { x: bcx, y: b.y }, horizontal: false }
-    : { p1: { x: acx, y: a.y }, p2: { x: bcx, y: b.y + NODE_H }, horizontal: false }
+  // —— 相向对自动锚点错开 ——
+  // 只在两条相向边的锚点完全重合（同节点同 side 同 t=0.5）时偏移 t 值
+  // 手动锚点用户已精确指定，不动；偏移沿边方向（水平锚点改 y，竖直锚点改 x）
+  // 稳定规则：id 较小的那条边（A→B 当 from_node < to_node）向一侧偏，反向的向另一侧偏
+  const revEdge = edges.value.find((x: any) => x.from_node === b.id && x.to_node === a.id)
+  if (revEdge && hasReverseEdge({ from_node: a.id, to_node: b.id })) {
+    const ANCHOR_OFFSET_PX = 14
+    const dir = a.id < b.id ? 1 : -1  // A→B 正方向，B→A 反方向
+    // 水平边锚点（side=l/r）：沿 y 方向错开
+    if (result.horizontal) {
+      result.p1.y += ANCHOR_OFFSET_PX * dir
+      result.p2.y += ANCHOR_OFFSET_PX * dir
+    } else {
+      // 竖直边锚点（side=t/b）：沿 x 方向错开
+      result.p1.x += ANCHOR_OFFSET_PX * dir
+      result.p2.x += ANCHOR_OFFSET_PX * dir
+    }
+  }
+  return result
 }
 
 function hasReverseEdge(e: any): boolean {
@@ -3280,7 +3301,9 @@ function computeEdge(e: any) {
   // 斜线直连不参与避让；曲线避开所有节点（含起止节点内缩区）；直角折线只看其他节点
   const rects = shape === 'straight' ? [] : shape === 'ortho' ? orthoBlockRects(a, b) : avoidRects(a, b)
 
-  // 1) 自动曲线（无控制点）：沿用原三次曲线 + 双向避让；穿过节点时改为绕行
+  // 1) 自动曲线（无控制点）：三次曲线 + 穿过节点时绕行
+  // 相向对的错开已经由 sideAnchors 锚点处理（p1/p2 沿边错开 ±14px），
+  // 曲线直接从错开后的锚点出发即可，不再走 offsetEdgePath 做二次法线偏移
   if (shape === 'curve' && wps.length === 0) {
     let c1 = { ...p1 }, c2 = { ...p2 }
     if (horizontal) {
@@ -3292,7 +3315,7 @@ function computeEdge(e: any) {
       c1 = { x: p1.x, y: my }
       c2 = { x: p2.x, y: my }
     }
-    const check = rev ? offsetCubicSamples(p1, c1, c2, p2, BIDIR_OFFSET) : cubicSamples(p1, c1, c2, p2)
+    const check = cubicSamples(p1, c1, c2, p2)
     const baseHits = routeHits(check, rects)
     // 穿过节点 → 沿法线绕行。绕行方向取同侧（反向线的法线相反，天然落到遮挡另一侧）。
     // 只有确实比原路径更干净时才改走绕行，避免绕行反而更糟。
@@ -3300,17 +3323,12 @@ function computeEdge(e: any) {
     const detScore = det ? routeHits(det.samples, rects).n * 10000 + routeHits(det.samples, rects).len * 5 : Infinity
     const baseScore = baseHits.n * 10000 + baseHits.len * 5
     if (!det || detScore >= baseScore) {
-      // 双向两条线：沿曲线法线做等距偏移（采样+平滑）→ 两条线处处平行、垂直间距恒定
-      const d = rev
-        ? offsetEdgePath(p1, c1, c2, p2, BIDIR_OFFSET)
-        : `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`
+      const d = `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`
       const mid = cubicAt(p1, c1, c2, p2, 0.5)
       const tang = cubicTangentAt(p1, c1, c2, p2, 0.5)
       const tlen = Math.hypot(tang.x, tang.y) || 1
-      const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
-      const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
-      const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: midX, y: midY }]
-      return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
+      const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: mid.x, y: mid.y }]
+      return { d, midX: mid.x, midY: mid.y, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
     }
     const mid = polylineMid(det.samples)
     return {
