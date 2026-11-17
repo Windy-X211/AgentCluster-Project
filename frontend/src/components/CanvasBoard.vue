@@ -998,8 +998,20 @@ const onKeyDown = (e: KeyboardEvent) => {
     if (k === 'z' || k === 'y') {
       if (editable || modal) return
       e.preventDefault()
-      if (k === 'y' || e.shiftKey) redoCanvas()
-      else undoCanvas()
+      if (k === 'y' || e.shiftKey) {
+        redoCanvas()
+      } else if (draw.value && draw.value.segs.length > 0) {
+        // 绘制连线中：撤回上一个已确认的落点（段）
+        draw.value.segs.pop()
+        draw.value.via = null
+        clearDrawSnap()
+        showToast(`已撤回上一段 (${draw.value.segs.length} 段剩余)`)
+      } else if (draw.value) {
+        // 还没确认任何一段 → 取消整条连线
+        cancelDraw(true)
+      } else {
+        undoCanvas()
+      }
       return
     }
     if (!e.shiftKey && (k === 'c' || k === 'x' || k === 'v')) {
