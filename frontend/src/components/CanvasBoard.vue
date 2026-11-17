@@ -3434,8 +3434,9 @@ function anchorHandlesFor(e: any, g: any): EdgeHandle[] {
   if (!a || !b) return []
   const { p1, p2 } = sideAnchors(a, b)
   const f = anchorSpecOf(e, 'from'), t = anchorSpecOf(e, 'to')
-  const from = f ? anchorPoint(f, nodeRect(a)) : (g?.anchorFrom || p1)
-  const to = t ? anchorPoint(t, nodeRect(b)) : (g?.anchorTo || p2)
+  // 和 mixedPoints / computeEdge 保持一致：固化锚点也走 anchorPtWithOffset
+  const from = f ? anchorPtWithOffset(e, 'from', f, nodeRect(a)) : (g?.anchorFrom || p1)
+  const to = t ? anchorPtWithOffset(e, 'to', t, nodeRect(b)) : (g?.anchorTo || p2)
   return [
     { kind: 'anchor', end: 'from', index: 0, x: from.x, y: from.y },
     { kind: 'anchor', end: 'to', index: 1, x: to.x, y: to.y },
