@@ -3905,6 +3905,43 @@ function setEdgeShape(edge: any, shape: EdgeShape) {
   closeMenus()
   showToast(`连线已设为${shapeLabel(shape)}${cleared ? '，控制点/锚点/分段已清除' : ''}`)
 }
+/** 批量：把 selectedEdgeIds 里的所有连线切到 shape。跳过已经是该 shape 的线。 */
+function setSelectedEdgeShapes(shape: EdgeShape) {
+  const ids = [...selectedEdgeIds.value]
+  if (!ids.length) return
+  pushHistory()
+  let changed = 0
+  for (const e of edges.value) {
+    if (!ids.includes(e.id)) continue
+    if (edgeShapeOf(e) === shape) continue
+    e.shape = shape
+    e.waypoints = []
+    e.segments = []
+    e.anchor_from = null
+    e.anchor_to = null
+    changed++
+  }
+  selectedEdgeIds.value = new Set(ids)
+  canvases.saveCurrent()
+  closeMenus()
+  showToast(`已把 ${changed} 条连线设为${shapeLabel(shape)}`)
+}
+function setSelectedEdgeDir(dir: OrthoDir | null) {
+  const ids = [...selectedEdgeIds.value]
+  if (!ids.length) return
+  pushHistory()
+  let changed = 0
+  for (const e of edges.value) {
+    if (!ids.includes(e.id)) continue
+    if (edgeShapeOf(e) !== 'ortho') continue
+    if (orthoDirOf(e) === dir) continue
+    e.ortho_dir = dir
+    changed++
+  }
+  canvases.saveCurrent()
+  closeMenus()
+  showToast(`已把 ${changed} 条直角折线方向设为 ${edgeDirLabelOf(dir)}`)
+}
 function shapeLabel(shape: EdgeShape): string {
   return shape === 'mixed' ? '分段连线' : shape === 'ortho' ? '直角折线'
     : shape === 'straight' ? '斜线直连' : '平滑曲线'
@@ -3997,6 +4034,9 @@ function edgeDirLabel(edge: any): string {
   if (!pref) return `自动（${name(actual || 'cw')}）`
   if (pref && actual && pref !== actual) return `${name(pref)}（遇阻挡已改走${name(actual)}）`
   return name(pref)
+}
+function edgeDirLabelOf(dir: OrthoDir | null): string {
+  return dir === 'cw' ? '顺时针' : dir === 'ccw' ? '逆时针' : '自动'
 }
 
 /** 逐段绘制时的预览色：与将要创建的连线一致（按源节点所属智能体） */
@@ -4609,6 +4649,32 @@ defineExpose({ viewportRef, computeNodeBbox })
     <!-- 画布空白区域右键菜单 -->
     <Teleport to="body">
       <div v-if="bgMenu" class="ctx-menu glass" :style="{ left: bgMenu.x + 'px', top: bgMenu.y + 'px' }" @click.stop>
+        <!-- 选中连线优先：批量改形状 / 方向 / 删除 -->
+        <template v-if="selectedEdgeIds.size">
+          <div class="ctx-title">已选 {{ selectedEdgeIds.size }} 条连线</div>
+          <div class="ctx-item submenu" @click.stop>
+            <div class="submenu-label">〰 连线形状{{ selectedEdgeIds.size > 1 ? '（批量）' : '' }}</div>
+            <div class="submenu-body">
+              <div class="sub-item" @click="setSelectedEdgeShapes('curve')">曲线（平滑）</div>
+              <div class="sub-item" @click="setSelectedEdgeShapes('straight')">直线（斜线直连）</div>
+              <div class="sub-item" @click="setSelectedEdgeShapes('ortho')">⌐ 直角折线</div>
+            </div>
+          </div>
+          <div v-if="[...selectedEdgeIds].some(id => edgeShapeOf(edges.value.find((e: any) => e.id === id)) === 'ortho')"
+               class="ctx-item submenu" @click.stop>
+            <div class="submenu-label">⟳ 折线方向（批量）</div>
+            <div class="submenu-body">
+              <div class="sub-item" @click="setSelectedEdgeDir('cw')">↻ 顺时针</div>
+              <div class="sub-item" @click="setSelectedEdgeDir('ccw')">↺ 逆时针</div>
+              <div class="sub-item" @click="setSelectedEdgeDir(null)">◎ 自动</div>
+            </div>
+          </div>
+          <div class="ctx-divider" />
+          <div class="ctx-item danger" @click="deleteSelectedEdges(); closeMenus()">
+            🗑 删除选中的 {{ selectedEdgeIds.size }} 条连线 <span class="ctx-kbd">Delete</span>
+          </div>
+          <div class="ctx-divider" />
+        </template>
         <template v-if="selectedNodeIds.size">
           <div class="ctx-title">已选 {{ selectedNodeIds.size }} 个智能体</div>
           <div class="ctx-item" @click="copySelection(); closeMenus()"><AppIcon name="clipboard-list" /> 复制 <span class="ctx-kbd">Ctrl+C</span></div>
@@ -4623,17 +4689,6 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div class="ctx-divider" />
         <div class="ctx-title">画布</div>
         <div class="ctx-item" @click="closeMenus(); resetView()">⟳ 重置视图</div>
-        <div class="ctx-item submenu" @click.stop>
-          <div class="submenu-label">〰 连线形状（全部连线）</div>
-          <div class="submenu-body">
-            <div class="sub-item edge-all-curve" :class="{ checked: defaultEdgeShape() === 'curve' }"
-                 @click="setAllEdgeShapes('curve')">曲线（平滑）</div>
-            <div class="sub-item edge-all-straight" :class="{ checked: defaultEdgeShape() === 'straight' }"
-                 @click="setAllEdgeShapes('straight')">直线（斜线直连）</div>
-            <div class="sub-item edge-all-ortho" :class="{ checked: defaultEdgeShape() === 'ortho' }"
-                 @click="setAllEdgeShapes('ortho')">⌐ 直角折线</div>
-          </div>
-        </div>
         <div class="ctx-divider" />
         <div class="ctx-item" @click="toggleWorkspace()"><AppIcon name="folder" /> 显示/隐藏工作区</div>
         <div class="ctx-item" @click="closeMenus(); wdPath = canvas?.workdir || ''; wdOpen = true"><AppIcon name="folder" /> 设置工作区文件夹…</div>
