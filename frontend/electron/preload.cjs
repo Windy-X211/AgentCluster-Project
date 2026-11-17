@@ -43,6 +43,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     resize: (w, h) => ipcRenderer.invoke('win:resize', w, h),
     move: (x, y) => ipcRenderer.invoke('win:move', x, y),
     isMaximized: () => ipcRenderer.invoke('win:isMaximized'),
+    /** 切换窗口全屏（true=进入全屏，false=退出全屏） */
+    toggleFullscreen: () => ipcRenderer.invoke('win:toggleFullscreen'),
   },
   // 后端状态
   api: {

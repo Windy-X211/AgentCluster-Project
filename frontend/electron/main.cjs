@@ -1400,6 +1400,14 @@ function registerIPC() {
   ipcMain.handle('win:resize', (_e, w, h) => mainWindow?.setSize(Math.round(w), Math.round(h)))
   ipcMain.handle('win:move', (_e, x, y) => mainWindow?.setPosition(Math.round(x), Math.round(y)))
   ipcMain.handle('win:isMaximized', () => mainWindow?.isMaximized() ?? false)
+  ipcMain.handle('win:toggleFullscreen', () => {
+    _log('[IPC] win:toggleFullscreen')
+    if (!mainWindow) return false
+    // 用 fullscreenable 保证 Windows 下真全屏（无标题栏覆盖整个屏幕）
+    const next = !mainWindow.isFullScreen()
+    mainWindow.setFullScreen(next)
+    return next
+  })
 
   // 剪贴板读写（渲染进程右键菜单「粘贴 / 复制」用；Electron 里 navigator.clipboard 常因权限/失焦失败）
   ipcMain.handle('clip:readText', () => { try { return clipboard.readText() } catch { return '' } })

@@ -968,6 +968,12 @@ function isModalOpen(): boolean {
 }
 // 监听空格 + 画布快捷键（复制/剪切/粘贴、撤销/重做、删除）
 const onKeyDown = (e: KeyboardEvent) => {
+  // F11 全局切换全屏（Electron 原生）
+  if (e.key === 'F11' || e.code === 'F11') {
+    e.preventDefault()
+    window.electronAPI?.window?.toggleFullscreen?.()
+    return
+  }
   const editable = isEditableTarget(e.target)
   const modal = isModalOpen()
   if (e.code === 'Space' && !editable) spaceDown.value = true
