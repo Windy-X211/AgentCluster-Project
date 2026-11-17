@@ -4660,7 +4660,7 @@ defineExpose({ viewportRef, computeNodeBbox })
               <div class="sub-item" @click="setSelectedEdgeShapes('ortho')">⌐ 直角折线</div>
             </div>
           </div>
-          <div v-if="[...selectedEdgeIds].some(id => edgeShapeOf(edges.value.find((e: any) => e.id === id)) === 'ortho')"
+          <div v-if="[...selectedEdgeIds].some(id => edgeShapeOf(edges.find((e: any) => e.id === id)) === 'ortho')"
                class="ctx-item submenu" @click.stop>
             <div class="submenu-label">⟳ 折线方向（批量）</div>
             <div class="submenu-body">
