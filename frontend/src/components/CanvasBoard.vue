@@ -2037,32 +2037,6 @@ function hasReverseEdge(e: any): boolean {
   return edges.value.some((x: any) => x.from_node === e.to_node && x.to_node === e.from_node)
 }
 
-// —— 同 pair 边自动间隔 ——
-// 任何两个节点之间的多条连线（无论同方向还是双向），都自动沿路径法线偏移，不重合
-const EDGE_LINE_SPACING = 16  // 两条线的垂直间距（画布坐标）
-
-/** 边的 pair key：A→B 和 B→A 是不同 key，但都纳入间隔组 */
-function edgePairKey(e: any): string {
-  return `${Math.min(e.from_node, e.to_node)}_${Math.max(e.from_node, e.to_node)}`
-}
-/** 计算某条边在其 pair 分组内的偏移量：
- *  N=1 → 0；N=2 → ±SPACING/2；N=3 → -SPACING, 0, +SPACING；N=4 → -1.5, -0.5, +0.5, +1.5 × SPACING
- *  方向由 from_node < to_node 决定，保证双向 pair 的 A→B / B→A 落到法线两侧 */
-function edgeOffsetBias(e: any): number {
-  const key = edgePairKey(e)
-  const group = edges.value
-    .filter((x: any) => edgePairKey(x) === key)
-    .sort((x: any, y: any) => x.id - y.id)
-  const N = group.length
-  if (N <= 1) return 0
-  const idx = group.findIndex((x: any) => x.id === e.id)
-  // 中心对称偏移，让多条线均匀散布在 pair 的法线两侧
-  const offset = (idx - (N - 1) / 2) * EDGE_LINE_SPACING
-  // A→B 用正方向；B→A（小 id 在 to_node）用反方向 → 两条双向线天然落到两侧
-  const dirSign = e.from_node < e.to_node ? 1 : -1
-  return offset * dirSign
-}
-
 const EDGE_SAMPLES = 64
 
 function cubicAt(p0: any, c1: any, c2: any, p3: any, t: number) {
@@ -2129,6 +2103,11 @@ function edgeShapeOf(e: any): EdgeShape {
   const s = e?.shape
   if (s === 'curve' || s === 'straight' || s === 'ortho' || s === 'mixed') return s
   return defaultEdgeShape()
+}
+/** 双向连线且两端共线时：按端点 id 稳定分配相反的边缘偏移，两条直线不会叠在一起 */
+function orthoBias(e: any): number {
+  if (!hasReverseEdge(e)) return 0
+  return e.from_node < e.to_node ? BIDIR_OFFSET : -BIDIR_OFFSET
 }
 function sanitizeWaypoints(raw: any): Pt[] {
   if (!Array.isArray(raw)) return []
@@ -3131,7 +3110,7 @@ function orthoDirOf(e: any): OrthoDir | null {
   return e?.ortho_dir === 'cw' || e?.ortho_dir === 'ccw' ? e.ortho_dir : null
 }
 function orthoBiasInfo(e: any, a: any, b: any): { bias: number; axis: 'x' | 'y' | null } {
-  const bias = edgeOffsetBias(e)
+  const bias = orthoBias(e)
   if (!bias) return { bias: 0, axis: null }
   const acy = a.y + NODE_H / 2, bcy = b.y + NODE_H / 2
   const acx = a.x + NODE_W / 2, bcx = b.x + NODE_W / 2
@@ -3297,12 +3276,11 @@ function computeEdge(e: any) {
   if (manualTo) p2 = anchorPoint(manualTo, rb)
   const shape = edgeShapeOf(e)
   const wps = sanitizeWaypoints(e.waypoints)
-  // 同 pair 多条边自动间隔偏移（edgeOffsetBias 带符号：正=法线+方向，负=反方向；0=不偏移）
-  const biasOffset = edgeOffsetBias(e)
+  const rev = hasReverseEdge(e)
   // 斜线直连不参与避让；曲线避开所有节点（含起止节点内缩区）；直角折线只看其他节点
   const rects = shape === 'straight' ? [] : shape === 'ortho' ? orthoBlockRects(a, b) : avoidRects(a, b)
 
-  // 1) 自动曲线（无控制点）：沿用原三次曲线 + 同 pair 自动间隔；穿过节点时改为绕行
+  // 1) 自动曲线（无控制点）：沿用原三次曲线 + 双向避让；穿过节点时改为绕行
   if (shape === 'curve' && wps.length === 0) {
     let c1 = { ...p1 }, c2 = { ...p2 }
     if (horizontal) {
@@ -3314,7 +3292,7 @@ function computeEdge(e: any) {
       c1 = { x: p1.x, y: my }
       c2 = { x: p2.x, y: my }
     }
-    const check = biasOffset !== 0 ? offsetCubicSamples(p1, c1, c2, p2, biasOffset) : cubicSamples(p1, c1, c2, p2)
+    const check = rev ? offsetCubicSamples(p1, c1, c2, p2, BIDIR_OFFSET) : cubicSamples(p1, c1, c2, p2)
     const baseHits = routeHits(check, rects)
     // 穿过节点 → 沿法线绕行。绕行方向取同侧（反向线的法线相反，天然落到遮挡另一侧）。
     // 只有确实比原路径更干净时才改走绕行，避免绕行反而更糟。
@@ -3322,15 +3300,15 @@ function computeEdge(e: any) {
     const detScore = det ? routeHits(det.samples, rects).n * 10000 + routeHits(det.samples, rects).len * 5 : Infinity
     const baseScore = baseHits.n * 10000 + baseHits.len * 5
     if (!det || detScore >= baseScore) {
-      // 同 pair 多条曲线：沿曲线法线做等距偏移（采样+平滑）→ 多条线处处平行、垂直间距恒定
-      const d = biasOffset !== 0
-        ? offsetEdgePath(p1, c1, c2, p2, biasOffset)
+      // 双向两条线：沿曲线法线做等距偏移（采样+平滑）→ 两条线处处平行、垂直间距恒定
+      const d = rev
+        ? offsetEdgePath(p1, c1, c2, p2, BIDIR_OFFSET)
         : `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`
       const mid = cubicAt(p1, c1, c2, p2, 0.5)
       const tang = cubicTangentAt(p1, c1, c2, p2, 0.5)
       const tlen = Math.hypot(tang.x, tang.y) || 1
-      const midX = mid.x - (tang.y / tlen) * biasOffset
-      const midY = mid.y + (tang.x / tlen) * biasOffset
+      const midX = mid.x + (rev ? -tang.y / tlen * BIDIR_OFFSET : 0)
+      const midY = mid.y + (rev ? tang.x / tlen * BIDIR_OFFSET : 0)
       const handles: EdgeHandle[] = [{ kind: 'insert', index: 0, x: midX, y: midY }]
       return { d, midX, midY, midAngle: Math.atan2(tang.y, tang.x) * 180 / Math.PI, handles }
     }
@@ -3368,14 +3346,7 @@ function computeEdge(e: any) {
   }
 
   // 3) 直线 / 含控制点的曲线
-  let pts: Pt[] = [p1, ...wps, p2]
-  // straight 直线沿自身法线整体偏移；曲线/折线不这样做（顶点偏移会引入折角瑕疵）
-  if (shape === 'straight' && biasOffset !== 0 && pts.length >= 2) {
-    const dx = pts[pts.length - 1].x - pts[0].x, dy = pts[pts.length - 1].y - pts[0].y
-    const len = Math.hypot(dx, dy) || 1
-    const nx = -dy / len, ny = dx / len   // 顺时针法线（和 offsetCubicSamples 方向一致）
-    pts = pts.map(p => ({ x: p.x + nx * biasOffset, y: p.y + ny * biasOffset }))
-  }
+  const pts: Pt[] = [p1, ...wps, p2]
   const smooth = shape === 'curve'
   if (smooth) {
     const base = smoothSamples(pts, AVOID_SAMPLES)
