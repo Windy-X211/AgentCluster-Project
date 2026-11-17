@@ -1987,6 +1987,25 @@ function anchorVar(spec: AnchorSpec, r: Rect): number {
 function anchorPoint(spec: AnchorSpec, r: Rect): Pt {
   return pointOnSide(spec.side, r, anchorVar(spec, r))
 }
+/** 相向对自动锚点错开（统一入口）：
+ *  mixed / curve / ortho / straight 所有 shape 在渲染锚点时都走这里，
+ *  保证相向对的两条线（无论单条还是多段）锚点自动沿边错开 ±14px。
+ *  手动锚点（用户拖到 t≠0.5 的位置）不动。 */
+const ANCHOR_COINCIDE_OFFSET_PX = 14
+function anchorPtWithOffset(e: any, end: AnchorEnd, spec: AnchorSpec, r: Rect): Pt {
+  const p = anchorPoint(spec, r)
+  if (!hasReverseEdge(e)) return p
+  // 只对「自动锚点」错开：finishDraw 固化的自动锚点 t=0.5
+  // 手动锚点用户拖到 t≠0.5 → 不动
+  if (spec.t < 0.4 || spec.t > 0.6) return p
+  const dir = e.from_node < e.to_node ? 1 : -1  // 和 sideAnchors 错开方向一致
+  if (sideAxis(spec.side) === 'H') {
+    p.y += ANCHOR_COINCIDE_OFFSET_PX * dir
+  } else {
+    p.x += ANCHOR_COINCIDE_OFFSET_PX * dir
+  }
+  return p
+}
 /** 四边中点吸附：鼠标靠近任一条边的中点（屏幕 10px 内）就精确吸到 t=0.5。
  *  四条边一起比，节点中心附近也能吸到最近的中点，不受「最近边」判定影响。 */
 const ANCHOR_MID_SNAP_PX = 10
@@ -2475,8 +2494,10 @@ function mixedPoints(e: any): Pt[] {
   if (!a || !b) return []
   const f = anchorSpecOf(e, 'from'), t = anchorSpecOf(e, 'to')
   const auto = sideAnchors(a, b)
-  const start = f ? anchorPoint(f, nodeRect(a)) : auto.p1
-  const end = t ? anchorPoint(t, nodeRect(b)) : auto.p2
+  // 固化锚点（finishDraw 写入的 anchor_from / anchor_to）也必须动态检查相向对并错开
+  // — mixed 的锚点不会每次都走 sideAnchors，所以统一用 anchorPtWithOffset
+  const start = f ? anchorPtWithOffset(e, 'from', f, nodeRect(a)) : auto.p1
+  const end = t ? anchorPtWithOffset(e, 'to', t, nodeRect(b)) : auto.p2
   const segs = readSegments(e)
   return segs.length ? [start, ...segs.slice(0, -1).map(s => s.end), end] : [start, end]
 }
@@ -3293,8 +3314,9 @@ function computeEdge(e: any) {
   const anchors = (manualFrom || manualTo) ? { from: manualFrom, to: manualTo } : null
   let { p1, p2, horizontal } = sideAnchors(a, b)
   // 手动锚点覆盖自动锚点：曲线 / 斜线直连 / 直角折线通用
-  if (manualFrom) p1 = anchorPoint(manualFrom, ra)
-  if (manualTo) p2 = anchorPoint(manualTo, rb)
+  // 同样走 anchorPtWithOffset，手动锚点 (t≠0.5) 自动跳过错开
+  if (manualFrom) p1 = anchorPtWithOffset(e, 'from', manualFrom, ra)
+  if (manualTo) p2 = anchorPtWithOffset(e, 'to', manualTo, rb)
   const shape = edgeShapeOf(e)
   const wps = sanitizeWaypoints(e.waypoints)
   const rev = hasReverseEdge(e)
