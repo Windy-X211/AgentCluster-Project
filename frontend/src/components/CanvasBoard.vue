@@ -1045,11 +1045,15 @@ function onMouseMove(e: MouseEvent) {
   }
   if (edgeDrag.value) {
     if (pendingEdgeSnapshot) { pushSnapshot(pendingEdgeSnapshot); pendingEdgeSnapshot = null }
-    moveEdgeWaypoint(c)
+    // 拖动连线控制点 / 顶点时也显示对齐辅助线 + 自动吸附
+    moveEdgeWaypoint(snapDrawPoint(c, scale.value))
     suppressBoardClick = true
   }
   // 线型菜单打开期间冻结预览终点，避免鼠标移到菜单上时预览乱跳
-  if (draw.value && !segMenu.value) { draw.value.mouse = c }
+  if (draw.value && !segMenu.value) {
+    // 绘制模式下：鼠标靠近其他节点的对齐线（边+中心）时自动吸附
+    draw.value.mouse = snapDrawPoint(c, scale.value)
+  }
 }
 function onMouseUpGlobal() {
   // 绘制模式是「点击式」的，鼠标抬起不能清空状态；只有落点 / 结束 / Esc 才结束
@@ -1220,36 +1224,48 @@ function drawTailTangent(d: DrawState): Pt {
   return tan
 }
 /** 预览终点：悬停在别的节点上时贴到该节点「朝向源节点那一侧的边中点」 */
+/** 预览终点：悬停在别的节点上时贴到该节点「鼠标所在边的中点」 */
 function drawPendingEnd(d: DrawState): Pt {
   const hid = hoverNodeId.value
+  let end: Pt
   if (hid != null && hid !== d.from) {
     const n = nodeById.value.get(hid)
-    const src = nodeById.value.get(d.from)
-    if (n && src) {
-      const srcCenter = { x: src.x + NODE_W / 2, y: src.y + NODE_H / 2 }
-      return anchorPoint(facingMidAnchor(nodeRect(n), srcCenter), nodeRect(n))
+    if (n) {
+      end = anchorPoint(nearestMidAnchor(nodeRect(n), d.mouse), nodeRect(n))
+    } else {
+      end = d.mouse
     }
+  } else {
+    end = d.mouse
   }
-  return d.mouse
+  // 直线段：靠近水平 / 竖直时自动校准（预览阶段就生效，所见即所得）
+  if (d.type === 'straight') {
+    const p0 = d.segs.length ? d.segs[d.segs.length - 1].end : drawStartPoint(d)
+    end = snapStraightHV(p0, end)
+  }
+  return end
 }
 /** 左键落点：确认当前段，并把线型弯向烘焙进段数据；随后自动开始下一段（沿用当前线型） */
 function confirmDrawSegment(c: Pt) {
   const d = draw.value
   if (!d) return
-  d.mouse = c
+  // 用 onMouseMove 里已经吸附对齐过的 d.mouse，不用原始 c
+  const cp = d.mouse
   segMenu.value = null
   // 第二段起的起点是上一落点，不是节点锚点：曲线控制点 / 垂线方向都依赖正确的 p0
   const p0 = d.segs.length ? d.segs[d.segs.length - 1].end : drawStartPoint(d)
-  if (Math.hypot(c.x - p0.x, c.y - p0.y) < SEG_MIN_LEN) return
+  // 直线段：靠近水平 / 竖直时自动校准（确认烘焙时用校准后的坐标）
+  const cFinal = d.type === 'straight' ? snapStraightHV(p0, cp) : cp
+  if (Math.hypot(cFinal.x - p0.x, cFinal.y - p0.y) < SEG_MIN_LEN) return
   const normal = d.type === 'vert' ? normalOf(drawTailTangent(d)) : null
   if (normal) {
-    const q = projectOnNormal(p0, c, normal)
+    const q = projectOnNormal(p0, cFinal, normal)
     if (Math.hypot(q.x - p0.x, q.y - p0.y) < SEG_MIN_LEN) return
   }
   d.anchor = drawStartSpec(d)   // 冻结起点锚点
   // 第一段紧贴源节点锚点：曲线控制点沿出边法线外推，确保从节点外部指向锚点
   const n0 = d.segs.length === 0 ? anchorNormal(drawStartSpec(d).side) : null
-  d.segs.push(makeDrawSegment(p0, c, d.type, d.via, normal, n0, null))
+  d.segs.push(makeDrawSegment(p0, cFinal, d.type, d.via, normal, n0, null))
   d.via = null
 }
 /** 点击目标节点收笔：以距离鼠标最近的边上点作为终点锚点 */
@@ -1264,10 +1280,17 @@ function finishDraw(toNodeId: number | null, c: Pt) {
   d.mouse = c
   const rf = nodeRect(fromNode), rt = nodeRect(toNode)
   const startSpec = drawStartSpec(d)
-  const srcCenter = { x: rf.l + NODE_W / 2, y: rf.t + NODE_H / 2 }
-  const endSpec = facingMidAnchor(rt, srcCenter)
+  const endSpec = nearestMidAnchor(rt, c)  // 终点锚点 = 鼠标所在边的中点
   const p0 = d.segs.length ? d.segs[d.segs.length - 1].end : anchorPoint(startSpec, rf)
-  const p1 = anchorPoint(endSpec, rt)
+  // 终点锚点：直线段时先吸水平/竖直，再夹紧到节点矩形（保持锚点始终贴住节点边缘）
+  let p1 = anchorPoint(endSpec, rt)
+  if (d.type === 'straight') {
+    p1 = snapStraightHV(p0, p1)
+    p1 = {
+      x: Math.max(rt.l, Math.min(rt.r, p1.x)),
+      y: Math.max(rt.t, Math.min(rt.b, p1.y)),
+    }
+  }
   const segs = d.segs.map(cloneSegment)
   if (Math.hypot(p1.x - p0.x, p1.y - p0.y) >= 2) {
     const normal = d.type === 'vert' ? normalOf(drawTailTangent(d)) : null
@@ -1305,6 +1328,7 @@ function finishDraw(toNodeId: number | null, c: Pt) {
 function cancelDraw(notify = false) {
   draw.value = null
   segMenu.value = null
+  clearDrawSnap()
   if (notify) showToast('已取消绘制连线')
 }
 /** 绘制中点节点 = 收笔（阻止冒泡，避免被当成空白落点再确认一段） */
@@ -1812,6 +1836,40 @@ const BIDIR_OFFSET = 16 // 双向连线每条沿法线偏移的距离；两条�
 // —— 边缘自动对齐 ——
 const SNAP_THRESHOLD = 8 // 吸附触发距离（画布坐标）
 const snapGuides = ref<{ x: number[]; y: number[] }>({ x: [], y: [] }) // 当前激活的对齐辅助线（画布坐标）
+/** 连线绘制时的对齐辅助线 + 吸附后的鼠标坐标 */
+const drawSnapGuides = ref<{ x: number[]; y: number[] }>({ x: [], y: [] })
+
+/** 把一个候选点吸附到所有节点的边（left/right/top/bottom）和中心线（cx/cy）对齐线。
+ *  吸附触发阈值 SNAP_THRESHOLD / scaleNow（屏幕像素换算到画布坐标）。
+ *  返回吸附后的 Pt + 激活的辅助线（填充 drawSnapGuides）。 */
+function snapDrawPoint(candidate: Pt, scaleNow: number): Pt {
+  // 排除悬停目标节点（drawPendingEnd 会贴到它的边上，避免同时贴两个目标）
+  const others = nodes.value.filter((n: any) => n.id !== hoverNodeId.value)
+  const threshold = SNAP_THRESHOLD / scaleNow
+  let bestDx = 0, bestDy = 0
+  const gx: number[] = [], gy: number[] = []
+  for (const o of others) {
+    const w = NODE_W, h = NODE_H
+    const oEdges = {
+      left: o.x, right: o.x + w, cx: o.x + w / 2,
+      top: o.y, bottom: o.y + h, cy: o.y + h / 2,
+    }
+    for (const v of [oEdges.left, oEdges.right, oEdges.cx]) {
+      const d = v - candidate.x
+      if (Math.abs(d) <= threshold && (Math.abs(d) < Math.abs(bestDx) || bestDx === 0)) { bestDx = d }
+      if (Math.abs(d) <= threshold && !gx.includes(v)) gx.push(v)
+    }
+    for (const v of [oEdges.top, oEdges.bottom, oEdges.cy]) {
+      const d = v - candidate.y
+      if (Math.abs(d) <= threshold && (Math.abs(d) < Math.abs(bestDy) || bestDy === 0)) { bestDy = d }
+      if (Math.abs(d) <= threshold && !gy.includes(v)) gy.push(v)
+    }
+  }
+  drawSnapGuides.value = { x: gx, y: gy }
+  return { x: candidate.x + bestDx, y: candidate.y + bestDy }
+}
+/** 连线绘制吸附的清理：Esc / finishDraw / cancelDraw 时调用 */
+function clearDrawSnap() { drawSnapGuides.value = { x: [], y: [] } }
 
 /**
  * 对节点的候选位置进行边缘吸附：
@@ -2083,12 +2141,26 @@ function linePath(pts: Pt[]): string {
 //   垂线 = 垂直于「上一段末端方向」的直线，垂足是上一段末尾；落点投影到该直线上决定长度与朝向。
 // ————————————————————————————————————————————————————————————————————————
 const SEG_MIN_LEN = 6
+/** 直线段靠近水平或竖直时的角度校准阈值（度）。即 |dy|/|dx| ≤ tan(THRESH°) 视为水平，
+ *  |dx|/|dy| ≤ tan(THRESH°) 视为竖直。15° ≈ 0.27 比例，手感与主流绘图工具（Excalidraw / Figma 连线路径）一致。 */
+const STRAIGHT_HV_THRESH_DEG = 15
 const DEFAULT_ARC_BULGE = 0.22   // 圆弧默认矢高 / 弦长
 const MAX_ARC_BULGE = 0.45       // 上限 0.5 就是半圆，留一点余量避免半径退化
 const VERT_EPS = 1.5             // 终点已落在垂线上时的容差（不必补连接短线）
 type BuiltSeg = { d: string; samples: Pt[]; mid: Pt; ctrl: Pt[]; endTan?: Pt }
 
 function clampNum(v: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, v)) }
+/** 直线段的水平 / 竖直自动校准：当 p0 → p1 的角度落在阈值内时，把 p1 吸到水平或竖直方向。
+ *  例如 p0=(0,0)、p1=(100,10)、阈值 15° → tan15°≈0.27，|10|/100=0.1 < 0.27 → 水平，返回 (100,0)。 */
+function snapStraightHV(p0: Pt, p1: Pt, threshDeg = STRAIGHT_HV_THRESH_DEG): Pt {
+  const dx = p1.x - p0.x, dy = p1.y - p0.y
+  if (dx === 0 && dy === 0) return p1
+  const tanT = Math.tan(threshDeg * Math.PI / 180)
+  const ax = Math.abs(dx), ay = Math.abs(dy)
+  if (ay <= tanT * ax) return { x: p1.x, y: p0.y }          // 水平：把 y 拉到 p0.y
+  if (ax <= tanT * ay) return { x: p0.x, y: p1.y }          // 竖直：把 x 拉到 p0.x
+  return p1
+}
 function isSegType(v: any): v is SegType { return v === 'straight' || v === 'curve' || v === 'arc' || v === 'vert' }
 function asPt(v: any): Pt | null {
   const x = Number(v?.x), y = Number(v?.y)
@@ -2229,6 +2301,32 @@ function segCurveCtrl(p0: Pt, p1: Pt, via?: Pt | null, n0?: Pt | null, n1?: Pt |
   }
   return [c1, c2]
 }
+/** 把一组连续的 curve 段统一用 Catmull-Rom 样条重算控制点，保证各段之间 G1 连续、
+ *  所有顶点严格在曲线上。这和单条 shape='curve' 曲线使用的 smoothThrough / smoothControls
+ *  完全同一套公式，实现"分段绘制的曲线 = 单条曲线"的视觉一致。
+ *  输入 pts 包含全部顶点（首锚点 + 各段 end + 末锚点），segs.length == pts.length - 1。
+ *  混合情况（curve + straight + curve）按非 curve 段分组处理，各组独立光滑。 */
+function applyCatmullRomCtrls(pts: Pt[], segs: EdgeSegment[]) {
+  if (pts.length < 3 || segs.length < 2) return  // 1 段无法形成样条
+  // 找出所有 curve 段的连续区间
+  let i = 0
+  while (i < segs.length) {
+    if (segs[i].type !== 'curve') { i++; continue }
+    // 连续 curve 段：从 i 到 j（含）
+    let j = i
+    while (j + 1 < segs.length && segs[j + 1].type === 'curve') j++
+    // 对应的顶点子序列：pts[i..j+1]，长度 = j-i+2
+    // 只有 1 段时也用 Catmull-Rom：相邻段不存在时用该段自身端点镜像作为前后控制点
+    const n = j - i + 1
+    for (let k = 0; k < n; k++) {
+      const segIdx = i + k
+      // smoothControls 用全局索引，所以需要映射
+      const { c1, c2 } = smoothControls(pts, segIdx)
+      segs[segIdx].ctrl = [c1, c2]
+    }
+    i = j + 1
+  }
+}
 /** 圆弧矢高：右键点在某处的垂距 s 反推圆弧中点矢高（抛物线近似 s(t)≈4b·t(1-t)） */
 function segBulge(p0: Pt, p1: Pt, via?: Pt | null): number {
   const bend = viaBend(p0, p1, via)
@@ -2362,9 +2460,12 @@ function mixedPoints(e: any): Pt[] {
   return segs.length ? [start, ...segs.slice(0, -1).map(s => s.end), end] : [start, end]
 }
 /** 渲染一条分段连线；每段返回自己的可拖手柄（顶点 / 曲线控制点 / 圆弧矢高 / 拆分点） */
+/** 渲染一条分段连线；每段返回自己的可拖手柄（顶点 / 圆弧矢高 / 拆分点） */
 function computeMixedEdge(e: any, segs: EdgeSegment[]) {
   const pts = mixedPoints(e)
   if (pts.length < 2) return null
+  // 连续的 curve 段统一用 Catmull-Rom 样条重算控制点 → 和单条 shape='curve' 同一公式，G1 连续
+  applyCatmullRomCtrls(pts, segs)
   let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`
   const samples: Pt[] = [pts[0]]
   const handles: EdgeHandle[] = []
@@ -2377,11 +2478,8 @@ function computeMixedEdge(e: any, segs: EdgeSegment[]) {
     prevTan = segEndTangent(pts[i], pts[i + 1], s.type, s.ctrl, s.bulge, built)
     d += ' ' + built.d
     samples.push(...built.samples.slice(1))
-    // 顶点柄（最后一段终点是目标锚点，交给锚点柄）
+    // 顶点柄（最后一段终点是目标锚点，交给锚点柄）；顶点 = Catmull-Rom 通过点 = 控制点
     if (i < segs.length - 1) handles.push({ kind: 'vertex', seg: i, index: i, x: pts[i + 1].x, y: pts[i + 1].y })
-    if (s.type === 'curve') {
-      built.ctrl.forEach((cp, k) => handles.push({ kind: 'ctrl', seg: i, ctrl: k, index: k, x: cp.x, y: cp.y }))
-    }
     if (s.type === 'arc') handles.push({ kind: 'bulge', seg: i, index: 0, x: built.mid.x, y: built.mid.y })
     // 拆分柄放在 25% 处，避免与圆弧矢高柄（中点）重叠
     const q = built.samples[Math.max(1, Math.floor(built.samples.length / 4))] || built.mid
@@ -2770,20 +2868,30 @@ function orthogonalize(
     if (direct) {
       out.push(q)
       prevDir = d
-      forbidOut = isTurn ? d : null
+      // 直连意味着 path 自然穿过 waypoint（前后同方向），不强制拐弯；
+      // 只有进 L 拐点兜底分支时才需要 forbidOut 防止同方向退化
+      forbidOut = null
       continue
     }
     const cands: Pt[] = [{ x: q.x, y: p.y }, { x: p.x, y: q.y }]
     let best: Pt | null = null, bestCost = Infinity
+    // 短距离兜底简化：segLen < ORTHO_MARGIN * 3 时强制单 L 拐点
+    // （跳过 ORTHO_EPS / forbidOut / wantFirst / wantLast 检查），
+    // 防止 waypoint 离锚点太近时触发 Z 形 / 3-4 段 / 多拐点兜底
+    const shortDist = segLen(p, q) < ORTHO_MARGIN * 3
     for (const c of cands) {
-      if (segLen(p, c) < ORTHO_EPS || segLen(c, q) < ORTHO_EPS) continue
-      const od = segDir(p, c), ad = segDir(c, q)
-      if (!od || !ad) continue
-      if (wantFirst && od !== wantFirst) continue
-      if (wantLast && ad !== wantLast) continue
-      if (forbidOut && od === forbidOut) continue
+      if (!shortDist) {
+        if (segLen(p, c) < ORTHO_EPS || segLen(c, q) < ORTHO_EPS) continue
+        const od = segDir(p, c), ad = segDir(c, q)
+        if (!od || !ad) continue
+        if (wantFirst && od !== wantFirst) continue
+        if (wantLast && ad !== wantLast) continue
+        if (forbidOut && od === forbidOut) continue
+      } else {
+        if (segLen(p, c) < ORTHO_EPS || segLen(c, q) < ORTHO_EPS) continue
+      }
       const trial = simplifyOrtho([...out, c, q])
-      const cost = orthoCost(trial, rects).score + (prevDir && od === prevDir ? 60 : 0)
+      const cost = orthoCost(trial, rects).score + (prevDir && segDir(p, c) === prevDir ? 60 : 0)
       if (cost < bestCost) { bestCost = cost; best = c }
     }
     if (best) {
@@ -2925,10 +3033,21 @@ function orthoCandidate(
   const valid = pts.every((p, i) => i === 0 || segDir(pts[i - 1], p) !== null)
     && pts.every((p, i) => i === 0 || i === pts.length - 1
       || segDir(pts[i - 1], p) !== segDir(p, pts[i + 1]))
+  // 方向对齐 bonus：有 waypoint 时，最后一段应该直接连到目标节点对应边
+  // endSegAlignBonus = waypoint 最后一段方向 === 目标锚点 side 的法线方向
+  // （sb='l'/'r' → 水平段='H'，sb='t'/'b' → 竖直段='V'）
+  let endSegAlignBonus = 0, startSegAlignBonus = 0
+  if (userWps.length && pts.length >= 3) {
+    const lastSegDir = segDir(pts[pts.length - 2], pts[pts.length - 1])
+    const firstSegDir = segDir(pts[0], pts[1])
+    if (lastSegDir && lastSegDir === eAxis) endSegAlignBonus = -5000
+    if (firstSegDir && firstSegDir === sAxis) startSegAlignBonus = -2000
+  }
   return {
     pts, corners: pts.slice(1, -1), dir, hits, cross, missing, valid,
     score: score + missing * 20000 + (pref && dir !== pref ? 320 : 0)
-      + (natA ? 0 : 180) + (natB ? 0 : 180),
+      + (natA ? 0 : 180) + (natB ? 0 : 180)
+      + endSegAlignBonus + startSegAlignBonus,
   }
 }
 
@@ -3000,6 +3119,50 @@ function orthoBiasInfo(e: any, a: any, b: any): { bias: number; axis: 'x' | 'y' 
   return { bias: 0, axis: null }
 }
 
+/** 从 waypoint 外部相对节点的**轴向走廊**出发，判断它最应该从哪条边连入。
+ *  规则（waypoint 已经被 pushWaypointOutsideNodes 推出节点外）：
+ *  1) wp.x 落在 [r.l, r.r] 内 → 水平走廊内，只能是 top 或 bottom（谁 y 距离近选谁）
+ *  2) wp.y 落在 [r.t, r.b] 内 → 竖直走廊内，只能是 left 或 right（谁 x 距离近选谁）
+ *  3) 两条都覆盖（wp 在角落外，比如右上方外）→ 对角线，按到两条相关边的距离排序
+ *  返回至少 2 条边（保证窄搜索空间足够构建候选）。 */
+function nearestSidesForWaypoint(wp: Pt, r: Rect): { side: OrthoSide; dist: number }[] {
+  const inH = wp.x >= r.l && wp.x <= r.r        // 水平走廊：top/bottom 才有资格
+  const inV = wp.y >= r.t && wp.y <= r.b        // 竖直走廊：left/right 才有资格
+  const sides: { side: OrthoSide; dist: number }[] = []
+  if (inH) {
+    sides.push({ side: 't', dist: Math.abs(r.t - wp.y) })
+    sides.push({ side: 'b', dist: Math.abs(r.b - wp.y) })
+  }
+  if (inV) {
+    sides.push({ side: 'l', dist: Math.abs(r.l - wp.x) })
+    sides.push({ side: 'r', dist: Math.abs(r.r - wp.x) })
+  }
+  if (!inH && !inV) {
+    // 角落外：wp 在 (r.l, r.t) 的左上外 → 应连 'b' 或 'r' 不对... 等等
+    // 角落外的话 wp 在 r.l 左边 且 在 r.t 上边，那应该连 'l' 还是 't'？
+    // 按对角线距离：算到 'l' 和 't' 的距离哪个小
+    if (wp.x < r.l && wp.y < r.t) {
+      const dl = r.l - wp.x, dt = r.t - wp.y
+      sides.push({ side: 't', dist: dt }, { side: 'l', dist: dl })
+    } else if (wp.x > r.r && wp.y < r.t) {
+      const dr = wp.x - r.r, dt = r.t - wp.y
+      sides.push({ side: 't', dist: dt }, { side: 'r', dist: dr })
+    } else if (wp.x < r.l && wp.y > r.b) {
+      const dl = r.l - wp.x, db = wp.y - r.b
+      sides.push({ side: 'b', dist: db }, { side: 'l', dist: dl })
+    } else {
+      const dr = wp.x - r.r, db = wp.y - r.b
+      sides.push({ side: 'b', dist: db }, { side: 'r', dist: dr })
+    }
+  }
+  // 兜底：保证至少返回 2 条边
+  if (sides.length < 2) {
+    sides.push(...ORTHO_SIDES.filter(s => !sides.some(x => x.side === s))
+      .map(s => ({ side: s, dist: Infinity })))
+  }
+  return sides.sort((a, b) => a.dist - b.dist)
+}
+
 /** 主入口：手动拐点为硬约束；自动布线按「双 L → 切换 → 多拐点绕行」逐级升级 */
 function routeOrthoEdge(
   a: any, b: any, userWps: Pt[],
@@ -3029,7 +3192,25 @@ function routeOrthoEdge(
 
   let cands: OrthoResult[]
   if (userWps.length) {
-    cands = build(fallbackSides, true)
+    // 有 waypoint 且锚点未手动固定 → 用 waypoint 轴向走廊选窄搜索：
+    // waypoint 最后一段应该直接连到它最近的目标边，第一段应该从源节点最近边出
+    const hasManualAnchor = fromSide != null || toSide != null
+    let narrowSides = fallbackSides
+    if (!hasManualAnchor && userWps.length >= 1) {
+      const lastWp = userWps[userWps.length - 1]
+      const firstWp = userWps[0]
+      const sbList = nearestSidesForWaypoint(lastWp, rb).map(x => x.side)
+      const saList = nearestSidesForWaypoint(firstWp, ra).map(x => x.side)
+      const narrow: [OrthoSide, OrthoSide][] = []
+      for (const sa of saList.slice(0, 2))
+        for (const sb of sbList.slice(0, 2))
+          narrow.push([sa, sb])
+      const filtered = limit(narrow)
+      if (filtered.length) narrowSides = filtered
+    }
+    cands = build(narrowSides, true)
+    // 窄搜索全挂 → fallback 到全部 16 种
+    if (!cands.length) cands = build(fallbackSides, true)
     if (!cands.length) cands = build(fallbackSides, false)
   } else {
     const two = limit(standardLSides(ra, rb))
@@ -3337,6 +3518,35 @@ function moveSegmentHandle(d: NonNullable<typeof edgeDrag.value>, c: Pt) {
   const rel = (c.x - (p0.x + p1.x) / 2) * nx + (c.y - (p0.y + p1.y) / 2) * ny
   s.bulge = clampNum(rel / len, -MAX_ARC_BULGE, MAX_ARC_BULGE)
 }
+/** 把 waypoint 推出所有节点矩形外部（margin = ORTHO_MARGIN * 2）。
+ *  拖 waypoint 太靠近节点时，orthogonalize 的短距离兜底会疯狂插入拐点；
+ *  这里先把它安全推出节点外，保证后续正交路由的正常工作。 */
+function pushWaypointOutsideNodes(wp: Pt, excludeId?: number): Pt {
+  const margin = ORTHO_MARGIN * 2  // 20px
+  let p = { ...wp }
+  for (let iter = 0; iter < 8; iter++) {  // 迭代推出，应对角落/边界情况
+    let pushed = false
+    for (const n of nodes.value) {
+      if (excludeId != null && n.id === excludeId) continue
+      const r = nodeRect(n)
+      const expanded = { l: r.l - margin, t: r.t - margin, r: r.r + margin, b: r.b + margin }
+      if (p.x >= expanded.l && p.x <= expanded.r && p.y >= expanded.t && p.y <= expanded.b) {
+        // 在节点矩形内 → 推向离中心更远的方向
+        const cx = (expanded.l + expanded.r) / 2
+        const cy = (expanded.t + expanded.b) / 2
+        const dx = p.x - cx, dy = p.y - cy
+        if (Math.abs(dx) > Math.abs(dy)) {
+          p.x = dx >= 0 ? expanded.r + 1 : expanded.l - 1
+        } else {
+          p.y = dy >= 0 ? expanded.b + 1 : expanded.t - 1
+        }
+        pushed = true
+      }
+    }
+    if (!pushed) break
+  }
+  return p
+}
 function moveEdgeWaypoint(c: Pt) {
   const d = edgeDrag.value
   if (!d) return
@@ -3352,14 +3562,16 @@ function moveEdgeWaypoint(c: Pt) {
   const p = ensureWaypoints(d.edge)[d.index]
   if (!p) return
   // 只改用户拐点；未手动固定的锚点跟随、自动插点、化简、消自交都由渲染层实时重算
-  p.x = c.x
-  p.y = c.y
+  const pushed = pushWaypointOutsideNodes(c, d.edge.from_node)
+  p.x = pushed.x
+  p.y = pushed.y
 }
 function endEdgeDrag() {
   pendingEdgeSnapshot = null
   const d = edgeDrag.value
   if (!d) return
   edgeDrag.value = null
+  clearDrawSnap()
   // 拖锚点 / 分段手柄都无需固化拐点，避免把自动布线变成手动控制点
   if (d.anchor || d.seg != null) { canvases.saveCurrent(); return }
   if (edgeShapeOf(d.edge) === 'ortho') commitOrthoGeometry(d.edge, false)
@@ -4095,6 +4307,14 @@ defineExpose({ viewportRef, computeNodeBbox })
             <line v-for="gy in snapGuides.y" :key="'gy-' + gy"
                   :x1="-9999" :y1="gy" :x2="9999" :y2="gy"
                   stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 4" opacity="0.85" />
+          </g>
+          <g v-if="(draw || edgeDrag) && (drawSnapGuides.x.length || drawSnapGuides.y.length)" class="snap-guides draw-snap" pointer-events="none">
+            <line v-for="gx in drawSnapGuides.x" :key="'dsx-' + gx"
+                  :x1="gx" :y1="-9999" :x2="gx" :y2="9999"
+                  stroke="var(--accent-2)" stroke-width="1" stroke-dasharray="5 3" opacity="0.9" />
+            <line v-for="gy in drawSnapGuides.y" :key="'dsy-' + gy"
+                  :x1="-9999" :y1="gy" :x2="9999" :y2="gy"
+                  stroke="var(--accent-2)" stroke-width="1" stroke-dasharray="5 3" opacity="0.9" />
           </g>
         </svg>
 
