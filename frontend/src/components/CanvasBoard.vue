@@ -4649,7 +4649,7 @@ defineExpose({ viewportRef, computeNodeBbox })
     <!-- 画布空白区域右键菜单 -->
     <Teleport to="body">
       <div v-if="bgMenu" class="ctx-menu glass" :style="{ left: bgMenu.x + 'px', top: bgMenu.y + 'px' }" @click.stop>
-        <!-- 选中连线优先：批量改形状 / 方向 / 删除 -->
+        <!-- 选中连线：只显示连线相关按钮，屏蔽节点段 / 画布设置 -->
         <template v-if="selectedEdgeIds.size">
           <div class="ctx-title">已选 {{ selectedEdgeIds.size }} 条连线</div>
           <div class="ctx-item submenu" @click.stop>
@@ -4673,9 +4673,9 @@ defineExpose({ viewportRef, computeNodeBbox })
           <div class="ctx-item danger" @click="deleteSelectedEdges(); closeMenus()">
             🗑 删除选中的 {{ selectedEdgeIds.size }} 条连线 <span class="ctx-kbd">Delete</span>
           </div>
-          <div class="ctx-divider" />
         </template>
-        <template v-if="selectedNodeIds.size">
+        <!-- 无连线选中 + 有节点选中：显示节点段 -->
+        <template v-else-if="selectedNodeIds.size">
           <div class="ctx-title">已选 {{ selectedNodeIds.size }} 个智能体</div>
           <div class="ctx-item" @click="copySelection(); closeMenus()"><AppIcon name="clipboard-list" /> 复制 <span class="ctx-kbd">Ctrl+C</span></div>
           <div class="ctx-item" @click="cutSelection(); closeMenus()"><AppIcon name="scissors" /> 剪切 <span class="ctx-kbd">Ctrl+X</span></div>
@@ -4684,17 +4684,20 @@ defineExpose({ viewportRef, computeNodeBbox })
           <div class="ctx-item sel-create-canvas" @click="createCanvasFromSelection()"><AppIcon name="palette" /> 用选中的智能体创建画布…</div>
           <div class="ctx-divider" />
         </template>
-        <div class="ctx-item" :class="{ disabled: !undoStack.length }" @click="undoCanvas()">↶ 撤销 <span class="ctx-kbd">Ctrl+Z</span></div>
-        <div class="ctx-item" :class="{ disabled: !redoStack.length }" @click="redoCanvas()">↷ 重做 <span class="ctx-kbd">Ctrl+Y</span></div>
-        <div class="ctx-divider" />
-        <div class="ctx-title">画布</div>
-        <div class="ctx-item" @click="closeMenus(); resetView()">⟳ 重置视图</div>
-        <div class="ctx-divider" />
-        <div class="ctx-item" @click="toggleWorkspace()"><AppIcon name="folder" /> 显示/隐藏工作区</div>
-        <div class="ctx-item" @click="closeMenus(); wdPath = canvas?.workdir || ''; wdOpen = true"><AppIcon name="folder" /> 设置工作区文件夹…</div>
-        <div class="ctx-divider" />
-        <div class="ctx-item" @click="closeMenus(); hideAllBubblesForce()"><AppIcon name="eye-off" /> 隐藏所有消息泡泡</div>
-        <div class="ctx-item" @click="closeMenus(); hideAllBubbles()"><AppIcon name="eye" /> 显示所有消息泡泡</div>
+        <!-- 完全无选中：显示画布全局菜单（撤销/重做/视图/工作区等） -->
+        <template v-else>
+          <div class="ctx-item" :class="{ disabled: !undoStack.length }" @click="undoCanvas()">↶ 撤销 <span class="ctx-kbd">Ctrl+Z</span></div>
+          <div class="ctx-item" :class="{ disabled: !redoStack.length }" @click="redoCanvas()">↷ 重做 <span class="ctx-kbd">Ctrl+Y</span></div>
+          <div class="ctx-divider" />
+          <div class="ctx-title">画布</div>
+          <div class="ctx-item" @click="closeMenus(); resetView()">⟳ 重置视图</div>
+          <div class="ctx-divider" />
+          <div class="ctx-item" @click="toggleWorkspace()"><AppIcon name="folder" /> 显示/隐藏工作区</div>
+          <div class="ctx-item" @click="closeMenus(); wdPath = canvas?.workdir || ''; wdOpen = true"><AppIcon name="folder" /> 设置工作区文件夹…</div>
+          <div class="ctx-divider" />
+          <div class="ctx-item" @click="closeMenus(); hideAllBubblesForce()"><AppIcon name="eye-off" /> 隐藏所有消息泡泡</div>
+          <div class="ctx-item" @click="closeMenus(); hideAllBubbles()"><AppIcon name="eye" /> 显示所有消息泡泡</div>
+        </template>
       </div>
     </Teleport>
 
