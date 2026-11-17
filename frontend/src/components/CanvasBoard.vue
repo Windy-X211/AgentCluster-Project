@@ -111,6 +111,8 @@ const lasso = ref<{
   originNodeId: number | null   // Shift+单击起点落在哪个节点上（用于点选切换）
   moved: boolean                // 是否已超过套索拖动阈值
   additive: boolean             // Shift+Ctrl 拖拽：连续框选（把命中节点加入现有选区）
+  mode: 'nodes' | 'edges'       // Shift 套索节点；Alt 套索连线
+  originEdgeId?: number | null  // Alt+单击起点落在哪条连线上
 } | null>(null)
 // 拖动开始时备份相关连线的控制点；拖动过程中按总位移重算，避免累积误差
 let dragWaypoints: { edge: any; points: Pt[] }[] = []
@@ -719,6 +721,24 @@ function startPan(e: MouseEvent) {
   suppressBoardClick = false
   const target = e.target as HTMLElement
   if (target?.closest(PAN_IGNORE)) return
+  if (e.altKey && !e.shiftKey) {
+    // Alt+左键 → 只框选连线（与 Shift 套索节点平行独立）
+    const c = clientToCanvas(e.clientX, e.clientY)
+    // 检查起点是否落在某条连线上
+    const edgeHit = target?.closest('.edge-hit') as HTMLElement | null
+    const edgeIdAttr = edgeHit?.getAttribute('data-edge-id') || edgeHit?.dataset?.edgeId
+    const originEdgeId = edgeIdAttr != null ? Number(edgeIdAttr) : null
+    lasso.value = {
+      x0: c.x, y0: c.y, x1: c.x, y1: c.y,
+      originNodeId: null,
+      originEdgeId: Number.isFinite(originEdgeId) ? originEdgeId : null,
+      moved: false,
+      additive: !!(e.ctrlKey || e.metaKey),
+      mode: 'edges',
+    }
+    e.preventDefault()
+    return
+  }
   if (e.shiftKey) {
     // Shift+左键 → 套索 / 点选；再按住 Ctrl → 连续框选（累加选区）
     const c = clientToCanvas(e.clientX, e.clientY)
@@ -730,6 +750,7 @@ function startPan(e: MouseEvent) {
       originNodeId: Number.isFinite(idNum) ? idNum : null,
       moved: false,
       additive: !!(e.ctrlKey || e.metaKey),
+      mode: 'nodes',
     }
     e.preventDefault()
     return
@@ -753,21 +774,96 @@ function updateLasso(c: Pt) {
   const moved = l.moved || Math.hypot(c.x - l.x0, c.y - l.y0) * scale.value >= 4
   lasso.value = { ...l, x1: c.x, y1: c.y, moved }
 }
+/** 从 edge 拿渲染用的顶点序列（首末锚点 + waypoints + ortho 折角）。
+ *  不做完整 path 计算，只算顶点——轻量够用。 */
+function edgeVertexPts(e: any): Pt[] {
+  const a = nodeById.value.get(e.from_node), b = nodeById.value.get(e.to_node)
+  if (!a || !b) return []
+  const ra = nodeRect(a), rb = nodeRect(b)
+  const wps = ensureWaypoints(e)
+  const shape = edgeShapeOf(e)
+  const f = anchorSpecOf(e, 'from'), t = anchorSpecOf(e, 'to')
+  const { p1, p2 } = sideAnchors(a, b)
+  const start = f ? anchorPtWithOffset(e, 'from', f, ra) : p1
+  const end = t ? anchorPtWithOffset(e, 'to', t, rb) : p2
+  if (shape === 'mixed') {
+    const segs = readSegments(e)
+    if (!segs.length) return [start, end]
+    return [start, ...segs.slice(0, -1).map(s => s.end), end]
+  }
+  if (shape === 'ortho') {
+    const { bias, axis } = orthoBiasInfo(e, a, b)
+    const rects = [ra, rb]
+    const anchors = { from: f, to: t }
+    const route = routeOrthoEdge(a, b, wps, orthoDirOf(e), bias, axis, rects, anchors)
+    return route.pts
+  }
+  return [start, ...wps, end]
+}
+/** 线段 vs 矩形相交：矩形包含端点或穿过任一边。 */
+function segIntersectsRect(p: Pt, q: Pt, minX: number, minY: number, maxX: number, maxY: number): boolean {
+  // 端点在矩形内
+  if ((p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY) ||
+      (q.x >= minX && q.x <= maxX && q.y >= minY && q.y <= maxY)) return true
+  // 线段和矩形四边逐一做线段相交
+  const edges: [Pt, Pt][] = [
+    [{ x: minX, y: minY }, { x: maxX, y: minY }],
+    [{ x: maxX, y: minY }, { x: maxX, y: maxY }],
+    [{ x: maxX, y: maxY }, { x: minX, y: maxY }],
+    [{ x: minX, y: maxY }, { x: minX, y: minY }],
+  ]
+  for (const [r, s] of edges) {
+    if (segsIntersect(p, q, r, s)) return true
+  }
+  return false
+}
+/** 两条线段相交检测（参数化）。 */
+function segsIntersect(a: Pt, b: Pt, c: Pt, d: Pt): boolean {
+  const denom = (b.x - a.x) * (d.y - c.y) - (b.y - a.y) * (d.x - c.x)
+  if (Math.abs(denom) < 1e-9) return false  // 平行
+  const t = ((c.x - a.x) * (d.y - c.y) - (c.y - a.y) * (d.x - c.x)) / denom
+  const u = ((c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)) / denom
+  return t >= -1e-6 && t <= 1 + 1e-6 && u >= -1e-6 && u <= 1 + 1e-6
+}
+/** 折线顶点 vs 矩形：contain=true 全部顶点在矩形内；contain=false 任一段穿过矩形。 */
+function polylineHitsRect(pts: Pt[], minX: number, minY: number, maxX: number, maxY: number, contain: boolean): boolean {
+  if (!pts.length) return false
+  if (contain) return pts.every(p => p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY)
+  // touch 模式：任一端点在矩形内 → 命中；否则任一段穿过矩形
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (segIntersectsRect(pts[i], pts[i + 1], minX, minY, maxX, maxY)) return true
+  }
+  return false
+}
+
 function finishLasso() {
   const l = lasso.value
   if (!l) return
+  const mode = l.mode || 'nodes'
   lasso.value = null
   const dx = l.x1 - l.x0, dy = l.y1 - l.y0
   const moved = l.moved || Math.max(Math.abs(dx), Math.abs(dy)) * scale.value >= 4
   if (!moved) {
-    // Shift+单击：点中节点 → 切换选中；Shift+Ctrl+单击 → 只增选不取消；点空白/连线 → 保持当前选区
-    if (l.originNodeId != null) {
-      if (l.additive) {
-        const next = new Set(selectedNodeIds.value)
-        next.add(l.originNodeId)
-        selectedNodeIds.value = next
-      } else {
-        toggleNodeSelection(l.originNodeId)
+    // 单击（未拖动）：根据模式走点选
+    if (mode === 'edges') {
+      if (l.originEdgeId != null) {
+        if (l.additive) {
+          const next = new Set(selectedEdgeIds.value)
+          next.add(l.originEdgeId)
+          selectedEdgeIds.value = next
+        } else {
+          toggleEdgeSelection(l.originEdgeId, false)
+        }
+      }
+    } else {
+      if (l.originNodeId != null) {
+        if (l.additive) {
+          const next = new Set(selectedNodeIds.value)
+          next.add(l.originNodeId)
+          selectedNodeIds.value = next
+        } else {
+          toggleNodeSelection(l.originNodeId)
+        }
       }
     }
     closeMenus()
@@ -777,16 +873,29 @@ function finishLasso() {
   const minY = Math.min(l.y0, l.y1), maxY = Math.max(l.y0, l.y1)
   // 左→右：完全包含才选中；右→左：碰到即选中
   const contain = dx >= 0
-  const hits = nodes.value.filter((n: any) => contain
-    ? (n.x >= minX && n.x + NODE_W <= maxX && n.y >= minY && n.y + NODE_H <= maxY)
-    : (n.x < maxX && n.x + NODE_W > minX && n.y < maxY && n.y + NODE_H > minY))
-  if (l.additive) {
-    // Shift+Ctrl：连续框选，把本轮命中节点并入现有选区
-    const next = new Set(selectedNodeIds.value)
-    for (const n of hits) next.add(n.id)
-    selectedNodeIds.value = next
+  if (mode === 'edges') {
+    const hits = edges.value.filter((e: any) => {
+      const pts = edgeVertexPts(e)
+      return polylineHitsRect(pts, minX, minY, maxX, maxY, contain)
+    })
+    if (l.additive) {
+      const next = new Set(selectedEdgeIds.value)
+      for (const e of hits) next.add(e.id)
+      selectedEdgeIds.value = next
+    } else {
+      selectedEdgeIds.value = new Set(hits.map((e: any) => e.id))
+    }
   } else {
-    selectedNodeIds.value = new Set(hits.map((n: any) => n.id))
+    const hits = nodes.value.filter((n: any) => contain
+      ? (n.x >= minX && n.x + NODE_W <= maxX && n.y >= minY && n.y + NODE_H <= maxY)
+      : (n.x < maxX && n.x + NODE_W > minX && n.y < maxY && n.y + NODE_H > minY))
+    if (l.additive) {
+      const next = new Set(selectedNodeIds.value)
+      for (const n of hits) next.add(n.id)
+      selectedNodeIds.value = next
+    } else {
+      selectedNodeIds.value = new Set(hits.map((n: any) => n.id))
+    }
   }
   closeMenus()
 }
@@ -4360,6 +4469,7 @@ defineExpose({ viewportRef, computeNodeBbox })
               </marker>
             </defs>
             <path v-if="item.g" :d="item.g.d"
+                  :data-edge-id="item.e.id"
                   :class="['edge-hit', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e), selected: selectedEdgeIds.has(item.e.id) }]"
                   @click.stop="onEdgeClick(item.e, $event)"
                   @dblclick="removeEdge(item.e.id)"
