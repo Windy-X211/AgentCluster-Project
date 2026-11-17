@@ -715,6 +715,13 @@ function applyPendingZoom() {
 // 任何 scale 下文字都是原生渲染，无需 will-change 挂载/释放的重光栅化过渡
 const PAN_IGNORE = '.canvas-toolbar, .ws-panel, .ws-trash, .ws-ctx, .ws-modal-bg, .ctx-menu, .modal-bg, .conv-float, .hint, .btn, input, label, select, textarea, button, a'
 function startPan(e: MouseEvent) {
+  // 中键（button===1）：无条件进入平移，不受节点/连线/修饰键限制
+  if (e.button === 1) {
+    suppressBoardClick = false
+    panning.value = { sx: e.clientX, sy: e.clientY, ox: tx.value, oy: ty.value }
+    e.preventDefault()   // 阻止浏览器原生中键自动滚动光标
+    return
+  }
   if (e.button !== 0) return
   // 绘制中左键一律用于落点/结束连线（空格+拖拽仍可平移视图）
   if (draw.value && !spaceDown.value) return
@@ -4390,6 +4397,7 @@ defineExpose({ viewportRef, computeNodeBbox })
 
 <template>
   <div class="canvas-board glass" ref="boardRef"
+       :class="{ 'panning-active': !!panning }"
        @dragover.prevent @drop="onDrop" @wheel.passive="onWheel"
        @mousedown="startPan" @mouseleave="pointerCanvas = null"
        @click="onBoardClick" @contextmenu="showBgMenu"
@@ -4877,7 +4885,8 @@ defineExpose({ viewportRef, computeNodeBbox })
 <style scoped>
 .canvas-board { flex: 1; position: relative; overflow: hidden; min-height: 0; cursor: default;
   backdrop-filter: none; -webkit-backdrop-filter: none; background: transparent; }
-.canvas-board.panning-active { cursor: grabbing; }
+.canvas-board.panning-active { cursor: grab; cursor: -webkit-grab; }
+.canvas-board.panning-active:active { cursor: grabbing; cursor: -webkit-grabbing; }
 .grid-bg { position: absolute; inset: 0; background-image: radial-gradient(circle, rgba(var(--surface-rgb), 0.06) 1px, transparent 1px); background-size: 24px 24px; pointer-events: none; z-index: 0; }
 
 /* 平移层：transform 只做纯平移，不产生纹理缩放，文字永不发糊 */

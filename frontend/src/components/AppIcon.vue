@@ -12,7 +12,7 @@ import {
   Terminal, Bug, ChevronDown, ChevronRight, Star, Info, Play, Square, Cpu, HardDrive,
   Cog, Compass, Waypoints, Network, Database, Archive, Download, ExternalLink, Home,
   GripVertical, MoreHorizontal, MoreVertical, Plus, Minus, CheckCheck, Circle,
-  ShoppingCart, HardDriveDownload, Paperclip, Timer, CornerDownLeft, Pause,
+  ShoppingCart, HardDriveDownload, Paperclip, Timer, CornerDownLeft, Pause, LogOut,
   type LucideIcon,
 } from '@lucide/vue'
 
@@ -45,6 +45,7 @@ const _MAP: Record<string, any> = {
   circle: Circle,
   'shopping-cart': ShoppingCart, 'hard-drive-download': HardDriveDownload,
   paperclip: Paperclip, timer: Timer, 'corner-down-left': CornerDownLeft, pause: Pause,
+  'log-out': LogOut,
 }
 
 // emoji → lucide 图标名（兼容模板中硬写 emoji + 后端/manifest 下发的 emoji 字符串）
