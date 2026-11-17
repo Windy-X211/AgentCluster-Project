@@ -19,7 +19,9 @@ def _repair_tool_calls_pairing(msgs: list) -> None:
 
     截断/撤销/删除单条消息后，可能留下「带 tool_calls 但无对应 tool 结果」的 assistant，
     下一轮调用 LLM 会被上游以 400 "insufficient tool messages following tool_calls message" 拒绝。
-    本函数原地剔除悬空 tool_call；若剔除后 tool_calls 为空则移除该字段。
+    本函数先剔除悬空 tool_call；若剔除后 tool_calls 为空则移除该字段。
+    随后反向剔除「有 tool_call_id、但前面没有对应 assistant 调用」的孤立 tool 消息，
+    避免这种消息继续进入模型上下文。
     """
     for i, m in enumerate(msgs):
         if not isinstance(m, dict):
@@ -36,16 +38,42 @@ def _repair_tool_calls_pairing(msgs: list) -> None:
             if not isinstance(nj, dict):
                 continue
             r = nj.get("role")
-            if r == "assistant":
+            # tool 结果必须紧跟在 assistant 的 tool_calls 后；
+            # 中间出现 user/system/下一轮 assistant 等任何非 tool 消息，都不能算配对。
+            if r != "tool":
                 break
-            if r == "tool":
-                answered.add(nj.get("tool_call_id", ""))
+            answered.add(nj.get("tool_call_id", ""))
         unmatched = tc_ids - answered
         if not unmatched:
             continue
         m["tool_calls"] = [tc for tc in m["tool_calls"] if isinstance(tc, dict) and tc.get("id", "") not in unmatched]
         if not m["tool_calls"]:
             m.pop("tool_calls", None)
+
+    # 反向清理：tool 消息只能紧跟在带对应 tool_call_id 的 assistant 之后。
+    kept: list = []
+    active_tool_ids: set[str] = set()
+    for m in msgs:
+        if not isinstance(m, dict):
+            kept.append(m)
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            active_tool_ids = {
+                tc.get("id", "") for tc in (m.get("tool_calls") or [])
+                if isinstance(tc, dict) and tc.get("id")
+            }
+            kept.append(m)
+        elif role == "tool":
+            tc_id = m.get("tool_call_id") or ""
+            if tc_id not in active_tool_ids:
+                continue
+            active_tool_ids.discard(tc_id)
+            kept.append(m)
+        else:
+            active_tool_ids.clear()
+            kept.append(m)
+    msgs[:] = kept
 
 
 class ConvIn(BaseModel):

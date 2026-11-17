@@ -40,6 +40,23 @@ from core.workflows import (
 
 logger = logging.getLogger("agent_runtime")
 
+# 工具调用的「发起时刻」登记表：tc_id → monotonic 秒。
+# 广播 C:（工具调用参数流完、前端已显示"正在调用"）那一刻写入；真正执行该工具时取出并
+# 注入 TOOL_CALL_TS_CTX，让 cmd.bg_wait(seconds=N) 的 N 秒从「命令发起」起算，
+# 从而扣除「参数流完 → 真正开始执行」之间模型收尾/调度排队那段看不见的耗时。
+_TC_CALL_MONO: dict[str, float] = {}
+_TC_CALL_MONO_MAX = 200
+
+
+def _mark_tool_call(tc_id: str) -> None:
+    """记录工具调用的发起时刻（C: 广播时调用），并按容量淘汰旧记录。"""
+    if not tc_id:
+        return
+    _TC_CALL_MONO[tc_id] = time.monotonic()
+    if len(_TC_CALL_MONO) > _TC_CALL_MONO_MAX:
+        for _k in list(_TC_CALL_MONO)[: len(_TC_CALL_MONO) - _TC_CALL_MONO_MAX]:
+            _TC_CALL_MONO.pop(_k, None)
+
 
 def _esc(s: str) -> str:
     """转义行协议载荷中的换行符，避免 payload 内的 \\n 破坏行分隔。
@@ -1153,7 +1170,8 @@ async def _exec_spawn_with_events(tc_id: str, args: dict, out: dict):
 
 async def _exec_tool_gated(tc_id: str, name: str, args: dict, out: dict, *,
                            conv_id: int | None = None,
-                           agent_id: int | None = None) -> Any:
+                           agent_id: int | None = None,
+                           call_ts: float | None = None) -> Any:
     """带权限闸门的工具执行（快/慢通道共用）：产出需要**先**发给前端的行，
     执行结果写入 out["result"]。
 
@@ -1164,29 +1182,45 @@ async def _exec_tool_gated(tc_id: str, name: str, args: dict, out: dict, *,
     agent.spawn 走 _exec_spawn_with_events（子智能体事件 SUB: 行实时转发），
     但确认闸门同样覆盖 —— spawn 本身就是危险操作，子过程内部的危险工具则由
     subagent 自己的事件队列再问一次。
+
+    call_ts：这条工具调用的「发起时刻」（monotonic 秒，广播 C: 事件那一刻记下）。
+    注入到工具线程的 TOOL_CALL_TS_CTX / TOOL_CALL_AT_CTX，供 cmd.bg_wait 之类的
+    定时工具把「参数流完 → 真正开始执行」这段模型收尾耗时扣除掉。
     """
     out["result"] = None
     from core import permissions
-    req = permissions.begin_request(name, args, conv_id=conv_id, agent_id=agent_id,
-                                    tool_call_id=tc_id)
-    if req is not None:
-        # ⚠️ JSON 行不做 _esc（与 R:/C: 同惯例）
-        yield f"P:{json.dumps(req, ensure_ascii=False)}\n"
-        if not await permissions.wait(req["id"]):
-            out["result"] = {
-                "error": f"用户拒绝执行：{name}（手动确认模式，本次调用未获授权，"
-                         f"请先征得用户同意再重试，或改用其它方式）",
-            }
+    _ts_tok = _at_tok = None
+    if call_ts is not None:
+        from core.commands import TOOL_CALL_TS_CTX, TOOL_CALL_AT_CTX
+        _ts_tok = TOOL_CALL_TS_CTX.set(call_ts)
+        _at_tok = TOOL_CALL_AT_CTX.set(
+            datetime.fromtimestamp(time.time() - (time.monotonic() - call_ts)).isoformat())
+    try:
+        req = permissions.begin_request(name, args, conv_id=conv_id, agent_id=agent_id,
+                                        tool_call_id=tc_id)
+        if req is not None:
+            # ⚠️ JSON 行不做 _esc（与 R:/C: 同惯例）
+            yield f"P:{json.dumps(req, ensure_ascii=False)}\n"
+            if not await permissions.wait(req["id"]):
+                out["result"] = {
+                    "error": f"用户拒绝执行：{name}（手动确认模式，本次调用未获授权，"
+                             f"请先征得用户同意再重试，或改用其它方式）",
+                }
+                return
+        if name == "agent.spawn":
+            _spawn_out: dict = {}
+            async for _sl in _exec_spawn_with_events(tc_id, args, _spawn_out):
+                yield _sl
+            out["result"] = _spawn_out.get("result") or {"ok": False, "error": "子智能体执行异常"}
             return
-    if name == "agent.spawn":
-        _spawn_out: dict = {}
-        async for _sl in _exec_spawn_with_events(tc_id, args, _spawn_out):
-            yield _sl
-        out["result"] = _spawn_out.get("result") or {"ok": False, "error": "子智能体执行异常"}
-        return
-    out["result"] = await asyncio.to_thread(_execute_tool, name, args,
-                                            conv_id=conv_id, tool_call_id=tc_id,
-                                            agent_id=agent_id)
+        out["result"] = await asyncio.to_thread(_execute_tool, name, args,
+                                                conv_id=conv_id, tool_call_id=tc_id,
+                                                agent_id=agent_id)
+    finally:
+        if _ts_tok is not None:
+            TOOL_CALL_TS_CTX.reset(_ts_tok)
+        if _at_tok is not None:
+            TOOL_CALL_AT_CTX.reset(_at_tok)
 
 
 def _extract_spawn_events(result: Any) -> list | None:
@@ -1689,12 +1723,31 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     if _wf_mode in ("plan", "spec", "goal") and _wf:
         system_prompt_base += workflow_preamble(_wf_mode, _wf)
     messages.append({"role": "system", "content": system_prompt_base})
+    # 历史配对防护：只回灌「assistant.tool_calls 之后紧跟的 tool 结果」。
+    # 旧会话可能留下没有 assistant.tool_calls 的孤立 tool 消息（快通道旧缺陷 / 手工删改），
+    # 这类消息不能进入 LLM 上下文，否则模型会看到“工具已执行但自己没发过调用”的假历史。
+    _history_tool_ids: set[str] = set()
     for m in agent_view(conv, agent.get("id")):
         # a2a 信封只用于前端展示，不进 LLM 历史（未知 role 会被接口拒绝）；
         # tool role / tool_calls 历史也要带上 —— 转换规则见 _history_llm_entry
         entry = _history_llm_entry(m, mode, speaker_names)
-        if entry is not None:
-            messages.append(entry)
+        if entry is None:
+            continue
+        if entry.get("role") == "assistant":
+            _history_tool_ids = {
+                tc.get("id", "") for tc in (entry.get("tool_calls") or [])
+                if isinstance(tc, dict) and tc.get("id")
+            }
+        elif entry.get("role") == "tool":
+            tc_id = entry.get("tool_call_id") or ""
+            if tc_id not in _history_tool_ids:
+                continue
+            _history_tool_ids.discard(tc_id)
+        else:
+            # tool 结果必须紧跟在带 tool_calls 的 assistant 之后；
+            # 中间插入 user/system 等消息时，旧 tool_call_id 不再有效。
+            _history_tool_ids.clear()
+        messages.append(entry)
     messages.append({"role": "user", "content": user_input})
     # 本轮用户消息的引用：快通道在其末尾动态附加 <continue> 续跑提示（仅本次请求的
     # 内存 messages，不写入 conv）；进入慢通道时用它把提示动态剔除。
@@ -1827,6 +1880,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 elif kind == "tool_call":
                     # 快通道意外遇到 tool_call（模型忽略了 tool_choice=none）→ 降级到慢通道
                     fast_tool_calls.append(payload)
+                    _mark_tool_call(payload["id"])   # 记发起时刻（供 cmd.bg_wait 精确计时）
                     yield f"C:{payload['id']}|{payload['name']}|{json.dumps(payload['arguments'], ensure_ascii=False)}\n"
                 elif kind == "tool_call_invalid":
                     # 实时检测：工具调用格式错误 → 收集并标记降级到慢通道纠错
@@ -1861,11 +1915,37 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         if fast_tool_calls:
             # 降级：把刚收到的 tool_call 当作慢通道第一轮的开始，执行后继续循环
             _last_assistant_text = fast_text
+            # 快通道事件里的 tool_call 是 {id,name,arguments}，而入库/回灌必须用
+            # OpenAI 的 {id,type,function:{name,arguments}}；不转换会导致下一轮
+            # 历史校验丢弃 tool_calls，留下孤立 tool 结果。
+            fast_tool_calls_stored: list[dict] = []
+            for _fc_i, _fc in enumerate(fast_tool_calls):
+                _fc_id = _fc.get("id") or f"call_fast_{_fc_i}"
+                _fc["id"] = _fc_id
+                _fc_args = _fc.get("arguments")
+                if not isinstance(_fc_args, str):
+                    try:
+                        _fc_args = json.dumps(_fc_args if _fc_args is not None else {},
+                                              ensure_ascii=False)
+                    except Exception:
+                        _fc_args = "{}"
+                fast_tool_calls_stored.append({
+                    "id": _fc_id,
+                    "type": "function",
+                    "function": {
+                        "name": _fc.get("name") or "",
+                        "arguments": _fc_args,
+                    },
+                })
             assistant_msg_fast: dict = {"role": "assistant", "content": fast_text,
-                                         "tool_calls": fast_tool_calls, "ts": datetime.utcnow().isoformat()}
+                                         "tool_calls": fast_tool_calls_stored,
+                                         "ts": datetime.utcnow().isoformat()}
             if assistant_reasoning:
                 assistant_msg_fast["reasoning"] = assistant_reasoning
             messages.append(assistant_msg_fast)
+            # 快通道降级执行工具时，assistant 也必须落库；否则下面的 tool 结果会变成
+            # 「只有 tool_call_id、没有 assistant.tool_calls」的孤立记录，污染后续上下文。
+            conv["messages"].append({**assistant_msg_fast, "agent_id": agent.get("id")})
             # 执行这些 tool_calls
             _fast_img_followups: list[dict] = []
             for tc in fast_tool_calls:
@@ -1877,7 +1957,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 _gated_out: dict = {}
                 async for _gl in _exec_tool_gated(tc["id"], tc["name"], args, _gated_out,
                                                   conv_id=conversation_id,
-                                                  agent_id=agent.get("id")):
+                                                  agent_id=agent.get("id"),
+                                                  call_ts=_TC_CALL_MONO.pop(tc["id"], None)):
                     yield _gl
                 result = _gated_out.get("result") or {"ok": False, "error": "工具执行异常"}
                 # 子智能体运行事件副本 → 落库字段（须在 truncate 前取出，避免进 R: JSON 被截断）
@@ -2099,6 +2180,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     tc = {"id": payload["id"], "type": "function", "function": {"name": payload["name"], "arguments": json.dumps(payload["arguments"], ensure_ascii=False)}}
                     assistant_tool_calls.append(tc)
                     _tc_args_json = json.dumps(payload["arguments"], ensure_ascii=False)
+                    _mark_tool_call(payload["id"])   # 记发起时刻（供 cmd.bg_wait 精确计时）
                     yield f"C:{payload['id']}|{payload['name']}|{_tc_args_json}\n"
                 elif kind == "tool_call_invalid":
                     # 实时检测：工具调用格式非法 → 不执行，记录后注入纠错反馈让模型重试
@@ -2373,7 +2455,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                     _gated_out: dict = {}
                     async for _gl in _exec_tool_gated(tc["id"], fn["name"], args, _gated_out,
                                                       conv_id=conversation_id,
-                                                      agent_id=agent.get("id")):
+                                                      agent_id=agent.get("id"),
+                                                      call_ts=_TC_CALL_MONO.pop(tc["id"], None)):
                         yield _gl
                     result = _gated_out.get("result") or {"ok": False, "error": "工具执行异常"}
                 # 子智能体运行事件副本 → 落库字段（须在 truncate 前取出，避免进 R: JSON 被截断）

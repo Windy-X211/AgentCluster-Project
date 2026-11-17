@@ -59,6 +59,28 @@ _LONG_RUN_CMD_STARTS = [
 # 正在运行的后台进程表：pid → {"proc": Popen, "command": str, "cwd": str, "started_at": float, "log_path": str}
 _BG_PROCESSES: dict[int, dict] = {}
 _BG_LOCK = threading.Lock()
+# 已退出后台进程的退出码缓存：_cleanup_dead_bg / bg_stop 会把死进程从 _BG_PROCESSES 移除，
+# cmd.bg_wait 若晚一步调用仍需拿到退出码与日志尾部，故单独留一份最近退出记录（超出容量按时间淘汰）
+_BG_EXITS: dict[int, dict] = {}
+_BG_EXITS_MAX = 50
+
+
+def _record_bg_exit(pid: int, info: dict, exit_code: int | None, reason: str = "exited") -> None:
+    """记录一个后台进程的退出信息（调用方必须已持有 _BG_LOCK）。"""
+    if not info:
+        return
+    _BG_EXITS[pid] = {
+        "pid": pid,
+        "command": info.get("command", ""),
+        "cwd": info.get("cwd", ""),
+        "log_path": info.get("log_path", ""),
+        "started_at": info.get("started_at", 0.0),
+        "finished_at": time.time(),
+        "exit_code": exit_code,
+        "reason": reason,
+    }
+    while len(_BG_EXITS) > _BG_EXITS_MAX:
+        _BG_EXITS.pop(next(iter(_BG_EXITS)), None)
 
 
 def _is_long_running(command: str) -> bool:
@@ -200,11 +222,14 @@ def _cleanup_dead_bg() -> None:
         for pid in dead:
             info = _BG_PROCESSES.pop(pid, None)
             if info:
+                rc = None
                 try:
                     rc = info["proc"].returncode
                     info["exit_code"] = rc
                 except Exception:
                     pass
+                # 退出码留底：cmd.bg_wait 可能在进程刚退出、表项已被清理之后才被调用
+                _record_bg_exit(pid, info, rc)
 
 
 def _is_gui_launch(command: str) -> bool:
@@ -515,7 +540,8 @@ def _run_foreground_auto(command: str, cwd: str, shell: bool = True,
                 "stdout": tail,
                 "log_path": log_path,
                 "note": "命令未在预期时间内结束，已转为后台运行（不阻塞智能体）。"
-                        "如需等待其完成，显式传 background=false。",
+                        "如需等它跑完，用 cmd.bg_wait(pid=上面的 pid)（定时等待）等待；"
+                        "也可用 cmd.bg_log 查看进度，或下次显式传 background=false 强制前台。",
             }
         time.sleep(0.2)
 
@@ -567,6 +593,7 @@ def cmd_cmd_bg_stop(pid: int, force: bool = False) -> dict:
         except Exception as e:
             return {"error": f"停止进程失败: {e}"}
         _BG_PROCESSES.pop(pid, None)
+        _record_bg_exit(pid, info, getattr(proc, "returncode", None), reason="stopped")
     return {"ok": True, "pid": pid, "stopped": True}
 
 
@@ -590,8 +617,199 @@ def cmd_cmd_bg_log(pid: int, tail: int = 50) -> dict:
         return {"error": f"读日志失败: {e}"}
 
 
+_WAIT_MAX_SECONDS = 1800   # 单次定时等待上限（30 分钟）：再长就该交给定时任务，而不是卡住智能体循环
+
+
+def cmd_cmd_bg_wait(pid: int | None = None, seconds: float | None = None,
+                    timeout: int = 300, tail_chars: int = 4000) -> dict:
+    """定时等待（工具名 cmd.bg_wait，界面名「定时等待」）。
+
+    两种用法，可只给一个，也可两个都给：
+      1) 纯定时 —— 只传 seconds：等 N 秒后返回，不依赖任何进程。
+         用于「等一会儿再回复用户」「过 N 秒后继续下一步」「给外部系统留出处理时间」。
+         这是系统内唯一允许的等待方式（禁止用 Start-Sleep / sleep / timeout 等命令睡时间）。
+      2) 等进程 —— 只传 pid：等待 cmd.run 后台化后的进程结束，返回退出码与输出尾部；
+         用于「命令被转后台了，但要确认它到底跑完没有」。
+      3) 两个都给：进程结束或定时到点，先到先返回；到点后进程继续在后台跑，不会被杀。
+
+    超时/到点都不会杀进程，控制权交还智能体（同一 pid 可再次调用继续等）。
+    单次定时上限 _WAIT_MAX_SECONDS 秒，更长的等待请分段多次调用。
+    """
+    _cleanup_dead_bg()
+    started = time.time()
+    wall_in = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    limit = max(200, int(tail_chars or 4000))
+
+    # —— 参数归一 ——
+    try:
+        pid_v = int(pid) if pid not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        return {"error": f"pid 不是合法整数：{pid!r}"}
+    if pid_v is not None and pid_v <= 0:
+        pid_v = None
+    sec = None
+    if seconds not in (None, ""):
+        try:
+            sec = float(seconds)
+        except (TypeError, ValueError):
+            return {"error": f"seconds 不是合法数字：{seconds!r}"}
+        if sec <= 0:
+            return {"error": "seconds 必须大于 0"}
+        if sec > _WAIT_MAX_SECONDS:
+            return {"error": f"单次定时等待最长 {_WAIT_MAX_SECONDS} 秒（30 分钟），{sec:g}s 超出上限",
+                    "hint": f"请拆分成分段等待（每次不超过 {_WAIT_MAX_SECONDS}s 多次调用）；"
+                            f"如果是「几小时后提醒」这类长周期需求，不要靠等待实现，改用定时任务或直接告知用户"}
+    if pid_v is None and sec is None:
+        return {"error": "定时等待需要至少一个参数：seconds（纯定时）或 pid（等进程结束）",
+                "hint": "例：等待 20 秒 → {\"seconds\": 20}；等后台进程 → {\"pid\": 1234}"}
+
+    # —— 情形 1：纯定时（不碰任何进程）——
+    if pid_v is None:
+        # 计时起点优先用「命令发起时刻」：agent_runtime 广播 C:（工具调用参数流完、前端已显示
+        # 「正在调用」）时记下 monotonic 时间戳，这里通过 TOOL_CALL_TS_CTX 拿到并作为起算点。
+        # 这样模型尾部输出 / 调度排队耗时会自动被扣除 —— 用户从看到"正在调用"到"返回"的跨度 ≈ N 秒，
+        # 而不是 N + 这段看不见的尾巴。
+        call_mono = TOOL_CALL_TS_CTX.get()
+        if call_mono is not None:
+            # 换成与 started 同一套时钟（epoch）：墙钟 = 现在 - monotonic 已过的秒数
+            call_wall = time.time() - (time.monotonic() - call_mono)
+            origin = call_wall
+            pre_exec = max(0.0, started - call_wall)
+        else:
+            origin = started
+            pre_exec = 0.0
+        deadline = origin + sec
+        while time.time() < deadline:
+            time.sleep(min(0.5, deadline - time.time()))
+        now = time.time()
+        waited = round(now - started, 1)
+        total = round(now - origin, 1)
+        if call_mono is not None and pre_exec >= sec:
+            note = (f"定时 {sec:g}s 已完成：从命令发起到现在已过 {total}s（发起后模型收尾等占用 {round(pre_exec,1)}s，"
+                    f"故本次没有再额外空等），可以继续执行")
+        else:
+            note = (f"定时 {sec:g}s 已完成（本次实际再等 {waited}s；从命令发起算起共 {total}s），"
+                    f"可以继续执行：回复用户或进入下一步任务")
+        return {
+            "ok": True,
+            "kind": "timer",
+            "completed": True,
+            "running": False,
+            "requested_s": sec,
+            "seconds": sec,
+            "waited_s": waited,
+            "total_s": total,
+            "pre_exec_s": round(pre_exec, 1),
+            "call_at": TOOL_CALL_AT_CTX.get(),
+            "exec_at": wall_in,
+            "done_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "note": note,
+        }
+
+    # —— 情形 2/3：等进程（可叠加定时上限）——
+    hard_deadline = started + max(1, int(timeout or 300))
+    timer_deadline = (started + sec) if sec else None
+
+    while True:
+        with _BG_LOCK:
+            info = _BG_PROCESSES.get(pid_v)
+            exit_info = _BG_EXITS.get(pid_v)
+
+        # 已不在运行表：用退出码缓存兜底（进程可能刚退出、表项已被清理）
+        if info is None:
+            if exit_info:
+                return {
+                    "ok": exit_info.get("exit_code") == 0,
+                    "kind": "process",
+                    "pid": pid_v,
+                    "completed": True,
+                    "running": False,
+                    "returncode": exit_info.get("exit_code"),
+                    "stdout": _read_log_text(exit_info.get("log_path", ""), limit),
+                    "stderr": "",
+                    "command": exit_info.get("command", ""),
+                    "cwd": exit_info.get("cwd", ""),
+                    "log_path": exit_info.get("log_path", ""),
+                    "note": "该进程已结束（退出信息来自退出码缓存）",
+                }
+            return {"error": f"后台进程 {pid_v} 不存在或已退出，且没有退出码记录",
+                    "hint": "先调用 cmd.bg_list 查看当前后台进程；若是本轮 cmd.run 返回的 pid，请核对是否写错。"
+                            "只想纯粹等一段时间的话，改成传 seconds"}
+
+        proc = info.get("proc")
+        rc = proc.poll() if proc else None
+        if rc is not None:
+            log_path = info.get("log_path", "")
+            out = _read_log_text(log_path, limit)
+            runtime_s = round(time.time() - info.get("started_at", started), 1)
+            with _BG_LOCK:
+                _BG_PROCESSES.pop(pid_v, None)
+                _record_bg_exit(pid_v, info, rc)
+            return {
+                "ok": rc == 0,
+                "kind": "process",
+                "pid": pid_v,
+                "completed": True,
+                "running": False,
+                "returncode": rc,
+                "stdout": out,
+                "stderr": "",
+                "command": info.get("command", ""),
+                "cwd": info.get("cwd", ""),
+                "log_path": log_path,
+                "waited_s": round(time.time() - started, 1),
+                "runtime_s": runtime_s,
+                "note": "已等到进程结束（exit_code=%d，进程总运行 %ss）" % (rc, runtime_s),
+            }
+
+        now = time.time()
+        if timer_deadline is not None and now >= timer_deadline:
+            return {
+                "ok": True,
+                "kind": "process",
+                "pid": pid_v,
+                "completed": False,
+                "running": True,
+                "timed_out": True,
+                "returncode": None,
+                "seconds": sec,
+                "waited_s": round(now - started, 1),
+                "uptime_s": round(now - info.get("started_at", started), 1),
+                "command": info.get("command", ""),
+                "log_path": info.get("log_path", ""),
+                "stdout": _read_log_text(info.get("log_path", ""), limit),
+                "note": f"定时 {sec:g}s 已到，进程仍在后台运行（未被杀）；"
+                        f"可再次调用 cmd.bg_wait 继续等，或用 cmd.bg_log 看进度、cmd.bg_stop 结束它",
+            }
+        if now >= hard_deadline:
+            return {
+                "ok": True,
+                "kind": "process",
+                "pid": pid_v,
+                "completed": False,
+                "running": True,
+                "timed_out": True,
+                "returncode": None,
+                "waited_s": round(now - started, 1),
+                "uptime_s": round(now - info.get("started_at", started), 1),
+                "command": info.get("command", ""),
+                "log_path": info.get("log_path", ""),
+                "stdout": _read_log_text(info.get("log_path", ""), limit),
+                "note": f"等待 {int(timeout)}s 后进程仍未结束，它继续在后台运行；"
+                        f"可再次调用 cmd.bg_wait 继续等，或用 cmd.bg_log 查看进度，"
+                        f"或用 cmd.bg_stop 结束它",
+            }
+        time.sleep(0.3)
+
+
 # —— 工作区目录上下文（与 A2A 的 TURN_CTX 同风格，在 agent_runtime 每轮执行入口设置）——
 WORKDIR_CTX: ContextVar[str | None] = ContextVar("workdir", default=None)
+
+# —— 工具调用发起时刻（monotonic 秒）：agent_runtime 广播 C: 事件时写入，执行工具前注入，
+# cmd.bg_wait 的 seconds 计时以它为起点，扣除「参数流完 → 真正开始执行」之间的模型收尾耗时 ——
+TOOL_CALL_TS_CTX: ContextVar[float | None] = ContextVar("tool_call_ts", default=None)
+# 机器可读的工具调用发起时刻（墙钟 ISO），用于排查端到端耗时对不上时定位是哪个环节
+TOOL_CALL_AT_CTX: ContextVar[str | None] = ContextVar("tool_call_at", default=None)
 
 # —— 备份上下文（文件快照）：在 agent_runtime 每次 _execute_tool 前设置 ——
 # 值为 dict: {"conv_id": int, "tool_call_id": str, "agent_id": int}
@@ -1807,9 +2025,20 @@ COMMAND_TOOLS = [
             "name": "cmd.run",
             "description": (
                 "在系统 shell 中运行一条命令（当前环境为 Windows PowerShell 5.1）。"
+                "\n\n⛔【硬性禁止】不要用命令去「等待时间」："
+                "\n- 不允许执行 Start-Sleep / sleep / timeout /t / ping -n <次数> / pause / Wait-Process 等任何"
+                "「单纯耗时间」的命令，也不许为了拖时间专门起一个 sleep 进程——它只会白占一次工具往返，"
+                "并把本轮会话卡住（这类命令无输出，6 秒后必然被转后台，等于白跑一趟）。"
+                "\n- 需要等待时只用 cmd.bg_wait（界面名「定时等待」），它是系统内唯一允许的等待工具："
+                "\n    · 单纯等一段时间 → cmd.bg_wait(seconds=N)，例如「等 20 秒后再回复用户」传 20；"
+                "\n    · 等某个已经在跑的真实进程跑完 → cmd.bg_wait(pid=...)。"
+                "\n- 用户提出「等 N 秒 / N 分钟后提醒我 / 再继续做」这类定时诉求，就用 cmd.bg_wait(seconds=N) 等待，"
+                "不要用 sleep 类命令假装等待；超过 1800 秒的长周期需求不要靠等待实现，直接告知用户并建议用定时任务。"
+                "\n\n"
                 "系统会自动识别长运行命令并以后台方式启动（如 http.server / uvicorn / node / vite / watch 等），"
                 "后台启动时立即返回 pid、端口探活结果，不会阻塞智能体。"
                 "短命令（如 dir / pip install）正常前台执行。"
+                "命令被转后台后若仍需等它跑完，用 cmd.bg_wait(pid)（定时等待）等它，不要盲目反复 cmd.bg_log。"
                 "也可显式传 background=true 强制后台，或 background=false 强制前台。"
                 "\n\n⚠️ 当前是 Windows PowerShell 5.1 环境："
                 "\n- 不要用 Linux 命令：pwd/cat/ls/grep/find/mkdir -p 均不存在或行为不符，改用 cd/Get-Content/Get-ChildItem/Select-String/New-Item -ItemType Directory -Force"
@@ -1871,6 +2100,39 @@ COMMAND_TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cmd.bg_wait",
+            "description": (
+                "⏳ 定时等待：让本轮先停住一段时间（或等某个后台进程结束）再继续。两种用法："
+                "\n1) 只传 seconds —— 纯定时等待 N 秒后返回，不依赖任何进程。用于「等一会儿再回复用户」"
+                "「过 N 秒再继续下一步任务」「给外部系统留出处理时间」这类场景。"
+                "计时从**你发起本命令那一刻**起算（参数流完到真正开始执行之间的模型收尾/排队耗时会被自动扣除），"
+                "所以用户在界面上看到「正在调用 → 返回」的跨度≈ N 秒，而不是 N + 尾巴。"
+                "\n2) 只传 pid —— 等待 cmd.run 后台化后的进程结束，返回它的退出码和输出尾部"
+                "（stdout 为日志末尾 tail_chars 字符）。命令被转后台后要确认「跑完了没有、有没有报错」，"
+                "用它，而不是反复 cmd.bg_log 盲查。"
+                "\n3) 两个都传 —— 进程结束或定时到点，先到先返回；到点后进程继续在后台跑，不会被杀。"
+                "\n⛔ 本命令是系统内**唯一**允许的等待方式：禁止改用 Start-Sleep / sleep / timeout /t / ping -n / "
+                "pause / Wait-Process 等命令去睡时间，那类命令只会白占一次工具往返、还会被自动转后台。"
+                "\n行为：阻塞轮询；超时或到点都不杀进程，控制权交还智能体（同参数可再次调用继续等）。"
+                "单次定时上限 1800 秒，更长的等待请分段多次调用。"
+                "\n返回：completed=true 时，timer 模式给出 waited_s，pid 模式给出 returncode（0=成功）与 runtime_s；"
+                "completed=false 且 running=true 表示进程仍在后台运行。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "number", "description": "定时等待秒数（纯定时用，如「等 20 秒后再回复」传 20）。与 pid 可同时传"},
+                    "pid": {"type": "integer", "description": "后台进程 PID（等进程用，从 cmd.run 后台返回体或 cmd.bg_list 取）"},
+                    "timeout": {"type": "integer", "description": "pid 模式下的最长等待秒数，默认 300；超时不杀进程，只把控制权交还"},
+                    "tail_chars": {"type": "integer", "description": "返回日志尾部的字符数，默认 4000（仅 pid 模式）"}
+                },
+                "required": []
+            }
+        }
+    },
 ]
 
 # 命令中文标签（前端能力标签与对话工具行共用，label 仅用于界面展示，不参与工具调用）
@@ -1890,6 +2152,7 @@ COMMAND_CN_LABELS = {
     "skill.invoke": "🔧 调用技能",
     "skill.read_section": "📑 读取技能章节",
     "cmd.run": "🚀 运行命令",
+    "cmd.bg_wait": "⏳ 定时等待",
     "cmd.bg_list": "📋 后台进程",
     "cmd.bg_stop": "🛑 停止进程",
     "cmd.bg_log": "📜 进程日志",
@@ -3689,7 +3952,7 @@ COMMAND_GROUPS = [
         "workspace.search",
     ]),
     ("智能命令", ["agent.smart_search", "agent.spawn"]),
-    ("命令运行", ["cmd.run", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
+    ("命令运行", ["cmd.run", "cmd.bg_wait", "cmd.bg_list", "cmd.bg_stop", "cmd.bg_log"]),
     ("集群编排", [
         "cluster.get_agent", "cluster.search_agents",
         "cluster.list_capabilities",

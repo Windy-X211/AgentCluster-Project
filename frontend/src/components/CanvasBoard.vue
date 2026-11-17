@@ -97,6 +97,8 @@ const dragging = ref<{
 const draw = ref<DrawState | null>(null)
 // 绘制中的「本段线型」右键菜单（客户端坐标 + 右键时的画布坐标）
 const segMenu = ref<{ x: number; y: number; via: Pt } | null>(null)
+// 记忆最后一次选择的段线型，下一条连线的第一段自动沿用
+const lastSegType = ref<SegType>('curve')
 // 画布平移（左键）
 const panning = ref<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
 const spaceDown = ref(false)
@@ -1193,7 +1195,7 @@ function startLink(e: MouseEvent, nodeId: number) {
     from: nodeId,
     anchor: nearestMidAnchor(nodeRect(node), c),
     mouse: c,
-    type: 'curve',
+    type: lastSegType.value,  // 第一段线型沿用最后一次选择的线型
     via: null,
     segs: [],
   }
@@ -1345,6 +1347,7 @@ function openSegMenu(e: MouseEvent) {
   clampToViewport(segMenu as any, '.seg-menu')
 }
 function chooseSegType(t: SegType) {
+  lastSegType.value = t  // 记忆，供下一条连线第一段沿用
   if (draw.value) {
     draw.value.type = t
     draw.value.via = segMenu.value?.via || null
