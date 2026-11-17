@@ -105,6 +105,7 @@ const spaceDown = ref(false)
 
 // 套索 / 多选
 const selectedNodeIds = ref<Set<number>>(new Set())
+const selectedEdgeIds = ref<Set<number>>(new Set())
 const lasso = ref<{
   x0: number; y0: number; x1: number; y1: number
   originNodeId: number | null   // Shift+单击起点落在哪个节点上（用于点选切换）
@@ -892,7 +893,11 @@ const onKeyDown = (e: KeyboardEvent) => {
   // Delete / Backspace 删除选中的智能体；输入框 / 模态框内保持系统默认
   if ((e.key === 'Delete' || e.key === 'Backspace') && !editable && !modal) {
     if (e.key === 'Backspace') e.preventDefault()  // 避免浏览器后退
-    if (selectedNodeIds.value.size) {
+    // 连线选中优先 → 避免节点套索同时套住连线时只删节点
+    if (selectedEdgeIds.value.size) {
+      e.preventDefault()
+      deleteSelectedEdges()
+    } else if (selectedNodeIds.value.size) {
       e.preventDefault()
       deleteSelectedNodes()
     }
@@ -1080,7 +1085,36 @@ function endDrag() {
 }
 
 // —— 选区 ——
-function clearSelection() { selectedNodeIds.value = new Set() }
+function clearSelection() { selectedNodeIds.value = new Set(); selectedEdgeIds.value = new Set() }
+function toggleEdgeSelection(id: number, additive = false) {
+  if (!additive) selectedNodeIds.value = new Set()
+  const next = new Set(selectedEdgeIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedEdgeIds.value = next
+}
+function selectEdge(id: number) {
+  selectedNodeIds.value = new Set()
+  selectedEdgeIds.value = new Set([id])
+}
+/** edge-hit @click 入口：单击选中 / Ctrl+单击多选 / Shift+单击点选切换 */
+function onEdgeClick(e: any, ev: MouseEvent) {
+  if (dragging.value || edgeDrag.value) return  // 拖动中不响应
+  if (ev.ctrlKey || ev.metaKey || ev.shiftKey) {
+    toggleEdgeSelection(e.id, true)
+  } else {
+    selectEdge(e.id)
+  }
+}
+function deleteSelectedEdges() {
+  const ids = [...selectedEdgeIds.value]
+  if (!ids.length) return
+  pushHistory()
+  canvas.value!.edges = edges.value.filter((e: any) => !selectedEdgeIds.value.has(e.id))
+  selectedEdgeIds.value = new Set()
+  closeMenus()
+  canvases.saveCurrent()
+}
 // Ctrl+A：全选当前画布的所有节点
 function selectAllNodes() {
   selectedNodeIds.value = new Set(nodes.value.map((n: any) => n.id))
@@ -4326,11 +4360,12 @@ defineExpose({ viewportRef, computeNodeBbox })
               </marker>
             </defs>
             <path v-if="item.g" :d="item.g.d"
-                  :class="['edge-hit', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e) }]"
+                  :class="['edge-hit', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e), selected: selectedEdgeIds.has(item.e.id) }]"
+                  @click.stop="onEdgeClick(item.e, $event)"
                   @dblclick="removeEdge(item.e.id)"
                   @contextmenu="showEdgeMenu($event, item.e)" />
             <path v-if="item.g" :d="item.g.d"
-                  :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e), ortho: item.ortho }]"
+                  :class="['edge', { active: isEdgeActive(item.e), dim: isEdgeDim(item.e), ortho: item.ortho, selected: selectedEdgeIds.has(item.e.id) }]"
                   :marker-end="`url(#egm-${item.e.id})`" pointer-events="none" />
             <path v-if="item.g" class="edge-mid"
                   :class="{ dim: isEdgeDim(item.e) }"
@@ -4753,6 +4788,8 @@ defineExpose({ viewportRef, computeNodeBbox })
 .edge.ortho { stroke-linejoin: round; stroke-linecap: round; }
 /* 调用进行中：加粗 + 强调色外发光 + 流动虚线 */
 .edge.active { stroke-width: 2.8; filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), 0.9)) saturate(1.35) brightness(1.12); animation: edgeFlow 0.6s linear infinite; }
+.edge.selected { stroke-width: 3; filter: drop-shadow(0 0 5px rgba(var(--accent-rgb), 0.85)); stroke-dasharray: none; }
+.edge.selected.dim { filter: grayscale(0.85) drop-shadow(0 0 3px rgba(var(--accent-rgb), 0.5)); opacity: 0.85; }
 /* 端点智能体已停用：整体去色并压暗 */
 .edge.dim { stroke-width: 1.5; stroke-dasharray: 4 4; cursor: default; animation: none; filter: grayscale(0.85); opacity: 0.55; }
 .edge.active.dim { filter: grayscale(0.85) drop-shadow(0 0 4px rgba(var(--accent-rgb), 0.25)); opacity: 0.7; }
