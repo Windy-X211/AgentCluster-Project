@@ -4788,8 +4788,27 @@ defineExpose({ viewportRef, computeNodeBbox })
 .edge.ortho { stroke-linejoin: round; stroke-linecap: round; }
 /* 调用进行中：加粗 + 强调色外发光 + 流动虚线 */
 .edge.active { stroke-width: 2.8; filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), 0.9)) saturate(1.35) brightness(1.12); animation: edgeFlow 0.6s linear infinite; }
-.edge.selected { stroke-width: 3; filter: drop-shadow(0 0 5px rgba(var(--accent-rgb), 0.85)); stroke-dasharray: none; }
-.edge.selected.dim { filter: grayscale(0.85) drop-shadow(0 0 3px rgba(var(--accent-rgb), 0.5)); opacity: 0.85; }
+/* 选中态：accent-2 强调色 + 加粗 + 双层发光（外圈淡 / 内圈亮），与节点选中 outline 同色系，
+   stroke-dasharray none 保证 dim / 进行中态的虚线被覆盖，整条连线实色实粗 */
+.edge.selected {
+  stroke: var(--accent-2) !important;
+  stroke-width: 3.5 !important;
+  stroke-dasharray: none !important;
+  filter:
+    drop-shadow(0 0 2px rgba(var(--accent-rgb), 0.9))
+    drop-shadow(0 0 8px color-mix(in oklab, var(--accent-2) 75%, transparent));
+}
+.edge.selected.dim {
+  stroke: var(--accent-2) !important;
+  stroke-width: 3 !important;
+  filter: grayscale(0.5)
+    drop-shadow(0 0 2px rgba(var(--accent-rgb), 0.6))
+    drop-shadow(0 0 6px color-mix(in oklab, var(--accent-2) 55%, transparent));
+  opacity: 0.9;
+}
+.edge.selected.active { animation: edgeFlow 0.5s linear infinite; }
+/* 未选中时 hover 悬停提示：轻微加粗 + 柔光，比 selected 态弱一档 */
+.edge:hover { stroke-width: 2.2; filter: drop-shadow(0 0 3px rgba(var(--accent-rgb), 0.4)); }
 /* 端点智能体已停用：整体去色并压暗 */
 .edge.dim { stroke-width: 1.5; stroke-dasharray: 4 4; cursor: default; animation: none; filter: grayscale(0.85); opacity: 0.55; }
 .edge.active.dim { filter: grayscale(0.85) drop-shadow(0 0 4px rgba(var(--accent-rgb), 0.25)); opacity: 0.7; }
