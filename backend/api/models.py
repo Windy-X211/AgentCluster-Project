@@ -150,7 +150,7 @@ def update_iface(iid: int, i: IfaceIn):
 def remove_iface(iid: int):
     return {"ok": delete_by("model_interfaces", iid)}
 
-@router.get("/{iid}/reasoning/{model_name}")
+@router.get("/{iid}/reasoning/{model_name:path}")
 async def detect_reasoning(iid: int, model_name: str):
     """检测指定接口下某个模型的推理能力档位。
 
