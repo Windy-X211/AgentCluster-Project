@@ -49,6 +49,11 @@ const migratePlan = ref<any>(null)   // dry-run 结果：copied / skipped / byte
 const migrateScanning = ref(false)
 const migrating = ref(false)
 
+// 删除源位置确认弹窗（迁移成功后弹出）
+const deleteConfirmOpen = ref(false)
+const deleteConfirmSource = ref('')  // 迁移完成后保留的源路径，供删除时使用
+const deleteConfirmDeleting = ref(false)
+
 // 默认能力的本地镜像（方便实时编辑、再写回 settings）
 const defaults = ref<{ commands: string[]; skills: string[]; plugins: string[] }>({
   commands: [], skills: [], plugins: [],
@@ -287,20 +292,30 @@ function fmtBytes(n: number): string {
 const normPath = (s: string) => String(s || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 
 async function openMigrate() {
-  const target = storageLocation.value.trim()
-  if (!target) { showToast('请先填写或选择目标位置', 'err'); return }
+  // 第 1 步：弹出系统文件夹选择器（初始定位到当前存储位置）
+  let target = storageLocation.value.trim()
+  try {
+    const r = await api.storage.pickFolder(target || storagePaths.value?.root || '', '选择要迁移到的目标文件夹')
+    if (!r?.path) return  // 用户取消，静默关闭
+    target = r.path.trim()
+    storageLocation.value = target  // 同时更新输入框显示
+  } catch (e: any) {
+    alert('打开选择器失败：' + (e?.message || e))
+    return
+  }
+  if (!target) return
+  // 第 2 步：路径校验
   if (storagePaths.value?.root && normPath(target) === normPath(storagePaths.value.root)) {
     showToast('该位置就是当前存储位置，无需迁移', 'err')
     return
   }
+  // 第 3 步：弹迁移确认弹窗 + dry-run 预估
   migrateTarget.value = target
   migratePlan.value = null
   migrateScanning.value = true
   migrateOpen.value = true
   try {
-    // dry-run：只统计，不写盘、不切根
     migratePlan.value = await api.storage.migrate(target, true)
-    // 用后端解析后的绝对路径作准（相对路径也按项目根解析过了）
     if (migratePlan.value?.target) migrateTarget.value = migratePlan.value.target
   } catch (e: any) {
     migrateOpen.value = false
@@ -320,22 +335,50 @@ async function doMigrate() {
   if (migrating.value || migrateScanning.value || !migrateTarget.value) return
   migrating.value = true
   try {
-    const r = await api.storage.migrate(migrateTarget.value, false)
+    const r = await api.storage.migrate(migrateTarget.value, false, false)
     storagePaths.value = r?.paths ?? null
     if (!storagePaths.value) {
       try { storagePaths.value = await api.storage.paths() } catch {}
     }
     storageLocation.value = storagePaths.value?.root || migrateTarget.value
+    // 保存源路径，供删除确认弹窗使用
+    const sourcePath = r?.source || ''
     migrateOpen.value = false
     migratePlan.value = null
     // 新位置的 settings / 模型接口可能不同，同步刷新
     await Promise.all([settings.fetch(), models.fetch()])
     showToast(`已迁移 ${r?.copied ?? 0} 个文件（${fmtBytes(r?.bytes ?? 0)}）到 ${storagePaths.value?.root || migrateTarget.value}`)
+    // 迁移完成，弹出是否删除原位置数据的询问
+    if (sourcePath && !r?.source_deleted) {
+      deleteConfirmSource.value = sourcePath
+      deleteConfirmOpen.value = true
+    }
   } catch (e: any) {
     showToast('迁移失败：' + (e?.message || e), 'err')
   } finally {
     migrating.value = false
   }
+}
+
+/** 用户确认删除原位置数据 */
+async function confirmDeleteSource() {
+  if (deleteConfirmDeleting.value) return
+  deleteConfirmDeleting.value = true
+  try {
+    await api.storage.deleteSource(deleteConfirmSource.value)
+    deleteConfirmOpen.value = false
+    deleteConfirmSource.value = ''
+    showToast('原位置数据已删除')
+  } catch (e: any) {
+    showToast('删除失败：' + (e?.message || e), 'err')
+  } finally {
+    deleteConfirmDeleting.value = false
+  }
+}
+
+function skipDeleteSource() {
+  deleteConfirmOpen.value = false
+  deleteConfirmSource.value = ''
 }
 
 // —— 模型接口 ——
@@ -715,6 +758,82 @@ const agentGroupOptions = computed(() => {
         </div>
       </div>
 
+      <!-- 权限设置（危险操作授权 + 可操作范围，后端执行端见 core/permissions.py） -->
+      <div class="panel glass">
+        <div class="panel-title">
+          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>权限设置</span>
+          <span class="hint">限制智能体的危险操作与可操作范围</span>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">操作权限</span>
+            <span class="hint">智能体执行危险操作（写/删文件、运行命令、插件、派生子智能体…）时如何授权</span>
+          </div>
+          <div class="appearance-row">
+            <label class="radio-label" :class="{ active: permMode === 'manual' }" @click="setPermMode('manual')">
+              <input type="radio" name="permissionMode" value="manual" :checked="permMode === 'manual'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">手动确认</span>
+            </label>
+            <label class="radio-label" :class="{ active: permMode === 'auto' }" @click="setPermMode('auto')">
+              <input type="radio" name="permissionMode" value="auto" :checked="permMode === 'auto'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">自动审核</span>
+            </label>
+            <label class="radio-label" :class="{ active: permMode === 'full' }" @click="setPermMode('full')">
+              <input type="radio" name="permissionMode" value="full" :checked="permMode === 'full'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">完全权限</span>
+            </label>
+          </div>
+          <div class="sound-desc">
+            <div class="sound-main">{{ permModeDesc.title }}</div>
+            <div class="sound-sub">{{ permModeDesc.sub }}</div>
+          </div>
+        </div>
+
+        <div class="cap-block">
+          <div class="cap-header">
+            <span class="cap-title">工作范围</span>
+            <span class="hint">智能体可以在哪些目录里改文件、跑命令</span>
+          </div>
+          <div class="appearance-row">
+            <label class="radio-label" :class="{ active: scopeMode === 'workspace' }" @click="setScopeMode('workspace')">
+              <input type="radio" name="workScopeMode" value="workspace" :checked="scopeMode === 'workspace'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">仅限工作区</span>
+            </label>
+            <label class="radio-label" :class="{ active: scopeMode === 'custom' }" @click="setScopeMode('custom')">
+              <input type="radio" name="workScopeMode" value="custom" :checked="scopeMode === 'custom'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">指定范围</span>
+            </label>
+            <label class="radio-label" :class="{ active: scopeMode === 'global' }" @click="setScopeMode('global')">
+              <input type="radio" name="workScopeMode" value="global" :checked="scopeMode === 'global'" />
+              <span class="radio-dot"></span>
+              <span class="radio-text">电脑全局</span>
+            </label>
+          </div>
+          <div class="sound-desc">
+            <div class="sound-main">{{ scopeModeDesc.title }}</div>
+            <div class="sound-sub">{{ scopeModeDesc.sub }}</div>
+          </div>
+
+          <div v-if="scopeMode === 'custom'" class="perm-paths">
+            <textarea class="input perm-paths-input" v-model="scopePathsText" rows="4"
+                      spellcheck="false"
+                      placeholder="每行一个绝对目录，例如：&#10;D:\Projects\我的工作区&#10;E:\素材"></textarea>
+            <div class="perm-paths-actions">
+              <button class="btn" :disabled="scopeSaving" @click="saveScopePaths">
+                {{ scopeSaving ? '保存中…' : '保存范围' }}
+              </button>
+              <span class="hint">目录不存在时会自动忽略；留空则回退到「仅限工作区」</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 外观设置 -->
       <div class="panel glass">
         <div class="panel-title">
@@ -1057,9 +1176,9 @@ const agentGroupOptions = computed(() => {
           <!-- mousedown.prevent：阻止输入框 blur 先把存储位置切走，否则迁移会变成「原地迁移」 -->
           <button class="btn sm ghost" @mousedown.prevent @click="browseStorage" :disabled="storageSaving || migrating" title="选择目标目录（只填入路径，不立即切换）">浏览…</button>
           <button class="btn sm ghost" @mousedown.prevent @click="openMigrate" :disabled="migrating"
-                  title="把当前用户数据复制到该位置并切换存储位置（源数据保留）">迁移到此处</button>
+                  title="把当前用户数据复制到该位置并切换存储位置（迁移完成后可选择删除原数据）">迁移</button>
         </div>
-        <div class="storage-loc-tip">默认位置为用户数据目录（Windows：%LOCALAPPDATA%\AgentCluster，已在项目文件夹之外）；输入框回车/失焦 = 仅切换（按该位置现有数据接管），要把当前数据搬过去请点「迁移到此处」</div>
+        <div class="storage-loc-tip">默认位置为用户数据目录（Windows：%LOCALAPPDATA%\AgentCluster，已在项目文件夹之外）；输入框回车/失焦 = 仅切换（按该位置现有数据接管），要把当前数据搬过去请点「迁移」</div>
         <table class="tbl" v-if="storagePaths">
           <thead><tr><th>名称</th><th>类型</th><th>相对路径</th><th>数量</th><th style="width: 120px"></th></tr></thead>
           <tbody>
@@ -1115,82 +1234,6 @@ const agentGroupOptions = computed(() => {
           </tbody>
         </table>
         <div v-if="!storagePaths" class="empty">后端未返回路径信息</div>
-      </div>
-
-      <!-- 权限设置（危险操作授权 + 可操作范围，后端执行端见 core/permissions.py） -->
-      <div class="panel glass">
-        <div class="panel-title">
-          <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>权限设置</span>
-          <span class="hint">限制智能体的危险操作与可操作范围</span>
-        </div>
-
-        <div class="cap-block">
-          <div class="cap-header">
-            <span class="cap-title">操作权限</span>
-            <span class="hint">智能体执行危险操作（写/删文件、运行命令、插件、派生子智能体…）时如何授权</span>
-          </div>
-          <div class="appearance-row">
-            <label class="radio-label" :class="{ active: permMode === 'manual' }" @click="setPermMode('manual')">
-              <input type="radio" name="permissionMode" value="manual" :checked="permMode === 'manual'" />
-              <span class="radio-dot"></span>
-              <span class="radio-text">手动确认</span>
-            </label>
-            <label class="radio-label" :class="{ active: permMode === 'auto' }" @click="setPermMode('auto')">
-              <input type="radio" name="permissionMode" value="auto" :checked="permMode === 'auto'" />
-              <span class="radio-dot"></span>
-              <span class="radio-text">自动审核</span>
-            </label>
-            <label class="radio-label" :class="{ active: permMode === 'full' }" @click="setPermMode('full')">
-              <input type="radio" name="permissionMode" value="full" :checked="permMode === 'full'" />
-              <span class="radio-dot"></span>
-              <span class="radio-text">完全权限</span>
-            </label>
-          </div>
-          <div class="sound-desc">
-            <div class="sound-main">{{ permModeDesc.title }}</div>
-            <div class="sound-sub">{{ permModeDesc.sub }}</div>
-          </div>
-        </div>
-
-        <div class="cap-block">
-          <div class="cap-header">
-            <span class="cap-title">工作范围</span>
-            <span class="hint">智能体可以在哪些目录里改文件、跑命令</span>
-          </div>
-          <div class="appearance-row">
-            <label class="radio-label" :class="{ active: scopeMode === 'workspace' }" @click="setScopeMode('workspace')">
-              <input type="radio" name="workScopeMode" value="workspace" :checked="scopeMode === 'workspace'" />
-              <span class="radio-dot"></span>
-              <span class="radio-text">仅限工作区</span>
-            </label>
-            <label class="radio-label" :class="{ active: scopeMode === 'custom' }" @click="setScopeMode('custom')">
-              <input type="radio" name="workScopeMode" value="custom" :checked="scopeMode === 'custom'" />
-              <span class="radio-dot"></span>
-              <span class="radio-text">指定范围</span>
-            </label>
-            <label class="radio-label" :class="{ active: scopeMode === 'global' }" @click="setScopeMode('global')">
-              <input type="radio" name="workScopeMode" value="global" :checked="scopeMode === 'global'" />
-              <span class="radio-dot"></span>
-              <span class="radio-text">电脑全局</span>
-            </label>
-          </div>
-          <div class="sound-desc">
-            <div class="sound-main">{{ scopeModeDesc.title }}</div>
-            <div class="sound-sub">{{ scopeModeDesc.sub }}</div>
-          </div>
-
-          <div v-if="scopeMode === 'custom'" class="perm-paths">
-            <textarea class="input perm-paths-input" v-model="scopePathsText" rows="4"
-                      spellcheck="false"
-                      placeholder="每行一个绝对目录，例如：&#10;D:\Projects\我的工作区&#10;E:\素材"></textarea>
-            <div class="perm-paths-actions">
-              <button class="btn" :disabled="scopeSaving" @click="saveScopePaths">
-                {{ scopeSaving ? '保存中…' : '保存范围' }}
-              </button>
-              <span class="hint">目录不存在时会自动忽略；留空则回退到「仅限工作区」</span>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
 
@@ -1289,6 +1332,32 @@ const agentGroupOptions = computed(() => {
       </div>
     </div>
 
+    <!-- 迁移成功后：是否删除原位置数据 -->
+    <div class="modal-bg" v-if="deleteConfirmOpen">
+      <div class="modal popup-surface delete-confirm-box">
+        <div class="modal-head">
+          <div class="modal-title">迁移完成</div>
+        </div>
+        <div class="delete-confirm-body">
+          <div class="delete-confirm-hint">用户数据已成功迁移到新位置，原位置数据仍完整保留：</div>
+          <div class="delete-confirm-path">
+            <span class="delete-confirm-path-label">原位置</span>
+            <span class="mono">{{ deleteConfirmSource }}</span>
+          </div>
+          <div class="delete-confirm-question">是否删除原位置数据？</div>
+          <div class="delete-confirm-warn">
+            删除后将无法恢复。建议先打开新位置确认数据完整，再选择删除。
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn ghost" :disabled="deleteConfirmDeleting" @click="skipDeleteSource">暂不删除</button>
+          <button class="btn danger" :disabled="deleteConfirmDeleting" @click="confirmDeleteSource">
+            {{ deleteConfirmDeleting ? '删除中…' : '删除原位置数据' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- 文件浏览器 -->
     <FileExplorerDialog
       v-model:visible="explorerOpen"
@@ -1334,6 +1403,24 @@ const agentGroupOptions = computed(() => {
 .migrate-sum { font-size: calc(12px * var(--font-scale)); line-height: 1.6; }
 .migrate-note { margin-top: 10px; font-size: calc(11px * var(--font-scale)); line-height: 1.7; opacity: .6; }
 .migrate-box .actions { margin-top: 16px; }
+
+.delete-confirm-box { width: 480px; }
+.delete-confirm-body { padding: 4px 0 8px; }
+.delete-confirm-hint { font-size: calc(12px * var(--font-scale)); line-height: 1.6; margin-bottom: 12px; opacity: .8; }
+.delete-confirm-path {
+  display: flex; gap: 8px; align-items: baseline; font-size: calc(12px * var(--font-scale));
+  padding: 8px 12px; border-radius: 8px; margin-bottom: 14px;
+  background: rgba(var(--surface-rgb), 0.05); border: 1px solid rgba(var(--surface-rgb), 0.08); word-break: break-all;
+}
+.delete-confirm-path-label { flex-shrink: 0; opacity: .6; }
+.delete-confirm-question { font-size: calc(13px * var(--font-scale)); font-weight: 600; margin-bottom: 6px; }
+.delete-confirm-warn { font-size: calc(11px * var(--font-scale)); line-height: 1.7; opacity: .55; }
+.btn.danger {
+  background: rgba(239, 68, 68, 0.15); color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  &:hover:not(:disabled) { background: rgba(239, 68, 68, 0.25); border-color: rgba(239, 68, 68, 0.55); }
+  &:disabled { opacity: .5; cursor: not-allowed; }
+}
 
 .storage-loc-tip { font-size: calc(11px * var(--font-scale)); opacity: .5; margin: 6px 0 0; }
 .empty { padding: 24px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }

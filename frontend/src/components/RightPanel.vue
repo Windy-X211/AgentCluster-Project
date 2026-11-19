@@ -1493,7 +1493,7 @@ function extractEnvelopeText(envelope: any): string {
 //     · 右 侧：发给 A 的消息——用户消息（to_agent_id === cur）+ 其他智能体发给 A 的消息
 //     · A2A 信封卡片（A→B 的 🤝 组）不再渲染；发给 A 的 a2a 信封以纯文本消息气泡呈现
 //     · A2A 协议输入（接力段收到的信封渲染文本）不作为消息渲染
-//     · 其它智能体 B 的 assistant/tool 输出**不进入对话区**（画布节点气泡仍按各自 agent_id 全量展示）
+//     · 其它智能体 B 的 assistant/tool 输出：受「显示其他智能体消息」设置控制
 //     未选中智能体（cur == null）时展示全量。左右侧由 renderItems 分段决定。
 const visibleMsgs = computed(() => {
   const all: any[] = conv.value?.messages || []
@@ -1521,7 +1521,9 @@ const visibleMsgs = computed(() => {
       if (toOf(m) === cur) return showOtherAgents.value  // 其他智能体发给它的（受设置开关控制）
       return false
     }
-    return m.agent_id === cur
+    if (m.agent_id === cur) return true                  // 当前智能体的输出，始终显示
+    // 其他智能体的输出（assistant / tool_call / tool_result 等）：受设置开关控制
+    return showOtherAgents.value
   }
   // 过滤时保留原始下标，供压缩摘要定位（split 是共享历史下标）
   const pairs = all.map((m: any, idx: number) => [m, idx] as const).filter(([m]) => keep(m))
@@ -1599,8 +1601,12 @@ const renderItems = computed(() => {
       if (hasTool) out.push({ type: 'turn', start, end, children, side: 'left' })
       continue
     }
-    // 全部子块统一 side='left'，不再按左右侧切段
-    out.push({ type: 'turn', start, end, children, side: 'left' })
+    // 判断本段是否包含其他智能体的消息 → 使用 otherAgentsSide 设置的一侧
+    const hasOtherAgent = cur != null && children.some(
+      (c: any) => c.msg?.agent_id && c.msg.agent_id !== cur
+    )
+    const turnSide = hasOtherAgent ? otherAgentsSide.value : 'left'
+    out.push({ type: 'turn', start, end, children, side: turnSide })
   }
   return out
 })
@@ -3249,7 +3255,11 @@ const cvOverId = ref<number | null>(null)
 const cvOverPos = ref<'before' | 'after'>('before')
 function onCvDragStart(e: DragEvent, c: any) {
   cvDragId.value = c.id
-  if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(c.id)) }
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('canvas', String(c.id))
+    e.dataTransfer.setData('text/plain', String(c.id))
+  }
 }
 function onCvDragEnd() { cvDragId.value = null; cvOverId.value = null }
 function onCvDragOver(e: DragEvent, c: any) {
@@ -4306,7 +4316,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="row2">
           <!-- 上下文长度指示：进度条边框，起点从上边中心顺时针走；点击（弹窗确认后）立即压缩 -->
-          <div v-if="ctxBadgeText" ref="badgeRef" class="ctx-badge" :class="['lv-' + ctxLevel, { clickable: ctxInfo?.enabled }]" :title="ctxTitle" @click="onCtxBadgeClick">
+          <div v-if="settings.ctxBadgeEnabled && ctxBadgeText" ref="badgeRef" class="ctx-badge" :class="['lv-' + ctxLevel, { clickable: ctxInfo?.enabled }]" :title="ctxTitle" @click="onCtxBadgeClick">
             <span class="edge edge-top"    :style="edgeStyle?.top"></span>
             <span class="edge edge-right"   :style="edgeStyle?.right"></span>
             <span class="edge edge-bottom"  :style="edgeStyle?.bottom"></span>

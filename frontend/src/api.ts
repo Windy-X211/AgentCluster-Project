@@ -348,9 +348,12 @@ export const api = {
     pickFolder: (initial?: string, title?: string) =>
       req<{ path: string }>('/storage/pick_folder', { method: 'POST', body: JSON.stringify({ initial: initial || '', title: title || '' }) }),
     setLocation: (path: string) => req<any>('/storage/set_location', { method: 'POST', body: JSON.stringify({ path }), timeout: 600_000 }),
-    // 迁移用户数据到指定位置（dryRun 只统计，不写盘、不切根）
-    migrate: (path: string, dryRun = false) =>
-      req<any>('/storage/migrate', { method: 'POST', body: JSON.stringify({ path, dry_run: dryRun }), timeout: 600_000 })
+    // 迁移用户数据到指定位置（dryRun 只统计，不写盘、不切根；deleteSource 在迁移成功后删除源位置）
+    migrate: (path: string, dryRun = false, deleteSource = false) =>
+      req<any>('/storage/migrate', { method: 'POST', body: JSON.stringify({ path, dry_run: dryRun, delete_source: deleteSource }), timeout: 600_000 }),
+    // 删除迁移后留下的原位置数据目录（带安全检查）
+    deleteSource: (path: string) =>
+      req<any>('/storage/delete_source', { method: 'POST', body: JSON.stringify({ path }), timeout: 600_000 })
   },
   capabilities: {
     all: () => req<any>('/commands'),          // 返回 {commands, skills, plugins}

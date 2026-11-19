@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers, MutableHeaders
 from contextlib import asynccontextmanager
 
-from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, migrate_to, ROOT
+from core.store import init_store, load, upsert, get_store_paths, open_folder, pick_folder, set_root, migrate_to, ROOT, delete_data_dir
 from api import agents, agent_groups, canvases, conversations, models, settings, commands, rules, param_presets, plugins_debug, asr, backgrounds, extensions, market, permissions
 
 from datetime import datetime
@@ -508,16 +508,18 @@ def storage_set_location(payload: dict):
 
 @app.post("/api/storage/migrate")
 def storage_migrate(payload: dict):
-    """把当前用户数据迁移到指定位置：复制（不覆盖目标已有文件、不删除源数据）→ 切换存储根。
+    """把当前用户数据迁移到指定位置：复制（不覆盖目标已有文件）→ 切换存储根 → 可选删除源位置。
 
-    payload: {"path": "D:\\AgentClusterData", "dry_run": false}
-    dry_run=true 只返回将要复制/跳过的文件数，不写盘、不切根（给确认弹窗预估用）。
+    payload: {"path": "D:\\AgentClusterData", "dry_run": false, "delete_source": false}
+    - dry_run=true 只返回将要复制/跳过的文件数，不写盘、不切根（给确认弹窗预估用）。
+    - delete_source=true 时，复制+切根成功后删除原位置整个数据目录（含 _legacy，务必确认）。
     """
     new_path = (payload.get("path") or "").strip()
     if not new_path:
         raise HTTPException(400, "path required")
     try:
-        result = migrate_to(new_path, dry_run=bool(payload.get("dry_run")))
+        result = migrate_to(new_path, dry_run=bool(payload.get("dry_run")),
+                            delete_source=bool(payload.get("delete_source")))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except OSError as e:
@@ -529,6 +531,23 @@ def storage_migrate(payload: dict):
             reload_capabilities()
         except Exception as e:
             print(f"[storage] reload_capabilities 失败（不阻断迁移）：{e}")
+    return {"ok": True, **result}
+
+
+@app.post("/api/storage/delete_source")
+def storage_delete_source(payload: dict):
+    """删除迁移后留下的原位置数据目录（前端"是否删除原位置数据"弹窗确认后调用）。
+
+    payload: {"path": "C:\\Users\\xxx\\AppData\\Local\\AgentCluster"}
+    安全检查：目录必须是合法的用户数据目录（包含 settings.json 或 agents/），
+    且不能是当前 ROOT 或与 ROOT 存在包含关系。
+    """
+    path_str = (payload.get("path") or "").strip()
+    if not path_str:
+        raise HTTPException(400, "path required")
+    result = delete_data_dir(path_str)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("reason") or "删除失败")
     return {"ok": True, **result}
 
 

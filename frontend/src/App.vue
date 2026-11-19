@@ -7,6 +7,8 @@ import PermissionConfirm from '@/components/PermissionConfirm.vue'
 import BackgroundLayer from '@/components/BackgroundLayer.vue'
 import WindowControls from '@/components/WindowControls.vue'
 import ResizeHandles from '@/components/ResizeHandles.vue'
+import PromptDialog from '@/components/PromptDialog.vue'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
 
 const layout = useLayoutStore()
 const route = useRoute()
@@ -57,4 +59,7 @@ watch(() => canvases.current?.id, v => {
   <GuideManager v-if="!isQuickChat" />
   <!-- 危险操作手动确认弹窗（权限设置 = 手动确认时全局拦截） -->
   <PermissionConfirm />
+  <!-- 全局自绘 prompt / confirm 弹窗（替代浏览器原生对话框，解决 pywebview frameless 下被抑制的问题） -->
+  <PromptDialog />
+  <ConfirmDialog />
 </template>

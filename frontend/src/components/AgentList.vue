@@ -3,6 +3,7 @@ import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount, onDeactivat
 import { useAgentStore, useSettingsStore, useModelStore } from '@/stores'
 import { toolLabel } from '@/stores/conversation'
 import { agentAvatarGradient } from '@/utils/avatar'
+import { usePrompt, useConfirm } from '@/composables/useDialog'
 import AgentEditDialog from './AgentEditDialog.vue'
 
 const props = defineProps<{ collapsed: boolean }>()
@@ -104,7 +105,7 @@ watch(() => agents.groups, (gs) => {
 // —— 新建 ——
 // 组列表视图顶部按钮：新建组
 async function openNewGroup() {
-  const name = window.prompt('请输入组名')?.trim()
+  const name = (await usePrompt('请输入组名'))?.trim()
   if (!name) return
   await agents.createGroup({ name })
 }
@@ -147,7 +148,7 @@ async function ctxRenameGroup() {
   if (!groupCtx.value) return
   const g = groupCtx.value.g
   closeGroupCtx()
-  const name = window.prompt('请输入新组名', g.name)?.trim()
+  const name = (await usePrompt('请输入新组名', g.name))?.trim()
   if (!name) return
   await agents.updateGroup(g.id, { name })
 }
@@ -160,7 +161,7 @@ async function ctxDeleteGroup() {
   const g = groupCtx.value.g
   const n = agentsOfGroup(g.id).length
   closeGroupCtx()
-  if (window.confirm(`确定删除分组「${g.name}」吗？\n分组会被删除，组内 ${n} 个智能体将移回「全部」组（智能体保留）。`)) {
+  if (await useConfirm(`确定删除分组「${g.name}」吗？\n分组会被删除，组内 ${n} 个智能体将移回「全部」组（智能体保留）。`)) {
     await agents.removeGroup(g.id)
   }
 }
@@ -169,7 +170,7 @@ async function ctxClearGroup() {
   const g = groupCtx.value.g
   const n = agentsOfGroup(g.id).length
   closeGroupCtx()
-  if (window.confirm(`确定清空分组「${g.name}」吗？\n分组会保留，组内 ${n} 个智能体将移回「全部」组（智能体保留）。`)) {
+  if (await useConfirm(`确定清空分组「${g.name}」吗？\n分组会保留，组内 ${n} 个智能体将移回「全部」组（智能体保留）。`)) {
     await agents.clearGroup(g.id)
   }
 }
@@ -179,7 +180,7 @@ async function ctxPurgeGroup() {
   const n = agentsOfGroup(g.id).length
   closeGroupCtx()
   const msg = `⚠️ 确定删除分组「${g.name}」及其组内全部 ${n} 个智能体吗？\n智能体会被永久删除，它们在画布上的节点与连线也会一并清理，此操作不可恢复！`
-  if (window.confirm(msg)) {
+  if (await useConfirm(msg, { danger: true, cancelText: '再想想', confirmText: '彻底删除' })) {
     await agents.removeGroupWithAgents(g.id)
   }
 }
@@ -208,7 +209,7 @@ async function ctxDelete() {
   if (!ctx.value) return
   const a = ctx.value.a
   closeCtx()
-  if (window.confirm(`确定删除智能体「${a.name}」吗？其在画布上的节点与连线会一并清理。`)) {
+  if (await useConfirm(`确定删除智能体「${a.name}」吗？其在画布上的节点与连线会一并清理。`)) {
     await agents.remove(a.id)
   }
 }
@@ -222,7 +223,7 @@ async function ctxNewGroupAndAssign() {
   if (!ctx.value) return
   const a = ctx.value.a
   closeCtx()
-  const name = window.prompt('请输入组名')?.trim()
+  const name = (await usePrompt('请输入组名'))?.trim()
   if (!name) return
   const g = await agents.createGroup({ name })
   await agents.assignToGroup(a.id, g.id)

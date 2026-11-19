@@ -908,17 +908,18 @@ def _is_within(p: Path, root: Path) -> bool:
         return False
 
 
-def migrate_to(new_path: str, dry_run: bool = False) -> dict:
+def migrate_to(new_path: str, dry_run: bool = False, delete_source: bool = False) -> dict:
     """把当前 ROOT 下的用户数据复制到指定位置，随后把存储根切过去。
 
     安全约定（迁移是不可逆风险点，全部按「不破坏数据」设计）：
-      - 只复制、不删除：源位置数据原样保留，复制中途失败也不会丢数据；
+      - 只复制、不删除（默认）：源位置数据原样保留，复制中途失败也不会丢数据；
+      - delete_source=True 时，复制+切根成功后删除源位置整个目录（包含 _legacy，务必确认）；
       - 不覆盖：目标已有同名文件时跳过（避免用旧数据盖掉目标里的新数据），
         目标为空 = 完整迁移，目标已有数据 = 合并（目标优先）；
       - 拒绝同一位置 / 互相包含的目录（复制到自己内部会生成嵌套垃圾，包含关系还可能覆盖源文件）；
-      - dry_run 只统计，不建目录、不写文件、不切换 ROOT（供确认弹窗预估文件数）。
+      - dry_run 只统计，不建目录、不写文件、不切换 ROOT、不删源（供确认弹窗预估文件数）。
 
-    返回 {"source", "target", "copied", "skipped", "bytes", "dry_run", "switched", "paths"}。
+    返回 {"source", "target", "copied", "skipped", "bytes", "dry_run", "switched", "source_deleted", "paths"}。
     """
     raw = (new_path or "").strip()
     if not raw:
@@ -976,6 +977,7 @@ def migrate_to(new_path: str, dry_run: bool = False) -> dict:
         "bytes": total,
         "dry_run": dry_run,
         "switched": False,
+        "source_deleted": False,
         "paths": get_store_paths(),
     }
     if dry_run:
@@ -984,7 +986,60 @@ def migrate_to(new_path: str, dry_run: bool = False) -> dict:
     result["paths"] = set_root(str(target))   # 切根后 paths 指向新位置
     result["switched"] = True
     print(f"[store] 已迁移用户数据：{source} → {target}（复制 {copied} 个，跳过 {skipped} 个）")
+
+    if delete_source:
+        _delete_migrate_source(source)
+        result["source_deleted"] = True
+
     return result
+
+
+def _delete_migrate_source(source: Path) -> None:
+    """迁移成功后删除源位置整个目录（含 _legacy）—— migrate_to 内部调用。"""
+    delete_data_dir(str(source))
+
+
+def delete_data_dir(path_str: str) -> dict:
+    """删除一个已生效的用户数据目录（公开 API，供前端"迁移后删除源位置"调用）。
+
+    安全检查：
+      - 目录必须存在
+      - 目录必须包含 settings.json 或 agents/ 子目录（防止误删系统目录）
+      - 目录不能是当前 ROOT 或 ROOT 的父/子目录（防止误删正在使用的数据）
+
+    返回 {"ok": True/False, "path": str, "reason": str}。
+    """
+    raw = (path_str or "").strip()
+    if not raw:
+        return {"ok": False, "path": "", "reason": "路径不能为空"}
+    source = Path(raw).expanduser()
+    try:
+        source = source.resolve()
+    except OSError as e:
+        return {"ok": False, "path": str(source), "reason": f"无法解析路径：{e}"}
+
+    if not source.exists():
+        return {"ok": False, "path": str(source), "reason": "目录不存在"}
+    if not source.is_dir():
+        return {"ok": False, "path": str(source), "reason": "不是目录"}
+
+    cur_root = ROOT.resolve()
+    if source == cur_root:
+        return {"ok": False, "path": str(source), "reason": "该目录正是当前使用的存储位置，不能删除"}
+    if _is_within(source, cur_root) or _is_within(cur_root, source):
+        return {"ok": False, "path": str(source), "reason": "目录与当前存储位置存在包含关系，安全兜底拒绝删除"}
+
+    # 防误删保护：目录必须包含 settings.json 或 agents/（确认为我们的数据目录）
+    if not (source / "settings.json").exists() and not (source / "agents").is_dir():
+        return {"ok": False, "path": str(source), "reason": "未检测到数据目录特征（settings.json / agents），拒绝删除以防误删系统目录"}
+
+    try:
+        shutil.rmtree(source)
+        print(f"[store] 已删除数据目录：{source}")
+        return {"ok": True, "path": str(source), "reason": ""}
+    except Exception as e:
+        print(f"[store] 删除数据目录失败：{source}（{e}）")
+        return {"ok": False, "path": str(source), "reason": str(e)}
 
 
 def _count_skill_dirs() -> int:
