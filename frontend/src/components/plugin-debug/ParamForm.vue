@@ -74,8 +74,23 @@ function onInput(name: string, e: Event) {
 
 <template>
   <div class="param-form">
-    <!-- 固定头部（不随滚轮移动）：工具描述（默认折叠）+ 运行按钮 + 参数添加下拉框 -->
+    <!-- 固定头部（不随滚轮移动）：当前插件名称 + 工具描述（默认折叠）+ 运行按钮 + 参数添加下拉框 -->
     <div class="head">
+      <!-- 当前打开的插件标识：置于工具描述上方 -->
+      <div
+        v-if="plugin"
+        class="plugin-banner"
+        :title="plugin.label ? `${plugin.label}（${plugin.name}）` : plugin.name"
+      >
+        <span class="picon"><AppIcon :name="plugin.icon || 'plug'" /></span>
+        <div class="pmeta">
+          <span class="ptitle">{{ plugin.label || plugin.name }}</span>
+          <span class="pid">name: {{ plugin.name }}</span>
+        </div>
+        <span v-if="plugin.version" class="pver">v{{ plugin.version }}</span>
+      </div>
+      <div v-else class="plugin-banner none">未选择插件</div>
+
       <details v-if="plugin" class="tool-desc">
         <summary class="tool-desc-summary">
           <span class="tool-desc-label">工具描述</span>
@@ -182,6 +197,27 @@ function onInput(name: string, e: Event) {
 .param-form { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .head { flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-top: 12px; }
+
+.plugin-banner {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 10px 12px; border-radius: 10px;
+  background: rgba(var(--surface-rgb), 0.06); border: 1px solid rgba(var(--surface-rgb), 0.12);
+}
+.plugin-banner.none {
+  justify-content: center; font-size: calc(12px * var(--font-scale)); opacity: .5;
+  background: rgba(var(--surface-rgb), 0.03); border-style: dashed;
+}
+.picon { flex-shrink: 0; font-size: calc(18px * var(--font-scale)); line-height: 1; }
+.pmeta { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.ptitle {
+  font-size: calc(15px * var(--font-scale)); font-weight: 600; line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pid {
+  font-family: Consolas, monospace; font-size: calc(10px * var(--font-scale)); opacity: .5;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pver { flex-shrink: 0; font-family: Consolas, monospace; font-size: calc(11px * var(--font-scale)); opacity: .55; }
 
 .tool-desc {
   border-radius: 10px; overflow: hidden;
