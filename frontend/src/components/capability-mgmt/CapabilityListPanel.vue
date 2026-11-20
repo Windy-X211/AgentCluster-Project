@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useSettingsStore } from '@/stores'
 import { api } from '@/api'
 import type { ComboMember, ComboRecord } from '@/api'
@@ -126,7 +126,7 @@ function persistGroups(updatedMap?: GroupMap) {
     if (bKeys && bKeys.length === filtered.length && bKeys.every((k, i) => k === filtered[i])) continue
     clean[g] = filtered
   }
-  saveGroupsFor(activeType.value, clean)
+  return saveGroupsFor(activeType.value, clean)
 }
 
 // —— Toast ——
@@ -208,6 +208,156 @@ function commitNewGroup() {
 
 // —— 选中能力 ——
 function selectKey(key: string) { selectedKey.value = key }
+
+// ============================================================
+// 右键菜单 + 多选（仅技能/插件；命令是内置能力，不可删）
+// ============================================================
+const canManage = computed(() => activeType.value === 'skills' || activeType.value === 'plugins')
+const multiMode = ref(false)
+const multiSel = ref<Set<string>>(new Set())
+const capCtx = ref<{ x: number; y: number; key: string } | null>(null)
+const ctxMoveSub = ref(false)
+const deleting = ref(false)
+
+const allSelected = computed(() =>
+  allKeys.value.length > 0 && allKeys.value.every(k => multiSel.value.has(k)),
+)
+const capCtxTitle = computed(() => {
+  if (multiSel.value.size > 1) return `已选 ${multiSel.value.size} 项`
+  const k = capCtx.value?.key
+  if (!k) return ''
+  return (metaFor(activeType.value)[k] as any)?.label || k
+})
+const groupNamesForMove = computed(() => Object.keys(effectiveGroups.value))
+
+function onCapClick(key: string) {
+  if (multiMode.value) toggleMulti(key)
+  else selectKey(key)
+}
+
+function onCapContextMenu(e: MouseEvent, key: string) {
+  if (!canManage.value) return
+  e.preventDefault()
+  e.stopPropagation()
+  // 右键未选中的项 → 自动并入当前选择；右键已选中的项 → 保留整批选择
+  if (!multiSel.value.has(key)) {
+    multiSel.value = new Set([...multiSel.value, key])
+  }
+  ctxMoveSub.value = false
+  const MENU_W = 210
+  const MENU_H = multiMode.value ? 330 : 300
+  capCtx.value = {
+    x: Math.max(6, Math.min(e.clientX, window.innerWidth - MENU_W - 10)),
+    y: Math.max(6, Math.min(e.clientY, window.innerHeight - MENU_H - 10)),
+    key,
+  }
+}
+
+function closeCapCtx() {
+  capCtx.value = null
+  ctxMoveSub.value = false
+}
+
+function enterMultiMode(key?: string) {
+  multiMode.value = true
+  if (key) multiSel.value = new Set([...multiSel.value, key])
+  else if (!multiSel.value.size) multiSel.value = new Set()
+  closeCapCtx()
+}
+
+function exitMultiMode() {
+  multiMode.value = false
+  multiSel.value = new Set()
+  closeCapCtx()
+}
+
+function toggleMulti(key: string) {
+  const s = new Set(multiSel.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  multiSel.value = s
+}
+
+function toggleSelectAll() {
+  if (allSelected.value) multiSel.value = new Set()
+  else multiSel.value = new Set(allKeys.value)
+  closeCapCtx()
+}
+
+async function moveSelectedTo(group: string | null) {
+  const keys = [...multiSel.value]
+  if (!keys.length) { closeCapCtx(); return }
+  const map: GroupMap = { ...effectiveGroups.value }
+  for (const g of Object.keys(map)) map[g] = map[g].filter(k => !keys.includes(k))
+  if (group) {
+    if (!map[group]) map[group] = []
+    for (const k of keys) if (!map[group].includes(k)) map[group].push(k)
+  }
+  closeCapCtx()
+  try {
+    await persistGroups(map)
+    showToast(`已将 ${keys.length} 项移到「${group || '未分组'}」`)
+  } catch { /* saveGroupsFor 内部已提示 */ }
+}
+
+async function deleteSelectedCaps() {
+  const type = activeType.value
+  if (type !== 'skills' && type !== 'plugins') return
+  const keys = [...multiSel.value]
+  if (!keys.length) { showToast('请先选择要删除的能力', 'err'); return }
+  closeCapCtx()
+  const label = type === 'skills' ? '技能' : '插件'
+  const names = keys.map(k => (metaFor(type)[k] as any)?.label || k)
+  if (!confirm(`删除 ${keys.length} 个${label}？\n这会移除本地安装目录，不可恢复。\n\n${names.join('、')}`)) return
+  deleting.value = true
+  try {
+    const res = await api.capabilities.deleteCapabilities(type, keys)
+    const deleted: string[] = res?.deleted || []
+    const failed = res?.failed || []
+    await settings.reloadCapabilities()
+
+    if (deleted.length) {
+      // 从分组里摘除（空分组保留）
+      const nextGroups: GroupMap = {}
+      for (const [g, ks] of Object.entries(effectiveGroups.value)) {
+        nextGroups[g] = ks.filter(k => !deleted.includes(k))
+      }
+      try { await persistGroups(nextGroups) } catch { /* 已提示 */ }
+      // 从组合技成员里摘除
+      let combosChanged = false
+      const nextCombos: Record<string, ComboRecord> = {}
+      for (const [name, rec] of Object.entries(combosData.value)) {
+        const members = (rec.members || []).filter(m => !(m.type === type && deleted.includes(m.key)))
+        if (members.length !== (rec.members || []).length) combosChanged = true
+        nextCombos[name] = { ...rec, members }
+      }
+      if (combosChanged) {
+        combosData.value = nextCombos
+        await persistCombos()
+      }
+      if (selectedKey.value && deleted.includes(selectedKey.value)) selectedKey.value = null
+    }
+
+    await loadGroupsFor(type)
+    await loadCombos()
+    multiMode.value = false
+    multiSel.value = new Set()
+    if (failed.length) {
+      showToast(`已删除 ${deleted.length} 个${label}，${failed.length} 个失败：${failed.map(f => f.key).join('、')}`, 'err')
+    } else {
+      showToast(`已删除 ${deleted.length} 个${label}`)
+    }
+  } catch (e: any) {
+    showToast(`删除失败：${e?.message || e}`, 'err')
+  } finally {
+    deleting.value = false
+  }
+}
+
+function onDocClickCloseCtx() { if (capCtx.value) closeCapCtx() }
+function onDocKeyCloseCtx(e: KeyboardEvent) {
+  if (e.key === 'Escape' && capCtx.value) closeCapCtx()
+}
 
 // —— 详情数据 ——
 const detail = computed(() => {
@@ -316,6 +466,9 @@ function moveToGroup(key: string, targetGroup: string | null) {
 }
 
 onMounted(async () => {
+  window.addEventListener('click', onDocClickCloseCtx)
+  window.addEventListener('keydown', onDocKeyCloseCtx)
+  window.addEventListener('scroll', onDocClickCloseCtx, true)
   if (!settings.loaded) {
     await settings.fetch()
   }
@@ -323,9 +476,16 @@ onMounted(async () => {
   await loadCombos()
 })
 
+onBeforeUnmount(() => {
+  window.removeEventListener('click', onDocClickCloseCtx)
+  window.removeEventListener('keydown', onDocKeyCloseCtx)
+  window.removeEventListener('scroll', onDocClickCloseCtx, true)
+})
+
 // 类型切换时加载对应分组
 watch(activeType, async () => {
   selectedKey.value = null
+  exitMultiMode()
   if (activeType.value === 'combos') {
     await loadCombos()
   } else {
@@ -656,6 +816,16 @@ function commitAddMember() {
       <div class="top-actions">
         <button v-if="activeType === 'combos'" class="btn sm ghost" @click="openNewCombo">＋ 新建组合技</button>
         <button v-else class="btn sm ghost" @click="openNewGroup">＋ 新建分组</button>
+        <template v-if="canManage">
+          <button v-if="!multiMode" class="btn sm ghost" @click="enterMultiMode()">☑ 多选</button>
+          <template v-else>
+            <span class="multi-badge">已选 {{ multiSel.size }}</span>
+            <button class="btn sm ghost" @click="toggleSelectAll">{{ allSelected ? '取消全选' : '全选' }}</button>
+            <button class="btn sm ghost danger" :disabled="!multiSel.size || deleting"
+                    @click="deleteSelectedCaps">🗑 删除所选</button>
+            <button class="btn sm ghost" @click="exitMultiMode">退出多选</button>
+          </template>
+        </template>
         <button class="btn sm ghost" @click="reload" :disabled="loading">
           <span v-if="loading">⟳</span><span v-else>⟳ 刷新</span>
         </button>
@@ -697,12 +867,14 @@ function commitAddMember() {
           <div v-if="!collapsed.has(g.name)" class="group-items">
             <div v-for="k in g.keys" :key="k"
                  class="cap-item"
-                 :class="{ selected: selectedKey === k, dragging: false, 'insert-before': dragInsertKey === k && dragOverTarget === g.name }"
+                 :class="{ selected: selectedKey === k && !multiMode, dragging: false, 'insert-before': dragInsertKey === k && dragOverTarget === g.name, 'multi-on': multiMode, 'multi-checked': multiSel.has(k) }"
                  draggable="true"
-                 @click="selectKey(k)"
+                 @click="onCapClick(k)"
+                 @contextmenu.prevent="onCapContextMenu($event, k)"
                  @dragstart="onDragStart($event, k)"
                  @dragend="onDragEnd"
                  @dragover="onDragOverItem($event, k)">
+              <span v-if="multiMode" class="ci-check">{{ multiSel.has(k) ? '✓' : '' }}</span>
               <span class="ci-icon">{{ activeType === 'commands' ? '⌨' : activeType === 'skills' ? '✨' : '🧩' }}</span>
               <span class="ci-label">{{ (metaFor(activeType)[k] as any)?.label || k }}</span>
               <span class="ci-key">{{ k }}</span>
@@ -724,12 +896,14 @@ function commitAddMember() {
         <div v-if="!collapsed.has('__ungrouped__')" class="group-items ungrouped-items">
           <div v-for="k in groupedList.ungrouped" :key="k"
                class="cap-item"
-               :class="{ selected: selectedKey === k, 'insert-before': dragInsertKey === k && dragOverTarget === '__ungrouped__' }"
+               :class="{ selected: selectedKey === k && !multiMode, 'insert-before': dragInsertKey === k && dragOverTarget === '__ungrouped__', 'multi-on': multiMode, 'multi-checked': multiSel.has(k) }"
                draggable="true"
-               @click="selectKey(k)"
+               @click="onCapClick(k)"
+               @contextmenu.prevent="onCapContextMenu($event, k)"
                @dragstart="onDragStart($event, k)"
                @dragend="onDragEnd"
                @dragover="onDragOverItem($event, k)">
+            <span v-if="multiMode" class="ci-check">{{ multiSel.has(k) ? '✓' : '' }}</span>
             <span class="ci-icon">{{ activeType === 'commands' ? '⌨' : activeType === 'skills' ? '✨' : '🧩' }}</span>
             <span class="ci-label">{{ (metaFor(activeType)[k] as any)?.label || k }}</span>
             <span class="ci-key">{{ k }}</span>
@@ -977,6 +1151,34 @@ function commitAddMember() {
       </div>
     </Teleport>
 
+    <!-- 能力右键菜单（仅技能/插件） -->
+    <Teleport to="body">
+      <div v-if="capCtx" class="cap-ctx glass"
+           :style="{ left: capCtx.x + 'px', top: capCtx.y + 'px' }"
+           @click.stop @contextmenu.prevent>
+        <div class="ctx-title">{{ capCtxTitle }}</div>
+        <div v-if="!multiMode" class="ctx-item" @click.stop="enterMultiMode(capCtx.key)">☑ 多选模式</div>
+        <div class="ctx-item" @click.stop="toggleSelectAll">{{ allSelected ? '✕ 取消全选' : '☑ 全选当前列表' }}</div>
+        <div class="ctx-sep"></div>
+        <div class="ctx-item" @click.stop="ctxMoveSub = !ctxMoveSub">
+          📁 移到分组
+          <span class="ctx-arrow">{{ ctxMoveSub ? '▾' : '▸' }}</span>
+        </div>
+        <div v-if="ctxMoveSub" class="ctx-sub">
+          <div class="ctx-item sub" v-for="g in groupNamesForMove" :key="g"
+               @click.stop="moveSelectedTo(g)">{{ g }}</div>
+          <div v-if="!groupNamesForMove.length" class="ctx-item sub disabled">暂无分组</div>
+          <div class="ctx-item sub" @click.stop="moveSelectedTo(null)">（未分组）</div>
+        </div>
+        <div class="ctx-sep"></div>
+        <div class="ctx-item danger" @click.stop="deleteSelectedCaps">
+          🗑 删除{{ multiSel.size > 1 ? `所选（${multiSel.size}）` : '' }}
+        </div>
+        <div v-if="multiMode" class="ctx-sep"></div>
+        <div v-if="multiMode" class="ctx-item" @click.stop="exitMultiMode">退出多选</div>
+      </div>
+    </Teleport>
+
     <Transition name="fade">
       <div v-if="toast" class="toast" :class="toast.kind">{{ toast.msg }}</div>
     </Transition>
@@ -1042,10 +1244,32 @@ function commitAddMember() {
   background: rgba(var(--surface-rgb), 0.15); color: rgba(var(--text-rgb), 0.6);
 }
 .g-spacer { flex: 1; }
-.g-btn { opacity: 0; transition: opacity .15s; padding: 2px 6px; font-size: calc(11px * var(--font-scale)); }
-.group-header:hover .g-btn { opacity: 0.7; }
-.g-btn:hover { opacity: 1 !important; color: rgb(var(--text-rgb)); }
-.g-btn.danger:hover { color: #e08080; }
+.g-btn {
+  opacity: 0;
+  transition: opacity .15s, background .15s, color .15s;
+  padding: 2px 6px;
+  font-size: calc(11px * var(--font-scale));
+  /* 关键：必须显式给颜色。按钮默认走浏览器 UA 的 ButtonText（黑/白），
+     在深色玻璃卡片上会和背景同色 → 编辑/删除图标看不见 */
+  color: rgba(var(--text-rgb), 0.72);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.group-header:hover .g-btn { opacity: 0.85; }
+.combo-item:hover .g-btn { opacity: 0.85; }
+.g-btn:hover {
+  opacity: 1 !important;
+  color: rgb(var(--text-rgb));
+  background: rgba(var(--surface-rgb), 0.12);
+}
+.g-btn.danger { color: #ff9a9a; }
+.g-btn.danger:hover {
+  color: #ffb0b0;
+  background: rgba(232, 92, 92, 0.18);
+}
 .g-rename-input {
   flex: 1; padding: 2px 6px; border-radius: 4px;
   background: rgba(var(--surface-rgb), 0.15); border: 1px solid rgba(var(--accent-rgb), 0.4);
@@ -1240,6 +1464,69 @@ function commitAddMember() {
   font-family: Consolas, monospace; font-size: calc(10px * var(--font-scale)); opacity: .4;
   text-align: right;
 }
+
+/* ============ 多选 & 右键菜单 ============ */
+.multi-badge {
+  display: inline-flex; align-items: center;
+  padding: 2px 9px; border-radius: 999px;
+  font-size: calc(11px * var(--font-scale));
+  background: rgba(var(--accent-rgb), 0.14);
+  border: 1px solid rgba(var(--accent-rgb), 0.25);
+  color: var(--accent-light);
+}
+.ci-check {
+  width: 14px; height: 14px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 4px; border: 1px solid rgba(var(--surface-rgb), 0.35);
+  font-size: calc(10px * var(--font-scale)); line-height: 1;
+  color: rgb(var(--text-rgb));
+}
+.cap-item.multi-checked {
+  background: rgba(var(--accent-rgb), 0.12);
+  border-color: rgba(var(--accent-rgb), 0.32);
+}
+.cap-item.multi-checked .ci-check {
+  background: rgba(var(--accent-rgb), 0.55);
+  border-color: rgba(var(--accent-rgb), 0.7);
+}
+.cap-item.multi-on { cursor: pointer; }
+
+.cap-ctx {
+  position: fixed; z-index: 2200; min-width: 190px; max-width: 240px;
+  padding: 5px; border-radius: 8px;
+  max-height: 70vh; overflow-y: auto;
+  box-shadow: 0 10px 30px rgba(var(--shadow-rgb), 0.28);
+  font-size: calc(12px * var(--font-scale));
+}
+.ctx-title {
+  padding: 6px 9px 7px; font-weight: 600;
+  color: rgba(var(--text-rgb), 0.55);
+  font-size: calc(11px * var(--font-scale));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ctx-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 9px; border-radius: 6px; cursor: pointer; user-select: none;
+  color: rgba(var(--text-rgb), 0.85);
+}
+.ctx-item:hover { background: rgba(var(--surface-rgb), 0.12); }
+.ctx-item.danger { color: #e08080; }
+.ctx-item.danger:hover { background: rgba(220, 100, 100, 0.14); }
+.ctx-item.disabled { opacity: .4; cursor: default; }
+.ctx-item.sub { padding-left: 22px; }
+.ctx-arrow { margin-left: auto; opacity: .5; font-size: calc(10px * var(--font-scale)); }
+.ctx-sep { height: 1px; margin: 4px 6px; background: rgba(var(--surface-rgb), 0.14); }
+.ctx-sub {
+  display: flex; flex-direction: column;
+  max-height: 38vh; overflow-y: auto;
+  border-left: 2px solid rgba(var(--accent-rgb), 0.25);
+  margin-left: 8px;
+}
+.btn.danger {
+  color: #e08080;
+  border-color: rgba(220, 100, 100, 0.35);
+}
+.btn.danger:hover:not(:disabled) { background: rgba(220, 100, 100, 0.14); }
 
 /* Toast */
 .toast {

@@ -62,6 +62,63 @@ def reload_capabilities():
     }
 
 
+@router.post("/delete")
+def delete_capabilities(payload: dict):
+    """卸载技能 / 插件：删除本地安装目录并热重载注册表。
+
+    命令是内置能力，不支持删除（前端只在技能/插件上提供删除入口）。
+    payload: {"type": "skills" | "plugins", "keys": ["..."]}
+    返回: {"ok": bool, "deleted": [...], "failed": [{"key", "error"}]}
+    """
+    import shutil
+    import sys
+    from pathlib import Path
+
+    from skills import SKILL_REGISTRY, load_skills, _skills_root
+    from plugins import PLUGIN_REGISTRY, load_plugins, _plugins_root
+
+    type_ = (payload or {}).get("type")
+    keys = (payload or {}).get("keys") or []
+    if type_ not in ("skills", "plugins"):
+        return {"ok": False, "error": "仅支持删除 skills / plugins", "deleted": [], "failed": []}
+    if not isinstance(keys, list) or not keys:
+        return {"ok": False, "error": "keys 不能为空", "deleted": [], "failed": []}
+
+    registry = SKILL_REGISTRY if type_ == "skills" else PLUGIN_REGISTRY
+    root = (_skills_root() if type_ == "skills" else _plugins_root()).resolve()
+
+    deleted: list[str] = []
+    failed: list[dict] = []
+    for key in keys:
+        key = str(key)
+        try:
+            entry = registry.get(key) or {}
+            src = entry.get("_source_dir")
+            target = Path(src) if src else (root / key)
+            target = target.resolve()
+            if not target.exists() or not target.is_dir():
+                failed.append({"key": key, "error": "目录不存在（可能已被删除）"})
+                continue
+            # 安全护栏：只允许删除该类型根目录下的直属子目录
+            if target == root or root not in target.parents:
+                failed.append({"key": key, "error": "路径非法，拒绝删除"})
+                continue
+            shutil.rmtree(target)
+            if type_ == "plugins":
+                # 清掉已加载的插件模块，避免残留旧代码
+                sys.modules.pop(f"_plugin_{target.name}", None)
+            deleted.append(key)
+        except Exception as e:
+            failed.append({"key": key, "error": f"{type(e).__name__}: {e}"})
+
+    if deleted:
+        if type_ == "skills":
+            load_skills()
+        else:
+            load_plugins()
+    return {"ok": not failed, "deleted": deleted, "failed": failed}
+
+
 @router.post("/run")
 def run(c: CmdIn):
     """先尝试命令，再尝试插件"""

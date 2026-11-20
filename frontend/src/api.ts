@@ -360,6 +360,12 @@ export const api = {
     commands: () => req<any>('/commands/commands'),
     plugins: () => req<any>('/commands/plugins'),
     reload: () => req<any>('/commands/reload', { method: 'POST' }),
+    // 卸载技能/插件（删除本地安装目录；命令为内置能力不可删）
+    deleteCapabilities: (type: 'skills' | 'plugins', keys: string[]) =>
+      req<{ ok: boolean; error?: string; deleted: string[]; failed: { key: string; error: string }[] }>(
+        '/commands/delete',
+        { method: 'POST', body: JSON.stringify({ type, keys }), timeout: 120_000 },
+      ),
     run: (d: any) => req('/commands/run', { method: 'POST', body: JSON.stringify(d), timeout: 600_000 }),
     dependencies: () => req<any>('/commands/dependencies'),
   },
