@@ -285,7 +285,7 @@ watch(
   flex: 1;
   font-family: Consolas, monospace;
   font-size: calc(12px * var(--font-scale));
-  color: rgba(var(--surface-rgb), .6);
+  color: rgba(var(--text-rgb), .6);
   background: rgba(var(--surface-rgb), .04);
   padding: 4px 10px;
   border-radius: 4px;
@@ -318,7 +318,7 @@ watch(
 .tree-root {
   padding: 8px 12px;
   font-size: calc(12px * var(--font-scale));
-  color: rgba(var(--surface-rgb), .5);
+  color: rgba(var(--text-rgb), .5);
   border-bottom: 1px solid rgba(var(--surface-rgb), .04);
   cursor: pointer;
   font-family: Consolas, monospace;
@@ -362,7 +362,7 @@ watch(
   align-items: center;
   justify-content: center;
   gap: 10px;
-  color: rgba(var(--surface-rgb), .4);
+  color: rgba(var(--text-rgb), .4);
 }
 .empty-big { font-size: calc(48px * var(--font-scale)); opacity: .5; }
 .empty-hint { font-size: calc(14px * var(--font-scale)); }
@@ -403,7 +403,7 @@ watch(
 .editor-footer {
   padding: 4px 14px;
   font-size: calc(11px * var(--font-scale));
-  color: rgba(var(--surface-rgb), .35);
+  color: rgba(var(--text-rgb), .35);
   border-top: 1px solid rgba(var(--surface-rgb), .06);
   background: rgba(var(--shadow-rgb), .12);
 }

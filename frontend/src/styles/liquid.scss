@@ -57,7 +57,9 @@
   --bg-base: #ffffff;
   --bg-grad-1: #ffffff;
   --bg-grad-2: #ffffff;
-  --surface-rgb: 20, 30, 50;
+  /* 冷调「玻璃墨」：所有 rgba(surface, .03~.12) 的填充/描边从灰变成极浅冷蓝，
+     白底上不再发灰，而是呈现玻璃雾面 */
+  --surface-rgb: 86, 118, 178;
   --shadow-rgb: 20, 30, 50;
   --text-rgb: 12, 18, 28;
   --accent-rgb: 37, 99, 235;
@@ -66,31 +68,23 @@
   --accent2-light: #7c3aed;
   --success-light: #16a34a;
   --panel-bg: #ffffff;
-  --node-bg-rgb: 228, 236, 245;
+  --node-bg-rgb: 249, 251, 255;
   --red-ink: #dc2626;
   --code-ink: #c2410c;
   --code-tint-bg: #e2ebf6;
   --code-tint-strong: #cfdbef;
   --code-tint-pre: #e2ebf6;
-  --tint-soft-bg: #f5f8fc;
-  --tint-input-bg: #f8fafc;
+  /* 去灰：浅灰底 → 半透明白（配 backdrop-filter 即为毛玻璃） */
+  --tint-soft-bg: rgba(255, 255, 255, 0.62);
+  --tint-input-bg: rgba(255, 255, 255, 0.72);
+  /* 毛玻璃面板三件套（.glass / .glass-soft / 弹层统一用它们） */
+  --glass-panel-bg: rgba(255, 255, 255, 0.55);
+  --glass-panel-bg-soft: rgba(255, 255, 255, 0.46);
+  --glass-panel-edge: rgba(255, 255, 255, 0.92);
+  --glass-panel-blur: blur(20px) saturate(190%);
+  --glass-panel-shadow: 0 14px 42px rgba(20, 30, 50, 0.10), 0 0 0 1px rgba(37, 99, 235, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 -1px 0 rgba(20, 30, 50, 0.05);
   --glass-shadow: 0 1px 8px rgba(20, 30, 50, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.6);
   --popup-shadow: 0 4px 20px rgba(20, 30, 50, 0.08);
-}
-
-/* 科技白：左右面板去玻璃灰底——容器背景透明露出白底，仅消息泡泡与列表卡片保留灰 */
-[data-theme="tech-white"] .left.glass,
-[data-theme="tech-white"] .right-panel.glass {
-  background: transparent;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-}
-
-/* 科技白：智能体列表卡片改用与消息泡泡一致的浅灰底（原 glass-soft 0.03 在白底上过淡） */
-[data-theme="tech-white"] .left .glass-soft {
-  background: var(--tint-soft-bg);
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
 }
 
 /* 护眼白（米黄） */
@@ -181,6 +175,97 @@ option {
   border-radius: 10px;
   box-shadow: var(--popup-shadow);
   color: var(--text);
+}
+
+/* ============================================================
+   科技白 · 全局毛玻璃（去灰）
+   只换「材质」，不动组件结构：所有界面统一生效
+   ============================================================ */
+[data-theme="tech-white"] .glass {
+  background: var(--glass-panel-bg);
+  backdrop-filter: var(--glass-panel-blur);
+  -webkit-backdrop-filter: var(--glass-panel-blur);
+  border-color: var(--glass-panel-edge);
+  box-shadow: var(--glass-panel-shadow);
+}
+
+[data-theme="tech-white"] .glass-soft {
+  background: var(--glass-panel-bg-soft);
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  border-color: rgba(255, 255, 255, 0.80);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.90);
+}
+
+/* 悬浮弹层：弹窗、右键菜单、气泡等，统一白玻璃 */
+[data-theme="tech-white"] .popup-surface {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(24px) saturate(190%);
+  -webkit-backdrop-filter: blur(24px) saturate(190%);
+  border-color: var(--glass-panel-edge);
+  box-shadow: 0 18px 48px rgba(20, 30, 50, 0.14), 0 0 0 1px rgba(37, 99, 235, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+/* 输入类控件：灰底 → 白玻璃 + 内阴影，聚焦走主色光晕 */
+[data-theme="tech-white"] .input {
+  background: rgba(255, 255, 255, 0.66);
+  border-color: rgba(var(--shadow-rgb), 0.14);
+  box-shadow: inset 0 1px 3px rgba(var(--shadow-rgb), 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.90);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+
+  &:focus {
+    border-color: rgba(var(--accent-rgb), 0.50);
+    box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.14), inset 0 1px 3px rgba(var(--shadow-rgb), 0.05);
+  }
+}
+
+/* 按钮：幽灵态 hover 不再落灰，实心态补白亮边 */
+[data-theme="tech-white"] .btn {
+  border-color: rgba(255, 255, 255, 0.85);
+}
+
+[data-theme="tech-white"] .btn.ghost:hover {
+  background: rgba(255, 255, 255, 0.55);
+}
+
+/* 弹窗容器：统一白玻璃，遮罩由深灰改为浅冷调 */
+html[data-theme="tech-white"] body .modal,
+html[data-theme="tech-white"] body .modal-card {
+  background: rgba(255, 255, 255, 0.78);
+  backdrop-filter: blur(26px) saturate(190%);
+  -webkit-backdrop-filter: blur(26px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.92);
+  box-shadow: 0 26px 64px rgba(20, 30, 50, 0.18), 0 0 0 1px rgba(37, 99, 235, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+html[data-theme="tech-white"] body .modal-bg {
+  background: rgba(226, 234, 248, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* 卡片类（参数预设等）：灰底 → 白玻璃 */
+html[data-theme="tech-white"] body .preset-card {
+  background: rgba(255, 255, 255, 0.55);
+  border-color: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 6px 20px rgba(20, 30, 50, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+/* 滚动条：灰 → 冷调薄雾 */
+[data-theme="tech-white"] ::-webkit-scrollbar-thumb {
+  background: rgba(var(--surface-rgb), 0.16);
+}
+
+/* 页面底光：给毛玻璃提供可模糊内容，同时保证白基调 */
+html[data-theme="tech-white"] body .bg-layer {
+  background:
+    radial-gradient(58% 54% at 6% 0%, rgba(var(--accent-rgb), 0.15), transparent 62%),
+    radial-gradient(44% 44% at 94% 2%, rgba(var(--accent2-rgb), 0.11), transparent 60%),
+    radial-gradient(52% 48% at 62% 102%, rgba(14, 165, 233, 0.12), transparent 64%),
+    linear-gradient(158deg, #ffffff 0%, #f6faff 46%, #ecf2fe 100%);
 }
 
 .btn {
@@ -431,4 +516,69 @@ html.desktop-frameless .pywebview-drag-region {
   line-height: 1;
   flex-shrink: 0;
   color: inherit;
+}
+
+/* ============================================================
+   科技白 · 能力管理 / 插件调试（.region-plugins）：局部补充
+   玻璃与去灰已由上面的全局规则统一处理，这里只补该区域的细节
+   ============================================================ */
+[data-theme="tech-white"] .region-plugins {
+  /* chip：从实色强调底改为薄染玻璃（按类型分色），配白亮边 */
+  .chip.blue,
+  .chip.purple,
+  .chip.green {
+    background: rgba(var(--accent-rgb), 0.10);
+    color: #12305c;
+    border-color: rgba(var(--accent-rgb), 0.24);
+    box-shadow:
+      0 2px 8px rgba(var(--shadow-rgb), 0.05),
+      inset 0 1px 0 rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  .chip.purple {
+    background: rgba(var(--accent2-rgb), 0.10);
+    color: #3a1f6b;
+    border-color: rgba(var(--accent2-rgb), 0.24);
+  }
+
+  .chip.green {
+    background: rgba(22, 163, 74, 0.10);
+    color: #134e2c;
+    border-color: rgba(22, 163, 74, 0.24);
+  }
+
+  .chip .x:hover {
+    background: rgba(255, 255, 255, 0.65);
+  }
+
+  /* 面板标题：标题与说明之间补出间距（原来两组文字紧贴） */
+  .panel-title {
+    justify-content: flex-start;
+    gap: 10px;
+
+    .hint {
+      margin-right: auto;
+    }
+  }
+}
+
+/* 能力选择器弹窗被 Teleport 到 body，脱离 .region-plugins 作用域，单独覆盖。
+   用 html 前缀抬高特异性，压过组件内 scoped 样式 */
+html[data-theme="tech-white"] .picker-mask {
+  background: rgba(233, 240, 252, 0.52);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+html[data-theme="tech-white"] .picker-popup {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(24px) saturate(190%);
+  -webkit-backdrop-filter: blur(24px) saturate(190%);
+  border-color: rgba(255, 255, 255, 0.92);
+  box-shadow:
+    0 24px 60px rgba(var(--shadow-rgb), 0.16),
+    0 0 0 1px rgba(var(--accent-rgb), 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
 }

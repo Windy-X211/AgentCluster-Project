@@ -49,8 +49,8 @@ async function close() { try { await windowAPI.close() } catch {} }
     <!-- 拖动区 2：中间空白 -->
     <div class="spacer pywebview-drag-region" />
     <!-- 下面这些都没有 pywebview-drag-region 类 → 可正常点击 -->
-    <RouterLink to="/market" class="nav-item"><AppIcon name="shopping-cart" /> 市场</RouterLink>
-    <RouterLink to="/extensions" class="nav-item"><AppIcon name="puzzle" /> 功能拓展</RouterLink>
+    <RouterLink to="/market" class="nav-item region-market"><AppIcon name="shopping-cart" /> 市场</RouterLink>
+    <RouterLink to="/extensions" class="nav-item region-extensions"><AppIcon name="puzzle" /> 功能拓展</RouterLink>
     <RouterLink to="/capabilities" class="nav-item"><AppIcon name="wrench" /> 能力管理</RouterLink>
     <RouterLink to="/settings" class="nav-item"><AppIcon name="settings" /> 设置</RouterLink>
     <template v-if="isDesktop">

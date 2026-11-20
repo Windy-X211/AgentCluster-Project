@@ -901,7 +901,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="mk-root">
+  <div class="mk-root region-market">
     <div class="mk-top glass">
       <RouterLink to="/" class="btn ghost">← 返回</RouterLink>
       <div class="top-drag pywebview-drag-region">
