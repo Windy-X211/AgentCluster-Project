@@ -149,6 +149,8 @@ const bgMenu = ref<{ x: number; y: number } | null>(null)
 const edgeMenu = ref<{ edge: any; x: number; y: number } | null>(null)
 // 消息气泡：每个节点的隐藏状态（按画布 id 持久化在画布的 meta 字段里）
 const bubbleHidden = ref<Record<number, boolean>>({})
+// 仅显示「正在运行」的智能体气泡：全局开关放在 settings（所有画布共用 + 重启沿用上次选择）
+const runningBubblesOnly = computed(() => settings.runningBubblesOnly)
 const renameEdit = ref(false)
 const renameValue = ref('')
 const newCanvasDialog = ref(false)
@@ -447,8 +449,7 @@ function getBubbleForAgent(agentId: number) {
 const BUBBLE_W = 230, BUBBLE_H = 140, BUBBLE_GAP = 12
 const bubbleLayout = computed<Map<number, 'top' | 'bottom'>>(() => {
   const layout = new Map<number, 'top' | 'bottom'>()
-  const visible = nodes.value.filter((n: any) =>
-    getBubbleForAgent(n.agent_id) && !bubbleHidden.value[n.id])
+  const visible = nodes.value.filter((n: any) => isBubbleVisible(n))
   if (visible.length <= 1) {
     if (visible.length === 1) layout.set(visible[0].id, 'top')
     return layout
@@ -536,6 +537,36 @@ function nodeState(agentId: number): 'speaking' | 'calling' | 'waiting' | null {
   const callEdges = convs.callEdges || []
   if (callEdges.some(d => d.from === agentId || d.to === agentId)) return 'calling'
   return 'waiting'
+}
+
+/**
+ * 「仅显示正在运行的消息泡泡」模式下的运行判定。
+ * 算运行中：正在输出 token（speaking）、正在发起/接收调用（calling）、
+ * 气泡里还有没回结果的工具或仍在流式的深度思考。
+ * 闲置等待（waiting）与整体运行结束都不算 → 运行一结束气泡自动收起。
+ */
+function isAgentRunning(agentId: number): boolean {
+  if (!runningBubblesOnly.value) return true
+  const st = nodeState(agentId)
+  if (st === 'speaking' || st === 'calling') return true
+  const bubble = getBubbleForAgent(agentId)
+  if (bubble?.streaming) return true
+  // 工具还在转圈 / 深度思考还在流式：绑定自己正在干活
+  return (bubble?.chunks || []).some(
+    (c) => (c.kind === 'tool' && !!c.toolRunning) || (c.kind === 'reasoning' && !!c.streaming)
+  )
+}
+
+/** 气泡是否可见：有气泡数据 + 未被手动隐藏 + 「仅运行中」过滤 */
+function isBubbleVisible(n: any): boolean {
+  if (!getBubbleForAgent(n.agent_id)) return false
+  if (bubbleHidden.value[n.id]) return false
+  return isAgentRunning(n.agent_id)
+}
+
+/** 空白区菜单：勾选/取消「仅显示正在运行的消息泡泡」（写入全局设置，所有画布同步） */
+function toggleRunningBubblesOnly() {
+  settings.setRunningBubblesOnly(!settings.runningBubblesOnly)
 }
 
 // —— 连线配色：按「源智能体」定纯色 ——
@@ -4350,23 +4381,51 @@ function resetBubbleStick() {
   })
 }
 
-function scrollBubblesToBottom() {
+/** 单个气泡贴底：仅在用户没有主动上滑脱离跟随时生效 */
+function stickOneBubble(el: HTMLElement) {
+  if ((el as any).__stickBottom === false) return
+  const target = el.scrollHeight
+  if (Math.abs(el.scrollTop - target) < 1) return
+  el.scrollTop = target
+}
+
+/**
+ * 气泡首次出现 / 重新显示后贴底。
+ * 一次 rAF 往往早于字体加载、markdown 重排、图片撑高等异步布局，
+ * 因此在随后若干帧内持续跟随 scrollHeight，保证「加载完就在最新一条」。
+ * 用户上滑（__stickBottom === false）或气泡卸载时立即停止。
+ */
+function pinBubbleToBottom(el: HTMLElement, frames = 24) {
+  if (!el) return
+  stickOneBubble(el)
+  let left = frames
+  const step = () => {
+    if (!el.isConnected || (el as any).__stickBottom === false) return
+    stickOneBubble(el)
+    if (--left > 0) requestAnimationFrame(step)
+  }
+  requestAnimationFrame(step)
+}
+
+/** 模板函数 ref：气泡挂载（含切对话、双击头像重新显示）即贴底 */
+function registerBubble(el: any) {
+  if (!el || el.nodeType !== 1) return
+  pinBubbleToBottom(el as HTMLElement)
+}
+
+function scrollBubblesToBottom(onlyStreaming = false) {
   const root = boardRef.value
   if (!root) return
-  // 只自动贴底「正在流式输出的发言者」那个气泡，已完成的让用户自由滚动
-  if (!convs.streaming) return
-  root.querySelectorAll<HTMLElement>('.node-bubble.streaming').forEach(el => {
-    if ((el as any).__stickBottom === false) return
-    el.scrollTop = el.scrollHeight
-  })
+  // 流式发言者优先贴底；已完成的气泡在未脱离跟随时同样贴底，
+  // 这样历史消息异步渲染完成后停在最新一条，而不是停在最上面。
+  const sel = onlyStreaming ? '.node-bubble.streaming' : '.node-bubble'
+  root.querySelectorAll<HTMLElement>(sel).forEach(stickOneBubble)
 }
 
 function scrollAllBubblesToBottom() {
   const root = boardRef.value
   if (!root) return
-  root.querySelectorAll<HTMLElement>('.node-bubble').forEach(el => {
-    el.scrollTop = el.scrollHeight
-  })
+  root.querySelectorAll<HTMLElement>('.node-bubble').forEach((el) => pinBubbleToBottom(el))
 }
 
 // 气泡流式自动滚到底：监听 bubbleMap（内容每次变化都重新计算，含 token 到达时的 content mutate）
@@ -4374,7 +4433,7 @@ function scrollAllBubblesToBottom() {
 watch([bubbleMap, bubbleScrollKey], async () => {
   await nextTick()
   // 等浏览器完成本帧布局后再滚，确保 scrollHeight 已包含最新文字
-  requestAnimationFrame(scrollBubblesToBottom)
+  requestAnimationFrame(() => scrollBubblesToBottom())
 }, { flush: 'post' })
 
 // 打开/切换对话记录时，把画布上所有当前显示的气泡一次性滑到底部
@@ -4394,13 +4453,13 @@ watch(() => [convs.streaming, convs.speakingAgent] as const, async ([sp], oldVal
   let rafId = 0
   const tick = () => {
     if (!convs.streaming) return
-    scrollBubblesToBottom()
+    scrollBubblesToBottom(true)
     rafId = requestAnimationFrame(tick)
   }
   rafId = requestAnimationFrame(tick)
   // 下一帧立即滚一次（内容刚到位）
   await nextTick()
-  scrollBubblesToBottom()
+  scrollBubblesToBottom(true)
 })
 
 // 暴露 viewportRef 给父组件（钉住模式下 WorkspaceOverlay 要嵌入 viewport 内部）
@@ -4590,7 +4649,8 @@ defineExpose({ viewportRef, computeNodeBbox })
              @dblclick="onNodeDblClick($event, n)"
              @contextmenu="showCtxMenu($event, n)">
           <!-- 消息气泡：双击气泡可隐藏；流式输出中也尊重用户的隐藏设置 -->
-          <div v-if="getBubbleForAgent(n.agent_id) && !bubbleHidden[n.id]"
+          <div v-if="isBubbleVisible(n)"
+               :ref="registerBubble"
                class="node-bubble"
                :class="{
                  streaming: getBubbleForAgent(n.agent_id)?.streaming,
@@ -4721,6 +4781,8 @@ defineExpose({ viewportRef, computeNodeBbox })
           <div class="ctx-item" @click="toggleWorkspace()"><AppIcon name="folder" /> 显示/隐藏工作区</div>
           <div class="ctx-item" @click="closeMenus(); wdPath = canvas?.workdir || ''; wdOpen = true"><AppIcon name="folder" /> 设置工作区文件夹…</div>
           <div class="ctx-divider" />
+          <div class="ctx-item" :class="{ checked: runningBubblesOnly }"
+               @click.stop="toggleRunningBubblesOnly()">仅显示正在运行的消息泡泡</div>
           <div class="ctx-item" @click="closeMenus(); hideAllBubblesForce()"><AppIcon name="eye-off" /> 隐藏所有消息泡泡</div>
           <div class="ctx-item" @click="closeMenus(); hideAllBubbles()"><AppIcon name="eye" /> 显示所有消息泡泡</div>
         </template>
