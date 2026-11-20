@@ -388,7 +388,7 @@ const BUILTIN_PRESETS = [
   { name: '日日新', url: 'https://token.sensenova.cn/v1' },
   { name: '火山引擎', url: 'https://ark.cn-beijing.volces.com/api/v3' },
   { name: '阿里云百炼', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-  { name: '华为云 ModelArts', url: 'https://api.modelarts-ma.mas.huawei.com/v1' },
+  { name: '华为云 MaaS', url: 'https://api.modelarts-maas.com/v2' },
   { name: '本地 Ollama', url: 'http://localhost:11434/v1' },
 ]
 const PRESETS_KEY = 'agent-cluster.iface.urlPresets'

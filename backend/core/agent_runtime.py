@@ -650,56 +650,33 @@ _MODEL_OCCUPANCIES: dict[tuple[str, str], set[str]] = {}
 
 async def _occupy_model(agent: dict, interface: dict | None, owner_tag: str,
                          canvas: dict | None) -> str:
-    """并行模式下分配一个模型。
+    """模型选择：所有模式下均使用 agent 自己配置的模型。
 
-    - 串行模式：直接算好 default_model 返回，不做任何登记。
-    - 并行模式：在 Lock 内从 interface.models[] 里选一个当前空闲的槽，登记后返回。
-      如果所有备选都被占（模型数不足），则退化为共用——选择当前占用者最少的槽，
-      允许同一个模型并行被多个 agent 同时使用。
+    - agent 显式指定了 model → 用 agent.model
+    - 否则用 interface.default_model
+    - 兜底用 "gpt-4o-mini"
 
-    上层（agent_reply 的 finally 块）必须调用 _release_model(owner_tag) 释放。
-    释放动作**不依赖返回值**，只靠 owner_tag 从全局占用表里删掉。"""
+    不再做"并行时均分可用模型"的分配逻辑——每个 agent 始终使用自己的默认接口/模型。
+    同一个 API endpoint 天然支持并发请求，无需前端侧做模型槽位抢占。"""
     exec_mode = (canvas or {}).get("execution_mode", "serial") if canvas else "serial"
 
-    # 先算 default_model（尊重 agent.model 覆盖）
-    default_model = (agent.get("model")
-                     or (interface or {}).get("default_model")
-                     or "gpt-4o-mini")
+    # 直接算好 default_model（尊重 agent.model 覆盖）
+    model = (agent.get("model")
+             or (interface or {}).get("default_model")
+             or "gpt-4o-mini")
 
-    # agent 自己指定了 model → 不做抢占分配
-    if agent.get("model") or exec_mode != "parallel":
-        if exec_mode != "parallel":
-            # 串行：直接返回，不登记
-            return default_model
-        # 并行但指定了 model → 只登记该模型（优先独占，被占满时共用）
-        ordered = [default_model]
-    else:
-        # —— 并行模式，未指定 agent.model：从 interface.models[] 里挑一个空闲槽 ——
-        models_list = (interface or {}).get("models") or []
-        if not models_list:
-            models_list = [default_model]
-        ordered: list[str] = []
-        if default_model in models_list:
-            ordered.append(default_model)
-        for m in models_list:
-            if m not in ordered:
-                ordered.append(m)
+    if exec_mode != "parallel":
+        # 串行：直接返回，不登记
+        return model
 
+    # 并行：也直接用自己的默认模型，不做均分分配
+    # 仍做登记（占用表），便于将来如需限流时可扩展
     url = (interface or {}).get("url") or "_"
     async with _MODEL_KEY_LOCK:
-        # 优先占用第一个空闲槽
-        for m in ordered:
-            key = (url, m)
-            holders = _MODEL_OCCUPANCIES.setdefault(key, set())
-            # 自己可能已在占用表里（嵌套 relay 同 task 重入），视为空闲可重占
-            if not holders or holders == {owner_tag}:
-                holders.add(owner_tag)
-                return m
-        # 模型数不够（所有候选槽都被占）：退化为共用——
-        # 选择当前占用者最少的槽，允许多个 agent 并行共用同一模型
-        m = min(ordered, key=lambda x: len(_MODEL_OCCUPANCIES.get((url, x), ())))
-        _MODEL_OCCUPANCIES.setdefault((url, m), set()).add(owner_tag)
-        return m
+        key = (url, model)
+        holders = _MODEL_OCCUPANCIES.setdefault(key, set())
+        holders.add(owner_tag)
+        return model
 
 
 def _release_all_for_owner(owner_tag: str) -> None:
