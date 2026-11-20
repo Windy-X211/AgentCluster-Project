@@ -98,6 +98,10 @@
   --popup-menu-edge: rgba(255, 255, 255, 0.92);
   --popup-menu-shadow: 0 16px 44px rgba(20, 30, 50, 0.16), 0 0 0 1px rgba(37, 99, 235, 0.05);
   --popup-menu-blur: blur(22px) saturate(190%);
+  /* 文件编辑器（数据文件浏览器的编辑窗口） */
+  --editor-bg: #ffffff;
+  --editor-ink: #0c121c;
+  --warn-ink: #b45309;
   /* 原生控件（select 展开列表、滚动条等）跟随浅色，否则系统深色模式下是黑的 */
   color-scheme: light;
 }

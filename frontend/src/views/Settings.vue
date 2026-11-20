@@ -18,6 +18,56 @@ function startGuide(type: 'flow' | 'region') {
   router.push('/')
 }
 
+// —— 右侧目录：快速跳转到各设置区块 ——
+const sectionList = [
+  { id: 'sec-model', name: '模型接口' },
+  { id: 'sec-ctx', name: '历史上下文压缩' },
+  { id: 'sec-agent', name: '默认智能体' },
+  { id: 'sec-perm', name: '权限设置' },
+  { id: 'sec-appearance', name: '外观设置' },
+  { id: 'sec-guide', name: '新手引导' },
+  { id: 'sec-sound', name: '提示音' },
+  { id: 'sec-asr', name: '语音识别' },
+  { id: 'sec-launch', name: '启动方式' },
+  { id: 'sec-storage', name: '数据存储' },
+] as const
+const panelsRef = ref<HTMLElement | null>(null)
+const activeSection = ref<string>(sectionList[0].id)
+
+function sectionEl(id: string): HTMLElement | null {
+  const root = panelsRef.value
+  return root ? (root.querySelector('#' + id) as HTMLElement | null) : null
+}
+
+// 点击目录：让面板滚动容器滚到对应区块（留 8px 呼吸位）
+function jumpToSection(id: string) {
+  const root = panelsRef.value
+  const el = sectionEl(id)
+  if (!root || !el) return
+  const top = el.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop - 8
+  activeSection.value = id
+  root.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+}
+
+// 滚动监听：以容器顶部往下 28px 作为判定线，高亮当前区块
+let _spyRaf = 0
+function onPanelsScroll() {
+  if (_spyRaf) return
+  _spyRaf = requestAnimationFrame(() => {
+    _spyRaf = 0
+    const root = panelsRef.value
+    if (!root) return
+    const line = root.getBoundingClientRect().top + 28
+    let current: string = sectionList[0].id
+    for (const s of sectionList) {
+      const el = sectionEl(s.id)
+      if (el && el.getBoundingClientRect().top <= line) current = s.id
+    }
+    if (root.scrollTop + root.clientHeight >= root.scrollHeight - 8) current = sectionList[sectionList.length - 1].id
+    activeSection.value = current
+  })
+}
+
 const themeOptions = [
   { id: 'standard', name: '标准配色-深邃黑', bg: '#000000', bgGrad: '#080808', text: '#ececec', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
   { id: 'galaxy-blue', name: '银河蓝', bg: '#0a0e1a', bgGrad: '#1a2340', text: '#ececec', accent: '#6ea8ff', surface: 'rgba(255,255,255,0.12)' },
@@ -231,6 +281,8 @@ onMounted(async () => {
   try { storagePaths.value = await api.storage.paths() } catch {}
   storageLocation.value = storagePaths.value?.root || ''
   loadBackgrounds()
+  // 数据回来后布局高度会变，重新校准一次目录高亮
+  setTimeout(onPanelsScroll, 60)
 })
 onBeforeUnmount(() => window.removeEventListener('keydown', onIfaceKeydown))
 
@@ -679,9 +731,10 @@ const agentGroupOptions = computed(() => {
       </div>
     </div>
 
-    <div class="panels">
+    <div class="settings-body">
+      <div class="panels" ref="panelsRef" @scroll.passive="onPanelsScroll">
       <!-- 模型接口 -->
-      <div class="panel glass">
+      <div id="sec-model" class="panel glass">
         <div class="panel-title">
           <span>模型接口</span>
           <button class="btn" @click="openNew">+ 新建接口</button>
@@ -709,7 +762,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 历史上下文压缩 -->
-      <div class="panel glass">
+      <div id="sec-ctx" class="panel glass">
         <div class="panel-title">
           <span><AppIcon name="save" /> 历史上下文压缩</span>
           <span class="hint">达到压缩线时自动把较早历史压缩成摘要</span>
@@ -737,7 +790,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 默认智能体 -->
-      <div class="panel glass">
+      <div id="sec-agent" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><rect width="18" height="10" x="3" y="7" rx="2"/><path d="M12 11v4"/><path d="M8 11v4"/><path d="M16 11v4"/></svg>默认智能体</span>
           <span class="hint">新建对话时自动选中</span>
@@ -759,7 +812,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 权限设置（危险操作授权 + 可操作范围，后端执行端见 core/permissions.py） -->
-      <div class="panel glass">
+      <div id="sec-perm" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>权限设置</span>
           <span class="hint">限制智能体的危险操作与可操作范围</span>
@@ -835,7 +888,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 外观设置 -->
-      <div class="panel glass">
+      <div id="sec-appearance" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>外观设置</span>
           <span class="hint">界面外观偏好</span>
@@ -1020,7 +1073,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 新手引导 -->
-      <div class="panel glass">
+      <div id="sec-guide" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>新手引导</span>
           <span class="hint">再次查看引导说明</span>
@@ -1040,7 +1093,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
           <span class="hint">任务结束时的声音反馈</span>
-      <div class="panel glass">
+      <div id="sec-sound" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>提示音</span>
           <span class="hint">画布运行结束时的声音反馈</span>
@@ -1066,7 +1119,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 语音识别 -->
-      <div class="panel glass">
+      <div id="sec-asr" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>语音识别</span>
           <span class="hint">SenseVoice 同声传译</span>
@@ -1106,7 +1159,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 启动方式 -->
-      <div class="panel glass">
+      <div id="sec-launch" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.9A12.8 12.8 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>启动方式</span>
           <span class="hint">下次双击 start.bat 时的行为</span>
@@ -1163,7 +1216,7 @@ const agentGroupOptions = computed(() => {
       </div>
 
       <!-- 数据存储 -->
-      <div class="panel glass">
+      <div id="sec-storage" class="panel glass">
         <div class="panel-title">
           <span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>数据存储</span>
           <span class="hint">v2 · 每条记录一个 json</span>
@@ -1179,7 +1232,7 @@ const agentGroupOptions = computed(() => {
                   title="把当前用户数据复制到该位置并切换存储位置（迁移完成后可选择删除原数据）">迁移</button>
         </div>
         <div class="storage-loc-tip">默认位置为用户数据目录（Windows：%LOCALAPPDATA%\AgentCluster，已在项目文件夹之外）；输入框回车/失焦 = 仅切换（按该位置现有数据接管），要把当前数据搬过去请点「迁移」</div>
-        <table class="tbl" v-if="storagePaths">
+        <table class="tbl storage-tbl" v-if="storagePaths">
           <thead><tr><th>名称</th><th>类型</th><th>相对路径</th><th>数量</th><th style="width: 120px"></th></tr></thead>
           <tbody>
             <tr>
@@ -1235,6 +1288,25 @@ const agentGroupOptions = computed(() => {
         </table>
         <div v-if="!storagePaths" class="empty">后端未返回路径信息</div>
       </div>
+      </div>
+
+      <!-- 右侧目录：点击快速跳转到对应设置区块，滚动时自动高亮 -->
+      <aside class="settings-toc" v-if="sectionList.length">
+        <div class="toc-head">目录</div>
+        <nav class="toc-list">
+          <button
+            v-for="s in sectionList"
+            :key="s.id"
+            type="button"
+            class="toc-item"
+            :class="{ active: activeSection === s.id }"
+            @click="jumpToSection(s.id)"
+          >
+            <span class="toc-bar"></span>
+            <span class="toc-text">{{ s.name }}</span>
+          </button>
+        </nav>
+      </aside>
     </div>
 
     <!-- 接口编辑弹窗（popup-surface 实底：glass 的 blur+saturate 采样深色遮罩，浅色主题下整窗发灰） -->
@@ -1424,7 +1496,15 @@ const agentGroupOptions = computed(() => {
 
 .storage-loc-tip { font-size: calc(11px * var(--font-scale)); opacity: .5; margin: 6px 0 0; }
 .empty { padding: 24px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }
-.tag-t { font-size: calc(10px * var(--font-scale)); padding: 2px 8px; border-radius: 4px; background: rgba(var(--accent-rgb), 0.15); color: var(--accent-light); border: 1px solid rgba(var(--accent-rgb), 0.25); font-family: Consolas, monospace; }
+.tag-t { font-size: calc(11px * var(--font-scale)); padding: 0; border: none; background: none; color: rgba(var(--text-rgb), 0.55); font-family: inherit; font-weight: 400; }
+
+/* 数据存储表：名称做主信息（更大、更深、加粗），类型退成次要说明，不再高亮底色 */
+.storage-tbl td:first-child {
+  font-size: calc(14px * var(--font-scale));
+  font-weight: 600;
+  color: rgb(var(--text-rgb));
+}
+.storage-tbl .tag-t { opacity: .9; }
 
 .cap-block { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(var(--surface-rgb), 0.06); }
 .cap-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
