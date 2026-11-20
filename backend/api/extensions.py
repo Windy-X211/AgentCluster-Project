@@ -32,11 +32,56 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 import core.store as _store
 
 router = APIRouter()
+
+# —— 拓展配置页的「浅色主题覆写」——
+# 拓展自带 config.html 普遍写死了深色配色，与主程序的科技白（毛玻璃）主题割裂。
+# 前端打开配置弹窗时带上 ?theme=<当前主题>，这里在返回的 HTML 里注入一段覆写样式：
+# 拓展自身代码零改动，主程序换主题即可让配置页跟着变。
+_EXT_LIGHT_OVERRIDES = """
+<style id="ac-theme-overrides">
+:root { color-scheme: light; }
+html, body { background: #ffffff !important; color: #0c121c !important; }
+body { background: linear-gradient(180deg, #ffffff 0%, #f7faff 55%, #eff4fd 100%) !important; }
+.card, .panel, .block, .box, .group {
+  background: rgba(255, 255, 255, .62) !important;
+  border-color: rgba(86, 118, 178, .16) !important;
+  box-shadow: 0 6px 20px rgba(20, 30, 50, .06), inset 0 1px 0 rgba(255, 255, 255, .9) !important;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+}
+pre, textarea, .tool, .list, .row-item {
+  background: rgba(255, 255, 255, .78) !important;
+  border-color: rgba(86, 118, 178, .16) !important;
+  color: #1f2937 !important;
+}
+input, input.text, select { background: rgba(255, 255, 255, .9) !important; border-color: rgba(86, 118, 178, .22) !important; color: #0c121c !important; }
+button { background: rgba(255, 255, 255, .72) !important; border-color: rgba(86, 118, 178, .22) !important; color: #0c121c !important; }
+button:hover { background: rgba(37, 99, 235, .08) !important; }
+button.primary { background: rgba(37, 99, 235, .12) !important; border-color: rgba(37, 99, 235, .45) !important; color: #2563eb !important; }
+button.warn, button.danger { background: rgba(220, 38, 38, .10) !important; border-color: rgba(220, 38, 38, .3) !important; color: #dc2626 !important; }
+.status.ok, .ok { color: #15803d !important; background: rgba(22, 163, 74, .10) !important; }
+.status.bad, .bad, .err { color: #dc2626 !important; background: rgba(220, 38, 38, .10) !important; }
+.tool b { color: #2563eb !important; }
+.switch input { background: rgba(86, 118, 178, .22) !important; }
+code, kbd { background: rgba(255, 255, 255, .72) !important; color: #c2410c !important; }
+*::-webkit-scrollbar-thumb { background: rgba(86, 118, 178, .2) !important; }
+</style>
+"""
+
+_THEME_LIGHT = {"tech-white", "eye-care"}
+
+
+def _inject_theme_css(html: str, theme: str) -> str:
+    """给拓展配置页注入浅色覆写样式（仅浅色主题）。"""
+    if theme not in _THEME_LIGHT:
+        return html
+    if "</head>" in html:
+        return html.replace("</head>", _EXT_LIGHT_OVERRIDES + "</head>", 1)
+    return _EXT_LIGHT_OVERRIDES + html
 
 # —— 存储根（用户数据目录）——
 # 不缓存成模块级常量：用户在设置里切换/迁移存储位置后，拓展读写要跟着走新 ROOT
@@ -433,14 +478,16 @@ async def mount_extension_backends(app: Any) -> int:
                 if _cfg_fp.exists() and _cfg_fp.stat().st_size <= _MAX_FILE_BYTES:
                     def _make_cfg(fp):
                         from fastapi.responses import HTMLResponse
-                        def _config():
+                        def _config(request: Request):
                             try:
-                                return HTMLResponse(fp.read_text(encoding="utf-8"))
+                                text = fp.read_text(encoding="utf-8")
                             except UnicodeDecodeError:
                                 try:
-                                    return HTMLResponse(fp.read_text(encoding="gbk"))
+                                    text = fp.read_text(encoding="gbk")
                                 except Exception:
                                     return HTMLResponse("", status_code=500)
+                            theme = (request.query_params.get("theme") or "").strip()
+                            return HTMLResponse(_inject_theme_css(text, theme))
                         return _config
                     router.add_api_route("/config", _make_cfg(_cfg_fp), methods=["GET"])
             app.include_router(router, prefix=f"/api/ext/{eid}", tags=[f"ext-{eid}"])

@@ -85,6 +85,11 @@
   --glass-panel-shadow: 0 14px 42px rgba(20, 30, 50, 0.10), 0 0 0 1px rgba(37, 99, 235, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 -1px 0 rgba(20, 30, 50, 0.05);
   --glass-shadow: 0 1px 8px rgba(20, 30, 50, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.6);
   --popup-shadow: 0 4px 20px rgba(20, 30, 50, 0.08);
+  /* 弹窗遮罩 / toast（去黑去灰，改浅冷雾） */
+  --modal-mask: rgba(226, 234, 248, 0.55);
+  --modal-mask-blur: blur(8px) saturate(150%);
+  --toast-bg: rgba(255, 255, 255, 0.9);
+  --toast-ink: #0c121c;
 }
 
 /* 护眼白（米黄） */
