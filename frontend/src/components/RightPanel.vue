@@ -3,6 +3,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, nextTick, render, createVNode } from 'vue'
 import { useRoute } from 'vue-router'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
+import { CANVAS_LIST_MIN, CANVAS_LIST_MAX } from '@/stores/layout'
 import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, parseTs } from '@/stores/conversation'
 import { renderChatMarkdown } from '@/utils/markdown'
 import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
@@ -496,6 +497,54 @@ const convsCollapsed = computed({ get: () => layout.convsCollapsed, set: (v: boo
 const route = useRoute()
 const isHomeRoute = computed(() => route.path === '/')
 const canvasesCollapsed = ref(true) // 画布列表默认折叠
+
+// ============ 画布列表 / 对话区 分界线拖动 ============
+// .divider 兼作拖动把手（视觉上仍是 1px 细线，实际有 6px 热区）：
+// 上下拖动调节画布列表区高度；拖动中只改 store 内存值（不写 localStorage），
+// 松开后一次性持久化，避免每帧写盘。折叠态下画布列表只剩标题栏，按下忽略。
+const cvResizing = ref(false)
+let cvDragStartY = 0
+let cvDragStartH = 0
+let cvDragMaxH = CANVAS_LIST_MAX
+
+const canvasesPaneStyle = computed(() => (
+  canvasesCollapsed.value ? {} : { height: `${layout.canvasListHeight}px` }
+))
+
+function onDividerDown(e: MouseEvent) {
+  if (canvasesCollapsed.value) return          // 折叠态不响应，避免误触
+  if (e.button !== 0) return
+  e.preventDefault()
+  cvResizing.value = true
+  cvDragStartY = e.clientY
+  cvDragStartH = layout.canvasListHeight
+  const panel = (e.currentTarget as HTMLElement | null)?.closest('.right-panel') as HTMLElement | null
+  const panelH = panel?.clientHeight || window.innerHeight
+  // 下限保证画布列表可用，上限给对话区留 160px，避免把对话区压没
+  cvDragMaxH = Math.max(CANVAS_LIST_MIN, Math.min(CANVAS_LIST_MAX, panelH - 160))
+  document.body.style.cursor = 'row-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('mousemove', onDividerMove)
+  window.addEventListener('mouseup', onDividerUp)
+}
+function onDividerMove(e: MouseEvent) {
+  if (!cvResizing.value) return
+  const h = cvDragStartH + (e.clientY - cvDragStartY)
+  layout.canvasListHeight = Math.min(cvDragMaxH, Math.max(CANVAS_LIST_MIN, h))
+}
+function onDividerUp() {
+  if (!cvResizing.value) return
+  cvResizing.value = false
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  window.removeEventListener('mousemove', onDividerMove)
+  window.removeEventListener('mouseup', onDividerUp)
+  layout.setCanvasListHeight(layout.canvasListHeight)   // 落定后持久化
+}
+function onDividerDblClick() {
+  if (canvasesCollapsed.value) return
+  layout.resetCanvasListHeight()
+}
 const convDesc = ref(true) // 对话记录排序：true = 新在上，false = 新在下
 
 // —— 对话记录分类方式：无分类 / 按集群（画布）/ 按工作区（会话级 workdir）；localStorage 记忆上次选择 ——
@@ -3806,9 +3855,12 @@ onDeactivated(() => {
   window.removeEventListener('mouseup', onLbResizeEnd)
   window.removeEventListener('mousemove', onLbPanMove)
   window.removeEventListener('mouseup', onLbPanEnd)
+  // 画布列表高度拖动：被切走时立即收尾（清监听 + 恢复光标 + 持久化）
+  onDividerUp()
   unmountAllVizSlots()
 })
 onBeforeUnmount(() => {
+  onDividerUp()
   // 清理附件预览 URL
   for (const a of attachments.value) { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl) }
   unmountAllVizSlots()
@@ -3818,7 +3870,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="right-panel glass">
     <!-- 画布列表 -->
-    <div class="canvases-pane">
+    <div class="canvases-pane" :class="{ 'has-height': !canvasesCollapsed }" :style="canvasesPaneStyle">
       <div class="section-title clickable" @click="canvasesCollapsed = !canvasesCollapsed" :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
         <button class="collapse-btn" type="button"
                 :title="canvasesCollapsed ? '展开画布列表' : '折叠画布列表'">
@@ -3876,7 +3928,9 @@ onBeforeUnmount(() => {
                 @click="deleteCanvas(cvCtxMenu.id)">删除此画布</button>
       </div>
     </Teleport>
-    <div class="divider" ></div>
+    <div class="divider" :class="{ enabled: !canvasesCollapsed, dragging: cvResizing }"
+         @mousedown="onDividerDown" @dblclick="onDividerDblClick"
+         :title="canvasesCollapsed ? '展开画布列表后可上下拖动调节高度' : '上下拖动调节画布列表高度（双击恢复默认）'"></div>
     <!-- 对话 -->
     <div class="chat-pane" ref="chatPaneEl">
       <div class="chat-header">
@@ -4665,7 +4719,9 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .right-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
-.canvases-pane { padding: 4px 0; flex-shrink: 0; }
+.canvases-pane { padding: 4px 0; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+/* 展开时按记忆高度固定（高度由 style 注入），并留出对话区最低空间 */
+.canvases-pane.has-height { max-height: calc(100% - 140px); }
 /* 画布标题与对话标题使用完全相同的 padding，确保折叠按钮左右对齐 */
 .canvases-pane > .section-title { padding: 6px 8px 4px; gap: 6px; }
 .section-title.clickable { cursor: pointer; border-radius: 6px; transition: background .15s; }
@@ -4673,7 +4729,8 @@ onBeforeUnmount(() => {
 .section-title .add-canvas-btn { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: calc(16px * var(--font-scale)); font-weight: 500; line-height: 1; color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.10); border: 1px solid rgba(var(--accent-rgb), 0.26); border-radius: 7px; cursor: pointer; transition: background .2s ease, border-color .2s ease, color .2s ease; }
 .section-title .add-canvas-btn:hover { background: rgba(var(--accent-rgb), 0.20); border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent-light); }
 .section-title .add-canvas-btn:active { background: rgba(var(--accent-rgb), 0.28); }
-.cv-list { padding: 2px 4px; max-height: 180px; overflow-y: auto; }
+/* 列表区占满画布面板剩余高度，内容超出时独立滚动（高度随拖动改变） */
+.cv-list { padding: 2px 4px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .cv-item { padding: 6px 10px; border-radius: 8px; font-size: calc(12px * var(--font-scale)); cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 6px; position: relative; }
 .cv-item:hover { background: rgba(var(--surface-rgb), 0.05); }
 .cv-item.active { background: rgba(var(--accent-rgb), 0.15); border: 1px solid rgba(var(--accent-rgb), 0.25); }
@@ -4716,7 +4773,31 @@ onBeforeUnmount(() => {
 .cv-item:hover .del { opacity: .6; }
 .cv-item .del:hover { opacity: 1; color: #ff9090; background: rgba(232, 92, 92, 0.14); }
 .cv-rename { width: 100%; font-size: calc(12px * var(--font-scale)); padding: 2px 6px; border-radius: 4px; background: rgba(var(--shadow-rgb), 0.18); border: 1px solid rgba(var(--accent-rgb), 0.4); color: rgb(var(--text-rgb)); }
-.divider { height: 1px; flex-shrink: 0; background: rgba(var(--surface-rgb), 0.08); margin: 4px 10px; }
+/* 画布列表 / 对话区 分界线：兼作拖动把手（8px 热区，中间 1px 视觉线） */
+.divider {
+  height: 8px;
+  flex-shrink: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin: 0 10px;
+  cursor: default;
+}
+.divider::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  transform: translateY(-50%);
+  background: rgba(var(--surface-rgb), 0.08);
+  transition: background .15s ease, height .15s ease, box-shadow .15s ease;
+}
+/* 画布列表展开时才可拖动（折叠态只剩标题栏，无需调节） */
+.divider.enabled { cursor: row-resize; }
+.divider.enabled:hover::before { height: 2px; background: rgba(var(--accent-rgb), 0.45); }
+.divider.dragging::before { height: 2px; background: rgba(var(--accent-rgb), 0.8); box-shadow: 0 0 6px rgba(var(--accent-rgb), 0.35); }
 
 .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
 .chat-header { flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid rgba(var(--surface-rgb), 0.06); }

@@ -3,6 +3,10 @@ import { defineStore } from 'pinia'
 const KEY = 'agentcluster.layout.v1'
 export const RIGHT_MIN = 180
 export const RIGHT_DEFAULT = 300
+// 右侧面板内「画布列表」高度（画布列表与对话区之间的分界线可拖动调节）
+export const CANVAS_LIST_MIN = 96
+export const CANVAS_LIST_MAX = 640
+export const CANVAS_LIST_DEFAULT = 220
 // 双击画布空白区进入「聚焦模式」时对话区的收窄宽度
 export const RIGHT_FOCUS_COMPACT = 200
 export const FONT_SCALE_MIN = 0.85
@@ -69,6 +73,12 @@ function readSavedRightWidth(): number {
   return Math.max(RIGHT_MIN, Math.round(n))
 }
 
+function readCanvasListHeight(): number {
+  const n = Number(readStore()?.canvasListHeight)
+  if (!isFinite(n) || n <= 0) return CANVAS_LIST_DEFAULT
+  return Math.min(CANVAS_LIST_MAX, Math.max(CANVAS_LIST_MIN, Math.round(n)))
+}
+
 function readFontScale(): number {
   const n = Number(readStore()?.fontScale)
   if (!isFinite(n) || n <= 0) return FONT_SCALE_DEFAULT
@@ -107,6 +117,8 @@ function readBackgroundBlur(): number {
 export const useLayoutStore = defineStore('layout', {
   state: () => ({
     rightWidth: readWidth(),
+    // 画布列表区高度（拖动右侧面板内分界线调节，持久化）
+    canvasListHeight: readCanvasListHeight(),
     fontScale: readFontScale(),
     theme: readTheme(),
     fontFamily: readFontFamily(),
@@ -138,6 +150,14 @@ export const useLayoutStore = defineStore('layout', {
     },
     resetRightWidth() {
       this.setRightWidth(RIGHT_DEFAULT)
+    },
+    setCanvasListHeight(v: number) {
+      const n = Math.min(CANVAS_LIST_MAX, Math.max(CANVAS_LIST_MIN, Math.round(v)))
+      this.canvasListHeight = n
+      writeStore({ canvasListHeight: n })
+    },
+    resetCanvasListHeight() {
+      this.setCanvasListHeight(CANVAS_LIST_DEFAULT)
     },
     // 聚焦模式开关：进入时折叠智能体列表、收窄对话区并折叠对话记录；退出时恢复三者
     toggleFocusMode() {

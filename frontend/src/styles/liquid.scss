@@ -69,6 +69,9 @@
   --success-light: #16a34a;
   --panel-bg: #ffffff;
   --node-bg-rgb: 249, 251, 255;
+  /* 连线箭头外圈"抠图"描边：深色主题靠黑边把箭头从背景里抠出来，
+     浅色主题必须换成白色，否则箭头会被描成黑边（科技白下尤其刺眼） */
+  --edge-halo-rgb: 255, 255, 255;
   --red-ink: #dc2626;
   --code-ink: #c2410c;
   --code-tint-bg: #e2ebf6;
@@ -121,6 +124,8 @@ html[data-theme="tech-white"] body option {
   --success-light: #2f855a;
   --panel-bg: #ece1c5;
   --node-bg-rgb: 235, 225, 198;
+  /* 浅色主题同理：箭头外圈描边用米黄底色，避免黑边 */
+  --edge-halo-rgb: 244, 236, 214;
   --red-ink: #c53030;
   --code-ink: #92400e;
 }
