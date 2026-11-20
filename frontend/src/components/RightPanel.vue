@@ -1521,9 +1521,7 @@ const visibleMsgs = computed(() => {
       if (toOf(m) === cur) return showOtherAgents.value  // 其他智能体发给它的（受设置开关控制）
       return false
     }
-    if (m.agent_id === cur) return true                  // 当前智能体的输出，始终显示
-    // 其他智能体的输出（assistant / tool_call / tool_result 等）：受设置开关控制
-    return showOtherAgents.value
+    return m.agent_id === cur                           // assistant/tool 严格只属于自己，不受 showOtherAgents 影响
   }
   // 过滤时保留原始下标，供压缩摘要定位（split 是共享历史下标）
   const pairs = all.map((m: any, idx: number) => [m, idx] as const).filter(([m]) => keep(m))
@@ -1584,12 +1582,17 @@ const renderItems = computed(() => {
       const m2 = msgs[i] as any
       if (m2.role === 'tool_call' || m2.role === 'tool_result' || m2.role === 'tool') { i++; continue }
       if (m2.role === 'a2a') {
-        // 所有 a2a 信封统一渲染为 plain 子块（消息泡泡显示文字），不再有左右侧区分
-        children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: 'left' })
-        i++
+        // 只渲染"发给当前智能体"的信封（from !== cur）；自己发出的不渲染信封卡片。
+        // 显示在左/右侧由 sideOf（设置项）决定，与"是否渲染"无关。
+        const isOwn = cur != null && m2.envelope?.from?.agent_id === cur
+        if (cur == null || isOwn) {
+          i++
+        } else {
+          children.push({ kind: 'a2a-plain', msg: m2, idx: i, side: sideOf(m2) })
+          i++
+        }
       } else {
-        // 所有 assistant 子块统一 side='left'，不再按 agent 归属分左右
-        children.push({ kind: 'assistant', msg: m2, idx: i, side: 'left' })
+        children.push({ kind: 'assistant', msg: m2, idx: i, side: sideOf(m2) })
         i++
       }
     }
@@ -1601,12 +1604,17 @@ const renderItems = computed(() => {
       if (hasTool) out.push({ type: 'turn', start, end, children, side: 'left' })
       continue
     }
-    // 判断本段是否包含其他智能体的消息 → 使用 otherAgentsSide 设置的一侧
-    const hasOtherAgent = cur != null && children.some(
-      (c: any) => c.msg?.agent_id && c.msg.agent_id !== cur
-    )
-    const turnSide = hasOtherAgent ? otherAgentsSide.value : 'left'
-    out.push({ type: 'turn', start, end, children, side: turnSide })
+    // 按左右侧切成连续段：同侧相邻子块归入同一段
+    let g = 0
+    while (g < children.length) {
+      const side = children[g].side
+      const segStart = g === 0 ? start : children[g].idx
+      let ge = g
+      while (ge + 1 < children.length && children[ge + 1].side === side && children[ge + 1].kind === children[g].kind) ge++
+      const segEnd = ge + 1 < children.length ? children[ge + 1].idx - 1 : end
+      out.push({ type: 'turn', start: segStart, end: segEnd, children: children.slice(g, ge + 1), side })
+      g = ge + 1
+    }
   }
   return out
 })
@@ -2674,6 +2682,9 @@ function friendlyOp(op: string): string {
 //   用户停留在底部附近时自动贴底；用户上滑即脱离，不再抢滚动焦点（避免"锁底"）
 const BOTTOM_THRESHOLD = 48
 const stickBottom = ref(true)
+/** 对话区滚动时：距底部超过此阈值才显示"回到底部"按钮（px） */
+const SCROLL_BTN_THRESHOLD = 200
+const showScrollTopBtn = ref(false)
 
 function isNearBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_THRESHOLD
@@ -2682,6 +2693,9 @@ function onMessagesScroll() {
   const el = msgBox.value
   if (!el) return
   stickBottom.value = isNearBottom(el)
+  // 距底部超过阈值才显示回到底部按钮；滚回底部即隐藏
+  showScrollTopBtn.value = !stickBottom.value
+    && (el.scrollHeight - el.scrollTop - el.clientHeight > SCROLL_BTN_THRESHOLD)
   layout.chatMsgScrollTop = el.scrollTop
   console.log('[DBG scroll] saved chatMsgScrollTop=', el.scrollTop)
 }
@@ -2692,6 +2706,25 @@ function onConvListScroll() {
 function scrollToBottom() {
   const el = msgBox.value
   if (el) el.scrollTop = el.scrollHeight
+}
+/** 打开会话时把最后一条有内容的消息容器顶部对齐视口顶部 —— 保证消息泡泡开头完全可见 */
+function scrollToLastBubbleTop() {
+  const el = msgBox.value
+  if (!el) return
+  // 收集所有消息容器（用户 / 助手轮次），跳过空的 assistant turn
+  const allMsgs = el.querySelectorAll<HTMLElement>('.msg.user, .msg.assistant.turn')
+  let target: HTMLElement | null = null
+  for (let i = allMsgs.length - 1; i >= 0; i--) {
+    const m = allMsgs[i]
+    if (m.classList.contains('assistant') && m.classList.contains('empty')) continue
+    // 完全没有文本内容也跳过（比如只有工具调用、正文还没出来）
+    if (!m.textContent?.trim()) continue
+    target = m
+    break
+  }
+  if (!target) return
+  const delta = target.getBoundingClientRect().top - el.getBoundingClientRect().top
+  el.scrollTop = Math.max(0, el.scrollTop + delta - 8)
 }
 function followBottom() {
   if (stickBottom.value) scrollToBottom()
@@ -2760,14 +2793,13 @@ watch(() => convs.streaming, async (v) => {
   _wasStreamingForProc = v
 })
 
-// 切换对话记录时：滚动到底部，并默认选中运行中的智能体（优先）或最新一条回复的智能体
+// 切换对话记录时：滚到最后一条消息泡泡顶部（保证开头可见），并默认选中运行中的智能体（优先）或最新一条回复的智能体
 watch(() => convs.current, async (id) => {
   if (id == null) return
   scheduleCtxRefresh()
-  await nextTick()
-  // 切换对话记录：回到最新一条，并恢复底部跟随
   stickBottom.value = true
-  scrollToBottom()
+  await nextTick()
+  scrollToLastBubbleTop()
   const data = convs.currentData()
   const msgs = data?.messages || []
   // 正在输出流式消息的智能体优先（串行接力下 B 的输出挂在 A 的运行流里，
@@ -2796,6 +2828,9 @@ watch(() => convs.current, async (id) => {
     currentAgentId.value = running[0]
     convs.selectedAgentId = running[0]
   }
+  // refreshConv 拉完完整消息后 DOM 会重渲染，再滚一次确保定位到最后一条
+  await nextTick()
+  scrollToLastBubbleTop()
 })
 
 // ① 节点💬直接对话：回填选中智能体并聚焦输入框
@@ -4099,6 +4134,11 @@ onBeforeUnmount(() => {
           </div>
         </template>
       </div>
+      <!-- 悬浮回到底部按钮：距底部较远时出现；position: absolute 悬浮在 chat-box 上、chat-input 上方 -->
+      <button v-if="showScrollTopBtn" type="button" class="scroll-bottom-btn" title="回到底部 (End)"
+              @click="stickBottom = true; scrollToBottom()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>
+      </button>
       </div>
 
       <!-- 图片浮窗：8 方向边界改大小，滚轮只缩放图片不动窗口 -->
@@ -4461,6 +4501,25 @@ onBeforeUnmount(() => {
 
 .chat-scroll-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .chat-box { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
+.scroll-bottom-btn {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  z-index: 10;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid rgba(var(--surface-rgb), 0.18);
+  background: rgba(var(--tint-input-bg), 0.96);
+  backdrop-filter: blur(6px);
+  color: rgba(var(--text-rgb), 0.85);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.28);
+  transition: transform .12s ease, background .12s ease, color .12s ease;
+}
+.scroll-bottom-btn:hover { background: rgba(var(--accent-rgb), 0.22); color: var(--accent-ink); transform: translateY(1px); }
+.scroll-bottom-btn:active { transform: translateY(2px) scale(0.96); }
 .no-conv { text-align: center; opacity: .7; margin: 30px auto; font-size: calc(13px * var(--font-scale)); }
 
 /* ============ 消息容器 ============ */
