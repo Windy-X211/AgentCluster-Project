@@ -81,10 +81,11 @@ onBeforeUnmount(() => {
 .ht-tip {
   z-index: 3100; padding: 10px 12px; border-radius: 8px;
   font-size: calc(12px * var(--font-scale)); line-height: 1.55; overflow-y: auto; overflow-x: hidden;
-  background: rgba(30, 34, 50, 0.98);
+  /* 弹层底色跟随主题（深色主题近黑、科技白/护眼白为浅底），避免白底上黑框 */
+  background: rgba(var(--node-bg-rgb), 0.98);
   border: 1px solid rgba(var(--surface-rgb), 0.14);
   color: rgb(var(--text-rgb));
-  box-shadow: 0 12px 30px rgba(var(--shadow-rgb), 0.55);
+  box-shadow: var(--popup-shadow);
   backdrop-filter: blur(8px);
   white-space: pre-wrap; word-break: break-word;
   cursor: default;
