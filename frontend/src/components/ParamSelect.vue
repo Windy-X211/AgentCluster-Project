@@ -154,7 +154,7 @@ onBeforeUnmount(() => {
 .ps-trigger {
   display: flex; align-items: center; gap: 8px;
   width: 100%; padding: 8px 12px; border-radius: 8px; cursor: pointer; text-align: left;
-  background: rgba(var(--surface-rgb), 0.04);
+  background: var(--tint-input-bg, rgba(var(--surface-rgb), 0.04));
   border: 1px solid rgba(var(--surface-rgb), 0.1);
   color: rgb(var(--text-rgb)); font-size: calc(13px * var(--font-scale)); outline: none;
   transition: border-color .2s;
@@ -165,10 +165,11 @@ onBeforeUnmount(() => {
 .ps-caret { opacity: .55; flex-shrink: 0; font-size: calc(10px * var(--font-scale)); margin-left: auto; }
 .ps-list {
   z-index: 3000; overflow-y: auto; padding: 4px; border-radius: 8px;
-  background: rgba(26,31,48,0.98);
-  border: 1px solid rgba(var(--surface-rgb), 0.12);
-  box-shadow: 0 12px 30px rgba(var(--shadow-rgb), 0.55);
-  backdrop-filter: blur(8px);
+  background: var(--popup-menu-bg, rgba(26,31,48,0.98));
+  border: 1px solid var(--popup-menu-edge, rgba(var(--surface-rgb), 0.12));
+  box-shadow: var(--popup-menu-shadow, 0 12px 30px rgba(var(--shadow-rgb), 0.55));
+  backdrop-filter: var(--popup-menu-blur, blur(8px));
+  -webkit-backdrop-filter: var(--popup-menu-blur, blur(8px));
 }
 .ps-item {
   display: flex; align-items: baseline; gap: 8px; width: 100%;
@@ -186,11 +187,12 @@ onBeforeUnmount(() => {
 .ps-tip {
   z-index: 3100; padding: 10px 12px; border-radius: 8px;
   font-size: calc(12px * var(--font-scale)); line-height: 1.55; overflow-y: auto; overflow-x: hidden;
-  background: rgba(30,34,50,0.98);
-  border: 1px solid rgba(var(--surface-rgb), 0.14);
+  background: var(--popup-menu-bg, rgba(30,34,50,0.98));
+  border: 1px solid var(--popup-menu-edge, rgba(var(--surface-rgb), 0.14));
   color: rgb(var(--text-rgb));
-  box-shadow: 0 12px 30px rgba(var(--shadow-rgb), 0.55);
-  backdrop-filter: blur(8px);
+  box-shadow: var(--popup-menu-shadow, 0 12px 30px rgba(var(--shadow-rgb), 0.55));
+  backdrop-filter: var(--popup-menu-blur, blur(8px));
+  -webkit-backdrop-filter: var(--popup-menu-blur, blur(8px));
   white-space: pre-wrap; word-break: break-word;
   cursor: default;
   scrollbar-width: thin; scrollbar-color: rgba(var(--surface-rgb), 0.25) transparent;

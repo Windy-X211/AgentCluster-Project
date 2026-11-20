@@ -90,6 +90,20 @@
   --modal-mask-blur: blur(8px) saturate(150%);
   --toast-bg: rgba(255, 255, 255, 0.9);
   --toast-ink: #0c121c;
+  /* 下拉菜单 / 悬浮说明（Teleport 到 body，不受画布缩放影响，可用毛玻璃） */
+  --popup-menu-bg: rgba(255, 255, 255, 0.94);
+  --popup-menu-edge: rgba(255, 255, 255, 0.92);
+  --popup-menu-shadow: 0 16px 44px rgba(20, 30, 50, 0.16), 0 0 0 1px rgba(37, 99, 235, 0.05);
+  --popup-menu-blur: blur(22px) saturate(190%);
+  /* 原生控件（select 展开列表、滚动条等）跟随浅色，否则系统深色模式下是黑的 */
+  color-scheme: light;
+}
+
+/* 原生 select 的展开列表由浏览器绘制，只能靠 color-scheme / option 底色控制 */
+html[data-theme="tech-white"] body option {
+  color-scheme: light;
+  background: #ffffff;
+  color: #0c121c;
 }
 
 /* 护眼白（米黄） */

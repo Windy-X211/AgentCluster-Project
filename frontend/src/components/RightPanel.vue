@@ -3529,6 +3529,16 @@ function onCvDrag(e: DragEvent) {
   cvGhost.value = { ...cvGhost.value, x: e.clientX, y: e.clientY }
 }
 function onCvDragEnd() { cvDragId.value = null; cvOverId.value = null; cvGhost.value = null }
+// 卡片以光标为中心显示，保持与鼠标同位置
+const cvGhostStyle = computed(() => {
+  const g = cvGhost.value
+  if (!g) return {}
+  return {
+    left: g.x + 'px',
+    top: g.y + 'px',
+    width: g.w + 'px',
+  }
+})
 function onCvDragOver(e: DragEvent, c: any) {
   if (cvDragId.value == null) return
   e.preventDefault()
@@ -3851,8 +3861,7 @@ onBeforeUnmount(() => {
     </div>
     <!-- 画布拖拽时的悬浮卡片（自绘，保证文字清晰可读） -->
     <Teleport to="body">
-      <div v-if="cvGhost" class="cv-drag-ghost"
-           :style="{ left: cvGhost.x + 'px', top: cvGhost.y + 'px', width: cvGhost.w + 'px' }">
+      <div v-if="cvGhost" class="cv-drag-ghost" :style="cvGhostStyle">
         <span class="cv-label"><AppIcon name="palette" /> {{ cvGhost.name }}</span>
         <span class="cv-count">{{ cvGhost.count }}</span>
       </div>
@@ -4691,7 +4700,7 @@ onBeforeUnmount(() => {
   font-weight: 600;
   line-height: 1.35;
   opacity: 1;
-  transform: translate(-50%, 10px) rotate(-1deg);
+  transform: translate(-50%, -50%);
 }
 .cv-drag-ghost .cv-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cv-drag-ghost .cv-count { flex-shrink: 0; font-size: calc(11px * var(--font-scale)); font-family: Consolas, monospace; padding: 1px 6px; border-radius: 999px; background: rgba(var(--accent2-rgb), 0.16); color: var(--purple-ink); border: 1px solid rgba(var(--accent2-rgb), 0.34); line-height: 1.5; font-weight: 700; }
