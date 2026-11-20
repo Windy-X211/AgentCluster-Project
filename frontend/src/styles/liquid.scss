@@ -259,6 +259,53 @@ html[data-theme="tech-white"] body .preset-card {
   -webkit-backdrop-filter: blur(14px);
 }
 
+/* 工具行 / 思考行 / 子过程条：原来的暗灰底（shadow-rgb 12%~18%）→ 冷调雾面白 */
+html[data-theme="tech-white"] body .tr-pill,
+html[data-theme="tech-white"] body .tr-block,
+html[data-theme="tech-white"] body .tr-chip,
+html[data-theme="tech-white"] body .tr-summary,
+html[data-theme="tech-white"] body .arg-chip,
+html[data-theme="tech-white"] body .tc-name,
+html[data-theme="tech-white"] body .b-tool-row,
+html[data-theme="tech-white"] body .sub-proc {
+  background: rgba(240, 246, 255, 0.88);
+  border-color: rgba(86, 118, 178, 0.16);
+  box-shadow: 0 1px 2px rgba(20, 30, 50, 0.04), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+/* 工具输出 / 思考正文 / 代码块：暗灰块 → 极浅冷蓝 */
+html[data-theme="tech-white"] body .tr-body,
+html[data-theme="tech-white"] body .sp-text,
+html[data-theme="tech-white"] body .b-text.markdown code,
+html[data-theme="tech-white"] body .b-text.markdown pre {
+  background: rgba(232, 240, 252, 0.9);
+  border-color: rgba(86, 118, 178, 0.14);
+}
+
+/* 画布消息泡泡：白玻璃 + 轻冷投影（原来的深灰投影在白底上显灰） */
+html[data-theme="tech-white"] body .node-bubble {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  border: 1px solid rgba(37, 99, 235, 0.22);
+  box-shadow: 0 10px 28px rgba(20, 30, 50, 0.12), 0 0 0 1px rgba(255, 255, 255, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+/* 新建组等通用输入弹窗（PromptDialog）：遮罩与卡片对齐「编辑智能体」那套白玻璃 */
+html[data-theme="tech-white"] body .prompt-mask {
+  background: rgba(226, 234, 248, 0.55);
+  backdrop-filter: blur(8px) saturate(150%);
+  -webkit-backdrop-filter: blur(8px) saturate(150%);
+}
+
+html[data-theme="tech-white"] body .prompt-card {
+  background: rgba(255, 255, 255, 0.78);
+  backdrop-filter: blur(26px) saturate(190%);
+  -webkit-backdrop-filter: blur(26px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.92);
+  box-shadow: 0 26px 64px rgba(20, 30, 50, 0.18), 0 0 0 1px rgba(37, 99, 235, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
 /* 滚动条：灰 → 冷调薄雾 */
 [data-theme="tech-white"] ::-webkit-scrollbar-thumb {
   background: rgba(var(--surface-rgb), 0.16);

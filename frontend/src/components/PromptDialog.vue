@@ -77,17 +77,18 @@ const messageLines = computed(() => promptState.message.split('\n'))
 <style scoped>
 .prompt-mask {
   position: fixed; inset: 0; z-index: 9999;
-  background: rgba(var(--shadow-rgb), 0.5);
-  backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+  background: var(--modal-mask, rgba(var(--shadow-rgb), 0.5));
+  backdrop-filter: var(--modal-mask-blur, blur(4px)); -webkit-backdrop-filter: var(--modal-mask-blur, blur(4px));
   display: flex; align-items: center; justify-content: center; padding: 24px;
 }
 .prompt-card {
   width: min(440px, 100%);
-  background: var(--panel-bg, #0a0a0a);
+  background: var(--glass-panel-bg, var(--panel-bg, #0a0a0a));
   color: var(--text, #ececec);
-  border: 1px solid rgba(var(--surface-rgb, 255, 255, 255), 0.14);
+  border: 1px solid var(--glass-panel-edge, rgba(var(--surface-rgb, 255, 255, 255), 0.14));
   border-radius: 14px;
-  box-shadow: 0 20px 60px rgba(var(--shadow-rgb), 0.5);
+  box-shadow: var(--glass-panel-shadow, 0 20px 60px rgba(var(--shadow-rgb), 0.5));
+  backdrop-filter: var(--glass-panel-blur, none); -webkit-backdrop-filter: var(--glass-panel-blur, none);
   overflow: hidden;
 }
 .prompt-body { padding: 18px 20px 14px; }
@@ -95,7 +96,7 @@ const messageLines = computed(() => promptState.message.split('\n'))
 .prompt-input {
   width: 100%; margin-top: 12px;
   padding: 9px 12px;
-  background: rgba(var(--surface-rgb), 0.04);
+  background: var(--tint-input-bg, rgba(var(--surface-rgb), 0.04));
   border: 1px solid rgba(var(--surface-rgb), 0.15);
   border-radius: 8px;
   color: var(--text);
@@ -105,7 +106,7 @@ const messageLines = computed(() => promptState.message.split('\n'))
   transition: border-color .15s;
 }
 .prompt-input:focus { border-color: var(--accent); }
-.prompt-error { margin-top: 8px; font-size: 12px; color: #ff8888; }
+.prompt-error { margin-top: 8px; font-size: 12px; color: var(--red-ink, #ff8888); }
 .prompt-actions {
   display: flex; justify-content: flex-end; gap: 10px;
   padding: 12px 20px; border-top: 1px solid rgba(var(--surface-rgb), 0.08);
