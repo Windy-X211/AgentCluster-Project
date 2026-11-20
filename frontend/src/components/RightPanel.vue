@@ -3491,15 +3491,44 @@ function formatFilePath(path: string, type: 'summary' | 'detail'): string {
 const cvDragId = ref<number | null>(null)
 const cvOverId = ref<number | null>(null)
 const cvOverPos = ref<'before' | 'after'>('before')
+// 自定义拖拽预览卡片：原生拖影整体半透明、文字发虚，改用自绘卡片跟随光标
+const cvGhost = ref<{ name: string; count: number; x: number; y: number; w: number } | null>(null)
+let cvGhostCanvas: HTMLCanvasElement | null = null
+function emptyDragImage(): HTMLCanvasElement {
+  if (!cvGhostCanvas) {
+    const el = document.createElement('canvas')
+    el.width = 1; el.height = 1
+    el.style.cssText = 'position:fixed;left:-20px;top:-20px;width:1px;height:1px;opacity:0;pointer-events:none'
+    document.body.appendChild(el)
+    cvGhostCanvas = el
+  }
+  return cvGhostCanvas
+}
 function onCvDragStart(e: DragEvent, c: any) {
   cvDragId.value = c.id
   if (e.dataTransfer) {
     e.dataTransfer.effectAllowed = 'move'
     e.dataTransfer.setData('canvas', String(c.id))
     e.dataTransfer.setData('text/plain', String(c.id))
+    // 用 1×1 透明画布顶掉原生拖影，避免浏览器叠加的半透明效果
+    try { e.dataTransfer.setDragImage(emptyDragImage(), 0, 0) } catch { /* 忽略不支持的平台 */ }
+  }
+  const el = e.currentTarget as HTMLElement | null
+  cvGhost.value = {
+    name: c.name || '未命名画布',
+    count: c.nodes?.length || 0,
+    x: e.clientX,
+    y: e.clientY,
+    w: Math.min(260, Math.max(140, el?.offsetWidth || 180)),
   }
 }
-function onCvDragEnd() { cvDragId.value = null; cvOverId.value = null }
+function onCvDrag(e: DragEvent) {
+  if (!cvGhost.value) return
+  // 部分平台在拖拽收尾时会回传 0,0，忽略它避免卡片跳到左上角
+  if (e.clientX === 0 && e.clientY === 0) return
+  cvGhost.value = { ...cvGhost.value, x: e.clientX, y: e.clientY }
+}
+function onCvDragEnd() { cvDragId.value = null; cvOverId.value = null; cvGhost.value = null }
 function onCvDragOver(e: DragEvent, c: any) {
   if (cvDragId.value == null) return
   e.preventDefault()
@@ -3513,7 +3542,7 @@ function onCvDrop(e: DragEvent, c: any) {
   if (cvDragId.value == null) return
   e.preventDefault(); e.stopPropagation()
   const srcId = cvDragId.value
-  cvDragId.value = null; cvOverId.value = null
+  cvDragId.value = null; cvOverId.value = null; cvGhost.value = null
   if (srcId === c.id) return
   const cur = canvases.list.map(x => x.id)
   if (!cur.includes(srcId)) return
@@ -3795,6 +3824,7 @@ onBeforeUnmount(() => {
              :class="['cv-item', { active: canvas?.id === c.id, dragging: cvDragId === c.id, 'drop-before': cvOverId === c.id && cvOverPos === 'before' && cvDragId !== c.id, 'drop-after': cvOverId === c.id && cvOverPos === 'after' && cvDragId !== c.id }]"
              :draggable="renameId !== c.id"
              @dragstart="onCvDragStart($event, c)"
+             @drag="onCvDrag"
              @dragend="onCvDragEnd"
              @dragover="onCvDragOver($event, c)"
              @dragleave="onCvDragLeave(c)"
@@ -3819,6 +3849,14 @@ onBeforeUnmount(() => {
         <div v-if="!canvases.list.length" class="empty">还没有画布</div>
       </div>
     </div>
+    <!-- 画布拖拽时的悬浮卡片（自绘，保证文字清晰可读） -->
+    <Teleport to="body">
+      <div v-if="cvGhost" class="cv-drag-ghost"
+           :style="{ left: cvGhost.x + 'px', top: cvGhost.y + 'px', width: cvGhost.w + 'px' }">
+        <span class="cv-label"><AppIcon name="palette" /> {{ cvGhost.name }}</span>
+        <span class="cv-count">{{ cvGhost.count }}</span>
+      </div>
+    </Teleport>
     <!-- 画布列表右键菜单 -->
     <Teleport to="body">
       <div v-if="cvCtxMenu.show" class="ctx-menu"
@@ -4632,7 +4670,31 @@ onBeforeUnmount(() => {
 .cv-item.active { background: rgba(var(--accent-rgb), 0.15); border: 1px solid rgba(var(--accent-rgb), 0.25); }
 .cv-item[draggable="true"] { cursor: grab; }
 .cv-item[draggable="true"]:active { cursor: grabbing; }
-.cv-item.dragging { opacity: .4; }
+.cv-item.dragging { background: rgba(var(--accent-rgb), 0.10); outline: 1px dashed rgba(var(--accent-rgb), 0.45); outline-offset: -1px; }
+/* 拖拽悬浮卡片：不透明底色 + 高对比文字，避免原生拖影的半透明发灰 */
+.cv-drag-ghost {
+  position: fixed;
+  z-index: 10000;
+  pointer-events: none;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--panel-bg);
+  border: 1px solid rgba(var(--accent-rgb), 0.55);
+  box-shadow: 0 10px 26px rgba(var(--shadow-rgb), 0.38), 0 0 0 3px rgba(var(--accent-rgb), 0.10);
+  color: rgb(var(--text-rgb));
+  font-size: calc(12px * var(--font-scale));
+  font-weight: 600;
+  line-height: 1.35;
+  opacity: 1;
+  transform: translate(-50%, 10px) rotate(-1deg);
+}
+.cv-drag-ghost .cv-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cv-drag-ghost .cv-count { flex-shrink: 0; font-size: calc(11px * var(--font-scale)); font-family: Consolas, monospace; padding: 1px 6px; border-radius: 999px; background: rgba(var(--accent2-rgb), 0.16); color: var(--purple-ink); border: 1px solid rgba(var(--accent2-rgb), 0.34); line-height: 1.5; font-weight: 700; }
 /* 拖拽落点指示线：上/下各一条高亮边 */
 .cv-item.drop-before { box-shadow: 0 -2px 0 0 var(--accent), 0 1px 0 0 rgba(var(--accent-rgb), 0.25); }
 .cv-item.drop-after { box-shadow: 0 2px 0 0 var(--accent), 0 -1px 0 0 rgba(var(--accent-rgb), 0.25); }
