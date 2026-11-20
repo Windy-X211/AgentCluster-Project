@@ -154,6 +154,26 @@ def strip_continue(text):
     return text
 
 
+def strip_self_name_prefix(text, name: str | None):
+    """剥掉模型「自报家门」的正文前缀：正文开头连续出现的 `[名字]` / `【名字】` / `（名字）`。
+
+    背景：集群模式下历史回灌会给 assistant 消息标注发言者，模型把自己带前缀的历史当成
+    输出格式，于是正文开头自带 `[悠悠]`，落库后又被回灌 → 越叠越多（`[悠悠] [悠悠] …`）。
+    这里只剥「开头且与本智能体名字一致」的短标签（可连续多个），正文其余内容一律不动；
+    名字不同的方括号（如 `[重要]`）不受影响。
+    """
+    if not isinstance(text, str) or not text or not name:
+        return text
+    n = str(name).strip()
+    if not n:
+        return text
+    pat = re.compile(
+        r"^\s*(?:[\[【（(]\s*" + re.escape(n) + r"\s*[\]】）)]\s*[：:,，\-—]?\s*)+"
+    )
+    out = pat.sub("", text, count=1)
+    return out
+
+
 class _ContinueScanner:
     """流式 <continue> 剥离器：标记可能被拆分到多个 chunk，需缓存尾部未判定字符。
 
@@ -190,6 +210,63 @@ class _ContinueScanner:
     def close(self) -> str:
         s, self._buf = self._buf, ""
         return s
+
+
+class _NamePrefixScanner:
+    """流式剥离正文开头「自报家门」的名字标签（`[悠悠]` / `【悠悠】` / `（悠悠）`，可叠多层）。
+
+    只在**一段输出的开头**判定：
+    - 首个非空白字符不是括号 → 立即全部放行（正常回复零延迟）；
+    - 是括号 → 等闭括号出现（标签可能被 chunk 切断），内容等于本智能体名字就丢弃，
+      否则原样放行（`[重要]`、`【提示】` 这类正常正文不受影响）。
+    判完即 done，后续 chunk 直接透传。
+    """
+
+    _CLOSE = {"[": "]", "【": "】", "（": "）", "(": ")"}
+
+    def __init__(self, name: str | None):
+        self.name = (name or "").strip()
+        self.buf = ""
+        self.done = not bool(self.name)
+        self.dropped = False               # 是否已经吃掉过名字标签（后续开口空白一并修掉）
+
+    def feed(self, delta: str) -> str:
+        if self.done:
+            return delta
+        self.buf += delta or ""
+        while True:
+            core = self.buf.strip()
+            if not core:
+                return ""                      # 只有空白：继续攒，别把开头换行提前吐出去
+            ch = core[0]
+            if ch not in self._CLOSE:
+                return self._flush()
+            idx = core.find(self._CLOSE[ch], 1)
+            if idx < 0:
+                # 尚未闭合：可能只是 chunk 被切断；明显过长则按正常正文放行
+                return self._flush() if len(core) > len(self.name) + 40 else ""
+            if core[1:idx].strip() != self.name:
+                return self._flush()
+            # 命中自己的名字 → 丢掉这一层，继续判是否还有第二层 [名字]
+            rest = core[idx + 1:].lstrip(" \u3000:：,，-—")
+            self.buf = rest
+            self.dropped = True
+            if not rest.strip():
+                return ""
+
+    def _flush(self) -> str:
+        out = self.buf.lstrip(" \u3000") if self.dropped else self.buf
+        self.buf, self.done = "", True
+        return out
+
+    def close(self) -> str:
+        if self.done:
+            return ""
+        out = strip_self_name_prefix(self.buf, self.name)
+        if self.dropped:
+            out = out.lstrip(" \u3000")
+        self.buf, self.done = "", True
+        return out
 
 
 # ===== 分层自适应循环参数 =====
@@ -601,13 +678,16 @@ def _sanitize_tool_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, 
     return cleaned
 
 
-def _history_llm_entry(m, mode: str, speaker_names: dict) -> dict | None:
+def _history_llm_entry(m, mode: str, speaker_names: dict, self_agent_id=None) -> dict | None:
     """落库消息 → LLM 历史条目；返回 None 表示跳过（a2a 信封只供前端展示、损坏消息防御）。
 
     初始组装与运行中压缩重建共用同一转换，保证两条路径产出的 LLM 历史完全一致：
     - <continue> 标记剥离 + 超长内容截断
-    - linked 集群模式给 assistant 消息标注发言者（智能体分得清谁说了什么）
-    - 保留 tool_calls / tool_call_id（工具配对历史完整回灌）"""
+    - linked 集群模式给**其他**成员的 assistant 消息标注发言者（智能体分得清谁说了什么）
+    - 保留 tool_calls / tool_call_id（工具配对历史完整回灌）
+
+    self_agent_id：本智能体 id。自己的发言**不**加 `[名字]` 前缀——否则模型会把自己带前缀的
+    历史当成输出格式，下一轮正文自带 `[悠悠]` 并越叠越多（独立对话无此问题）。"""
     if not isinstance(m, dict):
         return None
     if m.get("role") == "a2a":
@@ -619,7 +699,15 @@ def _history_llm_entry(m, mode: str, speaker_names: dict) -> dict | None:
     if mode == "linked" and _m_role == "assistant" and m.get("agent_id") and content:
         name = speaker_names.get(m["agent_id"])
         if name:
-            content = f"[{name}] {content}"
+            # 历史脏数据可能已经带着上一轮自报家门的 `[名字]`（甚至叠了两层）→ 先剥干净，
+            # 否则回灌时会变成 `[悠悠] [悠悠] 正文`，继续教模型照抄。
+            content = strip_self_name_prefix(content, name)
+            try:
+                is_self = self_agent_id is not None and int(m["agent_id"]) == int(self_agent_id)
+            except (TypeError, ValueError):
+                is_self = False
+            if content and not is_self:
+                content = f"[{name}] {content}"
     entry = {"role": _m_role, "content": content}
     if m.get("tool_calls"): entry["tool_calls"] = m["tool_calls"]
     if m.get("tool_call_id"): entry["tool_call_id"] = m["tool_call_id"]
@@ -887,6 +975,15 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
     parts = [agent.get("system_prompt") or "你是一个智能体。"]
     agent_name = agent.get("name", "智能体")
     if agent_name: parts.append(f"\n你的名字: {agent_name}")
+    # 集群模式下历史消息会带 `[发言者名]` 标注（供你分辨谁说的），但那是**历史标注格式**，
+    # 不是你的输出格式。不写死这条约束时，模型会照抄自己带前缀的历史，正文开头自带 `[名字]`。
+    if canvas_id is not None:
+        parts.append(
+            "\n## 输出格式（硬性约束）\n"
+            f"- 你的回复是**纯正文**：不要以 `[{agent_name}]`、`【{agent_name}】`、`{agent_name}：` 之类的名字标签开头；\n"
+            "- 也不要在正文里重复自己的名字或自我介绍式开场；\n"
+            "- 历史消息里的 `[某某]` 前缀只是系统标注的发言者，你回复时不要模仿它。"
+        )
 
     # 工作区文件夹（画布级属性，independent / linked 模式都注入）
     if canvas and canvas.get("workdir"):
@@ -1752,7 +1849,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     for m in agent_view(conv, agent.get("id")):
         # a2a 信封只用于前端展示，不进 LLM 历史（未知 role 会被接口拒绝）；
         # tool role / tool_calls 历史也要带上 —— 转换规则见 _history_llm_entry
-        entry = _history_llm_entry(m, mode, speaker_names)
+        entry = _history_llm_entry(m, mode, speaker_names, agent.get("id"))
         if entry is None:
             continue
         if entry.get("role") == "assistant":
@@ -1873,13 +1970,14 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         _fast_upstream_error = False
         fast_text_scan = _ContinueScanner()
         fast_reason_scan = _ContinueScanner()
+        fast_name_scan = _NamePrefixScanner(agent.get("name"))
         _fast_td = _TDEmitter()   # TD: 参数广播节流器（大参数防 O(n²) 广播拖垮事件循环）
 
         try:
             async for kind, payload in chat(interface, model, messages, stream=True,
                                              tools=fast_tools, tool_choice=fast_tool_choice, reasoning_level=agent.get("reasoning_level", "off")):
                 if kind == "text":
-                    _delta = fast_text_scan.feed(payload)
+                    _delta = fast_name_scan.feed(fast_text_scan.feed(payload))
                     if _delta:
                         fast_content_parts.append(_delta)
                         yield f"T:{_esc(_delta)}\n"
@@ -1931,7 +2029,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
 
         fast_content_parts.append(fast_text_scan.close())
         fast_reasoning_parts.append(fast_reason_scan.close())
-        fast_text = strip_continue("".join(fast_content_parts))
+        _fast_tail = fast_name_scan.feed("") + fast_name_scan.close()
+        if _fast_tail:
+            fast_content_parts.append(_fast_tail)
+            yield f"T:{_esc(_fast_tail)}\n"
+        fast_text = strip_self_name_prefix(strip_continue("".join(fast_content_parts)), agent.get("name"))
         assistant_reasoning = strip_continue("".join(fast_reasoning_parts).strip())
 
         if fast_tool_calls:
@@ -2107,6 +2209,8 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
         assistant_tool_calls = []
         round_text_scan = _ContinueScanner()
         round_reason_scan = _ContinueScanner()
+        # 本轮正文开头的「[名字]」自报家门前缀实时剥离（不吃正常正文，见类注释）
+        round_name_scan = _NamePrefixScanner(agent.get("name"))
         # 实时检测：本轮中收集到的非法工具调用（用于流式结束后注入纠错反馈）
         _round_invalid_calls: list[dict] = []
         _upstream_error = False  # 上游返回非 200（如 400）时置位，跳过本轮后续处理
@@ -2138,7 +2242,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                         if _cinfo:
                             _rebuilt = [messages[0]]
                             for m in _av(conv, agent.get("id")):
-                                _entry = _history_llm_entry(m, mode, speaker_names)
+                                _entry = _history_llm_entry(m, mode, speaker_names, agent.get("id"))
                                 if _entry is not None:
                                     _rebuilt.append(_entry)
                             messages[:] = _rebuilt
@@ -2171,7 +2275,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             async for kind, payload in _gen:
 
                 if kind == "text":
-                    _delta = round_text_scan.feed(payload)
+                    _delta = round_name_scan.feed(round_text_scan.feed(payload))
                     if _delta:
                         assistant_content_parts.append(_delta)
                         _garbage_buf = (_garbage_buf + _delta)[-400:]
@@ -2223,8 +2327,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 await _gen.aclose()  # 关闭上游流
             except Exception:
                 pass
-            assistant_content_parts.append(round_text_scan.close())
-            assistant_text = strip_continue("".join(assistant_content_parts))
+            _name_tail = round_name_scan.feed(round_text_scan.close()) + round_name_scan.close()
+            if _name_tail:
+                assistant_content_parts.append(_name_tail)
+                yield f"T:{_esc(_name_tail)}\n"
+            assistant_text = strip_self_name_prefix(strip_continue("".join(assistant_content_parts)), agent.get("name"))
             assistant_msg = {"role": "assistant", "content": assistant_text, "ts": datetime.utcnow().isoformat()}
             stored = {**assistant_msg, "agent_id": agent.get("id")}
             conv["messages"].append(stored)
@@ -2278,8 +2385,11 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
                 await _gen.aclose()  # break 后显式关闭上游流，释放 httpx 连接
             except Exception:
                 pass
-            assistant_content_parts.append(round_text_scan.close())
-            assistant_text = strip_continue("".join(assistant_content_parts))
+            _name_tail = round_name_scan.feed(round_text_scan.close()) + round_name_scan.close()
+            if _name_tail:
+                assistant_content_parts.append(_name_tail)
+                yield f"T:{_esc(_name_tail)}\n"
+            assistant_text = strip_self_name_prefix(strip_continue("".join(assistant_content_parts)), agent.get("name"))
             assistant_msg = {"role": "assistant", "content": assistant_text, "ts": datetime.utcnow().isoformat()}
             stored = {**assistant_msg, "agent_id": agent.get("id")}
             conv["messages"].append(stored)
@@ -2295,9 +2405,12 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
             yield f"RN:（检测到流式输出退化，已中止并注入纠错反馈）\n"
             continue
 
-        assistant_content_parts.append(round_text_scan.close())
+        _name_tail = round_name_scan.feed(round_text_scan.close()) + round_name_scan.close()
+        if _name_tail:
+            assistant_content_parts.append(_name_tail)
+            yield f"T:{_esc(_name_tail)}\n"
         assistant_reasoning_parts_round.append(round_reason_scan.close())
-        assistant_text = strip_continue("".join(assistant_content_parts))
+        assistant_text = strip_self_name_prefix(strip_continue("".join(assistant_content_parts)), agent.get("name"))
         assistant_reasoning = strip_continue("".join(assistant_reasoning_parts_round).strip())
         _last_assistant_text = assistant_text
 
@@ -2631,7 +2744,7 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     # —— 先存最终 assistant 文字 + 发 F: 给前端 ——
     # 让前端立即知道发送方已完成自己的工作（去掉节点高亮），
     # 即使后端还有独立运行的接收方任务未结束。
-    final_text = strip_continue("".join(final_text_parts))
+    final_text = strip_self_name_prefix(strip_continue("".join(final_text_parts)), agent.get("name"))
     # 去掉首尾连续空行，保留中间换行
     final_text = final_text.strip("\n")
     final_entry = {
