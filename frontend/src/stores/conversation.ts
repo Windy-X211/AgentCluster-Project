@@ -146,7 +146,7 @@ export function convLastTs(c: any): string {
 }
 
 /** 把后端 ISO（可能无时区）转为 Date，无时区按 UTC 解释 */
-function parseTs(s: string): Date | null {
+export function parseTs(s: string): Date | null {
   if (!s) return null
   const iso = /Z$|[+-]\d{2}:\d{2}$/.test(s) ? s : s + 'Z'
   const d = new Date(iso)

@@ -3,7 +3,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, nextTick, render, createVNode } from 'vue'
 import { useRoute } from 'vue-router'
 import { useConvStore, useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useLayoutStore } from '@/stores'
-import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag } from '@/stores/conversation'
+import { convDisplayName, convTimeLabel, sortConvsByActivity, buildToolGroups, toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, parseTs } from '@/stores/conversation'
 import { renderChatMarkdown } from '@/utils/markdown'
 import { getAvatarGradient, getAvatarInitial } from '@/utils/avatar'
 import { api } from '@/api'
@@ -1751,10 +1751,11 @@ const shareScreenshotsOfAssistant = imageRefsOfAssistant
 function toolBarIsOpen(idx: number): boolean {
   return toolBarOpen.value.has(idx)
 }
-function toggleToolBar(idx: number) {
+function toggleToolBar(idx: number, ev?: Event) {
   const s = new Set(toolBarOpen.value)
   if (s.has(idx)) {
     s.delete(idx)
+    clearExpandHold(ev)
   } else {
     s.add(idx)
     // 展开工具行时，自动展开当前正在执行的工具详情（流式参数立即可见）
@@ -1765,17 +1766,71 @@ function toggleToolBar(idx: number) {
       m.set(idx, running.tool_call_id)
       toolDetailOpen.value = m
     }
+    revealAfterExpand(ev)
   }
   toolBarOpen.value = s
 }
-function toggleToolDetail(assistantIdx: number, tcId: string) {
+function toggleToolDetail(assistantIdx: number, tcId: string, ev?: Event) {
   const m = new Map(toolDetailOpen.value)
-  if (m.get(assistantIdx) === tcId) m.delete(assistantIdx)
-  else m.set(assistantIdx, tcId)
+  if (m.get(assistantIdx) === tcId) {
+    m.delete(assistantIdx)
+    clearExpandHold(ev)
+  } else {
+    m.set(assistantIdx, tcId)
+    revealAfterExpand(ev)
+  }
   toolDetailOpen.value = m
 }
 function toolDetailIsOpen(assistantIdx: number, tcId: string): boolean {
   return toolDetailOpen.value.get(assistantIdx) === tcId
+}
+
+/**
+ * 过程框内条目展开后的自动定位：
+ * 条目能装进视口 → 保证整块可见（上方被裁顶对齐 / 下方被裁底对齐）；
+ * 条目比视口还高 → 标题行贴顶，从开头读。
+ * 期间主动脱离流式自动贴底，避免下一帧被 stickProcessBox 又拉回底部。
+ */
+function revealInProcessFrame(item: HTMLElement | null) {
+  if (!item || !item.isConnected) return
+  const box = item.closest('.process-body, .sub-proc') as HTMLElement | null
+  if (!box) return
+  const boxRect = box.getBoundingClientRect()
+  const itRect = item.getBoundingClientRect()
+  const viewH = box.clientHeight
+  if (!viewH) return
+  const top = itRect.top - boxRect.top + box.scrollTop
+  const height = itRect.height
+  const cur = box.scrollTop
+  let target = cur
+  if (height >= viewH - 8) target = top - 6                     // 超高条目：标题贴顶
+  else if (top < cur + 6) target = top - 6                      // 上方被裁：顶对齐
+  else if (top + height > cur + viewH - 6) target = top + height - viewH + 6   // 下方被裁：底对齐
+  // 展开查看期间持有滚动（暂停流式自动贴底），直到用户自己滚动或收起
+  ;(box as any).__expandHold = true
+  ;(box as any).__stickBottom = false
+  if (Math.abs(target - cur) < 2) return
+  ;(box as any).__lastUserScroll = Date.now()
+  ;(box as any).__autoScrolling = true
+  box.scrollTop = Math.max(0, target)
+  requestAnimationFrame(() => { (box as any).__autoScrolling = false })
+}
+
+/** 收起展开条目后：解除滚动保持，恢复流式自动贴底 */
+function clearExpandHold(ev?: Event) {
+  const pill = (ev?.currentTarget as HTMLElement | null) || null
+  const box = pill?.closest('.process-body, .sub-proc') as HTMLElement | null
+  if (box) (box as any).__expandHold = false
+}
+
+/** 展开动作统一入口：等两帧布局完成（第一帧等 DOM 展开、第二帧等字体/markdown 收尾）再定位 */
+function revealAfterExpand(ev?: Event) {
+  const pill = (ev?.currentTarget as HTMLElement | null) || null
+  if (!pill) return
+  const item = (pill.closest('.a2a-group-wrap')
+    || pill.closest('.think-row, .think-item, .tool-row, .tr-item, .tool-card')) as HTMLElement | null
+  if (!item) return
+  requestAnimationFrame(() => requestAnimationFrame(() => revealInProcessFrame(item)))
 }
 
 // ============ 过程窗口（流式期间展开，高度随内容自适应、封顶 260px，停止后折叠为 "(>过程)"） ============
@@ -1789,6 +1844,8 @@ const processBoxes = new Map<number, HTMLElement>()
 /** 把某个过程框贴到内容底部（仅流式中、且用户未主动上滑时）。 */
 function stickProcessBox(el: HTMLElement | null | undefined) {
   if (!el || !convs.streaming) return
+  // 用户正在阅读刚展开的条目：暂停自动贴底，别把视线拉走
+  if ((el as any).__expandHold) return
   const now = Date.now()
   const last = (el as any).__lastUserScroll || 0
   if (now - last > 5000) (el as any).__stickBottom = true
@@ -1830,6 +1887,11 @@ function onProcessBox(turnStart: number, el: HTMLElement | null) {
     ensureProcessWatcher(el)
   } else processBoxes.delete(turnStart)
 }
+// 新一轮输出开始：清掉上一轮"展开查看"留下的滚动保持，恢复自动贴底
+watch(() => convs.streaming, (streaming) => {
+  if (!streaming) return
+  processBoxes.forEach((el) => { (el as any).__expandHold = false })
+})
 /** 用户在该过程框内滑动即脱离自动跟随；记录最近一次滑动时间，5s 无滑动后恢复跟随。
  *  注意：我们自己写的 scrollTop 也会触发 scroll 事件，那种不算"用户滑动"，必须忽略，
  *  否则每次自动滚底都会把自己标记成脱离，导致永远贴不住底部。
@@ -1842,9 +1904,11 @@ function onProcessScroll(turnStart: number, e: Event) {
   const dist = el.scrollHeight - el.scrollTop - el.clientHeight
   if (dist <= 4) {   // 仍在底部 → 保持（或恢复）跟随
     ;(el as any).__stickBottom = true
+    ;(el as any).__expandHold = false
     return
   }
   ;(el as any).__stickBottom = false
+  ;(el as any).__expandHold = false
   ;(el as any).__lastUserScroll = Date.now()
 }
 /** 子过程框（agent.spawn 工具详情内的嵌套过程框）：复用主过程框的贴底机制
@@ -1864,9 +1928,11 @@ function onSubProcScroll(e: Event) {
   const dist = el.scrollHeight - el.scrollTop - el.clientHeight
   if (dist <= 4) {
     ;(el as any).__stickBottom = true
+    ;(el as any).__expandHold = false
     return
   }
   ;(el as any).__stickBottom = false
+  ;(el as any).__expandHold = false
   ;(el as any).__lastUserScroll = Date.now()
 }
 /** 所有"段"的边界（renderItems 切出的左右侧连续段）—— 用于按段归属判断 */
@@ -2029,18 +2095,128 @@ function showProcToggle(seg: any): boolean {
 }
 function toggleProcess(turnStart: number) {
   const s = new Set(processOpen.value)
-  if (s.has(turnStart)) s.delete(turnStart); else s.add(turnStart)
+  const willOpen = !s.has(turnStart)
+  if (willOpen) s.add(turnStart); else s.delete(turnStart)
   processOpen.value = s
+  if (willOpen) nextTick(() => requestAnimationFrame(() => revealProcessWindow(turnStart)))
+  else {
+    // 收起过程框：解除"展开查看"的滚动保持
+    const body = processBoxes.get(turnStart)
+    if (body) (body as any).__expandHold = false
+  }
+}
+/** 外层过程框展开后：把它滚到对话区里的合适位置（已完整可见则不动，避免无意义跳动） */
+function revealProcessWindow(turnStart: number) {
+  const body = processBoxes.get(turnStart)
+  const win = body?.closest('.process-window') as HTMLElement | null
+  const el = msgBox.value
+  if (!win || !el) return
+  const elRect = el.getBoundingClientRect()
+  const wRect = win.getBoundingClientRect()
+  const top = wRect.top - elRect.top + el.scrollTop
+  const height = wRect.height
+  const viewH = el.clientHeight
+  const cur = el.scrollTop
+  let target = cur
+  if (height >= viewH - 8) target = top - 8                                   // 超高：顶对齐
+  else if (top < cur + 8) target = top - 8                                    // 上方被裁：顶对齐
+  else if (top + height > cur + viewH - 8) target = top + height - viewH + 8   // 下方被裁：底对齐
+  if (Math.abs(target - cur) < 2) return
+  stickBottom.value = false   // 展开查看期间不跟随底部
+  el.scrollTop = Math.max(0, target)
 }
 // —— 过程框内的"思考过程"：默认单行（流式中循环覆盖、停止后截断首行），点击展开全文 ——
 const thinkOpen = ref(new Set<number>())   // 键 = assistant 子块 idx
 function thinkIsOpen(idx: number): boolean {
   return thinkOpen.value.has(idx)
 }
-function toggleThink(idx: number) {
+function toggleThink(idx: number, ev?: Event) {
   const s = new Set(thinkOpen.value)
-  if (s.has(idx)) s.delete(idx); else s.add(idx)
+  const willOpen = !s.has(idx)
+  if (willOpen) s.add(idx); else s.delete(idx)
   thinkOpen.value = s
+  if (willOpen) revealAfterExpand(ev)
+  else clearExpandHold(ev)
+}
+
+// —— 连续思考折叠组：与工具行（.tool-row/.tr-*）同一套逻辑 ——
+// 连续 = 相邻的带思考子块之间没有夹正文 / 工具行 / 截图 / a2a 信封；
+// 中间一旦出现可见过程内容就断组，另起一组。
+type ThinkGroupItem = { idx: number; msg: any }
+type ThinkGroup = { key: string; headIdx: number; items: ThinkGroupItem[] }
+
+/** 子块是否夹带"可见过程内容"（在过程框内实际渲染的正文 / 工具 / 截图 / a2a）
+ *  注意：被"提出"到过程框外的末条正文不算，否则会把它前面的思考错切成两组 */
+function chunkHasVisibleContent(ch: any): boolean {
+  if (ch.kind === 'a2a') return true
+  if (ch.kind !== 'assistant') return false
+  const m = ch.msg as any
+  if (trimMsgContent(m?.content) && !isPromotedMessage(ch.idx)) return true
+  if (hasTools(ch.idx)) return true
+  if (imageRefsOfAssistant(ch.idx).length) return true
+  return false
+}
+function hasReasoning(ch: any): boolean {
+  return ch.kind === 'assistant' && !!(ch.msg?.reasoning || '').trim()
+}
+
+/** 轮次内：assistant 子块 idx → 所属连续思考组 */
+const thinkGroups = computed(() => {
+  const map = new Map<number, Map<number, ThinkGroup>>()
+  for (const it of renderItems.value as any[]) {
+    if (it.type !== 'turn') continue
+    const byIdx = new Map<number, ThinkGroup>()
+    let cur: ThinkGroup | null = null
+    for (const ch of (it.children || []) as any[]) {
+      if (ch.kind === 'a2a-plain') continue   // 不在过程框内，不参与分组
+      if (hasReasoning(ch)) {
+        if (cur) cur.items.push({ idx: ch.idx, msg: ch.msg })
+        else cur = { key: 'tg-' + ch.idx, headIdx: ch.idx, items: [{ idx: ch.idx, msg: ch.msg }] }
+        byIdx.set(ch.idx, cur)
+        // 该子块自身夹了正文/工具/截图 → 连续性到此为止
+        if (chunkHasVisibleContent(ch)) cur = null
+      } else if (cur && chunkHasVisibleContent(ch)) {
+        cur = null
+      }
+    }
+    map.set(it.start, byIdx)
+  }
+  return map
+})
+
+function thinkGroupOf(turn: any, idx: number): ThinkGroup | null {
+  return thinkGroups.value.get(turn?.start)?.get(idx) ?? null
+}
+/** 该子块是否为所在思考组的组头（组只在组头位置渲染一次） */
+function isThinkHead(turn: any, idx: number): boolean {
+  const g = thinkGroupOf(turn, idx)
+  return !!g && g.headIdx === idx
+}
+function thinkGroupStreaming(g: ThinkGroup | null): boolean {
+  return !!g && g.items.some((x) => isStreamingMsg(x.msg))
+}
+function thinkGroupLatest(g: ThinkGroup | null): any {
+  return g && g.items.length ? g.items[g.items.length - 1].msg : null
+}
+/** 组展开状态：key 用组头 idx，流式期间组内新增思考不会改变 key */
+const thinkGroupOpen = ref(new Set<string>())
+function thinkGroupIsOpen(g: ThinkGroup | null): boolean {
+  return !!g && thinkGroupOpen.value.has(g.key)
+}
+function toggleThinkGroup(g: ThinkGroup | null, ev?: Event) {
+  if (!g) return
+  const s = new Set(thinkGroupOpen.value)
+  const willOpen = !s.has(g.key)
+  if (willOpen) s.add(g.key); else s.delete(g.key)
+  thinkGroupOpen.value = s
+  if (willOpen) revealAfterExpand(ev)
+  else clearExpandHold(ev)
+}
+/** 单段思考的折叠摘要：取首个非空行并截断 */
+function thinkBrief(text: any, max = 42): string {
+  const raw = stripContinueTag(String(text || ''))
+  const line = (raw.split(/\r?\n/).find((l) => l.trim()) || '').trim()
+  return line.length > max ? line.slice(0, max) + '…' : line
 }
 function scrollProcessBoxesToBottom() {
   if (!convs.streaming) return
@@ -2118,16 +2294,22 @@ function prettyResult(result: any): string {
   }
   try { return JSON.stringify(v, null, 2) } catch { return String(result) }
 }
-function toggleA2a(idx: number) {
+function toggleA2a(idx: number, ev?: Event) {
   const s = new Set(expandedA2a.value)
-  if (s.has(idx)) s.delete(idx); else s.add(idx)
+  const willOpen = !s.has(idx)
+  if (willOpen) s.add(idx); else s.delete(idx)
   expandedA2a.value = s
+  if (willOpen) revealAfterExpand(ev)
+  else clearExpandHold(ev)
 }
 
-function toggleA2aGroup(key: string) {
+function toggleA2aGroup(key: string, ev?: Event) {
   const s = new Set(expandedA2aGroup.value)
-  if (s.has(key)) s.delete(key); else s.add(key)
+  const willOpen = !s.has(key)
+  if (willOpen) s.add(key); else s.delete(key)
   expandedA2aGroup.value = s
+  if (willOpen) revealAfterExpand(ev)
+  else clearExpandHold(ev)
 }
 function isA2aGroupOpen(key: string): boolean {
   return expandedA2aGroup.value.has(key)
@@ -3010,9 +3192,12 @@ function toggleCtxSummary(idx: number) {
 function ctxSummaryMeta(m: any): string {
   const parts: string[] = []
   if (m?.compressed_count) parts.push(`${m.compressed_count} 条历史消息`)
-  if (m?.ts) {
-    const d = new Date(m.ts)
-    if (!isNaN(d.getTime())) parts.push(`${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`)
+  // 后端 ts 是 UTC 且不带时区标记，必须走 parseTs（无时区按 UTC 解释），
+  // 否则会被当成浏览器本地时间，整张卡片的时间早 8 小时。
+  const d = parseTs(String(m?.ts || ''))
+  if (d) {
+    const pad = (n: number) => String(n).padStart(2, '0')
+    parts.push(`${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`)
   }
   return parts.join(' · ')
 }
@@ -3993,7 +4178,7 @@ onBeforeUnmount(() => {
                     <div v-if="ch.kind === 'a2a'" class="a2a-group-wrap">
                       <!-- 多条时的组摘要头 -->
                       <div v-if="ch.items.length > 1" class="tool-card a2a a2a-group" :class="{ open: isA2aGroupOpen(ch.key) }">
-                        <div class="tc-header a2a-toggle" @click="toggleA2aGroup(ch.key)">
+                        <div class="tc-header a2a-toggle" @click="toggleA2aGroup(ch.key, $event)">
                           <span class="tc-ico"><AppIcon name="handshake" /></span>
                           <span class="tc-name">连续信封 ×{{ ch.items.length }}</span>
                           <span class="a2a-route">{{ ch.latest?.from?.name }} → {{ ch.latest?.to?.name }}</span>
@@ -4003,7 +4188,7 @@ onBeforeUnmount(() => {
                       <!-- 信封卡片列表：单条直接显示；多条需一级展开 -->
                       <div v-if="ch.items.length === 1 || isA2aGroupOpen(ch.key)" class="a2a-group-body" :class="{ single: ch.items.length === 1 }">
                         <div v-for="sub in ch.items" :key="sub.idx" class="tool-card a2a">
-                          <div class="tc-header a2a-toggle" @click="toggleA2a(sub.idx)">
+                          <div class="tc-header a2a-toggle" @click="toggleA2a(sub.idx, $event)">
                             <span class="tc-ico">{{ ch.items.length > 1 ? '✉️' : '🤝' }}</span>
                             <span class="tc-name">{{ kindLabel(sub.msg.envelope?.kind) }}</span>
                             <span class="a2a-route">{{ sub.msg.envelope?.from?.name }} → {{ sub.msg.envelope?.to?.name }}</span>
@@ -4032,21 +4217,50 @@ onBeforeUnmount(() => {
                       <!-- 接力切换发言者时，在窗口内标注当前智能体名 -->
                       <div v-if="childAgentLabel(ch, it)" class="child-agent-label">{{ childAgentLabel(ch, it) }}</div>
 
-                      <!-- 思考过程：流式中保留单行循环覆盖；停止后折叠态只显示"思考"二字，点击展开全文 -->
-                      <div v-if="(ch.msg.reasoning || '').trim()" class="think-stream clickable"
-                           :class="{ open: thinkIsOpen(ch.idx) }"
-                           @click.stop="toggleThink(ch.idx)"
-                           :title="thinkIsOpen(ch.idx) ? '点击收起思考过程' : '点击展开思考过程'">
-                        <span class="think-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg></span>
-                        <span class="think-text">{{ isStreamingMsg(ch.msg) ? cyclicWindow(stripContinueTag(ch.msg.reasoning), 70) : '思考' }}</span>
-                        <span v-if="isStreamingMsg(ch.msg)" class="think-cursor">▌</span>
-                        <span class="think-chev">{{ thinkIsOpen(ch.idx) ? '▾' : '▸' }}</span>
-                      </div>
-                      <div v-if="thinkIsOpen(ch.idx) && (ch.msg.reasoning || '').trim()" class="think-full"
-                           @dblclick.stop="toggleThink(ch.idx)"
-                           title="双击收起思考过程">
-                        <pre class="think-full-text">{{ stripContinueTag(ch.msg.reasoning) }}</pre>
-                      </div>
+                      <!-- 连续思考折叠组（与工具行同一套逻辑）：仅在组头位置渲染一次。
+                           折叠态一行摘要；展开后单段直接铺全文，多段逐条 pill 再点开全文 -->
+                      <template v-if="(ch.msg.reasoning || '').trim() && isThinkHead(it, ch.idx)">
+                        <template v-for="g in [thinkGroupOf(it, ch.idx)]" :key="(g && g.key) || ('tg-' + ch.idx)">
+                          <div v-if="g" class="think-row">
+                            <div class="think-summary"
+                                 :class="{ open: thinkGroupIsOpen(g), running: thinkGroupStreaming(g) }"
+                                 @click.stop="toggleThinkGroup(g, $event)"
+                                 :title="thinkGroupIsOpen(g) ? '点击收起思考过程' : '点击展开思考过程'">
+                              <span class="think-ico"><AppIcon name="brain" /></span>
+                              <span class="think-name">
+                                <template v-if="thinkGroupStreaming(g)">{{ cyclicWindow(stripContinueTag(thinkGroupLatest(g)?.reasoning || ''), 70) }}</template>
+                                <template v-else>思考</template>
+                              </span>
+                              <span v-if="g.items.length > 1" class="think-count">共 {{ g.items.length }} 段</span>
+                              <span v-if="thinkGroupStreaming(g)" class="think-cursor">▌</span>
+                              <span class="think-chev">{{ thinkGroupIsOpen(g) ? '▾' : '▸' }}</span>
+                            </div>
+
+                            <!-- 单段：展开即全文 -->
+                            <div v-if="thinkGroupIsOpen(g) && g.items.length === 1" class="think-full"
+                                 @dblclick.stop="toggleThinkGroup(g)" title="双击收起思考过程">
+                              <pre class="think-full-text">{{ stripContinueTag(g.items[0].msg.reasoning) }}</pre>
+                            </div>
+                            <!-- 多段：逐条 pill，点击单条再展开全文 -->
+                            <div v-else-if="thinkGroupIsOpen(g)" class="think-items">
+                              <div v-for="(ti, tii) in g.items" :key="'tgi-' + ti.idx" class="think-item">
+                                <div class="think-pill"
+                                     :class="{ expanded: thinkIsOpen(ti.idx), running: isStreamingMsg(ti.msg) }"
+                                     @click.stop="toggleThink(ti.idx, $event)"
+                                     :title="thinkIsOpen(ti.idx) ? '点击收起思考全文' : '点击展开思考全文'">
+                                  <span class="think-ico"><AppIcon name="brain" /></span>
+                                  <span class="think-pill-name">{{ tii + 1 }}. {{ thinkBrief(ti.msg.reasoning) }}</span>
+                                  <span class="think-chev">{{ thinkIsOpen(ti.idx) ? '▾' : '▸' }}</span>
+                                </div>
+                                <div v-if="thinkIsOpen(ti.idx)" class="think-full"
+                                     @dblclick.stop="toggleThink(ti.idx)" title="双击收起思考过程">
+                                  <pre class="think-full-text">{{ stripContinueTag(ti.msg.reasoning) }}</pre>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </template>
+                      </template>
 
                       <!-- 流式正文（仅流式中，带光标）—— 始终在过程框内流式显示 -->
                       <div v-if="isStreamingMsg(ch.msg) && trimMsgContent(ch.msg.content)" class="bubble markdown"><ChatBody :content="trimMsgContent(ch.msg.content)" :streaming="true" :extAPI="extAPI" /></div>
@@ -4072,7 +4286,7 @@ onBeforeUnmount(() => {
                       <div v-if="hasTools(ch.idx)" class="tool-row">
                         <div class="tr-summary"
                              :class="{ open: toolBarIsOpen(ch.idx), running: latestToolInfo(ch.idx)?.running }"
-                             @click="toggleToolBar(ch.idx)">
+                             @click="toggleToolBar(ch.idx, $event)">
                           <span class="tr-icon" :class="{ spinning: latestToolInfo(ch.idx)?.running }">{{ latestToolInfo(ch.idx)?.running ? '⟳' : '✓' }}</span>
                           <span class="tr-summary-name">{{ latestToolInfo(ch.idx)?.name }}<template v-if="latestToolInfo(ch.idx)?.fileName"> <span class="tr-filename">（{{ formatFilePath(latestToolInfo(ch.idx)?.fileName || '', 'summary') }}）</span></template></span>
                           <span class="tr-count" v-if="latestToolInfo(ch.idx)?.total && latestToolInfo(ch.idx)!.total! > 1">共 {{ latestToolInfo(ch.idx)?.total }} 个工具</span>
@@ -4082,7 +4296,7 @@ onBeforeUnmount(() => {
                           <div v-for="(t, toolIndex) in toolsOfAssistant(ch.idx).filter(t => t.role === 'tool_call')" :key="t.tool_call_id || ('tc-' + ch.idx + '-' + t.name)" class="tr-item">
                             <div class="tr-pill"
                                  :class="{ running: toolIsRunning(t), expanded: toolDetailIsOpen(ch.idx, t.tool_call_id) }"
-                                 @click="toggleToolDetail(ch.idx, t.tool_call_id)">
+                                 @click="toggleToolDetail(ch.idx, t.tool_call_id, $event)">
                               <span class="tr-icon" :class="{ spinning: toolIsRunning(t) }">{{ toolIsRunning(t) ? '⟳' : '✓' }}</span>
                               <span class="tr-name">
                                 <template v-if="latestToolInfo(ch.idx)?.total && (latestToolInfo(ch.idx)?.total ?? 0) > 1">
@@ -4608,6 +4822,45 @@ onBeforeUnmount(() => {
   color: rgba(var(--text-rgb), 0.72);
   font-family: Consolas, monospace;
 }
+/* —— 连续思考折叠组：与工具行（.tr-*）同一套规格，主色用 accent2 区分 —— */
+.think-row { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+.think-row .think-full { margin-top: 0; }
+.think-summary {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 9px;
+  background: rgba(var(--accent2-rgb), 0.10);
+  border: 1px solid rgba(var(--accent2-rgb), 0.26);
+  cursor: pointer; font-size: calc(11px * var(--font-scale));
+  color: rgba(var(--text-rgb), 0.72);
+  user-select: none; width: fit-content; max-width: 100%;
+  transition: background .15s, border-color .15s;
+}
+.think-summary:hover { background: rgba(var(--accent2-rgb), 0.18); }
+.think-summary:hover .think-chev { color: var(--purple-ink); }
+.think-summary.open { background: rgba(var(--accent2-rgb), 0.22); border-color: rgba(var(--accent2-rgb), 0.48); color: rgba(var(--text-rgb), 0.95); }
+.think-summary.open .think-chev { color: var(--purple-ink); }
+.think-summary.running { border-color: rgba(var(--accent2-rgb), 0.55); background: rgba(var(--accent2-rgb), 0.14); color: var(--purple-ink); }
+.think-ico { flex-shrink: 0; width: 11px; text-align: center; font-size: calc(11px * var(--font-scale)); }
+.think-name {
+  flex: 1; min-width: 0; overflow: hidden; white-space: nowrap;
+  font-style: italic; letter-spacing: 0.2px;
+}
+.think-count { flex-shrink: 0; font-size: calc(11px * var(--font-scale)); color: rgba(var(--text-rgb), 0.65); padding-left: 2px; }
+.think-items { display: flex; flex-direction: column; gap: 3px; padding-left: 2px; }
+.think-item { display: flex; flex-direction: column; gap: 2px; }
+.think-pill {
+  display: flex; align-items: center; gap: 5px;
+  padding: 2px 7px; border-radius: 7px;
+  background: rgba(var(--shadow-rgb), 0.18);
+  border: 1px solid rgba(var(--surface-rgb), 0.08);
+  cursor: pointer; font-size: calc(10.5px * var(--font-scale));
+  color: rgba(var(--text-rgb), 0.85); user-select: none;
+  transition: background .15s, border-color .15s;
+}
+.think-pill:hover { border-color: rgba(var(--accent2-rgb), 0.3); }
+.think-pill.expanded { border-color: rgba(var(--accent2-rgb), 0.4); }
+.think-pill.running { border-color: rgba(var(--accent2-rgb), 0.55); background: rgba(var(--accent2-rgb), 0.1); color: var(--purple-ink); }
+.think-pill-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-style: italic; }
 
 /* ============ 过程窗口：流式中展开的自适应框（封顶260px），停止后折叠为 "(>过程)" 文字 ============ */
 /* 折叠钮：紧贴智能体名称，无边框、纯文字，字体/字号与名称差异化 */
