@@ -200,11 +200,92 @@ async function deleteBackground(bg: any) {
 }
 
 function bgThumbStyle(bg: any): any {
-  if (bg.thumbnail) {
+  if (bg.thumbnail && bg.type !== 'video') {
     return { backgroundImage: `url(${api.backgrounds.rawUrl(bg.id, bg.thumbnail)})`, backgroundSize: 'cover', backgroundPosition: 'center' }
   }
   if (bg.preview) return { background: bg.preview }
   return { background: 'linear-gradient(135deg, #080808, #000000)' }
+}
+
+/* —— 背景缩略：静止态显示代表画面，悬停时换真实动画/视频并浮出放大预览 —— */
+const bgHoverId = ref<string | null>(null)
+const magnify = ref<{ id: string; name: string; url: string; x: number; y: number; w: number; h: number; base: any } | null>(null)
+let bgHoverTimer: number | null = null
+let bgMagnifyTimer: number | null = null
+let hoverCardEl: HTMLElement | null = null
+
+function bgRawUrl(bg: any) {
+  return api.backgrounds.rawUrl(bg.id, bg.entry || bg.thumbnail)
+}
+
+/** 默认背景卡：按当前主题给出真实底光，避免科技白下显示成一块黑 */
+const defaultBgStyle = computed(() => {
+  if (layout.theme === 'tech-white') {
+    return {
+      background:
+        'radial-gradient(58% 54% at 6% 0%, rgba(37,99,235,.15), transparent 62%),' +
+        'radial-gradient(44% 44% at 94% 2%, rgba(124,58,237,.11), transparent 60%),' +
+        'radial-gradient(52% 48% at 62% 102%, rgba(14,165,233,.12), transparent 64%),' +
+        'linear-gradient(158deg, #ffffff 0%, #f6faff 46%, #ecf2fe 100%)',
+    }
+  }
+  if (layout.theme === 'eye-care') {
+    return { background: 'radial-gradient(ellipse at 30% 20%, #faf3df 0%, #f4ecd6 70%)' }
+  }
+  return { background: 'radial-gradient(ellipse at 30% 20%, #080808 0%, #000000 70%)' }
+})
+
+function clearBgTimers() {
+  if (bgHoverTimer) { clearTimeout(bgHoverTimer); bgHoverTimer = null }
+  if (bgMagnifyTimer) { clearTimeout(bgMagnifyTimer); bgMagnifyTimer = null }
+}
+
+function onBgEnter(bg: any, e: MouseEvent) {
+  if (bg.type !== 'animation' && bg.type !== 'video') return
+  const card = e.currentTarget as HTMLElement
+  hoverCardEl = card
+  clearBgTimers()
+  bgHoverTimer = window.setTimeout(() => { bgHoverId.value = bg.id }, 120)
+  bgMagnifyTimer = window.setTimeout(() => {
+    magnify.value = { id: bg.id, name: bg.name, url: bgRawUrl(bg), x: 0, y: 0, w: 340, h: 213, base: bgThumbStyle(bg) }
+    placeMagnify()
+  }, 460)
+}
+
+/** 浮层跟随卡片：滚动时重算位置，避免浮层错位 */
+function placeMagnify() {
+  if (!magnify.value || !hoverCardEl) return
+  const r = hoverCardEl.getBoundingClientRect()
+  const { w, h } = magnify.value
+  const gap = 14
+  let x = r.right + gap
+  if (x + w > window.innerWidth - 12) x = r.left - w - gap
+  if (x < 12) x = Math.max(12, Math.min(window.innerWidth - w - 12, r.left))
+  let y = r.top - 56
+  if (y + h > window.innerHeight - 12) y = window.innerHeight - h - 12
+  if (y < 12) y = 12
+  magnify.value = { ...magnify.value, x, y }
+}
+
+let scrollRaf = 0
+function onPageScroll() {
+  if (!magnify.value || scrollRaf) return
+  scrollRaf = window.requestAnimationFrame(() => {
+    scrollRaf = 0
+    placeMagnify()
+  })
+}
+
+function onBgLeave() {
+  clearBgTimers()
+  bgHoverId.value = null
+  magnify.value = null
+  hoverCardEl = null
+}
+
+function hideMagnify() {
+  clearBgTimers()
+  magnify.value = null
 }
 
 const asrUninstalling = ref(false)
@@ -279,6 +360,7 @@ async function toggleAutostart() {
 
 onMounted(async () => {
   window.addEventListener('keydown', onIfaceKeydown)
+  window.addEventListener('scroll', onPageScroll, true)
   await Promise.all([models.fetch(), settings.fetch(), agents.fetch(), loadLaunchMode(), loadAutostart()])
   syncCtxSettings()
   syncPermSettings()
@@ -289,7 +371,11 @@ onMounted(async () => {
   // 数据回来后布局高度会变，重新校准一次目录高亮
   setTimeout(onPanelsScroll, 60)
 })
-onBeforeUnmount(() => window.removeEventListener('keydown', onIfaceKeydown))
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onIfaceKeydown)
+  window.removeEventListener('scroll', onPageScroll, true)
+  clearBgTimers()
+})
 
 function openPath(p: string) { api.storage.open(p).catch(() => {}) }
 // 将绝对路径转换为相对存储位置（root）的相对路径，供“路径”列展示
@@ -1061,17 +1147,32 @@ const agentGroupOptions = computed(() => {
           </div>
           <div class="bg-grid">
             <div class="bg-card" :class="{ active: layout.backgroundId === null }" @click="layout.setBackground(null)">
-              <div class="bg-preview" style="background: radial-gradient(ellipse at 30% 20%, #080808 0%, #000000 70%)"></div>
+              <div class="bg-preview" :style="defaultBgStyle"></div>
               <div class="bg-name">默认渐变</div>
             </div>
-            <div v-for="bg in bgList" :key="bg.id" class="bg-card" :class="{ active: layout.backgroundId === bg.id }" @click="layout.setBackground(bg.id)">
+            <div v-for="bg in bgList" :key="bg.id" class="bg-card" :class="{ active: layout.backgroundId === bg.id }"
+                 @click="layout.setBackground(bg.id)"
+                 @mouseenter="onBgEnter(bg, $event)" @mouseleave="onBgLeave">
               <div class="bg-preview" :style="bgThumbStyle(bg)">
+                <iframe v-if="bg.type === 'animation' && bgHoverId === bg.id" class="bg-live"
+                        :src="bgRawUrl(bg)" tabindex="-1" scrolling="no" aria-hidden="true"></iframe>
+                <video v-else-if="bg.type === 'video' && bgHoverId === bg.id" class="bg-live"
+                       :src="bgRawUrl(bg)" muted loop autoplay playsinline></video>
+                <video v-else-if="bg.type === 'video'" class="bg-live"
+                       :src="bgRawUrl(bg) + '#t=0.2'" muted preload="auto" playsinline></video>
                 <span class="bg-type-tag">{{ bg.type === 'animation' ? '动画' : bg.type === 'video' ? '视频' : '图片' }}</span>
                 <button v-if="!bg.builtin" class="bg-del" @click.stop="deleteBackground(bg)" title="删除"><AppIcon name="x" /></button>
               </div>
               <div class="bg-name">{{ bg.name }}</div>
             </div>
           </div>
+          <Teleport to="body">
+            <div v-if="magnify" class="bg-magnify"
+                 :style="{ left: magnify.x + 'px', top: magnify.y + 'px', width: magnify.w + 'px', height: magnify.h + 'px', ...magnify.base }">
+              <iframe :src="magnify.url" tabindex="-1" scrolling="no" aria-hidden="true"></iframe>
+              <div class="bg-magnify-name">{{ magnify.name }} · 实时预览</div>
+            </div>
+          </Teleport>
           <div v-if="layout.backgroundId" class="bg-sliders">
             <div class="bg-slider-row">
               <span class="bg-slider-label">不透明度</span>
@@ -1747,6 +1848,28 @@ const agentGroupOptions = computed(() => {
   &:hover { background: rgba(220,60,60,0.85); }
 }
 .bg-name { padding: 6px 8px; text-align: center; font-size: calc(12px * var(--font-scale)); }
+/* 缩略画面：静止态代表图 + 悬停真实动画，暗色背景在浅色主题下补一圈亮边 */
+.bg-preview {
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55), inset 0 0 0 2px rgba(12, 18, 28, 0.08);
+}
+.bg-live {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  border: 0; pointer-events: none; display: block; object-fit: cover;
+}
+.bg-magnify {
+  position: fixed; z-index: 1300; border-radius: 12px; overflow: hidden;
+  pointer-events: none; background: var(--panel-bg, #fff);
+  box-shadow: 0 24px 60px rgba(20, 30, 50, 0.24), 0 0 0 1px rgba(37, 99, 235, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  animation: bg-mag-in .16s ease-out;
+}
+.bg-magnify iframe { width: 100%; height: 100%; border: 0; display: block; pointer-events: none; }
+.bg-magnify-name {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 16px 10px 6px;
+  font-size: calc(12px * var(--font-scale)); color: #fff;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.5));
+}
+@keyframes bg-mag-in { from { opacity: 0; transform: translateY(4px) scale(.97); } to { opacity: 1; transform: none; } }
 .bg-sliders { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
 .bg-slider-row { display: flex; align-items: center; gap: 10px; }
 .bg-slider-label { font-size: calc(12px * var(--font-scale)); min-width: 56px; opacity: .8; }
