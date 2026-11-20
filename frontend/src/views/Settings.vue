@@ -737,8 +737,8 @@ const agentGroupOptions = computed(() => {
     </div>
 
     <div class="settings-body">
-      <!-- 左侧目录：点击快速跳转到对应设置区块，滚动时自动高亮 -->
-      <aside class="settings-toc">
+      <!-- 左侧目录：点击快速跳转到对应设置区块，滚动时自动高亮（.glass + z-index 抬到背景层之上） -->
+      <aside class="settings-toc glass">
         <div class="toc-head">目录</div>
         <nav class="toc-list">
           <button
@@ -1466,13 +1466,15 @@ const agentGroupOptions = computed(() => {
 .panels { display: grid; gap: 16px; width: 100%; max-width: 1104px; flex: 1 1 auto; min-height: 0; min-width: 0; overflow-y: auto; align-self: stretch; }
 .panel { padding: 18px; }
 
-/* 左侧目录（固定列，不随面板滚动；条目过多时内部滚动） */
+/* 左侧目录（固定列，不随面板滚动；条目过多时内部滚动）
+   material 用全局 .glass（有 backdrop-filter 才有毛玻璃质感），
+   position/z-index 必须显式给出：全局背景层是 fixed + z-index:0，
+   普通无定位的块会被它盖住（表现为「背景一换目录就看不见」）。 */
 .settings-toc {
   width: 180px; flex: 0 0 180px; align-self: flex-start; max-height: 100%;
+  position: relative; z-index: 1;
   display: flex; flex-direction: column; gap: 6px; padding: 14px 10px;
-  border-radius: 14px; overflow-y: auto;
-  background: rgba(var(--surface-rgb), 0.06);
-  border: 1px solid rgba(var(--surface-rgb), 0.10);
+  overflow-y: auto;
 }
 .toc-head {
   font-size: calc(11px * var(--font-scale)); font-weight: 600; letter-spacing: 1px;
