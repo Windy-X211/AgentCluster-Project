@@ -3033,6 +3033,23 @@ watch(() => convs.focusChatAt, async (t) => {
   taRef.value?.focus()
 })
 
+/** 开始对话前的会话归属校验：会话若绑定了某张画布，而这次发言的智能体不在该画布节点中，
+ *  且会话还没开始过对话（0 条消息）→ 解绑该画布（会话工作区保留）。
+ *  已在对话中的会话不改归属（历史属于那个集群），这一轮的提示词由后端按「非成员」处理：
+ *  不注入该画布的集群上下文与规章制度，只保留会话级工作区。 */
+async function ensureConvCanvasScope(agentId: number) {
+  const cur = convs.currentData() as any
+  if (!cur || cur.canvas_id == null) return
+  const cv = canvases.list.find((x: any) => x.id === cur.canvas_id)
+  const inCv = !!cv && (cv.nodes ?? []).some((n: any) => Number(n.agent_id) === Number(agentId))
+  if (inCv) return
+  if (Array.isArray(cur.messages) && cur.messages.length) return
+  await convs.update(cur.id, {
+    canvas_id: null,
+    agent_ids: Array.from(new Set([...(cur.agent_ids || []), agentId])),
+  })
+}
+
 async function send() {
   // 合并消息文本 + 附件
   const msgText = input.value.trim()
@@ -3045,6 +3062,7 @@ async function send() {
   attachments.value = []
 
   const agentId = currentAgentId.value ?? agents.list[0]?.id; if (!agentId) return alert('请先新建智能体')
+  await ensureConvCanvasScope(agentId)
   stickBottom.value = true   // 自己发的消息必须可见
   await convs.send(agentId, fullText)
   setTimeout(() => { stickBottom.value = true; scrollToBottom() }, 50)

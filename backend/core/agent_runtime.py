@@ -849,6 +849,40 @@ def _rules_for_agent(agent_id, canvas_id=None) -> list[str]:
     return out
 
 
+def canvas_has_agent(canvas: dict | None, agent_id) -> bool:
+    """该智能体是否是画布的节点成员。
+
+    画布挂载的信息（集群上下文 / peers / 规章制度 / 画布身份）只对该画布上的智能体生效：
+    用户在画布 A 打开时选中了 A 之外的智能体开始对话，那个智能体不能看到 A 的任何信息。
+    """
+    if not canvas or agent_id is None:
+        return False
+    for n in (canvas.get("nodes") or []):
+        if not isinstance(n, dict):
+            continue
+        try:
+            if int(n.get("agent_id")) == int(agent_id):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def canvas_scope(canvas: dict | None, agent_id) -> dict | None:
+    """该智能体视角的「有效画布」：成员 → 原画布；非成员 → 只保留会话级工作区与串并行设置，
+    画布 id / nodes / edges 一律不带（提示词里就不会出现该画布的集群信息与规章制度）。
+    `_scope="session"` 标记这份壳只带会话级工作区，提示词按「会话工作区」措辞。"""
+    if not canvas:
+        return None
+    if canvas_has_agent(canvas, agent_id):
+        return canvas
+    shell = {k: canvas[k] for k in ("workdir", "execution_mode") if canvas.get(k)}
+    if not shell:
+        return None
+    shell["_scope"] = "session"
+    return shell
+
+
 def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_id=None, canvas: dict | None = None, wd_probe=None) -> str:
     parts = [agent.get("system_prompt") or "你是一个智能体。"]
     agent_name = agent.get("name", "智能体")
@@ -867,7 +901,7 @@ def _system_prompt(agent: dict, tools: list, cluster_context: str = "", canvas_i
                 probe_note = f"\n- ❌ 系统写权限探测失败：{note}\n  不要继续尝试写入了，请立刻告知用户工作区没有写权限。"
         parts.append(
             f"\n## 工作区文件夹（硬性约束，必须遵守）\n"
-            f"当前画布绑定了工作区：`{wd}`\n"
+            f"{'当前会话绑定了工作区' if canvas.get('_scope') == 'session' else '当前画布绑定了工作区'}：`{wd}`\n"
             f"- 所有 file.read / file.write / file.structure / cmd.run 会以它为基准解析相对路径；"
             f"- 保存文件**一律用相对路径**，例如 file.write(path='report.md', content='...') "
             f"会写入 `{wd}\\report.md`；\n"
@@ -1650,6 +1684,17 @@ async def _agent_reply_inner(conversation_id: int, agent: dict, user_input: str,
     conv = run_registry.live_conv(conversation_id)
     # 记录初始消息数，用于 final upsert 时把内存中累积但未落库的 tool entries 合并进去
     _conv_initial_len = len(conv.get("messages", []))
+
+    # 会话所绑画布只对该画布上的智能体生效：这次发言的智能体不是该画布节点 → 这一轮按独立
+    # 对话跑，不注入该画布的集群上下文 / 规章制度（提示词里不出现别的画布的任何信息）。
+    # 只保留工作区与串并行设置——工作区是会话级产出目录，与画布归属无关。
+    # 放在工具构建之前：集群工具 / 接力 / 发言者前缀都随有效画布一起关掉。
+    if mode == "linked" and canvas and not canvas_has_agent(canvas, agent.get("id")):
+        canvas = canvas_scope(canvas, agent.get("id"))
+        mode = "independent"
+        # 本轮 turn 里记的画布同步收窄，避免后续 a2a 辅助函数按原画布去找集群成员
+        if not is_relay and isinstance(turn, dict) and "canvas" in turn:
+            turn["canvas"] = canvas
 
     # 选定模型 + 接口：由 agent_reply 入口统一分配好存进 turn（并行模式下可能挑了
     # default_model 之外的槽；串行模式直接等于 agent.model 或 interface.default_model）

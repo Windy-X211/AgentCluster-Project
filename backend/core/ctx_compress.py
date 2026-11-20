@@ -169,11 +169,16 @@ def agent_view(conv: dict | None, agent_id) -> list:
 # ==============================================================
 def assemble_context(conv: dict, agent: dict, canvas: dict | None):
     """与 runtime _agent_reply_inner 一致的上下文组装（不含本轮用户输入），用于 token 估算。"""
-    from core.agent_runtime import _system_prompt, _agent_tools, _build_cluster_context
+    from core.agent_runtime import _system_prompt, _agent_tools, _build_cluster_context, canvas_has_agent, canvas_scope
 
     interface = get_by("model_interfaces", agent.get("interface_id")) or (load("model_interfaces") or [{}])[0]
     model = agent.get("model") or interface.get("default_model") or "gpt-4o-mini"
     mode = "linked" if (conv or {}).get("canvas_id") else "independent"
+    # 与 runtime 同规则：该智能体不在会话所绑画布的节点中 → 按独立对话估算，
+     # 不计入该画布的集群上下文 / 规章制度（否则指示器会高估、压缩线提前触发）
+    if mode == "linked" and canvas and not canvas_has_agent(canvas, agent.get("id")):
+        canvas = canvas_scope(canvas, agent.get("id"))
+        mode = "independent"
     tools = _agent_tools(agent)
     cluster_context = ""
     if mode == "linked" and canvas:
