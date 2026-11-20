@@ -46,7 +46,12 @@ function jumpToSection(id: string) {
   if (!root || !el) return
   const top = el.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop - 8
   activeSection.value = id
+  const from = root.scrollTop
   root.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+  // 兜底：窗口最小化 / 页面不可见时平滑滚动会被浏览器挂起，300ms 没动就直接定位
+  window.setTimeout(() => {
+    if (Math.abs(root.scrollTop - from) < 1 && Math.abs(from - top) > 1) root.scrollTop = Math.max(0, top)
+  }, 320)
 }
 
 // 滚动监听：以容器顶部往下 28px 作为判定线，高亮当前区块
@@ -732,6 +737,24 @@ const agentGroupOptions = computed(() => {
     </div>
 
     <div class="settings-body">
+      <!-- 左侧目录：点击快速跳转到对应设置区块，滚动时自动高亮 -->
+      <aside class="settings-toc">
+        <div class="toc-head">目录</div>
+        <nav class="toc-list">
+          <button
+            v-for="s in sectionList"
+            :key="s.id"
+            type="button"
+            class="toc-item"
+            :class="{ active: activeSection === s.id }"
+            @click="jumpToSection(s.id)"
+          >
+            <span class="toc-bar"></span>
+            <span class="toc-text">{{ s.name }}</span>
+          </button>
+        </nav>
+      </aside>
+
       <div class="panels" ref="panelsRef" @scroll.passive="onPanelsScroll">
       <!-- 模型接口 -->
       <div id="sec-model" class="panel glass">
@@ -1289,24 +1312,6 @@ const agentGroupOptions = computed(() => {
         <div v-if="!storagePaths" class="empty">后端未返回路径信息</div>
       </div>
       </div>
-
-      <!-- 右侧目录：点击快速跳转到对应设置区块，滚动时自动高亮 -->
-      <aside class="settings-toc" v-if="sectionList.length">
-        <div class="toc-head">目录</div>
-        <nav class="toc-list">
-          <button
-            v-for="s in sectionList"
-            :key="s.id"
-            type="button"
-            class="toc-item"
-            :class="{ active: activeSection === s.id }"
-            @click="jumpToSection(s.id)"
-          >
-            <span class="toc-bar"></span>
-            <span class="toc-text">{{ s.name }}</span>
-          </button>
-        </nav>
-      </aside>
     </div>
 
     <!-- 接口编辑弹窗（popup-surface 实底：glass 的 blur+saturate 采样深色遮罩，浅色主题下整窗发灰） -->
@@ -1444,18 +1449,56 @@ const agentGroupOptions = computed(() => {
   padding: 16px; height: calc(100vh - var(--titlebar-h));
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
-/* 顶栏与下方面板区完全同宽同缘对齐（1100px 居中）：按钮和文字贴左，
+/* 顶栏与下方面板区完全同宽同缘对齐（1300px 居中，左侧让出目录列）：按钮和文字贴左，
    顶栏内右侧空白（.top-drag flex:1）留作拖拽区 */
 .top {
-  padding: 12px 20px; margin: 0 auto 16px; max-width: 1100px; width: 100%;
+  padding: 12px 20px; margin: 0 auto 16px; max-width: 1300px; width: 100%;
   display: flex; align-items: center; gap: 16px; flex-shrink: 0;
   h2 { font-size: calc(18px * var(--font-scale)); }
 }
 /* 标题 + 空白拖动区：flex:1 占满剩余空间，撑满高度才能接收鼠标事件 */
 .top-drag { flex: 1; align-self: stretch; display: flex; align-items: center; user-select: none; }
-/* 顶栏固定常驻，面板区内部滚动（面板还原 1100px 居中窄条） */
-.panels { display: grid; gap: 16px; max-width: 1100px; width: 100%; margin: 0 auto; flex: 1; min-height: 0; min-width: 0; overflow-y: auto; }
+/* 顶栏固定常驻，面板区内部滚动（目录 180 + 间距 16 + 面板 1104 = 1300，与顶栏左右同缘） */
+.settings-body {
+  flex: 1; min-height: 0; width: 100%; max-width: 1300px; margin: 0 auto;
+  display: flex; gap: 16px; align-items: stretch;
+}
+.panels { display: grid; gap: 16px; width: 100%; max-width: 1104px; flex: 1 1 auto; min-height: 0; min-width: 0; overflow-y: auto; align-self: stretch; }
 .panel { padding: 18px; }
+
+/* 左侧目录（固定列，不随面板滚动；条目过多时内部滚动） */
+.settings-toc {
+  width: 180px; flex: 0 0 180px; align-self: flex-start; max-height: 100%;
+  display: flex; flex-direction: column; gap: 6px; padding: 14px 10px;
+  border-radius: 14px; overflow-y: auto;
+  background: rgba(var(--surface-rgb), 0.06);
+  border: 1px solid rgba(var(--surface-rgb), 0.10);
+}
+.toc-head {
+  font-size: calc(11px * var(--font-scale)); font-weight: 600; letter-spacing: 1px;
+  color: rgba(var(--text-rgb), 0.5); padding: 0 8px 6px;
+}
+.toc-list { display: flex; flex-direction: column; gap: 2px; }
+.toc-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 8px;
+  border: none; background: transparent; border-radius: 8px; cursor: pointer; text-align: left;
+  color: rgba(var(--text-rgb), 0.68); font-family: inherit;
+  font-size: calc(12.5px * var(--font-scale)); transition: background .15s ease, color .15s ease;
+}
+.toc-item:hover { background: rgba(var(--surface-rgb), 0.10); color: rgba(var(--text-rgb), 0.95); }
+.toc-item.active { background: rgba(var(--surface-rgb), 0.10); color: rgba(var(--text-rgb), 1); font-weight: 600; }
+.toc-bar {
+  width: 3px; height: 13px; border-radius: 2px; flex-shrink: 0;
+  background: transparent; transition: background .15s ease;
+}
+.toc-item.active .toc-bar { background: var(--accent); }
+.toc-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 窗口不够宽时隐藏目录，回到原来 1100px 单列布局 */
+@media (max-width: 1240px) {
+  .top { max-width: 1100px; }
+  .settings-body { max-width: 1100px; }
+  .settings-toc { display: none; }
+}
 .panel-title { font-size: calc(15px * var(--font-scale)); font-weight: 600; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
 .panel-title .hint { font-size: calc(11px * var(--font-scale)); font-weight: normal; opacity: .5; }
 .tbl { width: 100%; margin-top: 12px; border-collapse: collapse; th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid rgba(var(--surface-rgb), 0.05); font-size: calc(13px * var(--font-scale)); } th { font-size: calc(11px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px; color: rgba(var(--text-rgb), 0.6); } }
