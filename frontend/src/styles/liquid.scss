@@ -31,6 +31,8 @@
   --code-tint-pre: rgba(var(--surface-rgb), 0.045);
   --tint-soft-bg: rgba(var(--surface-rgb), 0.045);
   --tint-input-bg: rgba(var(--surface-rgb), 0.03);
+  /* 箭头外圈描边：不再描黑，改用淡冷光晕（暗色主题靠它把箭头从底色里托出来） */
+  --edge-halo: rgba(212, 226, 255, 0.34);
   --glass-shadow: 0 8px 32px rgba(var(--shadow-rgb), 0.25), inset 0 1px 0 rgba(var(--surface-rgb), 0.08);
   --popup-shadow: 0 12px 40px rgba(var(--shadow-rgb), 0.5);
 }
@@ -50,6 +52,8 @@
   --success-light: #80e4b8;
   --panel-bg: #1a1f30;
   --node-bg-rgb: 20, 26, 44;
+  /* 箭头外圈描边：暗色主题也不描黑，改用淡冷光晕把箭头从底色里托出来 */
+  --edge-halo: rgba(198, 216, 255, 0.36);
 }
 
 /* 科技白 */
@@ -69,9 +73,8 @@
   --success-light: #16a34a;
   --panel-bg: #ffffff;
   --node-bg-rgb: 249, 251, 255;
-  /* 连线箭头外圈"抠图"描边：深色主题靠黑边把箭头从背景里抠出来，
-     浅色主题必须换成白色，否则箭头会被描成黑边（科技白下尤其刺眼） */
-  --edge-halo-rgb: 255, 255, 255;
+  /* 连线箭头外圈"抠图"描边：浅色主题用白色/米黄，绝不描黑 */
+  --edge-halo: rgba(255, 255, 255, 0.98);
   --red-ink: #dc2626;
   --code-ink: #c2410c;
   --code-tint-bg: #e2ebf6;
@@ -129,7 +132,7 @@ html[data-theme="tech-white"] body option {
   --panel-bg: #ece1c5;
   --node-bg-rgb: 235, 225, 198;
   /* 浅色主题同理：箭头外圈描边用米黄底色，避免黑边 */
-  --edge-halo-rgb: 244, 236, 214;
+  --edge-halo: rgba(250, 243, 223, 0.94);
   --red-ink: #c53030;
   --code-ink: #92400e;
 }

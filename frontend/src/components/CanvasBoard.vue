@@ -5286,7 +5286,7 @@ defineExpose({ viewportRef, computeNodeBbox })
    填充在内），把箭头从节点边缘和背景里"抠"出来；尺寸由模板的 arrowScale 反向补偿画布缩放 */
 .eg-arrow {
   fill: color-mix(in oklab, var(--accent) var(--edge-accent-share, 45%), var(--eg-c, var(--accent)));
-  stroke: rgb(var(--edge-halo-rgb, 10, 10, 10));
+  stroke: var(--edge-halo, rgba(255, 255, 255, 0.4));
   stroke-width: 2.4;
   stroke-linejoin: round;
   paint-order: stroke fill;
@@ -5347,7 +5347,7 @@ defineExpose({ viewportRef, computeNodeBbox })
    transform 里的 scale(arrowScale) 抵消画布缩放：画布缩小时箭头在屏幕上不会跟着变小。 */
 .edge-mid {
   fill: color-mix(in oklab, var(--accent) var(--edge-accent-share, 45%), var(--eg-c, var(--accent)));
-  stroke: rgb(var(--edge-halo-rgb, 10, 10, 10));
+  stroke: var(--edge-halo, rgba(255, 255, 255, 0.4));
   stroke-width: 3.6;
   stroke-linejoin: round;
   paint-order: stroke fill;
