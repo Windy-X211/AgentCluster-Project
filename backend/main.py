@@ -739,8 +739,9 @@ _IMG_EXT_MIME = {
 def fs_image(path: str = ""):
     """读取本地图片文件并以字节流返回（供 <img> 展示，如 browser_control 的 share 截图）。
 
-    路径安全：复用 _safe_resolve，限定在 AppData ROOT / 进程工作区 / 临时截图目录内。
-    仅允许图片扩展名，防把任意二进制当图片外泄。
+    路径安全：绝对路径放行任意本地位置（如用户图片目录 AI_Gallery），
+    仅靠下方图片扩展名白名单限制（只读不写、仅图片 MIME）；
+    相对路径仍限定在 AppData ROOT / 进程工作区 / 临时截图目录 / 画布·会话工作区内解析。
     """
     if not path:
         from fastapi import HTTPException
@@ -748,13 +749,12 @@ def fs_image(path: str = ""):
     try:
         fp = _safe_resolve(path)
     except Exception:
-        # _safe_resolve 拒绝（403）→ 放宽到画布工作区 / default_workdir：
-        # 智能体常把图片生成在工作区里，缩略图走本接口加载需放行这些路径。
         p = _P(path).resolve()
-        roots = _collect_workdir_roots()
         if not _P(path).is_absolute():
             # 相对路径（模型常给 workdir 内相对引用，如 tyut_img/campus1.jpg）
-            # → 逐个工作区根尝试拼接，命中文件且解析后仍在该根内才放行
+            # → 逐个工作区根尝试拼接，命中文件才放行
+            roots = _collect_workdir_roots()
+            hit = False
             for r in roots:
                 try:
                     cand = (r / path).resolve()
@@ -762,10 +762,11 @@ def fs_image(path: str = ""):
                     continue
                 if cand.is_file():
                     p = cand
+                    hit = True
                     break
-        if not any(_is_under(p, r) for r in roots):
-            from fastapi import HTTPException
-            raise HTTPException(403, f"path 超出允许范围：{path}")
+            if not hit:
+                from fastapi import HTTPException
+                raise HTTPException(403, f"相对路径未命中任何工作区：{path}")
         fp = p
     if not fp.is_file():
         from fastapi import HTTPException
