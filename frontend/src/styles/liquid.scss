@@ -24,6 +24,10 @@
   --green-ink: var(--success-light);
   --red-ink: #ff9090;
   --code-ink: #ffb088;
+  /* 插件调试等结果区：成功/失败/警告墨色，浅色主题会换成深绿/深红/深琥珀 */
+  --ok-ink: #b7f3da;
+  --err-ink: #ff9a9a;
+  --warn-ink: #ffcba0;
   --font-scale: 1;
   --app-font: "Noto Sans SC", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
   --code-tint-bg: rgba(var(--surface-rgb), 0.06);
@@ -52,6 +56,9 @@
   --success-light: #80e4b8;
   --panel-bg: #1a1f30;
   --node-bg-rgb: 20, 26, 44;
+  --ok-ink: #b7f3da;
+  --err-ink: #ff9a9a;
+  --warn-ink: #ffcba0;
   /* 箭头外圈描边：暗色主题也不描黑，改用淡冷光晕把箭头从底色里托出来 */
   --edge-halo: rgba(198, 216, 255, 0.36);
 }
@@ -77,6 +84,9 @@
   --edge-halo: rgba(255, 255, 255, 0.98);
   --red-ink: #dc2626;
   --code-ink: #c2410c;
+  /* 插件调试结果区：白底上必须用深色墨，浅绿/浅粉会看不清 */
+  --ok-ink: #05674a;
+  --err-ink: #b01c1c;
   --code-tint-bg: #e2ebf6;
   --code-tint-strong: #cfdbef;
   --code-tint-pre: #e2ebf6;
@@ -131,6 +141,9 @@ html[data-theme="tech-white"] body option {
   --success-light: #2f855a;
   --panel-bg: #ece1c5;
   --node-bg-rgb: 235, 225, 198;
+  --ok-ink: #1f5c3a;
+  --err-ink: #8f2b1f;
+  --warn-ink: #8a5a12;
   /* 浅色主题同理：箭头外圈描边用米黄底色，避免黑边 */
   --edge-halo: rgba(250, 243, 223, 0.94);
   --red-ink: #c53030;

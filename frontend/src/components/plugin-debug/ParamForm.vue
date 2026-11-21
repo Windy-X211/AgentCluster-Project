@@ -242,7 +242,7 @@ function onInput(name: string, e: Event) {
 .param { padding: 10px 12px; border-radius: 10px; background: rgba(var(--surface-rgb), 0.03); border: 1px solid rgba(var(--surface-rgb), 0.07); }
 .param-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .pname { font-size: calc(13px * var(--font-scale)); font-weight: 600; font-family: Consolas, monospace; }
-.req { color: #ff7a7a; margin-left: 3px; }
+.req { color: var(--err-ink, #ff9a9a); margin-left: 3px; }
 .ptype { margin-left: auto; font-size: calc(10px * var(--font-scale)); opacity: .5; font-family: Consolas, monospace; }
 .remove-btn { padding: 0 8px; font-size: calc(14px * var(--font-scale)); line-height: 1.4; }
 .pdesc { font-size: calc(12px * var(--font-scale)); opacity: .65; margin-bottom: 6px; line-height: 1.4;

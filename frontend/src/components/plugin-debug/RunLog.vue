@@ -34,8 +34,8 @@ const store = usePluginDebugStore()
   background: rgba(var(--surface-rgb), 0.03); border: 1px solid rgba(var(--surface-rgb), 0.06);
   font-family: Consolas, monospace;
 }
-.log-item.ok .status { color: var(--success-light); }
-.log-item.err .status { color: #ffb0b0; }
+.log-item.ok .status { color: var(--ok-ink, #c8f5e0); }
+.log-item.err .status { color: var(--err-ink, #ff9a9a); }
 .status { font-weight: bold; }
 .time { opacity: .55; }
 .plugin { font-weight: 600; }

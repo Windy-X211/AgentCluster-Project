@@ -67,14 +67,14 @@ const store = usePluginDebugStore()
 .empty { padding: 24px; text-align: center; opacity: .5; font-size: calc(13px * var(--font-scale)); }
 .scan-error {
   padding: 10px 12px; margin-bottom: 8px; border-radius: 8px; font-size: calc(12px * var(--font-scale));
-  background: rgba(255, 96, 96, 0.14); border: 1px solid rgba(255, 96, 96, 0.35); color: #ffb4b4;
+  background: color-mix(in srgb, var(--err-ink, #ff9a9a) 12%, transparent); border: 1px solid color-mix(in srgb, var(--err-ink, #ff9a9a) 34%, transparent); color: var(--err-ink, #ff9a9a);
 }
 .failed-block { margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(var(--surface-rgb), 0.08); }
 .failed-title { font-size: calc(11px * var(--font-scale)); text-transform: uppercase; letter-spacing: 1px; opacity: .55; margin-bottom: 6px; }
 .failed-item {
   display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 8px; margin-bottom: 6px;
-  background: rgba(255, 160, 96, 0.08); border: 1px solid rgba(255, 160, 96, 0.22);
+  background: color-mix(in srgb, var(--warn-ink, #ffcba0) 9%, transparent); border: 1px solid color-mix(in srgb, var(--warn-ink, #ffcba0) 24%, transparent);
 }
 .failed-name { font-size: calc(12px * var(--font-scale)); opacity: .8; }
-.failed-reason { font-size: calc(11px * var(--font-scale)); color: #ffcba0; }
+.failed-reason { font-size: calc(11px * var(--font-scale)); color: var(--warn-ink, #ffcba0); }
 </style>
