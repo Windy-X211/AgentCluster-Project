@@ -33,6 +33,9 @@ watch(() => layout.backgroundId, async (id) => {
   }
 }, { immediate: true })
 
+// 设置页修改了背景 manifest（轮播间隔/变换方式等）→ 重新拉取让改动即时生效
+watch(() => layout.bgStamp, () => { reload() })
+
 const current = computed(() =>
   layout.backgroundId ? list.value.find(b => b.id === layout.backgroundId) || null : null
 )
@@ -77,6 +80,60 @@ const iframeSandbox = computed(() => {
 })
 // pointer-lock 不是合法的 permission-policy 名称（沙箱 token 已经覆盖），带上会被浏览器告警
 const iframeAllow = 'fullscreen; autoplay; encrypted-media; gamepad'
+
+// —— 照片轮播（slideshow）：双缓冲交叉淡化 ——
+// 两张 img 叠放：A 恒显示，B 通过 opacity 0→1 淡入盖住 A；下一次 A 换新图、B 淡出露出 A。
+// 视觉等价于交叉淡化，且每次切换前 inactive 层已持有下一张图（本地服务加载极快）。
+const slideState = ref<{ a: string; b: string; showB: boolean }>({ a: '', b: '', showB: false })
+let slideTimer: number | null = null
+let slidePos = 0
+
+const slideUrls = computed<string[]>(() => {
+  const c: any = current.value
+  if (!c || c.type !== 'slideshow' || !Array.isArray(c.images)) return []
+  return c.images.map((f: string) => api.backgrounds.rawUrl(c.id, f))
+})
+
+function stopSlideTimer() {
+  if (slideTimer != null) {
+    clearInterval(slideTimer)
+    slideTimer = null
+  }
+}
+
+function advanceSlide() {
+  const urls = slideUrls.value
+  if (urls.length <= 1) return
+  slidePos = (slidePos + 1) % urls.length
+  // 提前预热下下张，避免淡入期间才开始加载
+  if (urls.length > 2) {
+    const pre = new Image()
+    pre.src = urls[(slidePos + 1) % urls.length]
+  }
+  const s = slideState.value
+  if (s.showB) { s.a = urls[slidePos]; s.showB = false }
+  else { s.b = urls[slidePos]; s.showB = true }
+}
+
+function restartSlide() {
+  stopSlideTimer()
+  const urls = slideUrls.value
+  slidePos = 0
+  slideState.value = { a: urls[0] || '', b: urls[1] || urls[0] || '', showB: false }
+  const c: any = current.value
+  const sec = Math.max(1, Number(c?.interval) || 8)
+  if (urls.length > 1) slideTimer = window.setInterval(advanceSlide, sec * 1000)
+}
+
+watch(
+  [() => current.value?.id, () => current.value?.interval, () => current.value?.transition],
+  () => {
+    if (current.value?.type === 'slideshow') restartSlide()
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(stopSlideTimer)
 
 const iframeRef = ref<HTMLIFrameElement | null>(null)
 
@@ -163,6 +220,19 @@ onBeforeUnmount(() => {
       class="bg-fill"
       alt=""
     />
+    <div
+      v-else-if="current.type === 'slideshow'"
+      class="bg-slideshow"
+      :class="{ instant: current.transition === 'none' }"
+    >
+      <img :src="slideState.a" class="bg-fill" alt="" />
+      <img
+        :src="slideState.b"
+        class="bg-fill bg-slide-top"
+        :style="{ opacity: slideState.showB ? 1 : 0 }"
+        alt=""
+      />
+    </div>
   </div>
 </template>
 
@@ -187,4 +257,9 @@ onBeforeUnmount(() => {
   object-fit: cover;
   outline: none;
 }
+/* 照片轮播：两层叠放，上层淡入淡出；instant 时无过渡直接跳变 */
+.bg-slideshow { position: relative; width: 100%; height: 100%; }
+.bg-slideshow .bg-fill { position: absolute; inset: 0; }
+.bg-slide-top { transition: opacity 1.2s ease; }
+.bg-slideshow.instant .bg-slide-top { transition: none; }
 </style>

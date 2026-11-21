@@ -149,7 +149,7 @@ const bgList = ref<any[]>([])
 const bgLoading = ref(false)
 const bgUploading = ref(false)
 const bgFileInput = ref<HTMLInputElement | null>(null)
-const bgUploadType = ref<'animation' | 'video' | 'image'>('image')
+const bgUploadType = ref<'animation' | 'video' | 'image' | 'slideshow'>('image')
 
 async function loadBackgrounds() {
   bgLoading.value = true
@@ -157,7 +157,7 @@ async function loadBackgrounds() {
   bgLoading.value = false
 }
 
-function pickBackgroundFiles(type: 'animation' | 'video' | 'image') {
+function pickBackgroundFiles(type: 'animation' | 'video' | 'image' | 'slideshow') {
   bgUploadType.value = type
   bgFileInput.value?.click()
 }
@@ -166,12 +166,13 @@ async function onBgFiles(e: Event) {
   const input = e.target as HTMLInputElement
   const files = input.files
   if (!files || !files.length) return
-  const typeLabel = bgUploadType.value === 'animation' ? '动画' : bgUploadType.value === 'video' ? '视频' : '图片'
+  const typeLabel = bgUploadType.value === 'animation' ? '动画' : bgUploadType.value === 'video' ? '视频' : bgUploadType.value === 'slideshow' ? '多图轮播' : '图片'
   if (!confirm(`将所选文件作为${typeLabel}背景上传？`)) { input.value = ''; return }
   bgUploading.value = true
   try {
     const form = new FormData()
-    form.append('name', files[0].name.replace(/\.[^.]+$/, '') || '自定义背景')
+    const baseName = files[0].name.replace(/\.[^.]+$/, '') || '自定义背景'
+    form.append('name', bgUploadType.value === 'slideshow' ? `照片轮播(${files.length}张)` : baseName)
     form.append('type', bgUploadType.value)
     for (const f of Array.from(files)) form.append('files', f)
     const created = await api.backgrounds.upload(form)
@@ -196,6 +197,22 @@ async function deleteBackground(bg: any) {
     showToast('已删除')
   } catch (err: any) {
     showToast('删除失败：' + (err?.message || err), 'err')
+  }
+}
+
+/* 当前选中的背景对象（轮播设置区跟随它） */
+const currentBg = computed(() => bgList.value.find(b => b.id === layout.backgroundId) || null)
+
+/* 修改照片轮播背景的轮播间隔 / 变换方式，持久化到 manifest 并通知背景层即时生效 */
+async function updateSlideshowSettings(patch: { interval?: number; transition?: string }) {
+  const bg = currentBg.value
+  if (!bg) return
+  try {
+    const updated = await api.backgrounds.update(bg.id, patch)
+    Object.assign(bg, updated)
+    layout.bumpBgStamp()
+  } catch (err: any) {
+    showToast('保存失败：' + (err?.message || err), 'err')
   }
 }
 
@@ -1142,6 +1159,7 @@ const agentGroupOptions = computed(() => {
               <button class="btn sm ghost" @click="pickBackgroundFiles('image')" :disabled="bgUploading"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>图片</button>
               <button class="btn sm ghost" @click="pickBackgroundFiles('video')" :disabled="bgUploading"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2" ry="2"/></svg>视频</button>
               <button class="btn sm ghost" @click="pickBackgroundFiles('animation')" :disabled="bgUploading"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 3v18"/><path d="m16.6 7.6-2.4 4.4-4.8 5.4 2.4-4.4 4.8-5.4"/></svg>动画</button>
+              <button class="btn sm ghost" @click="pickBackgroundFiles('slideshow')" :disabled="bgUploading"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 2v2"/><path d="M5.3 4.3 4 3"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 8v2a5 5 0 0 0 5 5"/><path d="m9 14 3 3 3-3"/></svg>多图轮播</button>
             </div>
           </div>
           <div class="bg-grid">
@@ -1159,7 +1177,7 @@ const agentGroupOptions = computed(() => {
                        :src="bgRawUrl(bg)" muted loop autoplay playsinline></video>
                 <video v-else-if="bg.type === 'video'" class="bg-live"
                        :src="bgRawUrl(bg) + '#t=0.2'" muted preload="auto" playsinline></video>
-                <span class="bg-type-tag">{{ bg.type === 'animation' ? '动画' : bg.type === 'video' ? '视频' : '图片' }}</span>
+                <span class="bg-type-tag">{{ bg.type === 'animation' ? '动画' : bg.type === 'video' ? '视频' : bg.type === 'slideshow' ? '轮播' : '图片' }}</span>
                 <button v-if="!bg.builtin" class="bg-del" @click.stop="deleteBackground(bg)" title="删除"><AppIcon name="x" /></button>
               </div>
               <div class="bg-name">{{ bg.name }}</div>
@@ -1187,6 +1205,25 @@ const agentGroupOptions = computed(() => {
                      @input="layout.setBackgroundBlur(Number(($event.target as HTMLInputElement).value))" />
               <span class="bg-slider-value">{{ layout.backgroundBlur }}px</span>
             </div>
+            <template v-if="currentBg?.type === 'slideshow'">
+              <div class="bg-slider-row">
+                <span class="bg-slider-label">轮播间隔</span>
+                <input class="font-scale-slider" type="range" min="2" max="60" step="1"
+                       :value="currentBg.interval || 8"
+                       @change="updateSlideshowSettings({ interval: Number(($event.target as HTMLInputElement).value) })" />
+                <span class="bg-slider-value">{{ currentBg.interval || 8 }}s</span>
+              </div>
+              <div class="bg-slider-row">
+                <span class="bg-slider-label">变换方式</span>
+                <div class="bg-transition-btns">
+                  <button class="btn sm" :class="{ ghost: (currentBg.transition || 'fade') !== 'fade' }"
+                          @click="updateSlideshowSettings({ transition: 'fade' })">渐变</button>
+                  <button class="btn sm" :class="{ ghost: (currentBg.transition || 'fade') !== 'none' }"
+                          @click="updateSlideshowSettings({ transition: 'none' })">直接切换</button>
+                </div>
+                <span class="bg-slider-value">{{ (currentBg.transition || 'fade') === 'fade' ? '交叉渐变' : '直接切换' }}</span>
+              </div>
+            </template>
           </div>
           <input ref="bgFileInput" type="file" multiple style="display:none" @change="onBgFiles" />
           <div class="hint-empty" style="margin-top: 8px">
@@ -1873,6 +1910,7 @@ const agentGroupOptions = computed(() => {
 .bg-slider-row { display: flex; align-items: center; gap: 10px; }
 .bg-slider-label { font-size: calc(12px * var(--font-scale)); min-width: 56px; opacity: .8; }
 .bg-slider-value { font-size: calc(12px * var(--font-scale)); font-weight: 600; min-width: 44px; text-align: right; color: var(--accent); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.bg-transition-btns { display: flex; gap: 6px; }
 
 .picker-mask {
   position: fixed; inset: 0;

@@ -27,6 +27,7 @@ export const FONT_FAMILIES: { id: string; name: string; stack: string }[] = [
   { id: 'kaiti', name: '楷体', stack: '"KaiTi", "楷体", "STKaiti", "华文楷体", serif' },
   { id: 'youyuan', name: '幼圆', stack: '"YouYuan", "幼圆", "Microsoft YaHei", sans-serif' },
   { id: 'system', name: '跟随系统', stack: '-apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif' },
+  { id: 'times-new-roman', name: 'Times New Roman', stack: '"Times New Roman", "Times", "Microsoft YaHei", "PingFang SC", serif' },
 ]
 export const FONT_FAMILY_DEFAULT: string = FONT_FAMILIES[0].id
 
@@ -148,8 +149,14 @@ export const useLayoutStore = defineStore('layout', {
     immersiveBarOpen: false,
     // 沉浸态「运行输出」浮窗是否打开
     immersivePeek: false,
+    // 背景数据版本戳（仅内存）：设置页修改背景 manifest（如轮播间隔/变换方式）后 +1，
+    // BackgroundLayer 监听它重新拉取列表，让改动无需切换背景即时生效
+    bgStamp: 0,
   }),
   actions: {
+    bumpBgStamp() {
+      this.bgStamp++
+    },
     setRightWidth(v: number) {
       const n = Math.max(RIGHT_MIN, Math.round(v))
       this.rightWidth = n

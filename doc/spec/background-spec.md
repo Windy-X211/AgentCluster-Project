@@ -29,8 +29,8 @@ AppData/backgrounds/
 |---|---|---|---|
 | `id` | string | 是 | 背景唯一标识，须与文件夹名一致 |
 | `name` | string | 是 | 显示名称 |
-| `type` | string | 是 | 背景类型：`animation` / `video` / `image` |
-| `entry` | string | 是 | 入口文件名（相对背景文件夹）<br>· animation → 一个自包含 HTML 文件<br>· video → 视频文件（mp4/webm）<br>· image → 图片文件（jpg/png/webp/gif） |
+| `type` | string | 是 | 背景类型：`animation` / `video` / `image` / `slideshow` |
+| `entry` | string | 是 | 入口文件名（相对背景文件夹）<br>· animation → 一个自包含 HTML 文件<br>· video → 视频文件（mp4/webm）<br>· image → 图片文件（jpg/png/webp/gif）<br>· slideshow → 第一张照片（与 `images[0]` 一致） |
 | `description` | string | 否 | 背景描述 |
 | `thumbnail` | string | 否 | 缩略图文件名（相对背景文件夹）。有则优先用于设置页预览 |
 | `preview` | string | 否 | 缩略图 CSS 背景值（如 `radial-gradient(...)`），无 `thumbnail` 时使用 |
@@ -39,6 +39,9 @@ AppData/backgrounds/
 | `builtin` | bool | 否 | 是否内置背景（内置不可删除） |
 | `interactive` | bool | 否 | animation 是否可交互（如鼠标视差），默认 false（依赖宿主转发 `bg-pointer` 消息） |
 | `playable` | bool | 否 | 沉浸模式下是否按「可玩的 HTML 小游戏」处理（原生鼠标/键盘/指针锁直达 iframe）。默认按 `interactive` 反推：显式 `true` 强制原生交互，`false` 强制视差协议；未声明时 `interactive:true` 视为视差、否则视为游戏 |
+| `images` | string[] | slideshow 必填 | 轮播照片文件名列表（按播放顺序） |
+| `interval` | number | 否 | slideshow 轮播间隔（秒），默认 8，范围 1~600 |
+| `transition` | string | 否 | slideshow 变换方式：`fade`（交叉渐变，默认）/ `none`（直接切换） |
 
 ### manifest.json 示例（动画）
 
@@ -159,6 +162,13 @@ AppData/backgrounds/
 - 格式：jpg / png / webp / gif（gif 可做简单循环动图）。
 - 建议分辨率 ≥1920×1080，文件大小 ≤5MB（前端加载流畅）。
 - `opacity` 建议 0.5~0.8。
+
+## 5.5 slideshow 类型规范（照片轮播）
+- 上传多张照片组成轮播背景：照片按上传顺序循环播放，第一张做入口与缩略图。
+- manifest 必填 `images`（文件名列表）；可选 `interval`（轮播间隔秒，默认 8）与 `transition`（`fade` 交叉渐变 / `none` 直接切换，默认 `fade`）。
+- 支持的图片格式与 image 类型一致（jpg / png / webp / gif / bmp / svg）。
+- 前端用双层 img 交叉淡化实现渐变；间隔与变换方式可在「设置 → 外观设置 → 背景」选中该背景后调整，改动持久化到 manifest.json 并即时生效。
+- 手工创建：在 `AppData/backgrounds/<id>/` 放入照片并编写 manifest.json（`type` 为 `slideshow`、列出 `images`）即可被扫描识别。
 
 ## 6. 让智能体生成背景
 

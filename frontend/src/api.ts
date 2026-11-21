@@ -335,6 +335,9 @@ export const api = {
       return r.json()
     },
     remove: (id: string) => req<any>(`/backgrounds/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    /** 更新背景设置（slideshow 的 interval / transition，及显示名） */
+    update: (id: string, data: { name?: string; interval?: number; transition?: string }) =>
+      req<any>(`/backgrounds/${encodeURIComponent(id)}/settings`, { method: 'PUT', body: JSON.stringify(data) }),
   },
   rules: {
     list: (canvasId?: number | null) => req<any[]>('/rules' + (canvasId != null ? `?canvas_id=${canvasId}` : '')),

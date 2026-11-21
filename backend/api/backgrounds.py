@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 import core.store as _store
 
@@ -37,7 +38,10 @@ _ALLOWED_EXT = {
     "animation": {".html", ".htm"},
     "video": {".mp4", ".webm", ".ogv", ".mov"},
     "image": {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg"},
+    "slideshow": {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg"},
 }
+
+_TRANSITIONS = ("fade", "none")
 
 
 def _safe_id(bg_id: str) -> str:
@@ -113,19 +117,25 @@ async def upload_background(
     bg_type: str = Form(..., alias="type"),
     description: str = Form(""),
     entry: str = Form(""),
+    interval: float = Form(8.0),
+    transition: str = Form("fade"),
     files: list[UploadFile] = File(...),
 ):
     """上传新背景。
 
     参数：
       name: 背景显示名
-      type: animation / video / image
+      type: animation / video / image / slideshow
       description: 描述（可选）
       entry: 指定入口文件名（可选）
+      interval: slideshow 轮播间隔（秒，可选，默认 8）
+      transition: slideshow 变换方式 fade（渐变）/ none（直接切换），默认 fade
       files: 资源文件列表
     """
-    if bg_type not in ("animation", "video", "image"):
-        raise HTTPException(400, "type 必须是 animation/video/image")
+    if bg_type not in ("animation", "video", "image", "slideshow"):
+        raise HTTPException(400, "type 必须是 animation/video/image/slideshow")
+    if bg_type == "slideshow" and transition not in _TRANSITIONS:
+        raise HTTPException(400, "transition 必须是 fade/none")
     if not files:
         raise HTTPException(400, "至少上传一个文件")
 
@@ -182,23 +192,71 @@ async def upload_background(
         "animation": "radial-gradient(circle at 50% 40%, #080808 0%, #000000 70%)",
         "video": "linear-gradient(135deg, #101010 0%, #000000 100%)",
         "image": "linear-gradient(135deg, #101010 0%, #000000 100%)",
+        "slideshow": "linear-gradient(135deg, #101010 0%, #000000 100%)",
     }
-    manifest = {
-        "id": bg_id,
-        "name": name,
-        "type": bg_type,
-        "entry": entry_file,
-        "description": description,
-        "preview": preview_map.get(bg_type, ""),
-        "opacity": 0.8 if bg_type != "animation" else 1.0,
-        "builtin": False,
-    }
-    # 图片/视频背景用自身做缩略图
-    if bg_type in ("image", "video"):
-        manifest["thumbnail"] = entry_file
+    if bg_type == "slideshow":
+        # 照片轮播：全部图片按上传顺序进 images，第一张做入口/缩略图
+        manifest = {
+            "id": bg_id,
+            "name": name,
+            "type": "slideshow",
+            "entry": saved_names[0],
+            "description": description,
+            "images": saved_names,
+            "interval": max(1.0, float(interval)),
+            "transition": transition,
+            "preview": preview_map["slideshow"],
+            "opacity": 0.8,
+            "builtin": False,
+            "thumbnail": saved_names[0],
+        }
+    else:
+        manifest = {
+            "id": bg_id,
+            "name": name,
+            "type": bg_type,
+            "entry": entry_file,
+            "description": description,
+            "preview": preview_map.get(bg_type, ""),
+            "opacity": 0.8 if bg_type != "animation" else 1.0,
+            "builtin": False,
+        }
+        # 图片/视频背景用自身做缩略图
+        if bg_type in ("image", "video"):
+            manifest["thumbnail"] = entry_file
     (d / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    return manifest
+
+
+class BgSettingsIn(BaseModel):
+    """背景设置更新入参（全部可选，只更新给出的字段）"""
+    name: str | None = None
+    interval: float | None = Field(None, ge=1, le=600)
+    transition: str | None = None
+
+
+@router.put("/{bg_id}/settings")
+def update_bg_settings(bg_id: str, data: BgSettingsIn):
+    """更新背景设置（当前用于 slideshow 的轮播间隔 / 变换方式，及显示名）"""
+    d = _bg_dir(bg_id)
+    mf = d / "manifest.json"
+    if not mf.is_file():
+        raise HTTPException(404, "manifest.json 不存在")
+    try:
+        manifest = json.loads(mf.read_text(encoding="utf-8"))
+    except Exception:
+        raise HTTPException(500, "manifest.json 解析失败")
+    if data.name is not None and data.name.strip():
+        manifest["name"] = data.name.strip()
+    if data.interval is not None:
+        manifest["interval"] = data.interval
+    if data.transition is not None:
+        if data.transition not in _TRANSITIONS:
+            raise HTTPException(400, "transition 必须是 fade/none")
+        manifest["transition"] = data.transition
+    mf.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
 
