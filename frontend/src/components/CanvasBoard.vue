@@ -5,6 +5,10 @@ import { api } from '@/api'
 import { toolLabel, extractToolFileName, cyclicWindow, stripContinueTag, type ToolCallPhase } from '@/stores/conversation'
 import { renderMarkdown } from '@/utils/markdown'
 import { getAvatarGradient, getAvatarRgb, getPaletteRgbPool, generateRgb, agentAvatarGradient, hexToRgbString } from '@/utils/avatar'
+import {
+  buildCron, checkCron, checkSched, clampEvery, describe, fmtWhen, humanizeGap,
+  HOUR_STEPS, MINUTE_STEPS, nextRuns, parseCron, schedFromTrigger, WEEK_LABELS, type Sched,
+} from '@/utils/schedule'
 
 const canvases = useCanvasStore()
 const agents = useAgentStore()
@@ -259,12 +263,94 @@ function nodeAvatarBg(node: any): string {
   return avatarGradient.value(node.agent_id)
 }
 
-// 触发设置
+// —— 触发设置：默认给「人话」入口，cron 只作为高级兜底 ——
 const triggerDlg = ref(false)
 const triggerAgentId = ref<number | null>(null)
-const triggerType = ref<'manual' | 'cron'>('manual')
-const triggerCron = ref('')
+const triggerMode = ref<'manual' | 'schedule'>('manual')
 const triggerMsg = ref('')
+const catchUp = ref(false)
+/** 结构化配置（唯一会被保存的形态；kind=cron 时才用 cronText） */
+const schedForm = ref<Sched>({ kind: 'daily', time: '09:00' })
+const cronText = ref('')
+/** 一次性任务此前已执行过（schedForm 仍展示，保存后重置） */
+const onceDone = ref(false)
+
+const TRIGGER_PRESETS: { key: string; label: string; sched: Sched }[] = [
+  { key: 'm5', label: '每 5 分钟', sched: { kind: 'every', every: 5, unit: 'minute' } },
+  { key: 'm30', label: '每 30 分钟', sched: { kind: 'every', every: 30, unit: 'minute' } },
+  { key: 'h1', label: '每小时整点', sched: { kind: 'every', every: 1, unit: 'hour' } },
+  { key: 'd9', label: '每天 09:00', sched: { kind: 'daily', time: '09:00' } },
+  { key: 'wd9', label: '每个工作日 09:00', sched: { kind: 'weekly', days: [1, 2, 3, 4, 5], time: '09:00' } },
+  { key: 'w1', label: '每周一 09:00', sched: { kind: 'weekly', days: [1], time: '09:00' } },
+  { key: 'mo1', label: '每月 1 日 09:00', sched: { kind: 'monthly', dom: 1, time: '09:00' } },
+  { key: 'once', label: '仅一次…', sched: { kind: 'once' } },
+]
+
+const TRIGGER_MSG_TPL = [
+  { label: '默认', v: '' },
+  { label: '总结进展', v: '请总结自上次触发以来的进展，并用三句话给出结论' },
+  { label: '检查更新', v: '请检查是否有新的变化或需要我关注的事项，没有就回复"无更新"' },
+  { label: '生成日报', v: '请生成一份简要日报：完成事项、遇到的问题、下一步计划' },
+]
+
+const effectiveCron = computed(() => (
+  schedForm.value.kind === 'cron' ? cronText.value.trim() : buildCron(schedForm.value)
+))
+
+/** 表单级错误（阻断保存） */
+const schedError = computed(() => {
+  if (triggerMode.value === 'manual') return ''
+  if (schedForm.value.kind === 'cron') {
+    const c = checkCron(cronText.value)
+    return c.ok ? '' : c.issues[0].msg
+  }
+  return checkSched(schedForm.value) || ''
+})
+
+/** cron 的「不算错但要提醒」项（日/周同写 = 或关系） */
+const schedWarn = computed(() => {
+  if (triggerMode.value === 'manual' || schedForm.value.kind !== 'cron') return ''
+  const c = checkCron(cronText.value)
+  return c.ok ? (c.warn || '') : ''
+})
+
+const previewText = computed(() => {
+  if (triggerMode.value === 'manual') return '手动：不自动运行，只在对话/连线中被触发'
+  if (schedForm.value.kind === 'cron') {
+    const parsed = parseCron(cronText.value)
+    return parsed ? describe(parsed) : `自定义规则 · ${cronText.value || '(空)'}`
+  }
+  return describe(schedForm.value)
+})
+
+const previewNext = computed(() => {
+  if (triggerMode.value === 'manual' || schedError.value) return ''
+  const s = schedForm.value.kind === 'cron'
+    ? (parseCron(cronText.value) || { kind: 'cron' as const, cron: cronText.value } as Sched)
+    : schedForm.value
+  const runs = nextRuns(s, new Date(), 3)
+  if (!runs.length) return ''
+  return runs.map(d => `${fmtWhen(d)}（${humanizeGap(d)}）`).join('　·　')
+})
+
+const saveLabel = computed(() => {
+  if (triggerMode.value === 'manual') return '保存'
+  return `保存 · ${previewText.value}`
+})
+
+/** 预设高亮：结构化配置与某个预设完全一致时才算命中 */
+const activePreset = computed(() => {
+  const f = schedForm.value
+  const hit = TRIGGER_PRESETS.find(p => {
+    const s = p.sched
+    if (s.kind !== f.kind) return false
+    if (s.kind === 'every') return s.every === f.every && s.unit === f.unit
+    if (s.kind === 'once') return false
+    if (s.kind === 'weekly') return (s.days || []).join() === (f.days || []).join() && s.time === f.time
+    return s.time === f.time && (s.kind !== 'monthly' || s.dom === f.dom)
+  })
+  return hit?.key || ''
+})
 
 const canvas = computed(() => canvases.current)
 const nodes = computed(() => canvas.value?.nodes || [])
@@ -1927,26 +2013,105 @@ function perceptionScopeOf(node: any): 'link' | 'global' {
   return (a?.perception_scope as any) === 'global' ? 'global' : 'link'
 }
 
-// ⑤ 触发设置
+// ⑤ 触发设置 —— 用户只需要选「什么时候」，cron 表达式是可选的兜底
+function setSched(s: Sched) {
+  schedForm.value = s
+  if (s.kind !== 'cron') cronText.value = buildCron(s)
+}
+function nextDateISO(offsetDays = 1): string {
+  const d = new Date()
+  d.setDate(d.getDate() + offsetDays)
+  const mm = d.getMonth() + 1 < 10 ? `0${d.getMonth() + 1}` : `${d.getMonth() + 1}`
+  const dd = d.getDate() < 10 ? `0${d.getDate()}` : `${d.getDate()}`
+  return `${d.getFullYear()}-${mm}-${dd}`
+}
+function pickKind(k: Sched['kind']) {
+  const cur = schedForm.value
+  const time = cur.time || '09:00'
+  if (k === 'every') setSched({ kind: 'every', every: 5, unit: 'minute' })
+  else if (k === 'daily') setSched({ kind: 'daily', time })
+  else if (k === 'weekly') setSched({ kind: 'weekly', days: cur.days?.length ? cur.days : [1, 2, 3, 4, 5], time })
+  else if (k === 'monthly') setSched({ kind: 'monthly', dom: cur.dom || 1, time })
+  else if (k === 'once') setSched({ kind: 'once', date: cur.kind === 'once' ? cur.date : nextDateISO(), time })
+  else if (k === 'cron') enterCronMode()
+}
+function applyPreset(p: { sched: Sched }) {
+  const s: Sched = { ...p.sched }
+  if (s.kind === 'once' && !s.date) { s.date = nextDateISO(); s.time = s.time || '09:00' }
+  setSched(s)
+}
+function toggleDay(d: number) {
+  const days = schedForm.value.days || []
+  const next = days.includes(d) ? days.filter(x => x !== d) : [...days, d].sort((a, b) => a - b)
+  setSched({ ...schedForm.value, days: next })
+}
+function setEvery(n: number, unit: 'minute' | 'hour') {
+  setSched({ ...schedForm.value, kind: 'every', every: clampEvery(n, unit), unit })
+}
+function enterCronMode() {
+  const built = buildCron(schedForm.value) || cronText.value || '0 9 * * *'
+  schedForm.value = { kind: 'cron', cron: built }
+  cronText.value = built
+}
+function exitCronMode() {
+  const p = parseCron(cronText.value)
+  if (!p || p.kind === 'cron') return
+  setSched(p)
+}
+const canExitCron = computed(() => {
+  if (schedForm.value.kind !== 'cron') return false
+  const p = parseCron(cronText.value)
+  return !!p && p.kind !== 'cron'
+})
+
 function openTriggerDlg(node: any) {
   const a = agentById(node.agent_id)
   if (!a) return
   closeMenus()
   triggerAgentId.value = a.id
-  const t = a.trigger || {}
-  triggerType.value = (t.type || 'manual') as any
-  triggerCron.value = t.cron || ''
+  const t: any = a.trigger || {}
+  triggerMode.value = (!t.type || t.type === 'manual') ? 'manual' : 'schedule'
   triggerMsg.value = t.message || ''
+  catchUp.value = !!t.catch_up
+  onceDone.value = !!t.done && t.type === 'once'
+  const s = schedFromTrigger(t)
+  if (s.kind === 'once' && !s.date) s.date = nextDateISO()
+  setSched(s)
+  if (s.kind === 'cron') cronText.value = s.cron || ''
   triggerDlg.value = true
 }
+
 async function saveTrigger() {
   const a = agentById(triggerAgentId.value!)
   if (!a) { triggerDlg.value = false; return }
-  await agents.update(a.id, {
-    ...a,
-    trigger: { type: triggerType.value, cron: triggerCron.value, message: triggerMsg.value },
-  })
+  if (triggerMode.value === 'manual') {
+    await agents.update(a.id, {
+      ...a,
+      trigger: { type: 'manual', cron: '', at: '', sched: null, message: '', catch_up: false, done: false },
+    })
+    showToast('已切换为手动触发')
+    triggerDlg.value = false
+    return
+  }
+  if (schedError.value) return
+  const form = schedForm.value
+  const s: Sched = form.kind === 'cron'
+    ? { kind: 'cron', cron: cronText.value.trim() }
+    : { ...form }
+  // 一次性的 date 必须真的存在（kind=once 在 checkSched 里已校验）
+  const trigger: any = {
+    type: s.kind === 'once' ? 'once' : 'schedule',
+    cron: s.kind === 'once' ? '' : buildCron(s),
+    sched: s,
+    at: s.kind === 'once' ? `${s.date} ${s.time}` : '',
+    message: triggerMsg.value.trim(),
+    catch_up: !!catchUp.value,
+    done: false,
+  }
+  await agents.update(a.id, { ...a, trigger })
   triggerDlg.value = false
+  const hint = s.kind === 'once' ? '' : '，已生效（无需点「运行」）'
+  showToast(`已保存：${describe(s)}${hint}`)
 }
 // ⑤ 运行/停止（按画布隔离：仅在当前画布处于运行态时才停止）
 function toggleRun() {
@@ -4523,7 +4688,7 @@ defineExpose({ viewportRef, computeNodeBbox })
         <div class="toolbar-right">
           <button class="btn ghost run-btn" :class="{ stop: runningOnThisCanvas }"
                   @click.stop="toggleRun"
-                  :title="runningOnThisCanvas ? '停止：中止定时触发与进行中的请求' : '运行：按节点右键配置的触发方式（等待/定时）运行集群'">
+                  :title="runningOnThisCanvas ? '停止：中止进行中的运行（定时计划不受影响，需在节点右键「触发设置」里修改）' : '运行：启动手动链路；配了定时计划的节点按计划自动触发，无需点这里'">
             <template v-if="runningOnThisCanvas"><span class="stop-icon" aria-hidden="true"></span>停止</template>
             <template v-else><AppIcon name="chevron-right" /> 运行</template>
           </button>
@@ -4882,26 +5047,131 @@ defineExpose({ viewportRef, computeNodeBbox })
     <!-- AgentEditDialog（画布节点 → 编辑智能体） -->
     <AgentEditDialog v-if="editingAgent" :agent="editingAgent" @close="editingAgent = null" />
 
-    <!-- 触发设置对话框 -->
+    <!-- 触发设置对话框：默认给「人话」入口，cron 只作高级兜底 -->
     <Teleport to="body">
-      <div v-if="triggerDlg" class="modal-bg">
-        <div class="modal glass">
+      <div v-if="triggerDlg" class="modal-bg" @click.self="triggerDlg = false">
+        <div class="modal glass tr-modal">
           <div class="modal-title">⏱ 触发设置 · {{ agentById(triggerAgentId!)?.name || '' }}</div>
-          <div class="trigger-types">
-            <label class="tr-opt"><input type="radio" value="manual" v-model="triggerType" /> 手动（运行后等待触发）</label>
-            <label class="tr-opt"><input type="radio" value="cron" v-model="triggerType" /> 定时（cron）</label>
+
+          <div class="tr-seg">
+            <button :class="['tr-seg-btn', { on: triggerMode === 'manual' }]" @click="triggerMode = 'manual'">手动</button>
+            <button :class="['tr-seg-btn', { on: triggerMode === 'schedule' }]" @click="triggerMode = 'schedule'">按计划自动运行</button>
           </div>
-          <label v-if="triggerType === 'cron'" class="lbl">
-            cron 表达式（分 时 日 月 周）
-            <input class="input" v-model="triggerCron" placeholder="如：*/5 * * * *（每 5 分钟）" />
-          </label>
-          <label v-if="triggerType === 'cron'" class="lbl">
-            触发消息（留空则默认）
-            <input class="input" v-model="triggerMsg" placeholder="【定时触发】请执行任务" />
-          </label>
+
+          <div v-if="triggerMode === 'manual'" class="tr-manual-tip">
+            不自动运行：只在对话里被呼叫、或上游智能体通过连线找它时才会触发。
+          </div>
+
+          <template v-else>
+            <!-- ① 预设：点一下就能用 -->
+            <div class="tr-presets">
+              <button v-for="p in TRIGGER_PRESETS" :key="p.key"
+                      :class="['tr-chip', { on: activePreset === p.key }]"
+                      @click="applyPreset(p)">{{ p.label }}</button>
+            </div>
+
+            <!-- ② 结构化表单：不用输入任何符号 -->
+            <div class="tr-form">
+              <div class="tr-kinds">
+                <button v-for="k in [{ v: 'every', t: '每隔' }, { v: 'daily', t: '每天' }, { v: 'weekly', t: '每周' }, { v: 'monthly', t: '每月' }, { v: 'once', t: '仅一次' }]"
+                        :key="k.v" :class="['tr-kind', { on: schedForm.kind === k.v }]"
+                        @click="pickKind(k.v as any)">{{ k.t }}</button>
+              </div>
+
+              <div v-if="schedForm.kind === 'every'" class="tr-line">
+                <span class="tr-word">每隔</span>
+                <select class="input tr-sel" :value="String(schedForm.every)"
+                        @change="setEvery(Number(($event.target as HTMLSelectElement).value), (schedForm.unit || 'minute'))">
+                  <option v-for="n in (schedForm.unit === 'hour' ? HOUR_STEPS : MINUTE_STEPS)" :key="n" :value="String(n)">{{ n }}</option>
+                </select>
+                <select class="input tr-sel tr-sel-unit" :value="schedForm.unit || 'minute'"
+                        @change="setEvery(Number(schedForm.every), ($event.target as HTMLSelectElement).value as any)">
+                  <option value="minute">分钟</option>
+                  <option value="hour">小时</option>
+                </select>
+                <span class="tr-word tr-dim">{{ schedForm.unit === 'hour' ? '整点触发' : '从 0 分开始计数' }}</span>
+              </div>
+
+              <div v-else-if="schedForm.kind === 'daily'" class="tr-line">
+                <span class="tr-word">每天</span>
+                <input class="input tr-time" type="time" :value="schedForm.time"
+                       @input="setSched({ ...schedForm, time: ($event.target as HTMLInputElement).value })" />
+                <span class="tr-word tr-dim">按本机时间</span>
+              </div>
+
+              <div v-else-if="schedForm.kind === 'weekly'" class="tr-line tr-wrap">
+                <span class="tr-word">每周</span>
+                <button v-for="d in [1, 2, 3, 4, 5, 6, 0]" :key="d"
+                        :class="['tr-day', { on: (schedForm.days || []).includes(d) }]"
+                        @click="toggleDay(d)">{{ WEEK_LABELS[d].replace('周', '') }}</button>
+                <input class="input tr-time" type="time" :value="schedForm.time"
+                       @input="setSched({ ...schedForm, time: ($event.target as HTMLInputElement).value })" />
+              </div>
+
+              <div v-else-if="schedForm.kind === 'monthly'" class="tr-line">
+                <span class="tr-word">每月</span>
+                <input class="input tr-num" type="number" min="1" max="31" :value="String(schedForm.dom || 1)"
+                       @input="setSched({ ...schedForm, dom: Number(($event.target as HTMLInputElement).value) || 1 })" />
+                <span class="tr-word">日</span>
+                <input class="input tr-time" type="time" :value="schedForm.time"
+                       @input="setSched({ ...schedForm, time: ($event.target as HTMLInputElement).value })" />
+                <span class="tr-word tr-dim">31 日在没有 31 号的月份不触发</span>
+              </div>
+
+              <div v-else-if="schedForm.kind === 'once'" class="tr-line">
+                <span class="tr-word">执行一次</span>
+                <input class="input tr-date" type="date" :value="schedForm.date"
+                       @input="setSched({ ...schedForm, date: ($event.target as HTMLInputElement).value })" />
+                <input class="input tr-time" type="time" :value="schedForm.time"
+                       @input="setSched({ ...schedForm, time: ($event.target as HTMLInputElement).value })" />
+              </div>
+
+              <div v-else class="tr-line">
+                <span class="tr-word tr-dim">正在用自定义表达式（见下方高级设置）</span>
+              </div>
+            </div>
+
+            <!-- ③ 高级：cron 兜底，默认不出现 -->
+            <div class="tr-adv">
+              <button v-if="schedForm.kind !== 'cron'" class="tr-adv-toggle" @click="enterCronMode">▸ 高级：改用 cron 表达式</button>
+              <template v-else>
+                <div class="tr-adv-head">
+                  <span class="tr-adv-label">cron 表达式（分 时 日 月 周）</span>
+                  <button class="tr-adv-toggle" :disabled="!canExitCron" @click="exitCronMode">
+                    ← {{ canExitCron ? '回到可视化设置' : '这段规则只能用表达式编辑' }}
+                  </button>
+                </div>
+                <input class="input tr-cron" v-model="cronText" placeholder="如 30 9 * * 1-5（每个工作日 09:30）" spellcheck="false" />
+              </template>
+            </div>
+
+            <!-- ④ 人话回显 + 未来 3 次：用户只需确认这句话对不对 -->
+            <div class="tr-preview" :class="{ bad: !!schedError }">
+              <div class="tr-humen">{{ schedError || previewText }}</div>
+              <div v-if="previewNext && !schedError" class="tr-next">下次：{{ previewNext }}</div>
+              <div v-if="schedWarn" class="tr-warn">提示：{{ schedWarn }}</div>
+              <div v-if="schedForm.kind !== 'cron'" class="tr-cron-hint">
+                等价表达式 <code>{{ effectiveCron }}</code> — 只是记录用，不必理解
+              </div>
+            </div>
+
+            <label class="lbl">触发时发给它的话（留空用默认）
+              <input class="input" v-model="triggerMsg" placeholder="【定时触发】请执行任务" />
+            </label>
+            <div class="tr-tpl">
+              <button v-for="t in TRIGGER_MSG_TPL" :key="t.label" class="tr-chip mini"
+                      :class="{ on: triggerMsg === t.v }" @click="triggerMsg = t.v">{{ t.label }}</button>
+            </div>
+
+            <label v-if="schedForm.kind !== 'once'" class="tr-check">
+              <input type="checkbox" v-model="catchUp" /> 应用重启后，若错过了执行时间，立即补跑一次
+            </label>
+            <div v-if="onceDone" class="tr-warn">这个一次性任务已经执行过；再保存会重新执行一次。</div>
+          </template>
+
           <div class="actions">
             <button class="btn ghost" @click="triggerDlg = false">取消</button>
-            <button class="btn" @click="saveTrigger">保存</button>
+            <button class="btn" :disabled="triggerMode === 'schedule' && !!schedError" @click="saveTrigger">{{ saveLabel }}</button>
           </div>
         </div>
       </div>
@@ -5395,8 +5665,60 @@ defineExpose({ viewportRef, computeNodeBbox })
   from { opacity: 0; transform: translate(-50%, -4px); }
   to   { opacity: 1; transform: translate(-50%, 0); }
 }
-.trigger-types { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
-.tr-opt { display: flex; gap: 8px; align-items: center; font-size: calc(13px * var(--font-scale)); cursor: pointer; color: rgba(var(--text-rgb), 0.85); }
+/* —— 触发设置：人话优先，cron 折叠 —— */
+.tr-modal { width: 490px; max-height: 84vh; overflow-y: auto; }
+.tr-seg { display: flex; gap: 6px; margin-bottom: 12px; }
+.tr-seg-btn { flex: 1; padding: 8px 10px; border-radius: 9px; cursor: pointer;
+  border: 1px solid rgba(var(--surface-rgb), 0.14); background: rgba(var(--surface-rgb), 0.05);
+  color: rgba(var(--text-rgb), 0.72); font-size: calc(12.5px * var(--font-scale)); transition: all .15s; }
+.tr-seg-btn:hover { border-color: rgba(var(--accent-rgb), 0.35); }
+.tr-seg-btn.on { border-color: rgba(var(--accent-rgb), 0.55); background: rgba(var(--accent-rgb), 0.16); color: rgba(var(--text-rgb), 0.95); }
+.tr-manual-tip { font-size: calc(12px * var(--font-scale)); line-height: 1.7; color: rgba(var(--text-rgb), 0.6); }
+.tr-presets { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
+.tr-chip { padding: 5px 9px; border-radius: 999px; cursor: pointer; white-space: nowrap;
+  border: 1px solid rgba(var(--surface-rgb), 0.13); background: rgba(var(--surface-rgb), 0.04);
+  color: rgba(var(--text-rgb), 0.72); font-size: calc(11.5px * var(--font-scale)); transition: all .15s; }
+.tr-chip:hover { border-color: rgba(var(--accent-rgb), 0.4); color: rgba(var(--text-rgb), 0.9); }
+.tr-chip.on { border-color: rgba(var(--accent-rgb), 0.6); background: rgba(var(--accent-rgb), 0.18); color: rgba(var(--text-rgb), 0.95); }
+.tr-chip.mini { padding: 3px 8px; font-size: calc(11px * var(--font-scale)); }
+.tr-form { border: 1px solid rgba(var(--surface-rgb), 0.1); border-radius: 10px; padding: 10px 11px; margin-bottom: 9px;
+  background: rgba(var(--surface-rgb), 0.03); }
+.tr-kinds { display: flex; gap: 4px; margin-bottom: 10px; }
+.tr-kind { flex: 1; padding: 5px 6px; border-radius: 7px; cursor: pointer; font-size: calc(12px * var(--font-scale));
+  border: 1px solid transparent; background: transparent; color: rgba(var(--text-rgb), 0.6); transition: all .15s; }
+.tr-kind:hover { background: rgba(var(--surface-rgb), 0.07); }
+.tr-kind.on { background: rgba(var(--accent-rgb), 0.18); border-color: rgba(var(--accent-rgb), 0.45); color: rgba(var(--text-rgb), 0.95); }
+.tr-line { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.tr-word { font-size: calc(12.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.82); }
+.tr-dim { opacity: .5; font-size: calc(11px * var(--font-scale)); }
+.tr-sel, .tr-num, .tr-time, .tr-date { padding: 5px 7px; height: auto; width: auto; font-size: calc(12px * var(--font-scale)); }
+.tr-sel { min-width: 66px; }
+.tr-sel-unit { min-width: 78px; }
+.tr-num { width: 64px; }
+.tr-time { width: 108px; }
+.tr-date { width: 148px; }
+.tr-day { width: 30px; height: 28px; border-radius: 7px; cursor: pointer; font-size: calc(12px * var(--font-scale));
+  border: 1px solid rgba(var(--surface-rgb), 0.14); background: rgba(var(--surface-rgb), 0.04); color: rgba(var(--text-rgb), 0.7); }
+.tr-day.on { border-color: rgba(var(--accent-rgb), 0.55); background: rgba(var(--accent-rgb), 0.2); color: rgba(var(--text-rgb), 0.95); }
+.tr-adv { margin-bottom: 9px; }
+.tr-adv-toggle { padding: 2px 0; border: 0; background: transparent; cursor: pointer;
+  color: rgba(var(--accent-rgb), 0.85); font-size: calc(11.5px * var(--font-scale)); }
+.tr-adv-toggle:disabled { color: rgba(var(--text-rgb), 0.4); cursor: default; }
+.tr-adv-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+.tr-adv-label { font-size: calc(11.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.5); }
+.tr-cron { font-family: ui-monospace, Consolas, monospace; letter-spacing: .3px; }
+.tr-preview { border-left: 3px solid rgba(var(--accent-rgb), 0.6); border-radius: 0 8px 8px 0; padding: 8px 10px; margin-bottom: 11px;
+  background: rgba(var(--accent-rgb), 0.07); }
+.tr-preview.bad { border-left-color: rgba(255, 110, 110, 0.75); background: rgba(255, 110, 110, 0.08); }
+.tr-humen { font-size: calc(13px * var(--font-scale)); font-weight: 600; color: rgba(var(--text-rgb), 0.95); line-height: 1.5; }
+.tr-next { margin-top: 4px; font-size: calc(11.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.68); line-height: 1.6; }
+.tr-warn { margin-top: 5px; font-size: calc(11px * var(--font-scale)); color: rgba(240, 180, 90, 0.95); line-height: 1.6; }
+.tr-cron-hint { margin-top: 5px; font-size: calc(10.5px * var(--font-scale)); color: rgba(var(--text-rgb), 0.42); }
+.tr-cron-hint code { font-family: ui-monospace, Consolas, monospace; background: rgba(var(--surface-rgb), 0.09);
+  padding: 1px 4px; border-radius: 4px; }
+.tr-tpl { display: flex; flex-wrap: wrap; gap: 4px; margin: -4px 0 10px; }
+.tr-check { display: flex; align-items: center; gap: 6px; font-size: calc(11.5px * var(--font-scale));
+  color: rgba(var(--text-rgb), 0.62); cursor: pointer; }
 .modal .lbl { display: flex; flex-direction: column; gap: 6px; font-size: calc(12px * var(--font-scale)); color: rgba(var(--text-rgb), 0.7); margin-bottom: 10px; }
 </style>
 

@@ -141,6 +141,13 @@ export const useLayoutStore = defineStore('layout', {
     convsCollapsed: true,
     // 进入聚焦前对话记录折叠态（仅内存）：退出聚焦时恢复原样
     savedConvsCollapsed: true,
+    // —— 沉浸模式（隐藏顶栏按钮/智能体列表/画布/对话区，只显示背景）——
+    // 仅内存、不持久化：每次启动都从工作台开始，避免一开窗就落进背景游戏里。
+    immersive: false,
+    // 沉浸态细条控制栏是否展开（角落悬浮球点击切换）
+    immersiveBarOpen: false,
+    // 沉浸态「运行输出」浮窗是否打开
+    immersivePeek: false,
   }),
   actions: {
     setRightWidth(v: number) {
@@ -215,6 +222,17 @@ export const useLayoutStore = defineStore('layout', {
       const n = Math.min(BG_BLUR_MAX, Math.max(BG_BLUR_MIN, Math.round(v)))
       this.backgroundBlur = n
       writeStore({ backgroundBlur: n })
+    },
+    // —— 沉浸模式 ——
+    // 进入：展开控制条（几秒后由 ImmersiveChrome 自动收起），关闭输出浮窗
+    // 退出：全部复位，背景恢复用户设定的不透明度/模糊度
+    setImmersive(v: boolean) {
+      this.immersive = !!v
+      this.immersiveBarOpen = !!v
+      this.immersivePeek = false
+    },
+    toggleImmersive() {
+      this.setImmersive(!this.immersive)
     },
   },
 })

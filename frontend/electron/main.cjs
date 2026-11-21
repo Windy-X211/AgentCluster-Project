@@ -614,6 +614,10 @@ async function createMainWindow() {
       nodeIntegration: false,
       sandbox: false,
       devTools: IS_DEV,
+      // 定时触发跑在渲染进程的常驻调度里：窗口失焦/被遮挡/最小化到托盘时
+      // Chromium 会把 timer 降到 1 次/分钟甚至暂停，导致定时不准或干脆不触发。
+      // 关掉后台节流（与 fairy 系窗口同策略）。
+      backgroundThrottling: false,
     },
   })
 
@@ -698,6 +702,16 @@ async function createMainWindow() {
 
   mainWindow.on('closed', () => { mainWindow = null })
 
+  // 关闭按钮 = 收进托盘，而不是销毁窗口。
+  // 定时触发/图表轮询都跑在这个渲染进程里，窗口一销毁调度就静默停摆（
+  // 而 app 又因为 window-all-closed 不退出，用户会以为「还在后台跑」）。
+  // 退出走托盘「退出程序」或 before-quit。
+  mainWindow.on('close', (e) => {
+    if (_quitting) return
+    e.preventDefault()
+    mainWindow.hide()
+  })
+
   // 新窗口走系统默认浏览器
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
@@ -715,6 +729,8 @@ async function createMainWindow() {
 // ---------- Tray ----------
 
 let tray = null
+/** 真正退出中（托盘「退出程序」/before-quit）：此时主窗口 close 不再拦截 */
+let _quitting = false
 let _trayRefreshTimer = null
 let _trayStatus = '已停止'
 
@@ -861,7 +877,8 @@ function _buildTrayMenuTemplate(statusText) {
     {
       label: '停止全部服务', icon: _trayIcons.stop, click: () => {
         stopBackend()
-        if (mainWindow) { mainWindow.close() }
+        // 服务已停：直接销毁界面（hide 会留下一个连不上后端的空壳窗口）
+        if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.destroy() }
         _updateTrayStatus('已停止')
       }
     },
@@ -1523,6 +1540,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  _quitting = true
   if (TRAY_ONLY) {
     _killWebProcesses()
   } else {

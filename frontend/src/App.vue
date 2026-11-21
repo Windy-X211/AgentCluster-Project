@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { watch, computed } from 'vue'
+import { watch, computed, onMounted } from 'vue'
 import { RouterView, useRoute } from 'vue-router'
 import { useLayoutStore, useConvStore, useCanvasStore, FONT_FAMILIES } from '@/stores'
 import GuideManager from '@/components/guide/GuideManager.vue'
@@ -42,6 +42,12 @@ watch(() => convs.current, v => {
 })
 watch(() => canvases.current?.id, v => {
   if (v != null) { try { localStorage.setItem('agent-cluster.canvas.current', String(v)) } catch { /* ignore */ } }
+})
+
+// 常驻定时调度：只在主窗口启动。临时对话小窗是独立渲染进程，
+// 同源 localStorage 共享防重键，但两个实例各跑一遍仍可能双触发，必须排除。
+onMounted(() => {
+  if (route.path !== '/quickchat') convs.ensureScheduler()
 })
 </script>
 

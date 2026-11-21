@@ -179,6 +179,35 @@ option {
   font-family: inherit;
 }
 
+/* —— 选区治理 ——
+   桌面无边框窗口里，双击拖动区 / 空白处偶发把整页文字一起选中（整窗一片蓝色）。
+   默认把 UI 外壳设为不可选中，只在真正需要复制的文本区域放开。 */
+html,
+body,
+#app {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 可选中区域：Markdown 正文、代码、输入框、显式标记的可复制文本 */
+input,
+textarea,
+select,
+option,
+[contenteditable="true"],
+pre,
+code,
+kbd,
+.cb-md,
+.markdown,
+.b-text,
+.md-body,
+.selectable,
+.copyable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 // 液态玻璃通用类
 .glass {
   background: $glass-bg;
@@ -476,6 +505,40 @@ option {
   height: calc(100vh - var(--titlebar-h));
   gap: 10px;
   padding: 10px;
+}
+
+/* —— 沉浸模式：隐藏工作区（顶栏 / 智能体列表 / 画布 / 对话区），只留背景 ——
+   用 visibility:hidden 而非 v-if / display:none：画布与对话区保持真实尺寸与挂载状态，
+   退出后缩放、平移、滚动位置都不跑偏。
+   pointer-events:none 让命中测试穿过界面层落到背景 iframe（可交互 HTML 背景需要）。 */
+.app-root.immersive {
+  pointer-events: none;
+}
+
+.app-root.immersive > .topbar,
+.app-root.immersive > .left,
+.app-root.immersive > .center,
+.app-root.immersive > .right,
+.app-root.immersive > .resize-handle {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* 顶栏隐藏时撤销其窗口拖动区（-webkit-app-region 基于命中测试，这里显式兜底一次），
+   避免一条看不见的拖拽带吃掉背景游戏顶部的点击 */
+.app-root.immersive > .topbar,
+.app-root.immersive > .topbar * {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* 沉浸态：body 级 Teleport 的浮层（对话记录浮层、新手引导）不随网格隐藏，单独收起。
+   权限确认 / 输入弹窗属于「需要用户处理」的阻塞操作，仍然保留可见。 */
+html.immersive-mode .conv-float,
+html.immersive-mode .rg-mask,
+html.immersive-mode .gw-overlay,
+html.immersive-mode .fg-root {
+  display: none !important;
 }
 
 /* —— 桌面独立窗口（pywebview frameless）—— */

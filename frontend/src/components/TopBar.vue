@@ -3,6 +3,11 @@ import { ref, onMounted } from 'vue'
 import { RouterLink } from 'vue-router'
 import { isDesktop, windowAPI } from '@/utils/env'
 import { useSnap } from '@/composables/useSnap'
+import { useLayoutStore } from '@/stores'
+
+const layout = useLayoutStore()
+
+function enterImmersive() { layout.setImmersive(true) }
 
 const isMax = ref(false)
 
@@ -53,6 +58,9 @@ async function close() { try { await windowAPI.close() } catch {} }
     <RouterLink to="/extensions" class="nav-item region-extensions"><AppIcon name="puzzle" /> 功能拓展</RouterLink>
     <RouterLink to="/capabilities" class="nav-item"><AppIcon name="wrench" /> 能力管理</RouterLink>
     <RouterLink to="/settings" class="nav-item"><AppIcon name="settings" /> 设置</RouterLink>
+    <button class="fold-btn" title="隐藏界面 · 沉浸模式（Ctrl+Shift+H）" @click="enterImmersive">
+      <AppIcon name="eye" size="15" />
+    </button>
     <template v-if="isDesktop">
       <button class="win-btn" title="最小化" @click="minimize">
         <svg width="12" height="12" viewBox="0 0 12 12"><rect x="1" y="5.4" width="10" height="1.2" fill="currentColor"/></svg>
@@ -89,6 +97,16 @@ async function close() { try { await windowAPI.close() } catch {} }
 .spacer { flex: 1; min-width: 20px; align-self: stretch; height: 100%; }
 
 .nav-item { color: rgb(var(--text-rgb)); text-decoration: none; font-size: calc(13px * var(--font-scale)); padding: 6px 12px; border-radius: 8px; transition: background .2s; user-select: none; &:hover { background: rgba(var(--surface-rgb), 0.06); } }
+
+/* 折叠按钮：把顶栏按钮/智能体列表/画布/对话区全部隐藏，只留背景 */
+.fold-btn {
+  width: 32px; height: 28px; border: none; background: transparent;
+  color: rgb(var(--text-rgb)); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 7px; opacity: 0.7;
+  transition: background .15s, opacity .15s, color .15s;
+}
+.fold-btn:hover { background: rgba(var(--surface-rgb), 0.12); opacity: 1; color: var(--accent-light); }
 .win-btn {
   width: 32px; height: 28px; border: none; background: transparent;
   color: rgb(var(--text-rgb)); cursor: pointer;

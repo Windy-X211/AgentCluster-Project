@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount } from 'vue'
-import { onBeforeRouteLeave } from 'vue-router'
+import { onBeforeRouteLeave, useRoute } from 'vue-router'
 import { useAgentStore, useCanvasStore, useModelStore, useSettingsStore, useConvStore, useLayoutStore } from '@/stores'
 import TopBar from '@/components/TopBar.vue'
 import AgentList from '@/components/AgentList.vue'
 import MainView from '@/components/MainView.vue'
 import RightPanel from '@/components/RightPanel.vue'
+import ImmersiveChrome from '@/components/ImmersiveChrome.vue'
 
 defineOptions({ name: 'Home' })
+
+const route = useRoute()
 
 
 const agents = useAgentStore()
@@ -92,6 +95,8 @@ onMounted(async () => {
 // 此守卫在 DOM 仍完整时触发，scrollTop 准确可靠（优于 onDeactivated，后者触发时 DOM
 // 已被 KeepAlive 移出文档，scrollTop 会被浏览器重置为 0）。
 onBeforeRouteLeave(() => {
+  // 沉浸模式只在首页有意义：去别的页面先退出，避免返回首页时界面仍是隐藏态
+  if (layout.immersive) layout.setImmersive(false)
   const chatBox = document.querySelector('.chat-box') as HTMLElement | null
   if (chatBox) {
     layout.chatMsgScrollTop = chatBox.scrollTop
@@ -99,15 +104,28 @@ onBeforeRouteLeave(() => {
   const convList = document.querySelector('.conv-list-wrap') as HTMLElement | null
   if (convList) layout.convListScrollTop = convList.scrollTop
 })
+
+// Ctrl+Shift+H：切换沉浸模式（Home 被 KeepAlive 常驻，所以用 route.path 判当前是否首页）
+function onGlobalKey(e: KeyboardEvent) {
+  if (!e.ctrlKey || !e.shiftKey) return
+  if (e.key !== 'H' && e.key !== 'h') return
+  if (route.path !== '/' && route.path !== '') return
+  e.preventDefault()
+  layout.toggleImmersive()
+}
+onMounted(() => window.addEventListener('keydown', onGlobalKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onGlobalKey))
 </script>
 
 <template>
-  <div class="app-root" :class="{ 'left-collapsed': layout.agentsCollapsed }" :style="gridStyle" @dblclick="onRootDblClick">
+  <div class="app-root" :class="{ 'left-collapsed': layout.agentsCollapsed, immersive: layout.immersive }" :style="gridStyle" @dblclick="onRootDblClick">
     <TopBar class="topbar glass" />
     <AgentList class="left glass" :collapsed="layout.agentsCollapsed" @toggle="layout.agentsCollapsed = !layout.agentsCollapsed" />
     <MainView v-if="canvases.current" class="center" />
     <div v-if="canvases.current" class="resize-handle" @mousedown="onHandleDown" title="拖动调整右侧面板宽度（双击复位）"></div>
     <RightPanel class="right" />
+    <!-- 沉浸模式：细条顶栏 + 状态徽标 + 运行输出浮窗（独立于网格，悬浮在背景之上） -->
+    <ImmersiveChrome v-if="layout.immersive" />
   </div>
 
 </template>

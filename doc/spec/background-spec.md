@@ -37,7 +37,8 @@ AppData/backgrounds/
 | `opacity` | number | 否 | 默认不透明度 0~1，默认 1.0 |
 | `blur` | number | 否 | 默认模糊度（px），默认 0 |
 | `builtin` | bool | 否 | 是否内置背景（内置不可删除） |
-| `interactive` | bool | 否 | animation 是否可交互（如鼠标视差），默认 false |
+| `interactive` | bool | 否 | animation 是否可交互（如鼠标视差），默认 false（依赖宿主转发 `bg-pointer` 消息） |
+| `playable` | bool | 否 | 沉浸模式下是否按「可玩的 HTML 小游戏」处理（原生鼠标/键盘/指针锁直达 iframe）。默认按 `interactive` 反推：显式 `true` 强制原生交互，`false` 强制视差协议；未声明时 `interactive:true` 视为视差、否则视为游戏 |
 
 ### manifest.json 示例（动画）
 
@@ -134,6 +135,16 @@ AppData/backgrounds/
 </body>
 </html>
 ```
+
+### 沉浸模式（可作为小游戏）
+
+首页顶栏的「隐藏界面」按钮会把顶栏、智能体列表、画布、对话区全部隐藏，只留背景（沉浸模式）。此时 animation 背景可以变成真正能玩的小游戏：
+
+- 默认（manifest 未声明 `interactive` / `playable`）：iframe 抢占整屏并直接接收原生鼠标、键盘事件，键盘焦点在进入沉浸时自动交给 iframe。
+- `playable: false` 或 `interactive: true`：走旧的 `bg-pointer` 视差协议（宿主 `postMessage` 转发坐标），适合内置的星空/流星雨等装饰性动效。
+- 可玩背景的沙箱能力：`allow-scripts allow-pointer-lock allow-popups`，并开放 `fullscreen` / `pointer-lock` / `autoplay`。**默认不开放 `allow-same-origin`**，因此 `localStorage`/`IndexedDB` 会抛安全错误——存档请用内存变量，或提示用户「沉浸模式不提供本地存储」。
+- 确实需要存档的小游戏：在「设置 → 外观设置 → 背景」卡片上把该背景的「存档」开关打开（按背景单独授权，会追加 `allow-same-origin`）。注意此时沙箱隔离基本失效，只应对可信的自编背景开启。
+- 建议给可玩背景加一个「按 Esc 退出」的画面提示：iframe 获得焦点后宿主收不到 Esc，用户需要点右上角的悬浮图标唤出控制条再退出。
 
 ## 4. video 类型规范
 - 格式：`mp4`（H.264）或 `webm`（VP9），优先 mp4（兼容性最佳）。

@@ -6,6 +6,7 @@ import { useSettingsStore } from './settings'
 import { usePermissionStore } from './permission'
 import { playSuccess, playError } from '@/utils/sound'
 import { API_BASE } from '@/utils/env'
+import { cronMatch } from '@/utils/schedule'
 
 /**
  * 行协议转义还原：后端 yield T:/RN: 等行前，会把 payload 中的
@@ -101,35 +102,11 @@ export interface RichMsg {
   sub_process?: any[]
 }
 
-// —— 简化 cron 匹配：5 字段（分 时 日 月 周），支持 * , - / ——
-function fieldMatch(field: string, value: number): boolean {
-  if (!field || field === '*') return true
-  for (const part of field.split(',')) {
-    if (part.includes('/')) {
-      const [range, stepStr] = part.split('/')
-      const step = parseInt(stepStr, 10)
-      if (!step || step < 1) continue
-      const base = range === '*' ? 0 : parseInt(range, 10)
-      if (Number.isNaN(base)) continue
-      if (value >= base && (value - base) % step === 0) return true
-    } else if (part.includes('-')) {
-      const [a, b] = part.split('-').map(x => parseInt(x, 10))
-      if (!Number.isNaN(a) && !Number.isNaN(b) && value >= a && value <= b) return true
-    } else {
-      if (parseInt(part, 10) === value) return true
-    }
-  }
-  return false
-}
+// —— cron 匹配统一收敛到 utils/schedule.ts（UI 与运行时同一套能力，避免"界面能选、运行时不匹配"）
+export { cronMatch } from '@/utils/schedule'
 
-export function cronMatch(expr: string, d: Date): boolean {
-  const parts = (expr || '').trim().split(/\s+/)
-  if (parts.length !== 5) return false
-  const [min, hour, dom, mon, dow] = parts
-  return fieldMatch(min, d.getMinutes()) && fieldMatch(hour, d.getHours()) &&
-    fieldMatch(dom, d.getDate()) && fieldMatch(mon, d.getMonth() + 1) &&
-    fieldMatch(dow, d.getDay())
-}
+const SCHED_FIRED_KEY = 'agent-cluster.scheduler.fired'
+const SCHED_LAST_KEY = 'agent-cluster.scheduler.last-run'
 
 /** 最后活动时间：最后一条消息 ts → created_at → epoch(id)，用于上新下旧排序 */
 export function convLastTs(c: any): string {
@@ -677,10 +654,13 @@ export const useConvStore = defineStore('conv', {
     _toolPending: {} as Record<number, Record<number, number>>,
     selectedAgentId: null as number | null, // 节点💬直接对话选中的智能体
     focusChatAt: 0,                          // 触发对话区聚焦输入框
-    running: false,                          // 画布运行中（等待/匹配触发）
+    running: false,                          // 手动链路运行中（定时计划不依赖它，见 initScheduler）
     runCanvasId: null as number | null,
-    _timer: null as ReturnType<typeof setInterval> | null,
-    _fired: {} as Record<string, string>,    // cron 防重 {agentId: 'YYYY-MM-DDTHH:MM'}
+    _timer: null as ReturnType<typeof setTimeout> | null,
+    _schedStarted: false,                    // 常驻调度只启动一次（多窗口下只有主窗口会启动）
+    _fired: {} as Record<string, string>,    // 防重 {agentId: 'YYYY-M-DTHH:MM'}（持久化到 localStorage）
+    _lastRun: {} as Record<string, number>,  // 最近一次定时触发的时间戳（catch_up 判定用）
+    _schedQueue: [] as any[],                // 会话正忙时暂存的待触发项
 
     _sendError: {} as Record<number, boolean>, // 会话 → 本轮 send 是否出现错误（E: 行 / 异常）
     _adopting: new Set<number>(), // 正在接管恢复的后端运行会话（防重复订阅）
@@ -1437,20 +1417,19 @@ export const useConvStore = defineStore('conv', {
       await this.refreshConv(cid)
     },
 
-    // —— 运行/停止：按节点右键配置的触发方式（manual 等待 / cron 定时）——
+    // —— 运行/停止：只管「手动链路」；定时计划由常驻调度独立驱动（见 initScheduler）——
     startRun(canvasId: number) {
+      this.ensureScheduler()
       if (this.running) return
       this.running = true
       this.runCanvasId = canvasId
-      this._fired = {}
-      this._timer = setInterval(() => this._cronTick(), 20000)
       this._cronTick()
     },
     stopRun() {
       this.running = false
       this.runCanvasId = null
-      if (this._timer) { clearInterval(this._timer); this._timer = null }
       // 中止当前会话的运行（流式按会话隔离，停止运行只影响当前会话）
+      // 注意：常驻调度不停——定时任务是否生效由节点自己的触发设置决定
       const cid = this.current
       if (cid != null) void this.stopSend()
     },
@@ -1479,6 +1458,22 @@ export const useConvStore = defineStore('conv', {
         this._abortLocal(cid, agentId)
       }
     },
+    /** 停止指定会话的指定智能体（沉浸态输出浮窗用：目标会话不一定是当前会话）。
+     *  与 stopSend 同策略：先通知后端取消运行，后端不可达/超时再 abort 本地流兜底。 */
+    async stopAgentRun(cid: number, agentId?: number | null) {
+      if (cid == null) return
+      const stillRunning = () => agentId != null
+        ? this._ctrls.has(`${cid}:${agentId}`)
+        : [...this._ctrls.keys()].some(k => k.startsWith(`${cid}:`))
+      if (stillRunning()) {
+        setTimeout(() => { if (stillRunning()) this._abortLocal(cid, agentId) }, 8000)
+      }
+      try {
+        await api.convs.stop(cid, agentId ?? null)
+      } catch {
+        this._abortLocal(cid, agentId)
+      }
+    },
     _abortLocal(cid: number, agentId?: number | null) {
       if (agentId != null) {
         this._ctrls.get(`${cid}:${agentId}`)?.abort()
@@ -1488,34 +1483,191 @@ export const useConvStore = defineStore('conv', {
         if (k.startsWith(`${cid}:`)) ctrl.abort()
       }
     },
-    async _cronTick() {
-      if (!this.running || this.runCanvasId == null) return
-      const now = new Date()
-      const minuteKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}T${now.getHours()}:${now.getMinutes()}`
-      const canvas = useCanvasStore().list.find(x => x.id === this.runCanvasId)
-      if (!canvas) return
-      const agents = useAgentStore().list
-      for (const n of canvas.nodes || []) {
-        const a = agents.find((x: any) => x.id === n.agent_id)
-        if (!a || a.enabled === false) continue
-        const t = a.trigger || {}
-        if (t.type !== 'cron' || !t.cron) continue
-        if (!cronMatch(t.cron, now)) continue
-        if (this._fired[a.id] === minuteKey) continue
-        this._fired[a.id] = minuteKey
-        // 落点：当前会话已绑该画布 → 直接用；否则找该画布的最近会话；都没有 → 新建
-        let conv = this.list.find(x => x.id === this.current && x.canvas_id === canvas.id)
-          ?? this.list.find(x => x.canvas_id === canvas.id)
-        if (!conv) conv = await this.create({
-          name: `⏱ ${canvas.name}`, agent_ids: canvas.nodes.map((x: any) => x.agent_id), canvas_id: canvas.id,
-          workdir: canvas.workdir ?? null, execution_mode: canvas.execution_mode ?? null,
-        })
-        else this.current = conv.id
-        // 该画布的对话正在流式 → 跳过本轮（流式状态已按会话隔离，不阻塞其他会话）
-        if (this.streamingConvIds.has(conv.id)) return
-        await this.send(a.id, t.message || '【定时触发】请执行任务')
-        return // 一轮只触发一个，避免并发
+    /* ---------------- 常驻定时调度 ----------------
+     * - 与应用同寿命：不依赖画布「运行」开关，窗口收进托盘后渲染进程仍在，照常触发
+     * - 对齐整分钟（不是 20s 轮询），分钟精度不漂移；休眠/切回前台补一次
+     * - 一轮可发出多个到点任务（≤4），会话正流式则排队下一分钟重试（最多 3 次）
+     * - 防重键持久化到 localStorage：重启落在同一分钟也不会重复触发
+     */
+    ensureScheduler() {
+      if (this._schedStarted) return
+      this._schedStarted = true
+      this._loadSchedState()
+      this._armSchedLoop()
+      if (typeof document !== 'undefined') {
+        const kick = () => { if (document.visibilityState === 'visible') void this._cronTick() }
+        document.addEventListener('visibilitychange', kick)
+        if (typeof window !== 'undefined') window.addEventListener('focus', kick)
       }
+      // 等画布/智能体列表加载完再做补跑扫描
+      setTimeout(() => this._catchUpScan(), 3000)
+    },
+    _loadSchedState() {
+      try {
+        const f = JSON.parse(localStorage.getItem(SCHED_FIRED_KEY) || '{}')
+        if (f && typeof f === 'object') this._fired = f
+        const l = JSON.parse(localStorage.getItem(SCHED_LAST_KEY) || '{}')
+        if (l && typeof l === 'object') this._lastRun = l
+      } catch { /* 本地缓存损坏 → 忽略 */ }
+    },
+    _saveSchedState() {
+      try {
+        localStorage.setItem(SCHED_FIRED_KEY, JSON.stringify(this._fired))
+        localStorage.setItem(SCHED_LAST_KEY, JSON.stringify(this._lastRun))
+      } catch { /* 隐私模式等存储不可用 → 忽略 */ }
+    },
+    _armSchedLoop() {
+      if (this._timer) clearTimeout(this._timer)
+      const now = new Date()
+      // 对齐到下一个整分：60000 - 已过的秒数 + 120ms 余量，避免每次都差一点
+      const wait = 60000 - (now.getSeconds() * 1000 + now.getMilliseconds()) + 120
+      this._timer = setTimeout(() => {
+        void this._cronTick()
+        this._armSchedLoop()
+      }, wait)
+    },
+    _minuteKey(d: Date) {
+      return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}T${d.getHours()}:${d.getMinutes()}`
+    },
+    /** 'YYYY-MM-DD HH:MM' → Date（本地时区） */
+    _parseAt(raw: string): Date | null {
+      const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})/.exec(String(raw || '').trim())
+      if (!m) return null
+      const hh = m[2].length === 1 ? `0${m[2]}` : m[2]
+      const d = new Date(`${m[1]}T${hh}:${m[3]}:00`)
+      return Number.isNaN(d.getTime()) ? null : d
+    },
+    /** 向后找最近一次 cron 命中（catch_up 用） */
+    _prevCronRun(expr: string, now: Date, maxMinutes = 1440): Date | null {
+      if (!expr) return null
+      const d = new Date(now.getTime())
+      d.setSeconds(0, 0)
+      for (let i = 0; i < maxMinutes; i++) {
+        d.setMinutes(d.getMinutes() - 1)
+        if (cronMatch(expr, d)) return new Date(d.getTime())
+      }
+      return null
+    },
+    /** 画布上所有配了定时/一次的节点（同一 agent 只取一次，多画布去重） */
+    _scheduledItems() {
+      const canvases = useCanvasStore().list
+      const agents = useAgentStore().list
+      const out: any[] = []
+      const seen = new Set<number>()
+      for (const canvas of canvases as any[]) {
+        for (const n of canvas.nodes || []) {
+          const a: any = (agents as any[]).find((x: any) => x.id === n.agent_id)
+          if (!a || a.enabled === false || seen.has(a.id)) continue
+          const t: any = a.trigger || {}
+          if (t.type !== 'cron' && t.type !== 'schedule' && t.type !== 'once') continue
+          seen.add(a.id)
+          out.push({ a, t, canvas })
+        }
+      }
+      return out
+    },
+    /** 落点会话：当前选中的同画布会话 → 该画布最近会话 → 新建 */
+    async _convForCanvas(canvas: any) {
+      let conv: any = this.list.find((x: any) => x.id === this.current && x.canvas_id === canvas.id)
+        ?? this.list.find((x: any) => x.canvas_id === canvas.id)
+      if (!conv) {
+        conv = await this.create({
+          name: `⏱ ${canvas.name}`, agent_ids: (canvas.nodes || []).map((x: any) => x.agent_id),
+          canvas_id: canvas.id, workdir: canvas.workdir ?? null, execution_mode: canvas.execution_mode ?? null,
+        })
+      }
+      return conv
+    },
+    async _setTriggerDone(a: any, t: any) {
+      try { await useAgentStore().update(a.id, { ...a, trigger: { ...t, done: true } }) } catch { /* 标记失败不影响已触发的执行 */ }
+    },
+    _markFired(agentId: number, minuteKey: string, when: Date) {
+      this._fired[agentId] = minuteKey
+      this._lastRun[agentId] = when.getTime()
+      this._saveSchedState()
+    },
+    async _fireScheduled(item: any, conv: any) {
+      // 该智能体的接力链仍在跑：不再叠一轮（send 里的防重入会 alert，后台触发时绝不能弹窗）
+      if ((this._runAgents[conv.id] ?? new Set<number>()).has(item.a.id)) {
+        console.warn('[scheduler] 该智能体上一轮还没结束，跳过本次触发', item.a?.name)
+        return
+      }
+      this.current = conv.id
+      if (item.t.type === 'once') void this._setTriggerDone(item.a, item.t)
+      const msg = String(item.t.message || '').trim() || '【定时触发】请执行任务'
+      try {
+        await this.send(item.a.id, msg)
+      } catch (e) {
+        console.warn('[scheduler] 触发失败', item.a?.name, e)
+      }
+    },
+    async _cronTick() {
+      const now = new Date()
+      const mk = this._minuteKey(now)
+      for (const item of this._scheduledItems()) {
+        const { a, t } = item
+        if (this._fired[a.id] === mk) continue
+        let when: Date | null = null
+        if (t.type === 'once') {
+          if (t.done) continue
+          const at = this._parseAt(t.at)
+          if (!at || now.getTime() < at.getTime()) continue
+          // 过期超过 24 小时：视为失效，只做标记（避免一周后突然弹出一条旧提醒）
+          if (now.getTime() - at.getTime() > 24 * 3600 * 1000) {
+            void this._setTriggerDone(a, t)
+            continue
+          }
+          // 一次性任务按「预定时间所在分钟」防重（done 标记是异步落库的，不能只靠它）
+          if (this._fired[a.id] === this._minuteKey(at)) continue
+          when = at
+        } else {
+          if (!t.cron || !cronMatch(t.cron, now)) continue
+          when = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes())
+        }
+        if (!this._schedQueue.some((q: any) => q.a.id === a.id && q.when.getTime() === when!.getTime())) {
+          this._schedQueue.push({ a, t, canvas: item.canvas, when, retry: 0 })
+        }
+      }
+      await this._drainSchedQueue()
+    },
+    async _drainSchedQueue() {
+      let fired = 0
+      while (this._schedQueue.length && fired < 4) {
+        const item: any = this._schedQueue[0]
+        const mk = this._minuteKey(item.when)
+        if (this._fired[item.a.id] === mk) { this._schedQueue.shift(); continue }
+        const conv = await this._convForCanvas(item.canvas)
+        if (!conv) { this._schedQueue.shift(); continue }
+        if (this.streamingConvIds.has(conv.id)) {
+          // 会话正在流式：本轮不发，下一分钟再来；连续 3 次仍忙则丢弃（避免无限堆积）
+          item.retry = (item.retry || 0) + 1
+          if (item.retry >= 3) {
+            this._schedQueue.shift()
+            console.warn('[scheduler] 会话持续忙碌，跳过本轮触发', item.a?.name)
+          }
+          break
+        }
+        this._schedQueue.shift()
+        this._markFired(item.a.id, mk, item.when)
+        fired++
+        void this._fireScheduled(item, conv)
+      }
+    },
+    /** 启动补跑：只对勾了 catch_up 的周期任务生效（一次性任务在 tick 里天然补跑） */
+    _catchUpScan() {
+      const now = new Date()
+      const mk = this._minuteKey(now)
+      for (const item of this._scheduledItems()) {
+        const { a, t, canvas } = item
+        if (!t.catch_up || t.type === 'once') continue
+        if (this._fired[a.id] === mk) continue
+        const prev = this._prevCronRun(String(t.cron || ''), now)
+        if (!prev) continue
+        const last = this._lastRun[a.id] || 0
+        if (last >= prev.getTime()) continue
+        this._schedQueue.push({ a, t, canvas, when: prev, retry: 0 })
+      }
+      void this._drainSchedQueue()
     },
 
 
