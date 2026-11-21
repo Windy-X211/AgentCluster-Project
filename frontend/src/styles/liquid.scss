@@ -28,6 +28,28 @@
   --ok-ink: #b7f3da;
   --err-ink: #ff9a9a;
   --warn-ink: #ffcba0;
+  /* 沉浸模式控制条 / 状态徽标 / 提示消息：深色主题是"暗玻璃+白字"，浅色主题整组换成"白玻璃+深字" */
+  --im-bg: rgba(8, 10, 14, 0.52);
+  --im-bg-strong: rgba(8, 10, 14, 0.68);
+  --im-bg-soft: rgba(8, 10, 14, 0.42);
+  --im-orb-bg: rgba(8, 10, 14, 0.34);
+  --im-orb-bg-hover: rgba(8, 10, 14, 0.62);
+  --im-ink: rgba(255, 255, 255, 0.92);
+  --im-ink-dim: rgba(255, 255, 255, 0.66);
+  --im-edge: rgba(255, 255, 255, 0.12);
+  --im-edge-strong: rgba(255, 255, 255, 0.16);
+  --im-hover: rgba(255, 255, 255, 0.14);
+  --im-shadow: 0 10px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --im-accent-bg: rgba(126, 226, 168, 0.14);
+  --im-accent-edge: rgba(126, 226, 168, 0.38);
+  --im-accent-ink: #d7ffe7;
+  --im-badge-bg: rgba(126, 226, 168, 0.26);
+  --im-badge-ink: #eafff2;
+  --im-chip-go-bg: rgba(255, 255, 255, 0.12);
+  --im-surface: rgba(255, 255, 255, 0.06);
+  --im-ink-soft: rgba(255, 255, 255, 0.84);
+  --im-ink-strong: #ffffff;
+  --im-shadow-soft: 0 8px 24px rgba(0, 0, 0, 0.28);
   --font-scale: 1;
   --app-font: "Noto Sans SC", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
   --code-tint-bg: rgba(var(--surface-rgb), 0.06);
@@ -59,6 +81,27 @@
   --ok-ink: #b7f3da;
   --err-ink: #ff9a9a;
   --warn-ink: #ffcba0;
+  --im-bg: rgba(8, 10, 14, 0.52);
+  --im-bg-strong: rgba(8, 10, 14, 0.68);
+  --im-bg-soft: rgba(8, 10, 14, 0.42);
+  --im-orb-bg: rgba(8, 10, 14, 0.34);
+  --im-orb-bg-hover: rgba(8, 10, 14, 0.62);
+  --im-ink: rgba(255, 255, 255, 0.92);
+  --im-ink-dim: rgba(255, 255, 255, 0.66);
+  --im-edge: rgba(255, 255, 255, 0.12);
+  --im-edge-strong: rgba(255, 255, 255, 0.16);
+  --im-hover: rgba(255, 255, 255, 0.14);
+  --im-shadow: 0 10px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --im-accent-bg: rgba(126, 226, 168, 0.14);
+  --im-accent-edge: rgba(126, 226, 168, 0.38);
+  --im-accent-ink: #d7ffe7;
+  --im-badge-bg: rgba(126, 226, 168, 0.26);
+  --im-badge-ink: #eafff2;
+  --im-chip-go-bg: rgba(255, 255, 255, 0.12);
+  --im-surface: rgba(255, 255, 255, 0.06);
+  --im-ink-soft: rgba(255, 255, 255, 0.84);
+  --im-ink-strong: #ffffff;
+  --im-shadow-soft: 0 8px 24px rgba(0, 0, 0, 0.28);
   /* 箭头外圈描边：暗色主题也不描黑，改用淡冷光晕把箭头从底色里托出来 */
   --edge-halo: rgba(198, 216, 255, 0.36);
 }
@@ -87,6 +130,28 @@
   /* 插件调试结果区：白底上必须用深色墨，浅绿/浅粉会看不清 */
   --ok-ink: #05674a;
   --err-ink: #b01c1c;
+  /* 沉浸模式：白玻璃 + 深字，控制条不再是一块黑板 */
+  --im-bg: rgba(255, 255, 255, 0.72);
+  --im-bg-strong: rgba(255, 255, 255, 0.92);
+  --im-bg-soft: rgba(255, 255, 255, 0.66);
+  --im-orb-bg: rgba(255, 255, 255, 0.66);
+  --im-orb-bg-hover: rgba(255, 255, 255, 0.94);
+  --im-ink: #0c121c;
+  --im-ink-dim: rgba(12, 18, 28, 0.62);
+  --im-edge: rgba(37, 99, 235, 0.14);
+  --im-edge-strong: rgba(37, 99, 235, 0.22);
+  --im-hover: rgba(37, 99, 235, 0.1);
+  --im-shadow: 0 14px 38px rgba(20, 30, 50, 0.16), 0 0 0 1px rgba(37, 99, 235, 0.06), inset 0 1px 0 #fff;
+  --im-accent-bg: rgba(37, 99, 235, 0.1);
+  --im-accent-edge: rgba(37, 99, 235, 0.3);
+  --im-accent-ink: #1d4ed8;
+  --im-badge-bg: rgba(37, 99, 235, 0.14);
+  --im-badge-ink: #1d4ed8;
+  --im-chip-go-bg: rgba(37, 99, 235, 0.1);
+  --im-surface: rgba(37, 99, 235, 0.06);
+  --im-ink-soft: rgba(12, 18, 28, 0.82);
+  --im-ink-strong: #0c121c;
+  --im-shadow-soft: 0 10px 28px rgba(20, 30, 50, 0.14), 0 0 0 1px rgba(37, 99, 235, 0.05);
   --code-tint-bg: #e2ebf6;
   --code-tint-strong: #cfdbef;
   --code-tint-pre: #e2ebf6;
@@ -144,6 +209,28 @@ html[data-theme="tech-white"] body option {
   --ok-ink: #1f5c3a;
   --err-ink: #8f2b1f;
   --warn-ink: #8a5a12;
+  /* 沉浸模式：米黄玻璃 + 深褐字 */
+  --im-bg: rgba(250, 243, 223, 0.78);
+  --im-bg-strong: rgba(250, 243, 223, 0.94);
+  --im-bg-soft: rgba(250, 243, 223, 0.72);
+  --im-orb-bg: rgba(250, 243, 223, 0.72);
+  --im-orb-bg-hover: rgba(250, 243, 223, 0.96);
+  --im-ink: #46371e;
+  --im-ink-dim: rgba(70, 55, 30, 0.62);
+  --im-edge: rgba(90, 70, 30, 0.16);
+  --im-edge-strong: rgba(90, 70, 30, 0.24);
+  --im-hover: rgba(90, 70, 30, 0.08);
+  --im-shadow: 0 14px 38px rgba(90, 70, 30, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  --im-accent-bg: rgba(43, 108, 176, 0.1);
+  --im-accent-edge: rgba(43, 108, 176, 0.3);
+  --im-accent-ink: #2b6cb0;
+  --im-badge-bg: rgba(43, 108, 176, 0.14);
+  --im-badge-ink: #2b6cb0;
+  --im-chip-go-bg: rgba(90, 70, 30, 0.08);
+  --im-surface: rgba(90, 70, 30, 0.05);
+  --im-ink-soft: rgba(70, 55, 30, 0.8);
+  --im-ink-strong: #46371e;
+  --im-shadow-soft: 0 10px 28px rgba(90, 70, 30, 0.16);
   /* 浅色主题同理：箭头外圈描边用米黄底色，避免黑边 */
   --edge-halo: rgba(250, 243, 223, 0.94);
   --red-ink: #c53030;

@@ -175,9 +175,9 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  border: 1px solid rgba(var(--surface-rgb), 0.16);
-  background: rgba(8, 10, 14, 0.34);
-  color: rgba(255, 255, 255, 0.86);
+  border: 1px solid var(--im-edge, rgba(255, 255, 255, 0.16));
+  background: var(--im-orb-bg, rgba(8, 10, 14, 0.34));
+  color: var(--im-ink, rgba(255, 255, 255, 0.86));
   cursor: pointer;
   pointer-events: auto;
   user-select: none;
@@ -186,7 +186,7 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   -webkit-backdrop-filter: blur(8px);
   transition: opacity .2s, transform .2s, background .2s;
 }
-.im-orb:hover { opacity: 1; transform: scale(1.06); background: rgba(8, 10, 14, 0.6); }
+.im-orb:hover { opacity: 1; transform: scale(1.06); background: var(--im-orb-bg-hover, rgba(8, 10, 14, 0.6)); }
 .im-orb.open { opacity: 0.9; }
 
 /* —— 细条顶栏 —— */
@@ -202,12 +202,12 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   padding: 0 8px 0 12px;
   border-radius: 14px;
   pointer-events: auto;
-  background: rgba(8, 10, 14, 0.52);
+  background: var(--im-bg, rgba(8, 10, 14, 0.52));
   backdrop-filter: blur(22px) saturate(160%);
   -webkit-backdrop-filter: blur(22px) saturate(160%);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--im-edge, rgba(255, 255, 255, 0.12));
+  box-shadow: var(--im-shadow, 0 10px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.1));
+  color: var(--im-ink, rgba(255, 255, 255, 0.92));
   user-select: none;
   animation: im-drop .18s ease-out;
   /* 整条控制条都是窗口拖动区；按钮区单独 no-drag，否则点不到按钮 */
@@ -249,12 +249,12 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   min-width: 0;
   max-width: 100%;
   font-size: calc(11.5px * var(--font-scale));
-  color: rgba(255, 255, 255, 0.66);
+  color: var(--im-ink-dim, rgba(255, 255, 255, 0.66));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.im-status.active { color: rgba(255, 255, 255, 0.9); }
+.im-status.active { color: var(--im-ink, rgba(255, 255, 255, 0.9)); }
 
 .im-dot {
   width: 6px; height: 6px;
@@ -284,18 +284,18 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   align-items: center;
   gap: 5px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.84);
+  border: 1px solid var(--im-edge, rgba(255, 255, 255, 0.12));
+  background: var(--im-surface, rgba(255, 255, 255, 0.06));
+  color: var(--im-ink-soft, rgba(255, 255, 255, 0.84));
   font-size: calc(11.5px * var(--font-scale));
   cursor: pointer;
   transition: background .15s, border-color .15s;
 }
-.im-btn:hover { background: rgba(255, 255, 255, 0.14); }
+.im-btn:hover { background: var(--im-hover, rgba(255, 255, 255, 0.14)); }
 .im-btn.accent {
-  border-color: rgba(126, 226, 168, 0.38);
-  background: rgba(126, 226, 168, 0.14);
-  color: #d7ffe7;
+  border-color: var(--im-accent-edge, rgba(126, 226, 168, 0.38));
+  background: var(--im-accent-bg, rgba(126, 226, 168, 0.14));
+  color: var(--im-accent-ink, #d7ffe7);
 }
 .im-badge {
   min-width: 16px; height: 16px; padding: 0 4px;
@@ -303,8 +303,8 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   border-radius: 8px;
   font-size: calc(10px * var(--font-scale));
   font-weight: 600;
-  background: rgba(126, 226, 168, 0.26);
-  color: #eafff2;
+  background: var(--im-badge-bg, rgba(126, 226, 168, 0.26));
+  color: var(--im-badge-ink, #eafff2);
 }
 
 .im-win {
@@ -312,11 +312,11 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   display: inline-flex; align-items: center; justify-content: center;
   border: none; border-radius: 6px;
   background: transparent;
-  color: rgba(255, 255, 255, 0.72);
+  color: var(--im-ink-soft, rgba(255, 255, 255, 0.72));
   cursor: pointer;
   transition: background .15s, color .15s;
 }
-.im-win:hover { background: rgba(255, 255, 255, 0.14); color: #fff; }
+.im-win:hover { background: var(--im-hover, rgba(255, 255, 255, 0.14)); color: var(--im-ink-strong, #fff); }
 .im-close:hover { background: #e81123; color: #fff; }
 
 /* —— 状态徽标（细条收起时） —— */
@@ -333,18 +333,18 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   border-radius: 999px;
   pointer-events: auto;
   cursor: pointer;
-  background: rgba(8, 10, 14, 0.42);
+  background: var(--im-bg-soft, rgba(8, 10, 14, 0.42));
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
-  color: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--im-edge-strong, rgba(255, 255, 255, 0.14));
+  box-shadow: var(--im-shadow-soft, 0 8px 24px rgba(0, 0, 0, 0.28));
+  color: var(--im-ink, rgba(255, 255, 255, 0.9));
   font-size: calc(11.5px * var(--font-scale));
   opacity: 0.72;
   transition: opacity .18s, background .18s;
   animation: im-fade .3s ease-out;
 }
-.im-chip:hover { opacity: 1; background: rgba(8, 10, 14, 0.66); }
+.im-chip:hover { opacity: 1; background: var(--im-bg-strong, rgba(8, 10, 14, 0.66)); }
 @keyframes im-fade { from { opacity: 0; } to { opacity: .72; } }
 .im-chip-text {
   white-space: nowrap;
@@ -355,7 +355,7 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--im-chip-go-bg, rgba(255, 255, 255, 0.12));
   font-size: calc(10.5px * var(--font-scale));
   opacity: .9;
 }
@@ -370,11 +370,11 @@ async function closeWin() { try { await windowAPI.close() } catch { /* ignore */
   padding: 8px 16px;
   border-radius: 10px;
   pointer-events: none;
-  background: rgba(8, 10, 14, 0.56);
+  background: var(--im-bg, rgba(8, 10, 14, 0.56));
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  color: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--im-edge, rgba(255, 255, 255, 0.12));
+  color: var(--im-ink, rgba(255, 255, 255, 0.9));
   font-size: calc(12px * var(--font-scale));
   line-height: 1.5;
   text-align: center;
