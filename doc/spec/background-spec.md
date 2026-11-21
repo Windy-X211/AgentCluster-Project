@@ -142,8 +142,11 @@ AppData/backgrounds/
 
 - 默认（manifest 未声明 `interactive` / `playable`）：iframe 抢占整屏并直接接收原生鼠标、键盘事件，键盘焦点在进入沉浸时自动交给 iframe。
 - `playable: false` 或 `interactive: true`：走旧的 `bg-pointer` 视差协议（宿主 `postMessage` 转发坐标），适合内置的星空/流星雨等装饰性动效。
-- 可玩背景的沙箱能力：`allow-scripts allow-pointer-lock allow-popups`，并开放 `fullscreen` / `pointer-lock` / `autoplay`。**默认不开放 `allow-same-origin`**，因此 `localStorage`/`IndexedDB` 会抛安全错误——存档请用内存变量，或提示用户「沉浸模式不提供本地存储」。
-- 确实需要存档的小游戏：在「设置 → 外观设置 → 背景」卡片上把该背景的「存档」开关打开（按背景单独授权，会追加 `allow-same-origin`）。注意此时沙箱隔离基本失效，只应对可信的自编背景开启。
+- 可玩背景的沙箱能力：`allow-scripts allow-pointer-lock allow-popups allow-same-origin`，并开放 `fullscreen` / `autoplay` / `gamepad` 等。
+  `allow-same-origin` 对**所有 HTML 背景**恒定开放，不能关：缺了它帧的源是不透明的，`localStorage` 会抛 `SecurityError`，
+  而背景脚本通常在启动阶段读存档，一抛错就中断后续初始化（`resizeCanvas` 没执行 → canvas 停在默认 300×150 → 整个布局被压扁）。
+  安全性说明：背景帧由 `127.0.0.1:8870` 提供，应用本体在 `localhost:5173`，两者不同源，同源授权只让背景拥有自己稳定的源，拿不到应用自身的 `localStorage` / DOM。
+- 存档直接可用：小游戏用 `localStorage` / `IndexedDB` 无需额外开关。
 - 建议给可玩背景加一个「按 Esc 退出」的画面提示：iframe 获得焦点后宿主收不到 Esc，用户需要点右上角的悬浮图标唤出控制条再退出。
 
 ## 4. video 类型规范

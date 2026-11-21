@@ -5,7 +5,6 @@ import { useModelStore, useSettingsStore, useLayoutStore, useGuideStore, useAgen
 import { api } from '@/api'
 import FileExplorerDialog from '@/components/FileExplorerDialog.vue'
 import { getAvatarGradient } from '@/utils/avatar'
-import { bgPermissionVersion, isBgSameOriginAllowed, setBgSameOriginAllowed } from '@/utils/bgPermission'
 import { testSuccess, testError } from '@/utils/sound'
 
 const models = useModelStore()
@@ -198,24 +197,6 @@ async function deleteBackground(bg: any) {
   } catch (err: any) {
     showToast('删除失败：' + (err?.message || err), 'err')
   }
-}
-
-/** 动画背景：按背景放开「本地存储（同源）」——沙箱默认不透明源，localStorage 会报安全错误。
- *  开启后 allow-scripts + allow-same-origin 同源，沙箱隔离基本失效，所以要做一次明确确认。 */
-function toggleBgSameOrigin(bg: any) {
-  const allowed = isBgSameOriginAllowed(bg.id)
-  setBgSameOriginAllowed(bg.id, !allowed)
-  showToast(
-    !allowed
-      ? `已开启「${bg.name}」的本地存储（存档可用）`
-      : `已关闭「${bg.name}」的本地存储：需要存档的背景可能启动时报错、画布/布局被压扁`
-  )
-}
-
-/** 模板用：读变更计数让卡片在开关后立刻刷新 */
-function bgStoreOn(bg: any): boolean {
-  bgPermissionVersion.value
-  return isBgSameOriginAllowed(bg?.id)
 }
 
 function bgThumbStyle(bg: any): any {
@@ -1179,11 +1160,6 @@ const agentGroupOptions = computed(() => {
                 <video v-else-if="bg.type === 'video'" class="bg-live"
                        :src="bgRawUrl(bg) + '#t=0.2'" muted preload="auto" playsinline></video>
                 <span class="bg-type-tag">{{ bg.type === 'animation' ? '动画' : bg.type === 'video' ? '视频' : '图片' }}</span>
-                <button v-if="bg.type === 'animation'" class="bg-store" :class="{ on: bgStoreOn(bg) }"
-                        @click.stop="toggleBgSameOrigin(bg)"
-                        :title="bgStoreOn(bg) ? '已允许该背景使用本地存储（游戏存档）；点击关闭' : '允许该背景在沉浸模式使用本地存储（游戏存档）'">
-                  存档{{ bgStoreOn(bg) ? '开' : '关' }}
-                </button>
                 <button v-if="!bg.builtin" class="bg-del" @click.stop="deleteBackground(bg)" title="删除"><AppIcon name="x" /></button>
               </div>
               <div class="bg-name">{{ bg.name }}</div>
@@ -1870,17 +1846,6 @@ const agentGroupOptions = computed(() => {
   display: flex; align-items: center; justify-content: center;
   &:hover { background: rgba(220,60,60,0.85); }
 }
-/* 动画背景的「存档」开关：按背景放开 iframe 的同源权限，让 HTML 小游戏能用 localStorage */
-.bg-store {
-  position: absolute; bottom: 4px; right: 4px;
-  height: 18px; padding: 0 6px;
-  border-radius: 4px; border: none; cursor: pointer;
-  background: rgba(0,0,0,0.5); color: rgba(255,255,255,0.86);
-  font-size: calc(10px * var(--font-scale));
-  backdrop-filter: blur(4px);
-  &:hover { background: rgba(0,0,0,0.75); }
-}
-.bg-store.on { background: rgba(var(--accent-rgb), 0.82); color: #fff; }
 .bg-name { padding: 6px 8px; text-align: center; font-size: calc(12px * var(--font-scale)); }
 /* 缩略画面：静止态代表图 + 悬停真实动画，暗色背景在浅色主题下补一圈亮边 */
 .bg-preview {
