@@ -440,6 +440,28 @@ async function browseStorage() {
   }
 }
 
+// —— 语音识别安装命令复制 ——
+const ASR_INSTALL_CMD = 'pip install funasr-onnx funasr modelscope onnxscript'
+const asrCmdCopied = ref(false)
+let asrCopyTimer: ReturnType<typeof setTimeout> | undefined
+async function copyAsrCmd() {
+  try {
+    await navigator.clipboard.writeText(ASR_INSTALL_CMD)
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = ASR_INSTALL_CMD
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+  }
+  asrCmdCopied.value = true
+  if (asrCopyTimer) clearTimeout(asrCopyTimer)
+  asrCopyTimer = setTimeout(() => { asrCmdCopied.value = false }, 2000)
+}
+
 // —— 迁移用户数据到指定位置 ——
 function fmtBytes(n: number): string {
   const v = Number(n) || 0
@@ -1298,7 +1320,10 @@ const agentGroupOptions = computed(() => {
           </div>
           <div v-if="!settings.asrAvailable" class="asr-install">
             <div class="asr-install-label">安装命令（在后端目录执行）：</div>
-            <div class="asr-cmd">pip install funasr-onnx funasr modelscope onnxscript</div>
+            <div class="asr-cmd-row">
+              <code class="asr-cmd">pip install funasr-onnx funasr modelscope onnxscript</code>
+              <button class="asr-copy-btn" :class="{ copied: asrCmdCopied }" :title="asrCmdCopied ? '已复制' : '复制安装命令'" @click="copyAsrCmd">{{ asrCmdCopied ? '已复制' : '复制' }}</button>
+            </div>
             <div class="asr-note">安装后重启后端即可使用。首次识别会自动下载 SenseVoiceSmall 模型（约 936MB）。</div>
           </div>
           <div v-if="settings.asrAvailable" class="asr-toggle">
@@ -1715,7 +1740,11 @@ const agentGroupOptions = computed(() => {
 .asr-desc { font-size: 13px; color: var(--text); opacity: 0.7; }
 .asr-install { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: rgba(var(--surface-rgb), 0.06); border: 1px solid rgba(var(--surface-rgb), 0.12); }
 .asr-install-label { font-size: 13px; margin-bottom: 6px; color: var(--text); opacity: 0.8; }
-.asr-cmd { font-family: monospace; font-size: 13px; padding: 6px 10px; border-radius: 6px; background: rgba(var(--shadow-rgb), 0.18); color: var(--code-ink, #ffb088); word-break: break-all; }
+.asr-cmd-row { display: flex; align-items: center; gap: 8px; }
+.asr-cmd { flex: 1; min-width: 0; font-family: monospace; font-size: 13px; padding: 6px 10px; border-radius: 6px; background: rgba(var(--shadow-rgb), 0.18); color: var(--code-ink, #ffb088); word-break: break-all; }
+.asr-copy-btn { flex-shrink: 0; padding: 4px 12px; border-radius: 6px; border: 1px solid rgba(var(--surface-rgb), 0.25); background: rgba(var(--surface-rgb), 0.1); color: var(--text); font-size: 12px; cursor: pointer; transition: background .15s, border-color .15s; }
+.asr-copy-btn:hover { background: rgba(var(--surface-rgb), 0.2); border-color: rgba(var(--surface-rgb), 0.4); }
+.asr-copy-btn.copied { border-color: rgba(34,197,94,0.5); color: #4ade80; }
 .asr-note { font-size: 12px; margin-top: 6px; color: var(--text); opacity: 0.5; }
 .asr-toggle { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .asr-switch { position: relative; width: 42px; height: 24px; border-radius: 12px; border: none; cursor: pointer; background: rgba(var(--surface-rgb), 0.2); transition: background .2s; padding: 0; flex-shrink: 0; }
