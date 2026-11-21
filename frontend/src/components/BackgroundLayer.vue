@@ -2,7 +2,6 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useLayoutStore } from '@/stores'
 import { api } from '@/api'
-import { bgPermissionVersion, isBgSameOriginAllowed } from '@/utils/bgPermission'
 
 const layout = useLayoutStore()
 const list = ref<any[]>([])
@@ -63,23 +62,21 @@ const playable = computed(() => {
   return c.interactive !== true
 })
 
-// 可交互态多给两项沙箱能力：指针锁（FPS 类游戏需要）、弹窗（部分游戏的全屏提示）
-// 本地存储（同源）按背景单独授权（设置页开关），默认关闭
-// 同源授权：缺省给所有 animation 背景（默认开，可逐个关）。
-// 背景帧源是 127.0.0.1:8870，应用本体在 localhost:5173，两者不同源，
-// 所以开 allow-same-origin 不会暴露应用自身数据；但不给的话 localStorage 抛异常，
-// 背景脚本常在启动阶段读存档，一抛错就中断初始化（snake.html 就是 canvas 停在 300×150）。
-const sameOriginAllowed = computed(() => {
-  bgPermissionVersion.value  // 依赖变更计数，开关一改立即重建 iframe 沙箱
-  return current.value?.type === 'animation' && isBgSameOriginAllowed(current.value?.id)
-})
+// 沙箱能力说明：
+//  · 可交互态（小游戏）额外需要指针锁（FPS 类）与弹窗（部分游戏的全屏提示）
+//  · HTML 背景一律带 allow-same-origin：缺了它帧的源是不透明的，localStorage 直接抛
+//    SecurityError，而背景脚本通常在启动阶段读存档，一抛错就中断后续初始化
+//    （snake.html 就是停在 resizeCanvas 之前，canvas 保持默认 300×150，布局被压扁）。
+//  · 安全性：背景帧由 127.0.0.1:8870 提供，应用本体在 localhost:5173，二者不同源，
+//    同源授权只让背景拥有自己稳定的源，拿不到应用自身的 localStorage / DOM。
 const iframeSandbox = computed(() => {
   const base = playable.value
     ? 'allow-scripts allow-pointer-lock allow-popups'
     : 'allow-scripts'
-  return sameOriginAllowed.value ? `${base} allow-same-origin` : base
+  return current.value?.type === 'animation' ? `${base} allow-same-origin` : base
 })
-const iframeAllow = 'fullscreen; pointer-lock; autoplay; encrypted-media; gamepad'
+// pointer-lock 不是合法的 permission-policy 名称（沙箱 token 已经覆盖），带上会被浏览器告警
+const iframeAllow = 'fullscreen; autoplay; encrypted-media; gamepad'
 
 const iframeRef = ref<HTMLIFrameElement | null>(null)
 
