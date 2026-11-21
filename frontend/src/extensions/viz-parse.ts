@@ -9,6 +9,76 @@ export interface VizSegment {
     type?: string        // kind === 'viz' 时的可视化类型
     data?: any           // kind === 'viz' 时的解析后数据（解析失败为 null）
     raw?: string         // kind === 'viz' 时的原始 JSON 字符串
+    error?: string       // kind === 'viz' 且 JSON 解析失败（自动修复也无效）时的错误说明
+}
+
+/**
+ * 修复 JSON 中常见的闭合括号错误：
+ *  1. 错配：对象用 ] 闭合 / 数组用 } 闭合 —— 按语法上下文替换为正确闭合符
+ *  2. 漏闭合：扫描结束仍未闭合 —— 按栈序补齐（栈序即唯一正确的闭合序列）
+ *  3. 数组内出现 "key": 形式 —— JSON 数组内不可能有 key:value，必然是数组漏闭合，在该 key 前补 ]
+ * 全部为确定性修复（语法上下文唯一确定），不做猜测。
+ * 无法修复（多余闭合符 / 字符串未闭合 / 无任何问题）返回 null。
+ */
+function fixBracketMismatch(raw: string): string | null {
+    const stack: string[] = []
+    const fixes: Array<{ i: number, ch: string, insert?: boolean }> = []
+    let esc = false
+    for (let i = 0; i < raw.length; i++) {
+        const c = raw[i]
+        if (esc) { esc = false; continue }
+        if (c === '"') {
+            let j = i + 1
+            while (j < raw.length) {
+                if (raw[j] === '\\') { j += 2; continue }
+                if (raw[j] === '"') break
+                j++
+            }
+            if (j >= raw.length) return null   // 字符串未闭合：不猜
+            let k = j + 1
+            while (k < raw.length && /\s/.test(raw[k])) k++
+            if (raw[k] === ':' && stack.length && stack[stack.length - 1] === '[') {
+                let ins = i
+                while (ins > 0 && /\s/.test(raw[ins - 1])) ins--
+                if (ins > 0 && raw[ins - 1] === ',') ins--
+                fixes.push({ i: ins, ch: ']', insert: true })
+                stack.pop()
+            }
+            i = j
+            continue
+        }
+        if (c === '{' || c === '[') { stack.push(c); continue }
+        if (c === '}' || c === ']') {
+            const top = stack.pop()
+            if (top === undefined) return null  // 多余闭合符：不猜
+            const expect = top === '{' ? '}' : ']'
+            if (c !== expect) fixes.push({ i, ch: expect })
+        }
+    }
+    if (!fixes.length && !stack.length) return null
+    let out = raw
+    for (let k = fixes.length - 1; k >= 0; k--) {
+        const f = fixes[k]
+        out = f.insert ? out.slice(0, f.i) + f.ch + out.slice(f.i)
+                       : out.slice(0, f.i) + f.ch + out.slice(f.i + 1)
+    }
+    for (let k = stack.length - 1; k >= 0; k--) {
+        out += stack[k] === '{' ? '}' : ']'
+    }
+    return out
+}
+
+/** 解析 viz JSON：失败时先尝试括号错配修复，仍失败则返回 null 并给出错误说明 */
+function parseVizJson(raw: string): { data: any, error?: string } {
+    try {
+        return { data: JSON.parse(raw) }
+    } catch (e1) {
+        const fixed = fixBracketMismatch(raw)
+        if (fixed != null) {
+            try { return { data: JSON.parse(fixed) } } catch { /* 修复后仍非法，按原始错误报出 */ }
+        }
+        return { data: null, error: `JSON 解析失败：${(e1 as Error).message}` }
+    }
 }
 
 /**
@@ -42,9 +112,8 @@ export function parseVizSegments(content: string): VizSegment[] {
         }
         const type = m[1]
         const raw = m[2]
-        let data: any = null
-        try { data = JSON.parse(raw) } catch { /* 解析失败保留 raw，渲染器回退 */ }
-        segs.push({ kind: 'viz', type, data, raw })
+        const { data, error } = parseVizJson(raw)
+        segs.push({ kind: 'viz', type, data, raw, error })
         last = re.lastIndex
     }
     if (last < content.length) {

@@ -13,15 +13,22 @@ const props = defineProps<{
   type: string
   data?: any
   raw?: string
+  error?: string
   extAPI?: any
 }>()
 
 const renderer = computed(() => getVizRenderer(props.type))
+const parseFailed = computed(() => props.data == null && !!props.error)
 </script>
 
 <template>
+  <div v-if="parseFailed" class="viz-slot-fallback">
+    <div class="vsf-head"><AppIcon name="alert-triangle" /> viz JSON 解析失败（{{ type }}）</div>
+    <div class="vsf-err">{{ error }}</div>
+    <pre class="vsf-raw">{{ raw }}</pre>
+  </div>
   <component
-    v-if="renderer"
+    v-else-if="renderer"
     :is="renderer"
     :data="data || {}"
     :raw="raw || ''"
@@ -43,5 +50,6 @@ const renderer = computed(() => getVizRenderer(props.type))
 }
 .vsf-head { margin-bottom: 4px; }
 .vsf-head code { background: rgba(255,255,255,.1); padding: 1px 4px; border-radius: 3px; }
+.vsf-err { margin: 4px 0; opacity: .9; }
 .vsf-raw { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: 11px; opacity: .8; }
 </style>

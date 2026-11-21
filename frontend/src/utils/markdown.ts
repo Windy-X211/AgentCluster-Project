@@ -444,6 +444,13 @@ export function renderChatMarkdown(text: string | undefined | null): string {
       if (s.kind === 'md') {
         const html = renderMarkdown(s.text || '')
         out += html ? _postChatAttachments(html) : ''
+      } else if (s.error) {
+        // JSON 解析失败（自动修复也无效）：静态失败框（无交互，无需挂载 Vue 组件）
+        out += `<div class="viz-slot-fallback" style="padding:8px 12px;background:rgba(255,180,80,.12);border:1px dashed rgba(255,180,80,.5);border-radius:6px;font-size:12px;">`
+          + `<div style="margin-bottom:4px;">⚠ viz JSON 解析失败（${escHtml(s.type || '')}）</div>`
+          + `<div style="margin:4px 0;opacity:.9;">${escHtml(s.error)}</div>`
+          + `<pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-size:11px;opacity:.8;">${escHtml((s.raw || '').slice(0, 2000))}</pre>`
+          + `</div>`
       } else {
         // viz 占位 div：data-viz-type + data-viz-enc(base64(Unicode-safe JSON)) + data-viz-valid
         // 挂载层（RightPanel）扫描 .viz-slot 并动态挂载 VizBlock 组件

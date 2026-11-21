@@ -31,7 +31,7 @@ function mdHtml(text?: string): string {
 <template>
   <template v-for="(s, i) in segs" :key="i">
     <div v-if="s.kind === 'md'" class="cb-md" v-html="mdHtml(s.text)"></div>
-    <VizBlock v-else :type="s.type || ''" :data="s.data" :raw="s.raw" :extAPI="extAPI" />
+    <VizBlock v-else :type="s.type || ''" :data="s.data" :raw="s.raw" :error="s.error" :extAPI="extAPI" />
   </template>
   <span v-if="streaming" class="stream-cursor">▌</span>
 </template>
